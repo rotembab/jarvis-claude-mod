@@ -188,7 +188,7 @@ def test_full_session_like_the_mod(helper: Helper, fish: FakeFishServer, tmp_pat
     # Stop mid-reply.
     helper.post("speak", {"replyId": "reply-2", "seq": 0, "text": "A long sentence " * 20, "final": False})
     helper.wait_for("speech_started", replyId="reply-2")
-    time.sleep(0.3)
+    time.sleep(0.6)  # ~4 s of audio queued: still mid-reply, and well past the first word
     assert helper.post("stop", {"reason": "user"}) == (200, {"ok": True, "stopped": True})
     done = helper.wait_for("speech_done", replyId="reply-2")[-1]
     assert done["interrupted"] is True and done["spokenText"]

@@ -270,11 +270,9 @@ class DeadOutput(FakePlayback):
         self.dead = False
         self.closes = 0
 
-    def _run(self) -> None:
-        period = self.block / 24_000 / self.speed
-        while not self._stop.wait(period):
-            if not self.dead:
-                self.mixer.render(self.block)
+    def _render_block(self) -> None:
+        if not self.dead:
+            self.mixer.render(self.block)
 
     def close(self) -> None:
         self.closes += 1

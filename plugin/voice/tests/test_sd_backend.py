@@ -52,18 +52,26 @@ class FakeStream:
 
     def _run(self) -> None:
         block = int(self.samplerate * 0.01)
+        started = time.monotonic()
         n = 0
         while self.active:
-            if self.kind == "input":
-                if not self.sd.mute_input:
-                    data = np.full((block, self.channels), 0.2 + 0.001 * (n % 7), np.float32)
-                    self.kwargs["callback"](data, block, None, None)
-            else:
-                out = np.zeros((block, self.channels), np.float32)
-                self.kwargs["callback"](out, block, None, None)
-                self.sd.rendered.append(out[:, 0].copy())
-            n += 1
-            time.sleep(block / self.samplerate)  # real-time pacing
+            # Real-time pacing by the clock, like a driver: CI machines oversleep
+            # short sleeps, which would otherwise deliver too few blocks.
+            due = int((time.monotonic() - started) * self.samplerate / block) + 1
+            while n < due and self.active:
+                self._deliver(block, n)
+                n += 1
+            time.sleep(block / self.samplerate)
+
+    def _deliver(self, block: int, n: int) -> None:
+        if self.kind == "input":
+            if not self.sd.mute_input:
+                data = np.full((block, self.channels), 0.2 + 0.001 * (n % 7), np.float32)
+                self.kwargs["callback"](data, block, None, None)
+        else:
+            out = np.zeros((block, self.channels), np.float32)
+            self.kwargs["callback"](out, block, None, None)
+            self.sd.rendered.append(out[:, 0].copy())
 
     def abort(self) -> None:
         self.aborts += 1

@@ -125,9 +125,21 @@ class FakePlayback:
         self._stop.set()
 
     def _run(self) -> None:
+        # Pace by the clock, not by wait() timeouts, the way a sound card does:
+        # Windows rounds Event.wait to its ~15.6 ms timer tick and busy macOS
+        # machines oversleep, which would otherwise play several times slower
+        # than ``speed``.
         period = self.block / TTS_SAMPLERATE / self.speed
+        started = time.monotonic()
+        rendered = 0
         while not self._stop.wait(period):
-            self.mixer.render(self.block)
+            due = int((time.monotonic() - started) / period)
+            while rendered < due and not self._stop.is_set():
+                self._render_block()
+                rendered += 1
+
+    def _render_block(self) -> None:
+        self.mixer.render(self.block)
 
     def add_speech(self, pcm: np.ndarray, generation: int | None = None) -> None:
         self.mixer.add_speech(pcm, generation)
