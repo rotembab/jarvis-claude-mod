@@ -84,11 +84,12 @@ def test_suspend_before_the_first_heartbeat_restarts_the_grace() -> None:
 
 def test_watchdog_thread_fires() -> None:
     fired = threading.Event()
-    dog = HeartbeatWatchdog(fired.set, timeout=0.2, grace=0.3, poll=0.02).start()
+    # Wide margins: a busy CI machine can oversleep a short wait several times over.
+    dog = HeartbeatWatchdog(fired.set, timeout=1.0, grace=2.0, poll=0.02).start()
     try:
         dog.beat()
-        assert not fired.wait(0.1)
-        assert fired.wait(2.0)
+        assert not fired.wait(0.3)
+        assert fired.wait(5.0)
     finally:
         dog.stop()
 

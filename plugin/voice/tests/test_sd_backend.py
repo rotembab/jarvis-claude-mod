@@ -200,10 +200,12 @@ def test_capture_falls_back_to_native_rate_and_resamples(sd: FakeSD) -> None:
         assert sd.streams[-1].samplerate == 48_000
         time.sleep(0.4)
         cap.begin()
+        began = time.monotonic()
         time.sleep(0.6)
         clip = cap.end()
-        # 0.3 s pre-roll + ~0.6 s, captured at 48 kHz and resampled to 16 kHz.
-        assert 0.6 * 16_000 < clip.size < 1.5 * 16_000
+        recorded = time.monotonic() - began  # a busy machine may oversleep
+        # 0.3 s pre-roll + what was recorded, captured at 48 kHz and resampled to 16 kHz.
+        assert 0.6 * 16_000 < clip.size < (0.3 + recorded + 0.2) * 16_000
     finally:
         cap.close()
 
