@@ -1,0 +1,92 @@
+// The slice of `$` the mod uses, as a plain object of functions. The engine
+// requires `$` to be spelled `$.noun.event(...)` at every call site (it is
+// never passed around), so register.tsx builds this port inside a hook from
+// closures, and every other module depends on the port instead of on `$`.
+
+import type {
+  HookStream,
+  HttpInit,
+  HttpResponse,
+  ProcessRunInit,
+  ProcessRunResult,
+  ProcessSpawnChunk,
+  ProcessSpawnRequest,
+  ProcessSpawnResult,
+  PromptSubmitResult,
+  Timer,
+  ToastOptions,
+} from 'claude-code'
+
+import type { JarvisHelperRef, JarvisView } from '../types'
+
+/** The environment variables the mod reads (each read by its literal name). */
+export type EnvSnapshot = {
+  OS?: string
+  USERPROFILE?: string
+  LOCALAPPDATA?: string
+  HOME?: string
+  NO_PROXY?: string
+  CLAUDE_CODE_REMOTE?: string
+}
+
+export type Engine = {
+  /** The plugin's folder (holds .claude-plugin/ and voice/). */
+  pluginRoot: string
+  env: () => Promise<EnvSnapshot>
+
+  now: () => Promise<number>
+  after: (ms: number, fn: () => void) => Timer
+  every: (ms: number, fn: () => void) => Timer
+
+  fetch: (url: string, init: HttpInit) => Promise<HttpResponse>
+  spawn: (request: ProcessSpawnRequest) => HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+  run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult>
+  exists: (path: string) => Promise<boolean>
+  writeFile: (path: string, text: string) => Promise<void>
+
+  storeGet: (key: string) => Promise<unknown>
+  storeSet: (key: string, value: unknown) => Promise<void>
+  storeDelete: (key: string) => Promise<void>
+  readHelperRef: () => Promise<JarvisHelperRef | null>
+  writeHelperRef: (ref: JarvisHelperRef | null) => Promise<void>
+  writeView: (view: JarvisView) => Promise<void>
+
+  status: (text: string | undefined) => void
+  toast: (text: string, options?: ToastOptions) => void
+  /** A dim line in the transcript (not sent to the model). */
+  log: (text: string) => void
+  /** A line in the debug log only. */
+  debug: (text: string) => void
+
+  /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
+  submitPrompt: (text: string) => Promise<PromptSubmitResult>
+  abortTurn: (turnId: string) => Promise<void>
+}
+
+/** Resolves after `ms` on the engine's clock (a hooks module has no timers). */
+export function delay(engine: Engine, ms: number): Promise<void> {
+  return new Promise(resolve => {
+    engine.after(ms, resolve)
+  })
+}
+
+export const TIMEOUT = Symbol('timeout')
+
+/** Races `promise` against the clock; `$.http.fetch` itself has no timeout. */
+export function withTimeout<T>(engine: Engine, promise: Promise<T>, ms: number): Promise<T | typeof TIMEOUT> {
+  return new Promise((resolve, reject) => {
+    const timer = engine.after(ms, () => resolve(TIMEOUT))
+    promise.then(
+      value => {
+        timer.cancel()
+        resolve(value)
+      },
+      (error: unknown) => {
+        timer.cancel()
+        reject(error)
+      },
+    )
+  })
+}
+
+export const describeError = (error: unknown): string => (error instanceof Error ? error.message : String(error))

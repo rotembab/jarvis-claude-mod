@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------- Node / TypeScript
+node_modules/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+coverage/
+
+# ---------------------------------------------------------------- Claude Code
+# Contracts the engine lays into a plugin folder when it loads it.
+plugin/.claude-plugin/types/
+.claude-plugin/types/
+# Personal Claude Code settings for this checkout.
+.claude/settings.local.json
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ---------------------------------------------------------------- uv
+# Cache folders if UV_CACHE_DIR is pointed inside the checkout.
+.uv-cache/
+uv-cache/
+
+# ---------------------------------------------------------------- Jarvis runtime data
+# The helper's data folder (venv, models, logs) normally lives in
+# %USERPROFILE%\.jarvis; these cover a --data-dir pointed inside the checkout.
+.jarvis/
+.jarvis-dev/
+models/
+logs/
+*.log
+
+# ---------------------------------------------------------------- Secrets
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------- OS and editor junk
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*~
+*.swp
+*.swo
+.idea/

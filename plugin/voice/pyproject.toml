@@ -1,0 +1,58 @@
+[project]
+name = "jarvis-voice"
+version = "0.1.0"
+description = "Local voice helper for the Jarvis Claude Code mod: push-to-talk, faster-whisper STT, Fish Audio live TTS."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26",
+    "sounddevice>=0.5.1",
+    "soxr>=0.5",
+    "faster-whisper>=1.1.1",
+    # Pinned exactly: the Windows wheel bundles cuDNN's cudnn64_9.dll dispatcher
+    # (9.10.2.21 in 4.8.2), and the cuDNN sub-libraries in the `cuda` extra must
+    # be the same version. Bump both together.
+    "ctranslate2==4.8.2",
+    "websockets>=15",
+    "ormsgpack>=1.9",
+    "pynput>=1.8.1",
+]
+
+[project.optional-dependencies]
+# GPU libraries for CTranslate2. Windows also needs cuDNN's sub-libraries
+# (cudnn_ops64_9.dll, cudnn_cnn64_9.dll, ...): the Whisper encoder's first
+# Conv1D aborts the process without them. The Linux wheel does not use cuDNN.
+cuda = [
+    "nvidia-cublas-cu12>=12.4 ; sys_platform == 'win32' or sys_platform == 'linux'",
+    "nvidia-cudnn-cu12==9.10.2.21 ; sys_platform == 'win32'",
+]
+
+[project.scripts]
+jarvis-voice = "jarvis_voice.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "jsonschema>=4.23"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "BLE", "I", "UP", "SIM", "RUF", "N"]
+ignore = ["SIM105", "RUF001", "RUF002", "RUF003", "N818"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jarvis_voice"]
+known-local-folder = ["conftest", "fakes", "fish_fake"]

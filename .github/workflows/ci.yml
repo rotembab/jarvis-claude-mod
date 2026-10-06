@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  helper:
+    name: helper (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # sounddevice bundles PortAudio in its Windows and macOS wheels; on Linux it
+      # loads the system library, so install it for the import to succeed.
+      - name: Install PortAudio
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libportaudio2
+
+      # setup-uv publishes no floating major tag, so pin the release by commit.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: plugin/voice/uv.lock
+
+      # --locked fails the build when uv.lock is out of date with pyproject.toml;
+      # /jarvis setup installs from the lock file, so it must stay current.
+      - name: Install the helper and its dev dependencies
+        run: uv sync --locked --project plugin/voice --group dev
+
+      - name: Run helper tests
+        run: uv run --locked --project plugin/voice pytest -q plugin/voice/tests
+
+  mod:
+    name: mod
+    runs-on: ubuntu-latest
+    env:
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        run: |
+          npm i -g @anthropic-ai/claude-code
+          claude --version
+
+      # Checks the marketplace file and the plugin.json of the entry it lists.
+      - name: Validate the marketplace
+        run: claude plugin validate --strict .
+
+      # Checks the manifest, the userConfig, the types contract and the hooks module.
+      - name: Validate the plugin
+        run: claude plugin validate plugin
+
+      # Runs plugin/hooks/*.test.ts against the engine. The tests mock the helper
+      # ($.process.spawn, $.http.fetch) and need no login or API key.
+      - name: Run mod tests
+        run: claude plugin test plugin
+
+      # No `tsc -p plugin` step: Claude Code writes the API declarations into
+      # plugin/.claude-plugin/types/ only when a session loads the mod, and no
+      # command lays them without one. docs/DEVELOPING.md has the local check.

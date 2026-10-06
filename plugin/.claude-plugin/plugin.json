@@ -1,0 +1,43 @@
+{
+  "name": "jarvis",
+  "version": "0.1.0",
+  "description": "A JARVIS-style voice for Claude Code: hold push-to-talk to speak, hear the reply. Local speech-to-text, Fish Audio speech.",
+  "author": { "name": "Rotem" },
+  "license": "MIT",
+  "keywords": ["voice", "speech", "push-to-talk", "tts", "stt", "jarvis"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "fishApiKey": {
+      "type": "string",
+      "title": "Fish Audio API key",
+      "description": "Key for Fish Audio text-to-speech (fish.audio, API keys page). Stored in secure storage. Leave empty to use FISH_AUDIO_API_KEY from your settings.json env.",
+      "sensitive": true,
+      "required": false
+    },
+    "voiceId": {
+      "type": "string",
+      "title": "Fish Audio voice",
+      "description": "The model id of a Fish Audio voice (its reference id). Empty uses Fish Audio's default voice; /jarvis voice <id> overrides it.",
+      "required": false
+    },
+    "pttKey": {
+      "type": "string",
+      "title": "Push-to-talk key",
+      "description": "Hold this key to talk, release to send. Examples: right ctrl, right alt, f13, caps lock.",
+      "default": "right ctrl"
+    },
+    "sttModel": {
+      "type": "string",
+      "title": "Speech-to-text model",
+      "description": "faster-whisper model. auto picks large-v3-turbo on an NVIDIA GPU and small.en on the CPU. Run /jarvis setup after changing it to download the model.",
+      "options": ["auto", "base.en", "small.en", "small", "medium", "large-v3-turbo"],
+      "default": "auto"
+    },
+    "language": {
+      "type": "string",
+      "title": "Spoken language",
+      "description": "Language code for speech-to-text, such as en, de or he. English-only models (.en) ignore it.",
+      "default": "en"
+    }
+  }
+}

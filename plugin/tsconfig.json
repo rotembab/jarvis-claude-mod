@@ -1,0 +1,21 @@
+{
+  // The options the engine's typings recommend for a hooks module. The engine
+  // lays its declarations into .claude-plugin/types/ each time it loads the
+  // mod from a folder you own (claude --plugin-dir plugin), so `tsc -p plugin`
+  // type-checks after one such load; docs/DEVELOPING.md has the details.
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "types": [],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "react",
+    "jsxFactory": "h",
+    "jsxFragmentFactory": "Fragment"
+  },
+  "include": [".claude-plugin/types", "hooks", "types"]
+}

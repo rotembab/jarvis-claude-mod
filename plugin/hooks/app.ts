@@ -1,0 +1,342 @@
+// The mod's session-wide coordinator: built in register() from the user's
+// settings, bound to the engine port at session.start, it owns the helper
+// supervisor, the voice controller and the view the status line and band draw.
+
+import type { PluginOptions, RenderSurface } from 'claude-code'
+
+import type { JarvisPhase, JarvisView } from '../types'
+import type { Engine } from './engine'
+import { describeError } from './engine'
+import { Helper } from './helper'
+import type { HelperPhase } from './helper'
+import type { Platform } from './platform'
+import { detectPlatform, isRemoteSession } from './platform'
+import type { ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
+import { hasNvidiaGpu, runSetup } from './setup'
+import { statusLine } from './ui'
+import { Voice } from './voice'
+
+export const STT_MODELS = ['auto', 'base.en', 'small.en', 'small', 'medium', 'large-v3-turbo'] as const
+export type SttModel = (typeof STT_MODELS)[number]
+/** What `auto` means on the CPU (the helper's own pick there). */
+export const CPU_AUTO_MODEL: SttModel = 'small.en'
+
+/** What /jarvis setup was asked for: a model, and whether to install the CUDA libraries. */
+export type SetupOptions = { sttModel?: SttModel; useCuda?: boolean }
+
+export type JarvisSettings = {
+  fishApiKey?: string
+  voiceId?: string
+  pttKey: string
+  sttModel: SttModel
+  language: string
+}
+
+const optionString = (options: PluginOptions, key: string): string | undefined => {
+  const value = options[key]
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
+/** Reads the manifest's userConfig values, defaults filled in. */
+export function readSettings(options: PluginOptions): JarvisSettings {
+  const stt = optionString(options, 'sttModel')
+  return {
+    fishApiKey: optionString(options, 'fishApiKey'),
+    voiceId: optionString(options, 'voiceId'),
+    pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
+    sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
+    language: optionString(options, 'language') ?? 'en',
+  }
+}
+
+const HELPER_STATES: ReadonlySet<string> = new Set<HelperState>([
+  'starting',
+  'sleeping',
+  'listening',
+  'transcribing',
+  'speaking',
+  'error',
+])
+const LOCAL_SURFACES: ReadonlySet<RenderSurface> = new Set<RenderSurface>(['terminal', 'desktop'])
+const VOICE_OVERRIDE_KEY = 'voiceId'
+/**
+ * The speech model the last `/jarvis setup <model>` installed (the helper
+ * never downloads one itself), with the sttModel setting it overrode: it
+ * lapses once the setting changes, so the setting always has the last word.
+ */
+const STT_OVERRIDE_KEY = 'sttModel'
+type SttOverride = { model: SttModel; setting: SttModel }
+const LEVEL_INTERVAL_MS = 200
+
+export class Jarvis {
+  engine: Engine | undefined
+  platform: Platform | undefined
+  helper: Helper | undefined
+  voice: Voice | undefined
+  /** False in a cloud session: nothing local is started there. */
+  isLocal = false
+  ready: ReadyEvent | undefined
+  view: JarvisView = { phase: 'stopped' }
+  isSetupRunning = false
+
+  private hasAutoStarted = false
+  /** A local surface attached; it may come while session.start is still binding. */
+  private hasLocalAttach = false
+  private hasAnnouncedReady = false
+  private lastLevelAt = 0
+  private shownStatus: string | undefined
+
+  constructor(readonly settings: JarvisSettings) {}
+
+  /** session.start: binds the port; starts the helper when a local surface draws. */
+  async onSessionStart(engine: Engine, surface: RenderSurface | null): Promise<void> {
+    this.engine = engine
+    const env = await engine.env()
+    const platform = await detectPlatform(engine, env)
+    this.platform = platform
+    const helper = new Helper(engine, {
+      platform,
+      fishApiKey: this.settings.fishApiKey,
+      noProxy: env.NO_PROXY,
+      sttModel: () => this.sttModel(),
+      initialConfig: () => this.initialConfig(),
+      onEvent: event => this.onHelperEvent(event),
+      onPhase: (phase, detail) => this.onHelperPhase(phase, detail),
+    })
+    this.helper = helper
+    this.voice = new Voice(engine, {
+      platform,
+      helper,
+      onSubmitted: text => this.patch({ lastUtterance: text }),
+    })
+    this.isLocal = !isRemoteSession(env)
+    if (!this.isLocal) {
+      this.publish({ phase: 'unavailable' })
+      return
+    }
+    // The desktop app starts its sessions with no surface, then attaches one
+    // (perhaps while the awaits above ran).
+    if ((surface !== null && LOCAL_SURFACES.has(surface)) || this.hasLocalAttach) this.autoStart()
+  }
+
+  onAttach(surface: RenderSurface): void {
+    if (!LOCAL_SURFACES.has(surface)) return
+    this.hasLocalAttach = true
+    // Before session.start has finished, it starts the helper itself.
+    if (this.isLocal) this.autoStart()
+  }
+
+  /** Starts the helper (a user's request retries after already_running or a give-up). */
+  startHelper(userInitiated: boolean): void {
+    if (!this.isLocal || this.isSetupRunning) return
+    this.helper?.start({ userInitiated })
+  }
+
+  async restartHelper(): Promise<void> {
+    if (!this.isLocal || this.isSetupRunning || this.helper === undefined) return
+    await this.helper.restart()
+  }
+
+  /** The voice override /jarvis voice saved, else the userConfig value. */
+  async voiceId(): Promise<string | undefined> {
+    const stored = await this.engine?.storeGet(VOICE_OVERRIDE_KEY).catch(() => undefined)
+    return typeof stored === 'string' && stored !== '' ? stored : this.settings.voiceId
+  }
+
+  /**
+   * The speech model in use: the one `/jarvis setup <model>` last installed
+   * while the setting is what it was then, else the setting.
+   */
+  async sttModelChoice(): Promise<SttModel> {
+    return (await this.storedSttModel()) ?? this.settings.sttModel
+  }
+
+  /** The speech model the helper loads (`--stt-model`); undefined lets it choose ("auto"). */
+  async sttModel(): Promise<string | undefined> {
+    const model = await this.sttModelChoice()
+    return model === 'auto' ? undefined : model
+  }
+
+  /** The model a setup installs: the one named, else the one in use. */
+  async setupModel({ sttModel, useCuda }: SetupOptions): Promise<SttModel> {
+    const model = sttModel ?? (await this.sttModelChoice())
+    // The helper resolves auto by the GPU it sees, not by the CUDA libraries
+    // installed: without them, auto would pick the GPU model and fall back.
+    return model === 'auto' && useCuda === false ? CPU_AUTO_MODEL : model
+  }
+
+  async setVoiceOverride(voiceId: string | undefined): Promise<void> {
+    if (this.engine === undefined) return
+    if (voiceId === undefined) await this.engine.storeDelete(VOICE_OVERRIDE_KEY)
+    else await this.engine.storeSet(VOICE_OVERRIDE_KEY, voiceId)
+  }
+
+  /**
+   * /jarvis setup after uv was found: stops the helper (Windows locks a
+   * running venv), installs, downloads the model, starts the helper again.
+   * A model named here (or pinned by `cpu`) is remembered, so the helper
+   * loads the one installed.
+   */
+  async runSetup(uv: string, request: SetupOptions): Promise<void> {
+    const { engine, platform, helper } = this
+    if (engine === undefined || platform === undefined || helper === undefined || this.isSetupRunning) return
+    this.isSetupRunning = true
+    this.publish({ ...this.view, phase: 'setup', detail: 'stopping the helper' })
+    try {
+      if (!(await helper.stop())) {
+        // uv would fail on (or half-replace) files the live helper holds open.
+        engine.log(
+          'Jarvis setup did not run: the voice helper did not exit, and a running helper keeps its files locked. It stops by itself within a minute; then run /jarvis setup again.',
+        )
+        engine.toast('Jarvis setup did not run; the transcript says why.')
+        return
+      }
+      const useCuda = request.useCuda ?? (await hasNvidiaGpu(engine, platform))
+      const sttModel = await this.setupModel(request)
+      const result = await runSetup(engine, platform, uv, {
+        sttModel: sttModel === 'auto' ? undefined : sttModel,
+        useCuda,
+        onProgress: text => this.publish({ ...this.view, phase: 'setup', detail: text }),
+        debug: line => engine.debug(`jarvis: ${line}`),
+      })
+      if (result.ok) {
+        const isChosen = request.sttModel !== undefined || request.useCuda === false
+        await this.rememberSttModel(isChosen ? sttModel : undefined)
+        engine.log(`Jarvis setup finished (${result.summary}). Starting the voice helper.`)
+        engine.toast('Jarvis is installed. Starting the voice helper.')
+      } else {
+        engine.log(`Jarvis setup failed: ${result.message}`)
+        engine.toast('Jarvis setup failed; the transcript has the details.')
+      }
+    } catch (error) {
+      engine.log(`Jarvis setup failed: ${describeError(error)}`)
+      engine.toast('Jarvis setup failed; the transcript has the details.')
+    } finally {
+      this.isSetupRunning = false
+      this.publish({ ...this.view, phase: 'stopped', detail: undefined })
+      helper.start({ userInitiated: true })
+    }
+  }
+
+  /** Merges a change into the view and publishes it. */
+  patch(change: Partial<JarvisView>): void {
+    this.publish({ ...this.view, ...change })
+  }
+
+  /** The `/jarvis setup <model>` override, while the setting is the one it overrode. */
+  private async storedSttModel(): Promise<SttModel | undefined> {
+    const stored = await this.engine?.storeGet(STT_OVERRIDE_KEY).catch(() => undefined)
+    if (typeof stored !== 'object' || stored === null) return undefined
+    const { model, setting } = stored as Partial<Record<keyof SttOverride, unknown>>
+    return setting === this.settings.sttModel ? STT_MODELS.find(one => one === model) : undefined
+  }
+
+  /**
+   * Records the model a setup installed against the current setting; a model
+   * equal to the setting needs no override. Undefined (a bare setup, which
+   * installed the model in use) only clears an override that has lapsed.
+   */
+  private async rememberSttModel(model: SttModel | undefined): Promise<void> {
+    const engine = this.engine
+    if (engine === undefined) return
+    const setting = this.settings.sttModel
+    if (model === undefined) {
+      if ((await this.storedSttModel()) === undefined) await engine.storeDelete(STT_OVERRIDE_KEY)
+    } else if (model === setting) {
+      await engine.storeDelete(STT_OVERRIDE_KEY)
+    } else {
+      const override: SttOverride = { model, setting }
+      await engine.storeSet(STT_OVERRIDE_KEY, override)
+    }
+  }
+
+  private autoStart(): void {
+    if (this.hasAutoStarted) return
+    this.hasAutoStarted = true
+    this.startHelper(false)
+  }
+
+  private async initialConfig(): Promise<ConfigCommand> {
+    const voiceId = await this.voiceId()
+    // The speech model is not here: the helper loads it from its argv at start.
+    return {
+      pttKey: this.settings.pttKey,
+      language: this.settings.language,
+      ...(voiceId === undefined ? {} : { voiceId }),
+    }
+  }
+
+  private onHelperEvent(event: HelperEvent): void {
+    this.voice?.onHelperEvent(event)
+    switch (event.type) {
+      case 'hello':
+        this.patch({ phase: 'starting', detail: undefined })
+        return
+      case 'state':
+        this.patch({ phase: event.state, ...(event.state === 'listening' ? {} : { micLevel: undefined }) })
+        return
+      case 'ready':
+        this.ready = event
+        this.patch({ pttKey: event.pttKey })
+        if (!this.hasAnnouncedReady) {
+          this.hasAnnouncedReady = true
+          this.engine?.toast(`Jarvis is ready. Hold ${event.pttKey} to talk.`)
+        }
+        return
+      case 'level': {
+        const now = performance.now()
+        if (this.view.phase !== 'listening' || now - this.lastLevelAt < LEVEL_INTERVAL_MS) return
+        this.lastLevelAt = now
+        this.patch({ micLevel: event.mic })
+        return
+      }
+      case 'utterance':
+        this.patch({ lastUtterance: event.text })
+        return
+      case 'error': {
+        const detail = event.hint ? `${event.message} (${event.hint})` : event.message
+        if (event.fatal) this.patch({ phase: 'error', detail })
+        else {
+          this.patch({ detail })
+          this.engine?.toast(`Jarvis: ${detail}`, { timeoutMs: 8000 })
+        }
+        return
+      }
+      default:
+        return
+    }
+  }
+
+  private onHelperPhase(phase: HelperPhase, detail: string | undefined): void {
+    if (this.isSetupRunning) return // setup owns the status line until it ends
+    const phases: Record<HelperPhase, JarvisPhase | undefined> = {
+      stopped: 'stopped',
+      not_installed: 'not_installed',
+      starting: 'starting',
+      running: undefined, // the helper's own state events say what it is doing
+      restarting: 'restarting',
+      elsewhere: 'elsewhere',
+      failed: 'failed',
+    }
+    const next = phases[phase]
+    if (next === undefined) {
+      if (!HELPER_STATES.has(this.view.phase)) this.patch({ phase: 'starting' })
+      return
+    }
+    this.patch({ phase: next, detail })
+  }
+
+  private publish(view: JarvisView): void {
+    // undefined fields are dropped: $.state holds JSON data.
+    const clean = JSON.parse(JSON.stringify(view)) as JarvisView
+    this.view = clean
+    const engine = this.engine
+    if (engine === undefined) return
+    void engine.writeView(clean).catch(() => undefined)
+    const line = statusLine(clean)
+    if (line !== this.shownStatus) {
+      this.shownStatus = line
+      engine.status(line)
+    }
+  }
+}

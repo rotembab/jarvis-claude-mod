@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rotembab/jarvis-claude-mod/plugin/protocol/schema.json",
+  "title": "Jarvis helper protocol v1",
+  "description": "Messages between the Jarvis Claude Code mod and the jarvis-voice helper. Events: helper -> mod, one JSON object per stdout line. Commands: mod -> helper, HTTP POST /v1/<name> with a JSON body; responses are CommandResponse.",
+  "$defs": {
+    "v": { "const": 1 },
+    "HelperState": { "enum": ["starting", "sleeping", "listening", "transcribing", "speaking", "error"] },
+    "Platform": { "enum": ["windows", "macos", "linux"] },
+    "ErrorCode": {
+      "enum": [
+        "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable",
+        "mic_blocked", "mic_in_use", "no_input_device", "no_output_device",
+        "stt_model_missing", "stt_failed", "ptt_unavailable", "bad_request", "unauthorized", "internal"
+      ]
+    },
+    "UtteranceSource": { "enum": ["ptt", "command", "wake"] },
+
+    "HelloEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "port", "pid", "platform", "version", "capabilities"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "hello" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "pid": { "type": "integer" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "version": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "StateEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "state"],
+      "properties": { "v": { "$ref": "#/$defs/v" }, "type": { "const": "state" }, "state": { "$ref": "#/$defs/HelperState" } }
+    },
+    "LevelEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "mic", "out"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "level" },
+        "mic": { "type": "number", "minimum": 0, "maximum": 1 },
+        "out": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "UtteranceEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "id", "text", "source", "durationMs"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "utterance" },
+        "id": { "type": "string" }, "text": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/UtteranceSource" },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "language": { "type": "string" }
+      }
+    },
+    "SpeechStartedEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "replyId"],
+      "properties": { "v": { "$ref": "#/$defs/v" }, "type": { "const": "speech_started" }, "replyId": { "type": "string" } }
+    },
+    "SpeechDoneEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "replyId", "interrupted", "spokenText"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "speech_done" },
+        "replyId": { "type": "string" }, "interrupted": { "type": "boolean" }, "spokenText": { "type": "string" }
+      }
+    },
+    "BargeInEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "spokenText"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "barge_in" },
+        "replyId": { "type": "string" }, "spokenText": { "type": "string" }
+      }
+    },
+    "ErrorEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "code", "message", "fatal"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "error" },
+        "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" },
+        "hint": { "type": "string" }, "fatal": { "type": "boolean" }
+      }
+    },
+    "ReadyEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "sttModel", "sttDevice", "pttKey"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "ready" },
+        "sttModel": { "type": "string" }, "sttDevice": { "enum": ["cuda", "cpu"] },
+        "voiceId": { "type": "string" }, "pttKey": { "type": "string" }
+      }
+    },
+    "Event": {
+      "oneOf": [
+        { "$ref": "#/$defs/HelloEvent" }, { "$ref": "#/$defs/StateEvent" }, { "$ref": "#/$defs/LevelEvent" },
+        { "$ref": "#/$defs/UtteranceEvent" }, { "$ref": "#/$defs/SpeechStartedEvent" }, { "$ref": "#/$defs/SpeechDoneEvent" },
+        { "$ref": "#/$defs/BargeInEvent" }, { "$ref": "#/$defs/ErrorEvent" }, { "$ref": "#/$defs/ReadyEvent" }
+      ]
+    },
+
+    "HeartbeatCommand": { "type": "object", "additionalProperties": false, "properties": {} },
+    "SpeakCommand": {
+      "type": "object", "additionalProperties": false,
+      "required": ["replyId", "seq", "text", "final"],
+      "properties": {
+        "replyId": { "type": "string", "minLength": 1 },
+        "seq": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string", "maxLength": 4000 },
+        "final": { "type": "boolean" }
+      }
+    },
+    "StopCommand": { "type": "object", "additionalProperties": false, "properties": { "reason": { "type": "string" } } },
+    "ListenCommand": {
+      "type": "object", "additionalProperties": false, "required": ["action"],
+      "properties": { "action": { "enum": ["start", "stop"] } }
+    },
+    "ConfigCommand": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
+        "sttModel": { "type": "string" }, "language": { "type": "string" }
+      }
+    },
+    "StatusCommand": { "type": "object", "additionalProperties": false, "properties": {} },
+    "TestVoiceCommand": { "type": "object", "additionalProperties": false, "properties": { "text": { "type": "string", "maxLength": 1000 } } },
+    "ShutdownCommand": { "type": "object", "additionalProperties": false, "properties": {} },
+
+    "CommandResponse": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "error": {
+          "type": "object", "required": ["code", "message"],
+          "properties": { "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" } }
+        }
+      }
+    },
+    "StatusResponse": {
+      "type": "object", "required": ["ok", "state", "version", "platform"],
+      "properties": {
+        "ok": { "const": true },
+        "state": { "$ref": "#/$defs/HelperState" },
+        "version": { "type": "string" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "sttModel": { "type": "string" }, "sttDevice": { "type": "string" },
+        "inputDevice": { "type": "string" }, "outputDevice": { "type": "string" },
+        "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
+        "fishKeySet": { "type": "boolean" }
+      }
+    }
+  },
+  "x-commands": {
+    "heartbeat": "#/$defs/HeartbeatCommand",
+    "speak": "#/$defs/SpeakCommand",
+    "stop": "#/$defs/StopCommand",
+    "listen": "#/$defs/ListenCommand",
+    "config": "#/$defs/ConfigCommand",
+    "status": "#/$defs/StatusCommand",
+    "test_voice": "#/$defs/TestVoiceCommand",
+    "shutdown": "#/$defs/ShutdownCommand"
+  }
+}
