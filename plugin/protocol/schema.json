@@ -135,7 +135,12 @@
         "error": {
           "type": "object", "required": ["code", "message"],
           "properties": { "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" } }
-        }
+        },
+        "stopped": { "type": "boolean", "description": "stop: true when a reply was playing or queued" },
+        "dropped": { "type": "boolean", "description": "speak: the sentence was ignored (stopped or finished reply, duplicate seq)" },
+        "replyId": { "type": "string", "description": "test_voice: the reply id its speech events carry" },
+        "applied": { "type": "array", "items": { "type": "string" }, "description": "config: the fields that took effect" },
+        "already": { "type": "boolean", "description": "listen: already in the requested state" }
       }
     },
     "StatusResponse": {
