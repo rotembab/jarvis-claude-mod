@@ -37,6 +37,9 @@ QUIET_LOGGERS = {
     "aiohttp": logging.WARNING,
     "paho": logging.WARNING,
     "srptools": logging.WARNING,
+    "websockets": logging.WARNING,
+    # The Smart Life SDK's token refresh puts the refresh token in a URL path, which urllib3 logs at DEBUG.
+    "urllib3": logging.WARNING,
 }
 
 

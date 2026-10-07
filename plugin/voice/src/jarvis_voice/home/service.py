@@ -331,7 +331,12 @@ class HomeService:
                 notes.append(f"{LABELS.get(hub, hub)} did not answer in time, so its devices are missing.")
             except Exception as exc:
                 log.warning("%s devices: %s", hub, type(exc).__name__, exc_info=True)
-                notes.append(f"{LABELS.get(hub, hub)} could not be reached, so its devices are missing.")
+                # A driver may attach a safe, spoken reason (a refused token, say) as ``spoken``.
+                spoken = getattr(exc, "spoken", None)
+                if isinstance(spoken, str) and spoken:
+                    notes.append(spoken)
+                else:
+                    notes.append(f"{LABELS.get(hub, hub)} could not be reached, so its devices are missing.")
         seen: set[str] = set()
         unique = []
         for device in devices:

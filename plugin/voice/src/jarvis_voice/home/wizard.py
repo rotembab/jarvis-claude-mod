@@ -156,7 +156,7 @@ def run_wizard(data_dir: Path, ui: Prompter | None = None, *, service: HomeServi
                 raise
             except Exception as exc:
                 log.exception("wizard step failed")
-                prompter.say(f"That step failed: {type(exc).__name__}: {exc}")
+                prompter.say(f"That step failed ({type(exc).__name__}). The helper's log has the details.")
     except (EOFError, KeyboardInterrupt):
         prompter.say("")
         return 0

@@ -33,7 +33,7 @@ from jarvis_voice.home.model import (
     slugify,
     unique_id,
 )
-from jarvis_voice.home.net import broadcast_targets, magic_packet, normalize_mac
+from jarvis_voice.home.net import HttpError, broadcast_targets, magic_packet, normalize_mac, request
 from jarvis_voice.home.runner import AsyncRunner
 from jarvis_voice.home.service import HomeService
 from jarvis_voice.home.store import HomeStore, PlainCodec, StoreError
@@ -220,6 +220,13 @@ def test_wake_on_lan_packet_and_targets() -> None:
     assert broadcast_targets("192.168.1.20") == ["255.255.255.255", "192.168.1.255"]
     assert broadcast_targets("tv.local") == ["255.255.255.255"]
     assert broadcast_targets(None) == ["255.255.255.255"]
+
+
+def test_a_header_that_cannot_be_sent_is_not_quoted() -> None:
+    # http.client quotes a bad header value in its error; a key must never reach a message that way.
+    with pytest.raises(HttpError) as caught:
+        request("GET", "http://127.0.0.1:9/", headers={"X-Auth-PSK": "abc\r\nnot-a-real-key"}, timeout=1)
+    assert caught.value.kind == "bad_url" and "not-a-real-key" not in str(caught.value)
 
 
 # --------------------------------------------------------------------------- async runner
@@ -420,6 +427,10 @@ def test_hub_devices_join_the_list_and_a_failing_hub_is_noted(tmp_path: Path) ->
     drivers["fakehub"].hub_error = OSError("down")
     text = service.handle({"action": "list"})["text"]
     assert "Sony TV" in text and "Fake hub could not be reached" in text.replace("fakehub", "Fake hub")
+    error = OSError("refused")
+    error.spoken = "The fake hub refused Jarvis's token."  # type: ignore[attr-defined]
+    drivers["fakehub"].hub_error = error
+    assert "The fake hub refused Jarvis's token." in service.handle({"action": "list"})["text"]
 
 
 def test_info_says_what_is_set_up_and_where(tmp_path: Path, reference_validator: Any) -> None:

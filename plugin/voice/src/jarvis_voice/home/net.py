@@ -90,6 +90,9 @@ def request(
         raise HttpError("tls", f"{where}: TLS failed ({exc.reason or type(exc).__name__})") from None
     except (OSError, http.client.HTTPException) as exc:
         raise HttpError("unreachable", f"{where} is unreachable ({type(exc).__name__})") from None
+    except ValueError:
+        # http.client quotes an invalid header value, which may be a key, so the message is dropped.
+        raise HttpError("bad_url", f"{where}: a header could not be sent") from None
     finally:
         connection.close()
 
