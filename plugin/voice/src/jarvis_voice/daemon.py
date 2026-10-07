@@ -11,8 +11,8 @@ Threads: push-to-talk callbacks, the ``listen`` command and the listener's
 decisions are funnelled into one action queue served by ``run()`` (the main
 thread), so listening transitions never race and the keyboard hook returns
 immediately (Windows silently unhooks slow low-level hooks). Transcription
-runs on its own worker; speech on the pipeline's worker; the wake word and
-voice activity on the listener's thread.
+runs on its own worker; speech on the pipeline's worker; the wake word, voice
+activity and echo cancelling on the listener's thread.
 """
 
 from __future__ import annotations
@@ -25,20 +25,22 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
 from . import __version__, protocol
+from . import platform as plat
 from .audio import chimes
 from .audio.capture import STT_SAMPLERATE, Capture
+from .audio.echo import EchoCanceller
 from .audio.errors import AudioError, digital_silence_error
 from .audio.levels import is_digital_silence, is_silent
 from .audio.playback import Playback
 from .events import EventSink
 from .lifecycle import HeartbeatWatchdog
 from .listen.listener import BARGE_MODES, BargeMode, Kind, Listener, ListenerConfig
-from .listen.models import WAKE_PHRASE
+from .listen.models import PLAIN_WAKE_PHRASE, WAKE_PHRASE
 from .listen.vad import VoiceDetector
 from .listen.wakeword import WakeScorer
 from .ptt.base import PttUnavailable, PushToTalk
@@ -50,16 +52,71 @@ from .tts.base import SpeechSynth
 
 log = logging.getLogger(__name__)
 
+EchoState = Literal["on", "off", "loading", "unavailable"]
 DEFAULT_TEST_LINE = "Good evening, sir. Voice systems are online and at your service."
 KEY_HINT = "Use a key name like 'right ctrl', 'f13' or 'alt+space' in the Jarvis plugin settings."
 WAKE_HINT = "Run /jarvis setup to download it. Push-to-talk still works."
+PLAIN_WAKE_HINT = f'Run /jarvis setup to download it (voice.log says what went wrong). "{WAKE_PHRASE}" still works.'
+# The canceller loaded and ran, then failed: reinstalling (the load-failure hint) would not help.
+ECHO_STOPPED_HINT = (
+    "Jarvis now hears the microphone as it is. /jarvis restart tries again; meanwhile, with speakers, "
+    "/jarvis bargein wake stops Jarvis interrupting himself."
+)
 _EXIT = object()
 # "Hey Jarvis," at the start of a hands-free transcript is the wake word itself, not the request.
 _WAKE_PREFIX = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|a)\W+)?jarvis\b\W*", re.IGNORECASE)
+# A "Hey Jarvis" clip whose pre-roll reached back to where the speech began (at
+# the start of an utterance, while plain "Jarvis" is on) can also keep a word or
+# two from before it: "So, hey Jarvis, ...", "Um, hey Jarvis" lose those too. A
+# greeting must sit between them and "Jarvis", so "Tell Jarvis to wait" stays
+# whole. Every other clip keeps the narrow prefix, as before plain "Jarvis": the
+# short pre-roll holds no words from before "Hey Jarvis", and in follow-ups and
+# barge-ins words before "Jarvis" are the request ("No, it's ok Jarvis, I've got it.").
+_WOKEN_PREFIX = re.compile(
+    r"^\W*(?:"
+    r"(?:[a-z']{1,7}\W+){0,2}?(?:hey|hi|hello|ok|okay)\W+"  # "So, hey Jarvis"
+    r"|(?:(?:hey|hi|hello|ok|okay|a)\W+){0,2}"  # "Jarvis", "Hey Jarvis", "Okay, hey Jarvis"
+    r")jarvis\b\W*",
+    re.IGNORECASE,
+)
+# The first word of a transcript, after the same greetings.
+_FIRST_WORD = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|a)\W+){0,2}(\w+)\b\W*", re.IGNORECASE)
 
 
-def strip_wake_phrase(text: str) -> str:
-    return _WAKE_PREFIX.sub("", text, count=1).strip()
+def strip_wake_phrase(text: str, *, woken: bool = False) -> str:
+    """Drop "Hey Jarvis" from the start of a hands-free transcript.
+
+    ``woken``: the wake word started the clip and its pre-roll reached back to where the speech began.
+    """
+    return (_WOKEN_PREFIX if woken else _WAKE_PREFIX).sub("", text, count=1).strip()
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    if len(a) > len(b):
+        a, b = b, a
+    if len(b) - len(a) > 1:
+        return False
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    return a[i + 1 :] == b[i + 1 :] if len(a) == len(b) else a[i:] == b[i + 1 :]
+
+
+def strip_plain_wake(text: str) -> str | None:
+    """The request after a plain "Jarvis" that opens a transcript; None when it does not open with the name.
+
+    Plain "Jarvis" wakes on sound-alikes too ("Travis", "service"), and the
+    transcript shows which it was. A first word one slip away that still
+    starts with "j" ("Jarvas") counts. "Jarvis" is deliberately not a hotword
+    for Whisper: that pulls "Travis" toward it.
+    """
+    match = _FIRST_WORD.match(text)
+    if match is None:
+        return None
+    word = match.group(1).lower()
+    if not (word.startswith("j") and _within_one_edit(word, "jarvis")):
+        return None
+    return text[match.end() :].strip()
 
 
 class HomeHandler(Protocol):
@@ -86,6 +143,7 @@ class DaemonConfig:
     wake_word: bool = True
     barge_in: BargeMode = "speech"
     wake_threshold: float = 0.5
+    plain_wake: bool = False  # plain "Jarvis" as well as "Hey Jarvis"
     follow_up_s: float = 8.0
 
 
@@ -94,6 +152,11 @@ class _Clip:
     pcm: np.ndarray
     source: protocol.UtteranceSource
     duration_ms: int
+    # What started a hands-free clip ("wake", "jarvis", "follow", "barge"); None for
+    # push-to-talk. A plain "Jarvis" clip is kept only if the transcript starts with it.
+    kind: Kind | None = None
+    # Its pre-roll reaches back to where the speech began (Listener.long_preroll).
+    long_preroll: bool = False
 
 
 class Daemon:
@@ -112,6 +175,8 @@ class Daemon:
         vad: VoiceDetector | None = None,
         wake_loader: Callable[[], WakeScorer] | None = None,
         home_factory: Callable[[], HomeHandler] | None = None,
+        plain_loader: Callable[[WakeScorer], None] | None = None,
+        echo_loader: Callable[[], EchoCanceller] | None = None,
     ) -> None:
         self.config = config
         self._events = events
@@ -142,6 +207,16 @@ class Daemon:
         self._home_factory = home_factory
         self._home: HomeHandler | None = None
         self._home_lock = threading.Lock()
+        # Attaches plain "Jarvis" to a loaded scorer that lacks it (fetching the
+        # model first); raises when it cannot.
+        self._plain_loader = plain_loader
+        self._wake_scorer: WakeScorer | None = None
+        self._plain_loading = False
+        self._plain_reported: WakeScorer | None = None  # the scorer whose missing plain model was reported
+        # Echo cancelling only cleans what the listener hears: without one there is nothing to load.
+        self._echo_loader = echo_loader if vad is not None else None
+        self._echo: EchoCanceller | None = None
+        self._echo_state: EchoState = "loading" if self._echo_loader is not None else "off"
 
         self._transcriber: Transcriber | None = None
         self._stt_error: SttError | None = None
@@ -169,7 +244,11 @@ class Daemon:
         self.listener: Listener | None = None
         if vad is not None:
             self.listener = Listener(
-                ListenerConfig(wake_threshold=config.wake_threshold, follow_up_s=config.follow_up_s),
+                ListenerConfig(
+                    wake_threshold=config.wake_threshold,
+                    plain_wake_threshold=config.wake_threshold,
+                    follow_up_s=config.follow_up_s,
+                ),
                 vad=vad,
                 wake=None,  # loaded in the background by start()
                 on_start=self._on_listener_start,
@@ -179,6 +258,7 @@ class Daemon:
                 audio_playing=lambda: not self._playback.speech_idle(),
                 wake_enabled=config.wake_word,
                 barge_mode=config.barge_in,
+                plain_wake=config.plain_wake,
             )
 
     # ------------------------------------------------------------------ lifecycle
@@ -214,6 +294,9 @@ class Daemon:
             self._capture.set_listener(self.listener.feed)
             if self._wake_loader is not None:
                 thread = threading.Thread(target=self._load_wake, name="wake-load", daemon=True)
+                thread.start()
+            if self._echo_loader is not None:
+                thread = threading.Thread(target=self._load_echo, name="aec-load", daemon=True)
                 thread.start()
         try:
             self._capture.open()  # kept open: the pre-roll, and the listener, need it
@@ -253,14 +336,21 @@ class Daemon:
         return self._exit_code or 0
 
     def _shutdown_components(self) -> None:
-        self._stopping.set()
+        with self._lock:  # with the echo canceller's loader, which checks it before wiring one in
+            self._stopping.set()
+            echo, self._echo = self._echo, None
         self.watchdog.stop()
-        steps = [self._ptt.stop, self.pipeline.close, self._capture.close, self._playback.close]
+        steps: list[Callable[[], None]] = [self._ptt.stop]
+        if echo is not None:
+            steps.append(lambda: self._playback.set_far_listener(None))  # the output stops feeding it
         if self.listener is not None:
-            steps.insert(1, self.listener.close)
+            steps.append(self.listener.close)
+        if echo is not None:
+            steps.append(echo.close)  # once the listener's thread, its other user, is done
         close_synth = getattr(self._synth, "close", None)  # the local voice owns a child process
         if callable(close_synth):
-            steps.insert(2, close_synth)
+            steps.append(close_synth)
+        steps += [self.pipeline.close, self._capture.close, self._playback.close]
         with self._home_lock:
             home, self._home, self._home_factory = self._home, None, None
         if home is not None:
@@ -412,7 +502,14 @@ class Daemon:
         self._chime("stop")
         return self._queue_clip(pcm, source)
 
-    def _queue_clip(self, pcm: np.ndarray, source: protocol.UtteranceSource) -> dict[str, Any]:
+    def _queue_clip(
+        self,
+        pcm: np.ndarray,
+        source: protocol.UtteranceSource,
+        *,
+        kind: Kind | None = None,
+        long_preroll: bool = False,
+    ) -> dict[str, Any]:
         queued = False
         duration_s = pcm.size / STT_SAMPLERATE
         if duration_s < self.config.min_clip_s:
@@ -425,7 +522,7 @@ class Daemon:
         else:
             with self._lock:
                 self._transcribing += 1
-            self._clips.put(_Clip(pcm, source, round(duration_s * 1000)))
+            self._clips.put(_Clip(pcm, source, round(duration_s * 1000), kind, long_preroll))
             queued = True
         self._refresh_state()
         if queued:
@@ -442,15 +539,109 @@ class Daemon:
             log.warning("wake word unavailable: %s", exc, exc_info=True)
             self._emit_error("wake_unavailable", f"The wake word model could not be loaded: {exc}", WAKE_HINT)
             return
+        with self._lock:
+            self._wake_scorer = scorer
         self.listener.set_wake_scorer(scorer)
-        log.info("wake word ready: %s", scorer.name)
+        log.info("wake word ready: %s (plain Jarvis: %s)", scorer.name, scorer.plain_name or "not loaded")
         self._emit_ready(only_if_sent=True)  # the mod learns that "Hey Jarvis" works now
+        self._want_plain_wake()
+
+    def _want_plain_wake(self) -> None:
+        """If plain "Jarvis" is on but the loaded wake word lacks its model, fetch it, without holding anything up."""
+        listener = self.listener
+        with self._lock:
+            scorer = self._wake_scorer
+            if listener is None or scorer is None or not listener.plain_enabled or scorer.plain_name is not None:
+                return
+            if self._plain_loader is None:
+                fetch = False
+            elif self._plain_loading:
+                return
+            else:
+                self._plain_loading = fetch = True
+        if not fetch:
+            self._report_missing_plain_wake(scorer)
+            return
+        thread = threading.Thread(target=self._load_plain_wake, args=(scorer,), name="plain-wake-load", daemon=True)
+        thread.start()
+
+    def _load_plain_wake(self, scorer: WakeScorer) -> None:
+        assert self._plain_loader is not None and self.listener is not None
+        try:
+            reason: str | None = None
+            try:
+                self._plain_loader(scorer)
+            except Exception as exc:
+                log.warning('plain "Jarvis" wake word unavailable: %s', exc)
+                reason = str(exc)
+            if scorer.plain_name is not None:
+                log.info("plain Jarvis ready: %s", scorer.plain_name)
+                if self.listener.plain_ready:
+                    self._emit_ready(only_if_sent=True)  # the mod learns that plain "Jarvis" works now
+            elif self.listener.plain_enabled:
+                self._report_missing_plain_wake(scorer, reason)
+        finally:
+            with self._lock:
+                self._plain_loading = False
+
+    def _report_missing_plain_wake(self, scorer: WakeScorer, reason: str | None = None) -> None:
+        """Plain "Jarvis" is switched on, but its model could not be loaded: say so once for this wake word."""
+        with self._lock:
+            if self._plain_reported is scorer:
+                return
+            self._plain_reported = scorer
+        because = f" ({reason})" if reason else ""
+        message = (
+            f'The plain "{PLAIN_WAKE_PHRASE}" wake word model could not be loaded{because}, '
+            f'so only "{WAKE_PHRASE}" wakes Jarvis.'
+        )
+        self._emit_error("wake_unavailable", message, PLAIN_WAKE_HINT)
+
+    def _load_echo(self) -> None:
+        """Until this has loaded (or if it cannot), the listener hears the microphone as it is."""
+        assert self._echo_loader is not None and self.listener is not None
+        try:
+            echo = self._echo_loader()
+        except Exception as exc:
+            log.warning("echo cancelling unavailable: %s", exc, exc_info=True)
+            with self._lock:
+                self._echo_state = "unavailable"
+            message = f"Echo cancelling could not be started: {exc}"
+            self._emit_error("aec_unavailable", message, plat.current().echo_cancel_hint())
+            return
+        with self._lock:  # the lock shutdown takes: a canceller that arrives as the helper stops is freed
+            stopping = self._stopping.is_set()
+            if not stopping:
+                self._echo, self._echo_state = echo, "on"
+                # Called on the listener's thread: enqueue only.
+                echo.set_on_failed(lambda exc: self._actions.put(lambda: self._echo_failed(echo, exc)))
+                self._playback.set_far_listener(echo.far)
+                self.listener.set_echo(echo)
+        if stopping:
+            echo.close()
+            return
+        log.info("echo cancelling ready")
+
+    def _echo_failed(self, echo: EchoCanceller, exc: Exception) -> None:
+        """The canceller stopped working mid-session and passes the microphone through: unhook it and say so."""
+        with self._lock:
+            if self._echo is not echo or self._stopping.is_set():
+                return
+            self._echo, self._echo_state = None, "unavailable"
+            self._playback.set_far_listener(None)
+            if self.listener is not None:
+                self.listener.set_echo(None)
+        echo.close()
+        message = f"Echo cancelling stopped working: {exc}"
+        self._emit_error("aec_unavailable", message, ECHO_STOPPED_HINT)
 
     def _on_listener_start(self, kind: Kind) -> None:  # listener thread: enqueue only
         self._actions.put(lambda: self._begin_hands_free(kind))
 
-    def _on_listener_end(self, pcm: np.ndarray | None, kind: Kind) -> None:
-        self._actions.put(lambda: self._end_hands_free(pcm))
+    def _on_listener_end(self, pcm: np.ndarray | None, kind: Kind) -> None:  # listener thread
+        # Read here, on the listener's thread: its next utterance sets it afresh.
+        long_preroll = self.listener is not None and self.listener.long_preroll
+        self._actions.put(lambda: self._end_hands_free(pcm, kind, long_preroll))
 
     def _begin_hands_free(self, kind: Kind) -> None:
         assert self.listener is not None
@@ -465,19 +656,25 @@ class Daemon:
             self._emit_error(stt_error.code, stt_error.message, stt_error.hint)
             self._chime("error")
             return
+        if kind == "jarvis" and not self._playback.speech_idle():
+            # The listener takes plain "Jarvis" only while Jarvis is quiet; if he
+            # has become audible since, a sound-alike must not cut him off.
+            self.listener.cancel()
+            return
         # Only cut Jarvis off when he is audible: a reply that is open but quiet
         # (Claude is running a tool) keeps going, and the mod queues the new words.
+        woken = kind in ("wake", "jarvis")
         if kind == "barge" or not self._playback.speech_idle():
-            self.pipeline.stop("wake word" if kind == "wake" else "voice", barge_in=True)
+            self.pipeline.stop("wake word" if woken else "voice", barge_in=True)
         self._playback.set_paused(True)
-        if kind == "wake":
+        if woken:
             self._chime("start")
         with self._lock:
             self._listen_source = "wake"
             self._awake = False
         self._refresh_state()
 
-    def _end_hands_free(self, pcm: np.ndarray | None) -> None:
+    def _end_hands_free(self, pcm: np.ndarray | None, kind: Kind, long_preroll: bool = False) -> None:
         with self._lock:
             if self._listen_source != "wake":
                 return
@@ -487,7 +684,7 @@ class Daemon:
         if pcm is None:
             self._refresh_state()
             return
-        self._queue_clip(pcm, "wake")
+        self._queue_clip(pcm, "wake", kind=kind, long_preroll=long_preroll)
 
     def _on_follow_up(self, opened: bool) -> None:
         with self._lock:
@@ -562,7 +759,10 @@ class Daemon:
             )
 
     def _wake_phrase(self) -> str | None:
-        return WAKE_PHRASE if self.listener is not None and self.listener.wake_ready else None
+        listener = self.listener
+        if listener is None or not listener.wake_ready:
+            return None
+        return PLAIN_WAKE_PHRASE if listener.plain_ready else WAKE_PHRASE
 
     def _stt_worker(self) -> None:
         while True:
@@ -579,8 +779,14 @@ class Daemon:
                     continue
                 result = transcriber.transcribe(clip.pcm, self._language)
                 text = result.text.strip()
-                if clip.source == "wake":
-                    text = strip_wake_phrase(text)
+                if clip.kind == "jarvis":
+                    request = strip_plain_wake(text)
+                    if request is None:
+                        log.info('dropped a %d ms clip: plain "Jarvis" woke on other words', clip.duration_ms)
+                        continue
+                    text = request
+                elif clip.source == "wake":  # "Hey Jarvis", a follow-up or a barge-in
+                    text = strip_wake_phrase(text, woken=clip.kind == "wake" and clip.long_preroll)
                 if text:
                     self._events.emit(
                         protocol.Utterance(
@@ -684,6 +890,9 @@ class Daemon:
             if "wakeWord" in body:
                 listener.set_wake_enabled(bool(body["wakeWord"]))
                 applied.append("wakeWord")
+            if "plainWake" in body:
+                listener.set_plain_wake(bool(body["plainWake"]))
+                applied.append("plainWake")
             if "bargeIn" in body and body["bargeIn"] in BARGE_MODES:
                 listener.set_barge_mode(body["bargeIn"])
                 applied.append("bargeIn")
@@ -708,6 +917,8 @@ class Daemon:
             applied.append("sttModel")
         if changed:
             self._emit_ready(only_if_sent=True)  # the mod shows ready.pttKey: keep it current
+        if body.get("plainWake"):
+            self._want_plain_wake()
         if key_error is not None:
             self._emit_error("bad_request", key_error, KEY_HINT)
             response = protocol.error_response("bad_request", key_error)
@@ -735,6 +946,7 @@ class Daemon:
                 "pttArmed": self._ptt_armed,
                 "wakeWord": self._wake_phrase(),
                 "bargeIn": self.listener.barge_mode if self.listener is not None else None,
+                "echoCancel": self._echo_state,
                 "sttRequested": self._stt_requested,
                 "language": self._language,
                 "speakingReplyId": reply_id,

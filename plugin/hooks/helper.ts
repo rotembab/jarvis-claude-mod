@@ -58,6 +58,8 @@ export type HelperOptions = {
   fishApiKey?: string
   /** The Fish Audio model (`JARVIS_TTS_MODEL`); undefined keeps the helper's default. */
   fishModel?: string
+  /** False switches the helper's echo cancelling off (`JARVIS_AEC=off`); it is on by default. */
+  echoCancel?: boolean
   /** NO_PROXY as the session has it; the child's gains the loopback hosts. */
   noProxy?: string
   /**
@@ -431,6 +433,7 @@ export class Helper {
     }
     if (this.options.fishApiKey) env.FISH_AUDIO_API_KEY = this.options.fishApiKey
     if (this.options.fishModel) env.JARVIS_TTS_MODEL = this.options.fishModel
+    if (this.options.echoCancel === false) env.JARVIS_AEC = 'off'
     if (tts.engine === 'local') {
       env.JARVIS_TTS_ENGINE = 'local'
       if (tts.localVoiceClip) env.JARVIS_LOCAL_VOICE = tts.localVoiceClip

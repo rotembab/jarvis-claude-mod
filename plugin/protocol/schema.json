@@ -11,7 +11,8 @@
       "enum": [
         "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable", "local_voice_failed",
         "mic_blocked", "mic_in_use", "no_input_device", "no_output_device",
-        "stt_model_missing", "stt_failed", "ptt_unavailable", "wake_unavailable", "bad_request", "unauthorized", "internal"
+        "stt_model_missing", "stt_failed", "ptt_unavailable", "wake_unavailable", "aec_unavailable",
+        "bad_request", "unauthorized", "internal"
       ]
     },
     "UtteranceSource": { "enum": ["ptt", "command", "wake"] },
@@ -91,7 +92,7 @@
         "v": { "$ref": "#/$defs/v" }, "type": { "const": "ready" },
         "sttModel": { "type": "string" }, "sttDevice": { "enum": ["cuda", "cpu"] },
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
-        "wakePhrase": { "type": "string", "description": "present while the wake word is loaded and switched on" },
+        "wakePhrase": { "type": "string", "description": "present while the wake word is loaded and switched on: \"Hey Jarvis\", or \"Jarvis\" while plain \"Jarvis\" works too" },
         "bargeIn": { "$ref": "#/$defs/BargeInMode" }
       }
     },
@@ -125,6 +126,7 @@
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
         "sttModel": { "type": "string" }, "language": { "type": "string" },
         "wakeWord": { "type": "boolean" },
+        "plainWake": { "type": "boolean", "description": "also wake on plain \"Jarvis\" at the start of an utterance (helpers with the wake.plain capability)" },
         "bargeIn": { "$ref": "#/$defs/BargeInMode" },
         "wakeThreshold": { "type": "number", "minimum": 0.05, "maximum": 0.95 }
       }
@@ -182,7 +184,8 @@
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
         "fishKeySet": { "type": "boolean" }, "ttsEngine": { "enum": ["fish", "local"] },
         "wakeWord": { "type": "string", "description": "the wake phrase, while it is loaded and switched on" },
-        "bargeIn": { "$ref": "#/$defs/BargeInMode" }
+        "bargeIn": { "$ref": "#/$defs/BargeInMode" },
+        "echoCancel": { "enum": ["on", "off", "loading", "unavailable"], "description": "echo cancelling of what the listener hears" }
       }
     }
   },

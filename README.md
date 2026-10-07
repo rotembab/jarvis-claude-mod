@@ -4,12 +4,12 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 
 - **Push-to-talk now.** Hold Right Ctrl, speak, release. Speech is transcribed on your own machine with faster-whisper (on an NVIDIA GPU when there is one).
 - **Fish Audio voice.** Replies are spoken sentence by sentence as Claude writes them, through Fish Audio's streaming text-to-speech, in the voice you pick.
-- **Hands-free.** Say "Hey Jarvis" and talk; talk over him to interrupt.
+- **Hands-free.** Say "Hey Jarvis" (or just "Jarvis", once you switch it on) and talk; talk over him to interrupt.
 - **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
 - **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant, over your home network. See [docs/HOME.md](docs/HOME.md).
 - **Later:** control of your PC with permission tiers.
 
-> **Status: phase 3 of 4 ("HUD").** Hands-free voice, barge-in and the HUD work on Windows; echo cancelling and a plain "Jarvis" wake word are in progress. Expect rough edges; see the [roadmap](#roadmap).
+> **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. Expect rough edges; see the [roadmap](#roadmap).
 
 ## Contents
 
@@ -120,7 +120,7 @@ The local voice loads onto the GPU when the helper starts (a few seconds) and st
 
 ## Using Jarvis
 
-1. Say **"Hey Jarvis"**, then what you want, in one breath or after a pause: "Hey Jarvis, did the build pass?" A chime plays and the status line shows `JARVIS · listening`.
+1. Say **"Hey Jarvis"**, then what you want, in one breath or after a pause: "Hey Jarvis, did the build pass?" A chime plays and the status line shows `JARVIS · listening`. After `/jarvis wake jarvis`, plain **"Jarvis"** works too when it starts what you say: "Jarvis, open the logs." Said in the middle of a sentence it is ignored, and it does nothing once Jarvis has started speaking a reply, until it ends, even in a quiet pause while Claude runs a tool: use "Hey Jarvis" then. It needs English transcription (`language` `en`). Its model (about 200 KB) is downloaded when you first switch it on, unless `/jarvis setup` already did.
 2. Stop talking. After about 0.7 seconds of silence Jarvis transcribes what you said and sends it to Claude as your message, exactly as if you had typed it.
 3. Claude answers. The answer appears on screen as usual and Jarvis reads it aloud as it streams. Code blocks and long tables are not read out; Jarvis tells you they are on screen.
 4. For about 8 seconds after Jarvis finishes, the status line shows `JARVIS · awake · keep talking`: just speak, no wake word needed.
@@ -128,7 +128,7 @@ The local voice loads onto the GPU when the helper starts (a few seconds) and st
 
 Push-to-talk still works the whole time: hold the key (Right Ctrl by default), speak, release. It works while another window has focus, and pressing it while Jarvis speaks also cuts him off.
 
-**Speakers instead of a headset?** Jarvis has no echo cancelling yet, so with speakers he can hear himself and stop mid-sentence. Run `/jarvis bargein wake` so only "Hey Jarvis" interrupts him. If the TV or other people wake him by mistake, set **Wake word sensitivity** to `low`.
+**Speakers instead of a headset?** Echo cancelling takes Jarvis's own voice out of what the microphone hears, so you can talk over him with speakers too. It learns your room during the first second or two he speaks. If he still stops himself mid-sentence (very loud speakers, or Windows sound effects such as loudness equalization), run `/jarvis bargein wake` so only "Hey Jarvis" interrupts him. If the TV or other people wake him by mistake, set **Wake word sensitivity** to `low`.
 
 Messages you type are answered in Claude's normal style and are not read aloud; the Jarvis persona applies to voice messages only.
 
@@ -157,9 +157,21 @@ A pane titled JARVIS opens beside the conversation when a session starts. Its ri
 
 Under the ring are the last thing you said and the last six things Claude ran (`›` running, `✓` done, `✗` failed).
 
-- In the terminal the ring is drawn in block characters. A pane opens by itself only in a window at least 144 columns wide; in a narrower one it waits for room, and `/jarvis hud` opens it at any width.
+- In the terminal the ring is drawn in block characters and grows to fill the room the pane has; the pane asks for up to half the window. A pane opens by itself only in a window at least 144 columns wide; in a narrower one it waits for room, and `/jarvis hud` opens it at any width.
 - In the desktop app's Code tab the ring is a vector drawing.
 - `/jarvis hud off` closes it and keeps it closed in new sessions; `/jarvis hud on` brings it back.
+
+#### Focus mode
+
+`/jarvis focus` shows only the HUD and the prompt while Jarvis is running. The HUD takes nearly the whole window, with what you said, the start of Claude's last reply and what Claude ran beside the ring, and the conversation folds away.
+
+- Typing a prompt brings the conversation back; it folds away again the next time you talk to Jarvis.
+- Ctrl+O shows the whole conversation at any time.
+- Questions for you, permission prompts and command output still show.
+- The reply Claude is writing streams in a narrow strip beside the HUD, and folds away once it is done.
+- In Claude Code's classic (non-fullscreen) view nothing is folded: the HUD grows tall above the prompt and the conversation scrolls up out of sight, where you can scroll back to it.
+- In the desktop app focus mode does nothing yet.
+- `/jarvis focus off` turns it off. The choice is kept for new sessions.
 
 ## Home devices
 
@@ -180,11 +192,12 @@ Run `/jarvis home setup`, or say "open home setup". A setup window opens where y
 | `/jarvis test` | Speak a test line (checks your Fish Audio key, voice and speakers). |
 | `/jarvis setup local [cpu]` | Install the local voice (Chatterbox-Turbo, about 6 GB). |
 | `/jarvis engine <fish\|local>` | Speak with Fish Audio or with the local voice. |
-| `/jarvis wake <on\|off>` | Listen for "Hey Jarvis", or use push-to-talk only. |
+| `/jarvis wake <on\|jarvis\|off>` | Listen for "Hey Jarvis", for plain "Jarvis" as well, or use push-to-talk only. |
 | `/jarvis bargein <speech\|wake\|off>` | What interrupts Jarvis while he speaks: any speech (default), only "Hey Jarvis", or nothing. |
 | `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis hud [on\|off]` | Open the HUD pane. `off` closes it and keeps it closed in new sessions; `on` opens it with each session again. |
+| `/jarvis focus [on\|off]` | Focus mode: while Jarvis runs, only the HUD and the prompt show. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis home [setup\|list\|status\|do]` | Home devices: what is set up, open the setup window, list devices, show one device's state, or run one command. See [docs/HOME.md](docs/HOME.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
@@ -200,10 +213,11 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `fishModel` | `s2.1-pro-free` | Fish Audio model: `s2.1-pro-free` (free through 30 Nov 2026) or `s2.1-pro` (needs API credit). Run `/jarvis restart` after changing it. |
 | `voiceEngine` | `fish` | Who speaks: `fish` (Fish Audio) or `local` (Chatterbox-Turbo on your PC, after `/jarvis setup local`). `/jarvis engine` changes it too. |
 | `localVoiceClip` | empty | A 10 to 20 second recording for the local voice to copy. Empty means its built-in voice. Run `/jarvis restart` after changing it. |
-| `wakeWord` | `on` | `on` listens for "Hey Jarvis"; `off` is push-to-talk only. `/jarvis wake` changes it too. |
-| `bargeIn` | `speech` | What interrupts Jarvis: `speech` (talking over him, best with a headset), `wake` (only "Hey Jarvis", for speakers or a noisy room) or `off`. `/jarvis bargein` changes it too. |
+| `wakeWord` | `on` | `on` listens for "Hey Jarvis"; `jarvis` also for plain "Jarvis" at the start of what you say (needs English transcription; its model is downloaded when you switch it on); `off` is push-to-talk only. `/jarvis wake` changes it too. |
+| `bargeIn` | `speech` | What interrupts Jarvis: `speech` (talking over him), `wake` (only "Hey Jarvis", for a noisy room, or speakers he still hears himself through) or `off`. `/jarvis bargein` changes it too. |
+| `echoCancelling` | `on` | `on` takes Jarvis's own voice out of what the microphone hears, so with speakers he doesn't interrupt or wake himself. `off` uses the microphone as it is. Run `/jarvis restart` after changing it. |
 | `modelRouting` | `auto` | `auto`: Sonnet answers voice requests, Opus complex ones and Fable the hardest ([Which model answers](#which-model-answers)). `off`: your session's model. `/jarvis routing` changes it too. |
-| `wakeSensitivity` | `medium` | `high` wakes more easily and more often by mistake; `low` needs a clearer "Hey Jarvis". Run `/jarvis restart` after changing it. |
+| `wakeSensitivity` | `medium` | `high` wakes more easily and more often by mistake; `low` needs a clearer "Hey Jarvis" (or "Jarvis"). Run `/jarvis restart` after changing it. |
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
 | `sttModel` | `auto` | Speech-to-text model: `auto`, `base.en`, `small.en`, `small`, `medium` or `large-v3-turbo`. `auto` means `large-v3-turbo` on an NVIDIA GPU and `small.en` on the CPU. Run `/jarvis setup` after changing it. |
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |
@@ -243,12 +257,12 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 
 ## Privacy
 
-- **Your audio stays on your computer.** The wake word, speech detection and transcription all run locally. While Jarvis runs, the helper keeps the microphone open (Windows shows Python using the microphone) and listens for "Hey Jarvis", holding only the last 2 seconds in memory. Nothing is recorded, transcribed or kept until it hears the wake word, you hold push-to-talk, you speak in the few seconds after a reply, or you talk over Jarvis while he speaks. Audio is never written to disk. `/jarvis wake off` turns the wake word off.
+- **Your audio stays on your computer.** The wake word, speech detection and transcription all run locally. While Jarvis runs, the helper keeps the microphone open (Windows shows Python using the microphone) and listens for the wake word ("Hey Jarvis", and plain "Jarvis" too once you switch it on), holding only the last 2 seconds in memory. Nothing is recorded, transcribed or kept until it hears the wake word, you hold push-to-talk, you speak in the few seconds after a reply, or you talk over Jarvis while he speaks. With plain "Jarvis" on, a clip that woke it is transcribed on your computer and dropped unless it starts with "Jarvis", so a sound-alike such as "Travis" goes nowhere. Audio is never written to disk. `/jarvis wake off` turns the wake word off.
 - **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message. With model routing on, each one also goes to Haiku, through the same Claude Code connection, to choose the model.
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
 - **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Smart Life scenes and the one-time Smart Life link. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log`. API keys and tokens are masked in it.
-- Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word model from openWakeWord's GitHub releases), Jarvis talks to nothing else.
+- Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word models from GitHub: openWakeWord's releases, and the plain "Jarvis" model from a community collection) and the helper fetching a wake word model that is missing (the "Hey Jarvis" model when it starts, the plain "Jarvis" model when you switch it on), Jarvis talks to nothing else.
 
 ## Troubleshooting
 
@@ -258,7 +272,10 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | Jarvis does not hear you | Windows may be blocking the microphone: Settings > Privacy & security > Microphone, turn on **Microphone access** and **Let desktop apps access your microphone**. Check the headset's mute switch. `/jarvis devices` shows which microphone is used. |
 | "The microphone delivered pure digital silence" | Something mutes the microphone completely: Windows' microphone privacy settings (above), or the headset itself (a mute button or light, a flipped-up or unplugged boom mic, or its own software, such as Logitech G HUB). Jarvis says this only when the microphone has sent nothing at all since it started, or for a push-to-talk clip before it has heard any sound. Headsets with a noise gate send exact silence between words, which is fine. |
 | Jarvis wakes by mistake, or misses "Hey Jarvis" | Change **Wake word sensitivity** (`low` wakes less often, `high` more easily). Say it clearly, like "hey JAR-vis". |
-| Jarvis stops himself mid-sentence | With speakers he can hear his own voice. Use a headset, or run `/jarvis bargein wake`. |
+| Plain "Jarvis" does not wake him | Say it first, after a moment's quiet: "Jarvis, ..." In the middle of a sentence it is ignored, and once Jarvis has started speaking a reply, until it ends (even while Claude runs a tool), only "Hey Jarvis" (or talking over him) works. It needs English transcription: with another `language`, Whisper may write the name differently and the request is dropped. A chime with no request means plain "Jarvis" woke on a sound-alike ("Travis, ...") and the transcript did not start with "Jarvis", so nothing was sent. If `/jarvis wake` says plain "Jarvis" is not ready, give it a moment (its model downloads when you switch it on); if it stays so, run `/jarvis setup`. |
+| Jarvis stops himself mid-sentence | With speakers he can hear his own voice. `/jarvis` shows whether echo cancelling is on; if it is and he still does, turn the speakers down, turn off Windows sound effects (loudness equalization, spatial sound), use a headset, or run `/jarvis bargein wake`. |
+| "Echo cancelling could not be started" | Run `/jarvis setup` to reinstall the voice helper. On Windows, Smart App Control can block the echo canceller's library (`livekit_ffi.dll`); everything else keeps working, and `/jarvis bargein wake` stops Jarvis interrupting himself through speakers. |
+| "Echo cancelling stopped working" | It loaded and ran, then failed; Jarvis now hears the microphone as it is. `/jarvis restart` tries again. Meanwhile, with speakers, `/jarvis bargein wake` stops Jarvis interrupting himself. |
 | Jarvis does not speak | Check the Fish Audio key (see above) and run `/jarvis test`. |
 | `JARVIS · active in another window` | Another Claude Code window has the helper. Close that window, then run `/jarvis` here. |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
@@ -278,7 +295,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | Phase | Name | What it adds |
 | --- | --- | --- |
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
-| 2 (now) | Always listening | Done: "Hey Jarvis", end-of-speech detection, the follow-up window, barge-in, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: echo cancelling for speakers, and a custom plain "Jarvis" wake word. |
+| 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
 
@@ -294,6 +311,6 @@ Issues and pull requests are welcome. [docs/DEVELOPING.md](docs/DEVELOPING.md) c
 
 [MIT](LICENSE). Copyright (c) 2026 Rotem (rotembab).
 
-The wake word code in `plugin/voice/src/jarvis_voice/listen/wakeword.py` is ported from [openWakeWord](https://github.com/dscripka/openWakeWord) (Apache License 2.0, David Scripka). The "Hey Jarvis" model it downloads is openWakeWord's and is licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): personal, non-commercial use. Speech detection uses the Silero VAD model that faster-whisper ships (MIT).
+The wake word code in `plugin/voice/src/jarvis_voice/listen/wakeword.py` is ported from [openWakeWord](https://github.com/dscripka/openWakeWord) (Apache License 2.0, David Scripka). The "Hey Jarvis" model it downloads is openWakeWord's and is licensed [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/): personal, non-commercial use. The optional plain "Jarvis" model (`jarvis_v2.onnx`) comes from [fwartner/home-assistant-wakewords-collection](https://github.com/fwartner/home-assistant-wakewords-collection); that repository is MIT-licensed, but the model was likely trained with openWakeWord's tooling and CC BY-NC-SA data, so treat it as personal, non-commercial use too. Neither model is in this repository: they are downloaded to your computer (by `/jarvis setup`, or by the helper: "Hey Jarvis" when it starts, plain "Jarvis" when you switch it on), pinned and checked against fixed SHA-256 sums. Speech detection uses the Silero VAD model that faster-whisper ships (MIT).
 
 JARVIS is a fictional character. This is an independent fan project, not affiliated with or endorsed by Marvel, Fish Audio or Anthropic.

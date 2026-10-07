@@ -57,6 +57,13 @@ def ptt_hint() -> str:
     )
 
 
+def echo_cancel_hint() -> str:
+    return (
+        "Run /jarvis setup to reinstall the voice helper. "
+        "Meanwhile, with speakers, /jarvis bargein wake stops Jarvis interrupting himself."
+    )
+
+
 def open_mic_settings() -> bool:
     try:
         subprocess.run(["open", _MIC_SETTINGS_URL], check=True, timeout=5)

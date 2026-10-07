@@ -42,6 +42,8 @@ uv-cache/
 models/
 logs/
 *.log
+# Model files (the wake word models are downloaded, never committed).
+*.onnx
 
 # ---------------------------------------------------------------- Voice audio
 # Reference clips and generated speech stay on your own machine (the helper keeps

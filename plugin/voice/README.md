@@ -6,7 +6,9 @@ Claude Code session as a child process. It handles:
 - the microphone and push-to-talk (PTT);
 - speech-to-text with faster-whisper;
 - text-to-speech over the Fish Audio live WebSocket API;
-- audio playback and barge-in.
+- audio playback and barge-in;
+- echo cancelling (WebRTC's AEC3, through livekit), so the wake word and barge-in
+  don't hear Jarvis's own voice through speakers.
 
 The mod and the helper talk over a versioned JSON protocol. The protocol is defined in
 `../protocol/schema.json`, and a copy ships inside the package as
@@ -17,7 +19,7 @@ The mod and the helper talk over a versioned JSON protocol. The protocol is defi
 ```
 python -m jarvis_voice run    [--data-dir D] [--stt-model M] [--ptt-key K] [--voice-id ID]
                               [--language L] [--input-device NAME] [--output-device NAME]
-                              [--instance-name N] [--log-level LEVEL]
+                              [--aec on|off] [--instance-name N] [--log-level LEVEL]
                               [--fake-audio] [--fake-stt] [--fake-fish URL]
 python -m jarvis_voice setup  [--data-dir D] [--stt-model M] [--no-verify]
 python -m jarvis_voice doctor [--data-dir D] [--no-network] [--no-mic]
@@ -40,7 +42,8 @@ The installed `jarvis-voice` script does the same as `python -m jarvis_voice`.
   - stdout gets one JSON progress line per step: `prepare`, `detect`, `download`,
     `verify`, then `done` or `error`.
 - **doctor**: prints a JSON report. It covers audio devices, a 1 s microphone test,
-  CUDA, downloaded models, Fish Audio (the key is masked) and PTT availability.
+  CUDA, downloaded models, Fish Audio (the key is masked), the wake word, echo
+  cancelling (a self-test on a synthetic echo: nothing is played) and PTT availability.
 
 Exit codes:
 
@@ -64,6 +67,7 @@ Exit codes:
 | `JARVIS_PTT_KEY` | Push-to-talk key, e.g. `right ctrl` (default), `f13`, `alt+space`, `vk:123`. |
 | `JARVIS_LANGUAGE` | Whisper language code. Default `en`. |
 | `JARVIS_INPUT_DEVICE` / `JARVIS_OUTPUT_DEVICE` | Device name, or part of one. Default: the system default. |
+| `JARVIS_AEC` | `off` turns echo cancelling off (the `--aec` default). Default `on`. |
 | `JARVIS_INSTANCE_NAME` | Name of the single-instance lock. Default `JarvisVoice`. |
 | `JARVIS_DATA_DIR` | Data directory. Default `~/.jarvis`. |
 | `JARVIS_LOG_LEVEL` | Log level. Default `INFO`. |

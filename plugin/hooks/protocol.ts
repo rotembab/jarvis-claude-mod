@@ -16,6 +16,7 @@ export type HelperPlatform = 'windows' | 'macos' | 'linux'
 export type UtteranceSource = 'ptt' | 'command' | 'wake'
 /** What interrupts Jarvis by voice: any speech, only the wake word, or nothing. */
 export type BargeInMode = 'speech' | 'wake' | 'off'
+export type EchoCancelState = 'on' | 'off' | 'loading' | 'unavailable'
 
 export type ErrorCode =
   | 'already_running'
@@ -31,6 +32,7 @@ export type ErrorCode =
   | 'stt_failed'
   | 'ptt_unavailable'
   | 'wake_unavailable'
+  | 'aec_unavailable'
   | 'bad_request'
   | 'unauthorized'
   | 'internal'
@@ -81,7 +83,7 @@ export type ReadyEvent = Envelope<'ready'> & {
   sttDevice: 'cuda' | 'cpu'
   voiceId?: string
   pttKey: string
-  /** "Hey Jarvis" while the wake word is loaded and switched on. */
+  /** "Hey Jarvis" while the wake word is loaded and switched on; "Jarvis" while plain "Jarvis" works too. */
   wakePhrase?: string
   bargeIn?: BargeInMode
 }
@@ -110,6 +112,8 @@ export type ConfigCommand = {
   sttModel?: string
   language?: string
   wakeWord?: boolean
+  /** Also wake on plain "Jarvis" at the start of an utterance (helpers with the `wake.plain` capability). */
+  plainWake?: boolean
   bargeIn?: BargeInMode
   /** 0.05 to 0.95; lower wakes more easily. */
   wakeThreshold?: number
@@ -168,6 +172,8 @@ export type StatusResponse = {
   /** The wake phrase, while it is loaded and switched on. */
   wakeWord?: string
   bargeIn?: BargeInMode
+  /** Echo cancelling of what the listener hears: loading at start; unavailable if it failed to load or broke. */
+  echoCancel?: EchoCancelState
 }
 
 export type HomeResult = 'done' | 'failed' | 'confirm'

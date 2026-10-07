@@ -168,6 +168,13 @@ def ptt_hint() -> str:
     return "Global keyboard hooks are unavailable; use /jarvis talk to talk instead."
 
 
+def echo_cancel_hint() -> str:
+    return (
+        "Run /jarvis setup to reinstall the voice helper; Smart App Control can also block livekit's "
+        "unsigned livekit_ffi.dll. Meanwhile, with speakers, /jarvis bargein wake stops Jarvis interrupting himself."
+    )
+
+
 def open_mic_settings() -> bool:
     """Open the microphone privacy page. Returns False when it could not be opened."""
     try:

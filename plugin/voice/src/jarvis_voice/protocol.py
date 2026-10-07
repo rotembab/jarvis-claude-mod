@@ -39,6 +39,7 @@ ErrorCode = Literal[
     "stt_failed",
     "ptt_unavailable",
     "wake_unavailable",
+    "aec_unavailable",
     "bad_request",
     "unauthorized",
     "internal",

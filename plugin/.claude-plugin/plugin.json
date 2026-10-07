@@ -43,16 +43,23 @@
     "wakeWord": {
       "type": "string",
       "title": "Wake word",
-      "description": "on: Jarvis listens for \"Hey Jarvis\" on this computer (nothing is recorded or sent before it hears it). off: push-to-talk only. /jarvis wake on|off switches without opening the settings.",
-      "options": ["on", "off"],
+      "description": "on: Jarvis listens for \"Hey Jarvis\" on this computer (nothing is recorded or sent before it hears it). jarvis: plain \"Jarvis\" at the start of what you say works too (English transcription only; it never interrupts a reply; its small model downloads when you switch it on). off: push-to-talk only. /jarvis wake on|jarvis|off switches without opening the settings.",
+      "options": ["on", "jarvis", "off"],
       "default": "on"
     },
     "bargeIn": {
       "type": "string",
       "title": "Interrupting Jarvis",
-      "description": "speech: talking while Jarvis speaks stops him and he listens (best with a headset). wake: only \"Hey Jarvis\" interrupts (for speakers or a noisy room). off: only push-to-talk or /jarvis stop. /jarvis bargein switches it.",
+      "description": "speech: talking while Jarvis speaks stops him and he listens (with speakers too, while echo cancelling is on). wake: only \"Hey Jarvis\" interrupts (for a noisy room, or if Jarvis still interrupts himself). off: only push-to-talk or /jarvis stop. /jarvis bargein switches it.",
       "options": ["speech", "wake", "off"],
       "default": "speech"
+    },
+    "echoCancelling": {
+      "type": "string",
+      "title": "Echo cancelling",
+      "description": "on: Jarvis takes his own voice out of what the microphone hears, so with speakers he doesn't interrupt or wake himself. off: the microphone is used as it is (try it if your voice sounds cut while Jarvis talks). Run /jarvis restart after changing it.",
+      "options": ["on", "off"],
+      "default": "on"
     },
     "wakeSensitivity": {
       "type": "string",

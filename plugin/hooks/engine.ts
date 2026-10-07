@@ -16,6 +16,7 @@ import type {
   ProcessSpawnRequest,
   ProcessSpawnResult,
   PromptSubmitResult,
+  SessionMessage,
   Timer,
   ToastOptions,
   UiBlitArgs,
@@ -24,6 +25,7 @@ import type {
 } from 'claude-code'
 
 import type { JarvisHelperRef, JarvisHud, JarvisView } from '../types'
+import type { PaneSize } from './hud'
 
 /** The engine's permission decision for a tool call (`$.tool.check`'s answer, the fields the mod reads). */
 export type ToolVerdict = {
@@ -68,6 +70,8 @@ export type Engine = {
   writeHelperRef: (ref: JarvisHelperRef | null) => Promise<void>
   writeView: (view: JarvisView) => Promise<void>
   writeHud: (hud: JarvisHud) => Promise<void>
+  /** Whether focus mode folds the conversation's rows away (they read it). */
+  writeFolded: (isFolded: boolean) => Promise<void>
 
   status: (text: string | undefined) => void
   toast: (text: string, options?: ToastOptions) => void
@@ -75,8 +79,8 @@ export type Engine = {
   log: (text: string) => void
   /** A line in the debug log only. */
   debug: (text: string) => void
-  /** Opens the HUD pane (placed at any width when the person asked for it, from 144 columns when not). */
-  openPane: () => Promise<UiOpenResult>
+  /** Opens the HUD pane at a size (placed at any width when the person asked for it, from 144 columns when not); opening it again resizes it. */
+  openPane: (size: PaneSize) => Promise<UiOpenResult>
   closePane: () => Promise<void>
   /** Repaints the pane's ring in place. */
   blit: (args: UiBlitArgs) => Promise<UiBlitResult>
@@ -100,6 +104,8 @@ export type Engine = {
   abortTurn: (turnId: string) => Promise<void>
   /** One completion through the session's own client and credentials. */
   complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
+  /** The main conversation's messages (the newest 4096). */
+  messages: () => Promise<readonly SessionMessage[]>
   /** The conversation's size at the last response, in tokens; undefined before the first (or after a compaction). */
   contextTokens: () => Promise<number | undefined>
 }

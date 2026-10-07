@@ -34,6 +34,11 @@ class Capture(Protocol):
     @property
     def level(self) -> float: ...
 
+    @property
+    def input_latency(self) -> float:
+        """Seconds from the microphone hearing a sound to its block arriving, as reported (0 if unknown)."""
+        ...
+
     def open(self) -> None:
         """Open the device (idempotent). Raises AudioError."""
         ...

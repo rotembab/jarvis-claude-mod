@@ -32,7 +32,7 @@ export type JarvisView = {
   detail?: string
   /** The push-to-talk key as the helper reported it ("right ctrl"). */
   pttKey?: string
-  /** The wake phrase ("Hey Jarvis") while the helper listens for it. */
+  /** The wake phrase while the helper listens for it: "Hey Jarvis", or "Jarvis" when plain "Jarvis" works too. */
   wakePhrase?: string
   /** The last transcribed utterance. */
   lastUtterance?: string
@@ -54,6 +54,10 @@ export type JarvisHud = {
   isThinking: boolean
   /** The latest tool calls, newest first. */
   actions: HudAction[]
+  /** The text of Claude's last reply, shown under the ring in focus mode. */
+  lastReply?: string
+  /** Focus mode shows: the pane asks for most of the screen and shows the reply. */
+  isFocus?: boolean
 }
 
 /**
@@ -73,6 +77,8 @@ declare module 'claude-code' {
       view: JarvisView
       helper: JarvisHelperRef | null
       hud: JarvisHud
+      /** Focus mode folds the conversation's rows away (the HUD docked beside them fills the screen). */
+      folded: boolean
     }
   }
 }

@@ -2,9 +2,11 @@
 
 Each stdout line is ``{"v":1,"type":"progress","step":...,"pct":0-100,"message":...}``.
 Steps: prepare, detect, download (the speech model, then the small wake word
-model), verify, then ``done`` (pct 100) on success or ``error`` on failure
-(exit code 1). A wake word download failure is reported but does not fail
-setup: push-to-talk works without it, and the helper retries at its next start.
+models for "Hey Jarvis" and plain "Jarvis"), verify, then ``done`` (pct 100)
+on success or ``error`` on failure (exit code 1). A wake word download failure
+is reported but does not fail setup: push-to-talk works without it (and
+"Hey Jarvis" without the plain "Jarvis" model). The helper retries "Hey Jarvis"
+at its next start, and plain "Jarvis" when it is switched on.
 """
 
 from __future__ import annotations
@@ -107,10 +109,27 @@ def download_model(name: str, cache_dir: Path, on_progress: ProgressFn) -> Path:
     return Path(path)
 
 
+class WakeDownloadError(OSError):
+    """A wake word model could not be downloaded; ``phrase`` says which one."""
+
+    def __init__(self, phrase: str, cause: BaseException) -> None:
+        super().__init__(f'"{phrase}": {cause}')
+        self.phrase = phrase
+        self.cause = cause
+
+
 def download_wake(models: Path) -> None:
     folder = wake_models.wake_dir(models)
-    if not wake_models.is_downloaded(folder):
-        wake_models.download(folder)
+    for phrase, files in (
+        (wake_models.WAKE_PHRASE, wake_models.HEY_JARVIS_FILES),
+        (wake_models.PLAIN_WAKE_PHRASE, wake_models.PLAIN_JARVIS_FILES),
+    ):
+        if wake_models.is_downloaded(folder, files):
+            continue
+        try:
+            wake_models.download(folder, files=files)
+        except Exception as exc:
+            raise WakeDownloadError(phrase, exc) from exc
 
 
 def _verify(requested: str, cache_dir: Path, device: SttDevice) -> tuple[str, SttDevice]:
@@ -181,14 +200,23 @@ def run_setup(
 
         fetch(name, 5, 85)
 
-        progress("download", 85, f'Downloading the "{wake_models.WAKE_PHRASE}" wake word model')
+        phrases = f'"{wake_models.WAKE_PHRASE}" and "{wake_models.PLAIN_WAKE_PHRASE}"'
+        progress("download", 86, f"Downloading the {phrases} wake word models")  # 85 was the speech model
         try:
             fetch_wake(cache)
         except Exception as exc:
             log.warning("wake word download failed", exc_info=True)
-            progress("download", 87, f"Could not download the wake word model ({exc}); push-to-talk still works")
+            if isinstance(exc, WakeDownloadError) and exc.phrase == wake_models.PLAIN_WAKE_PHRASE:
+                # "Hey Jarvis" comes first, so it is in place.
+                message = (
+                    f'Could not download the plain "{exc.phrase}" wake word model ({exc.cause}); '
+                    f'"{wake_models.WAKE_PHRASE}" and push-to-talk still work'
+                )
+            else:
+                message = f"Could not download the wake word model ({exc}); push-to-talk still works"
+            progress("download", 87, message)
         else:
-            progress("download", 87, "Wake word model ready")
+            progress("download", 87, "Wake word models ready")
         pct = 87
 
         if verify:

@@ -86,6 +86,18 @@ def test_fake_playback_consumes_in_real_time() -> None:
         pb.close()
 
 
+def test_fake_playback_tells_the_echo_canceller_when_it_closes() -> None:
+    pb = FakePlayback(speed=4.0)
+    tapped: list[tuple[np.ndarray | None, int]] = []
+    pb.set_far_listener(lambda block, rate: tapped.append((block, rate)))
+    pb.open()
+    wait_until(lambda: len(tapped) > 3, 1.0)
+    pb.close()
+    wait_until(lambda: tapped[-1][0] is None, 1.0)  # after its last block: nothing plays until it reopens
+    assert tapped[-1][1] == pb.device_rate == 24_000
+    assert sum(block is None for block, _ in tapped) == 1
+
+
 # --------------------------------------------------------------------------- capture
 
 

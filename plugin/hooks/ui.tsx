@@ -6,7 +6,8 @@ import type { Elements, RenderElement } from 'claude-code'
 
 import type { HudAction, JarvisHud, JarvisPhase, JarvisView } from '../types'
 import type { HudMode } from './hud'
-import { ACTION_LIMIT, MODE_LABELS, RING_KEY } from './hud'
+import type { HudLayout } from './hud'
+import { ACTION_LIMIT, MODE_LABELS, REPLY_ROWS, RING_KEY } from './hud'
 import { HUD_COLORS } from './hud-ring'
 import { ringSvg } from './hud-svg'
 
@@ -73,13 +74,54 @@ export type HudPaneData = {
   mode: HudMode
   view: JarvisView
   hud: JarvisHud
+  /** Focus mode shows: the reply goes under the ring, the conversation being folded away. */
+  isFocus?: boolean
 }
 
 const ACTION_MARKS: Record<HudAction['status'], string> = { running: '›', done: '✓', failed: '✗' }
 
-/** The lines under the ring: what you said, then what Claude did, newest first. */
-function hudTexts<E extends Pick<Elements['terminal'], 'Box' | 'Text'>>({ Box, Text }: E, data: HudPaneData, limit: number): RenderElement {
+/**
+ * The start of a reply in at most `rows` lines of `width` cells, its markdown
+ * marks dropped; an ellipsis ends it when it goes on.
+ */
+export function replyLines(text: string, width: number, rows: number): string[] {
+  const words = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^\s{0,3}(#{1,6}|>)\s*/gm, '')
+    .replace(/\*\*|__|`/g, '')
+    .split(/\s+/)
+    .filter(word => word !== '')
+  const lines: string[] = []
+  let line = ''
+  for (const word of words) {
+    const next = line === '' ? word : `${line} ${word}`
+    if (next.length <= width || line === '') {
+      line = next.length > width ? next.slice(0, width) : next
+      continue
+    }
+    lines.push(line)
+    line = word.slice(0, width)
+    if (lines.length === rows) break
+  }
+  if (lines.length < rows && line !== '') lines.push(line)
+  const isCut = lines.join(' ').length < words.join(' ').length
+  if (isCut && lines.length > 0) {
+    const last = lines[lines.length - 1] as string
+    lines[lines.length - 1] = `${last.slice(0, Math.max(0, width - 1))}…`
+  }
+  return lines
+}
+
+/** The lines under the ring: what you said, Claude's reply in focus mode, then what Claude did, newest first. */
+function hudTexts<E extends Pick<Elements['terminal'], 'Box' | 'Text'>>(
+  { Box, Text }: E,
+  data: HudPaneData,
+  limit: number,
+  columns: number,
+  replyRows: number,
+): RenderElement {
   const actions = data.hud.actions.slice(0, Math.max(0, limit))
+  const reply = data.isFocus && data.hud.lastReply ? replyLines(data.hud.lastReply, Math.max(10, columns - 7), replyRows) : []
   return (
     <Box flexDirection="column">
       {data.view.lastUtterance ? (
@@ -88,6 +130,12 @@ function hudTexts<E extends Pick<Elements['terminal'], 'Box' | 'Text'>>({ Box, T
           {data.view.lastUtterance}
         </Text>
       ) : null}
+      {reply.map((line, index) => (
+        <Text wrap="truncate-end">
+          <Text dimColor>{index === 0 ? 'jarvis ' : '       '}</Text>
+          {line}
+        </Text>
+      ))}
       {actions.map(action => (
         <Text wrap="truncate-end" dimColor={action.status !== 'running'} color={action.status === 'failed' ? 'error' : undefined}>
           {ACTION_MARKS[action.status]} {action.label}
@@ -108,29 +156,41 @@ function hudTitle<E extends Pick<Elements['terminal'], 'Text'>>({ Text }: E, mod
 
 export const hudColor = (mode: HudMode): string => `#${HUD_COLORS[mode].toString(16).padStart(6, '0')}`
 
-/** The rows the texts under the ring take at most. */
-export const HUD_TEXT_ROWS = 2 + ACTION_LIMIT
+/** A transcript row folded away by focus mode: it draws nothing. */
+export function foldedRow({ Box }: Pick<Elements['terminal'], 'Box'>): RenderElement {
+  return <Box />
+}
 
 /** The terminal pane: title, the ring (a Raster the HUD repaints), the texts. */
-export function hudTerminalTree(
-  { Box, Text, Raster }: HudTerminalElements,
-  data: HudPaneData,
-  ring: { columns: number; rows: number; cells: string },
-  actionRows: number,
-): RenderElement {
+export function hudTerminalTree({ Box, Text, Raster }: HudTerminalElements, data: HudPaneData, layout: HudLayout, cells: string): RenderElement {
+  const { ring } = layout
+  const raster = <Raster key={RING_KEY} columns={ring.columns} rows={ring.rows} cells={cells} />
+  const texts = hudTexts({ Box, Text }, data, layout.actionRows, layout.textColumns, layout.replyRows)
   return (
     <Box flexDirection="column">
       <Box justifyContent="center">{hudTitle({ Text }, data.mode)}</Box>
-      <Box justifyContent="center">
-        <Raster key={RING_KEY} columns={ring.columns} rows={ring.rows} cells={ring.cells} />
-      </Box>
-      {hudTexts({ Box, Text }, data, actionRows)}
+      {layout.isSide ? (
+        <Box flexDirection="row" justifyContent="center">
+          {raster}
+          <Box flexDirection="column" justifyContent="center" marginLeft={2} width={layout.textColumns}>
+            {texts}
+          </Box>
+        </Box>
+      ) : (
+        <Box justifyContent="center">{raster}</Box>
+      )}
+      {layout.isSide ? null : texts}
     </Box>
   )
 }
 
 /** The desktop pane: the same, the ring as an animated SVG. */
-export function hudSvgTree({ Box, Text, Svg }: HudSvgElements, data: HudPaneData, levels: { mic: number; out: number; t: number }): RenderElement {
+export function hudSvgTree(
+  { Box, Text, Svg }: HudSvgElements,
+  data: HudPaneData,
+  levels: { mic: number; out: number; t: number },
+  columns: number,
+): RenderElement {
   return (
     <Box flexDirection="column">
       <Box justifyContent="center">{hudTitle({ Text }, data.mode)}</Box>
@@ -143,7 +203,7 @@ export function hudSvgTree({ Box, Text, Svg }: HudSvgElements, data: HudPaneData
           isInteractive
         />
       </Box>
-      {hudTexts({ Box, Text }, data, ACTION_LIMIT)}
+      {hudTexts({ Box, Text }, data, ACTION_LIMIT, columns, REPLY_ROWS)}
     </Box>
   )
 }
