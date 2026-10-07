@@ -1,7 +1,9 @@
 // Which Claude Code session the app shows. Every window with the plugin
 // pushes its own snapshots; the one running the voice helper here (isOwner)
-// wins, else the one heard from last. A session that missed three heartbeats
-// is gone. Staleness is judged by when the app received a push, never by its
+// wins, else the one whose display changed last. A heartbeat that repeats what
+// a session showed does not count as a change, or two windows would take turns
+// on the screen every 2 seconds. A session that missed three heartbeats is
+// gone. Staleness is judged by when the app received a push, never by its
 // `at`, which comes from another process's clock and only orders one
 // session's snapshots.
 
@@ -12,7 +14,15 @@ export const STALE_MS = 6000
 /** Sessions remembered at most; the board is a display, not a log. */
 export const MAX_SESSIONS = 16
 
-type Entry = { snapshot: AppSnapshot; receivedAt: number }
+/** `changedAt`: when the app last received something new from the session (its first push, or a different display). */
+type Entry = { snapshot: AppSnapshot; receivedAt: number; changedAt: number }
+
+/** Everything a snapshot shows but its timestamp, which every heartbeat moves. */
+const shownKey = (snapshot: AppSnapshot): string => JSON.stringify({ ...snapshot, at: 0 })
+
+/** True when `a` changed after `b` (or at the same time, but was heard from later). */
+const isNewer = (a: Entry, b: Entry | undefined): boolean =>
+  b === undefined || a.changedAt > b.changedAt || (a.changedAt === b.changedAt && a.receivedAt >= b.receivedAt)
 
 export class SessionBoard {
   private readonly entries = new Map<string, Entry>()
@@ -21,7 +31,8 @@ export class SessionBoard {
   accept(snapshot: AppSnapshot, receivedAt: number): boolean {
     const held = this.entries.get(snapshot.sessionId)
     if (held !== undefined && held.snapshot.at > snapshot.at) return false
-    this.entries.set(snapshot.sessionId, { snapshot, receivedAt })
+    const isSame = held !== undefined && shownKey(held.snapshot) === shownKey(snapshot)
+    this.entries.set(snapshot.sessionId, { snapshot, receivedAt, changedAt: isSame ? held.changedAt : receivedAt })
     for (const [id, entry] of this.entries) {
       if (receivedAt - entry.receivedAt >= STALE_MS) this.entries.delete(id)
     }
@@ -33,14 +44,14 @@ export class SessionBoard {
     return true
   }
 
-  /** The snapshot to show at `now`: the newest live owner, else the newest live session. */
+  /** The snapshot to show at `now`: the live owner that changed last, else the live session that changed last. */
   current(now: number): AppSnapshot | undefined {
     let owner: Entry | undefined
     let latest: Entry | undefined
     for (const entry of this.entries.values()) {
       if (now - entry.receivedAt >= STALE_MS) continue
-      if (latest === undefined || entry.receivedAt >= latest.receivedAt) latest = entry
-      if (entry.snapshot.isOwner && (owner === undefined || entry.receivedAt >= owner.receivedAt)) owner = entry
+      if (isNewer(entry, latest)) latest = entry
+      if (entry.snapshot.isOwner && isNewer(entry, owner)) owner = entry
     }
     return (owner ?? latest)?.snapshot
   }

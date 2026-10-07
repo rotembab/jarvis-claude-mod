@@ -38,13 +38,34 @@ test('the window running the voice helper wins over a later one', () => {
   assert.equal(board.liveCount(2000), 2)
 })
 
-test('without an owner, the session heard from last wins', () => {
+test('without an owner, the session that changed last wins', () => {
   const board = new SessionBoard()
   board.accept(snap('a'), 1000)
   board.accept(snap('b'), 2000)
   assert.equal(board.current(2000)?.sessionId, 'b')
-  board.accept(snap('a', { at: 1100 }), 3000)
+  board.accept(snap('a', { at: 1100, mode: 'thinking' }), 3000)
   assert.equal(board.current(3000)?.sessionId, 'a')
+})
+
+test('heartbeats that repeat a display do not make two windows take turns', () => {
+  const board = new SessionBoard()
+  const a = (at: number) => snap('a', { phase: 'stopped', utterance: 'Open the browser', at })
+  const b = (at: number, overrides: Partial<AppSnapshot> = {}) => snap('b', { phase: 'elsewhere', at, ...overrides })
+  board.accept(b(1000), 1000)
+  board.accept(a(1100), 1100)
+  assert.equal(board.current(1100)?.sessionId, 'a')
+  // Each heartbeat (every 2 s) repeats what its window showed: a, which changed last, stays.
+  for (let t = 3000; t <= 9000; t += 2000) {
+    board.accept(b(t), t)
+    assert.equal(board.current(t)?.sessionId, 'a', `after b's heartbeat at ${t}`)
+    board.accept(a(t + 100), t + 100)
+    assert.equal(board.current(t + 100)?.sessionId, 'a', `after a's heartbeat at ${t + 100}`)
+  }
+  // Heartbeats keep a session live: a's last one came at 9100.
+  assert.equal(board.current(9100 + STALE_MS - 1)?.sessionId, 'a')
+  // Once b shows something new, it wins.
+  board.accept(b(10_000, { mode: 'thinking' }), 10_000)
+  assert.equal(board.current(10_000)?.sessionId, 'b')
 })
 
 test('a snapshot older than the one held for its session is ignored', () => {

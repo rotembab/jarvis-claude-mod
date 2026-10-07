@@ -78,7 +78,7 @@ The plugin looks for the app at the start of each session and every few seconds 
 | `/jarvis app off` | "The HUD is no longer sent to the Jarvis app. /jarvis app on sends it again." It stays off in new sessions. |
 | `/jarvis app on` | Sends it again (on is the default). |
 
-- With several Claude Code windows open, each one sends its HUD. The app shows the window that runs the voice helper, and otherwise the one it heard from last.
+- With several Claude Code windows open, each one sends its HUD. The app shows the window that runs the voice helper, and otherwise the one whose HUD changed last (a window that only says it is still there does not take over the screen).
 - A Claude Code session in the cloud never connects: the app is on your computer, the session is not.
 
 ## Start with Windows
