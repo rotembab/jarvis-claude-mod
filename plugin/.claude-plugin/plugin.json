@@ -1,6 +1,6 @@
 {
   "name": "jarvis",
-  "version": "0.3.2",
+  "version": "0.6.0",
   "description": "A JARVIS-style voice for Claude Code: say \"Hey Jarvis\" (or hold push-to-talk) to speak, hear the reply, talk over it to interrupt. Local wake word and speech-to-text, Fish Audio speech.",
   "author": { "name": "Rotem" },
   "license": "MIT",
