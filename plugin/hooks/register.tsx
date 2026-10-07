@@ -8,6 +8,8 @@ import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
 import { describeError } from './engine'
+import type { HandsEngine } from './hands'
+import { HANDS_TOOL, runHandsTool } from './hands'
 import { HOME_TOOL, HOME_TOOL_SPEC } from './home'
 import { actionLabel, HUD_PANE, hudLayout, hudMode, PANE_START } from './hud'
 import { isRemoteSession } from './platform'
@@ -16,6 +18,7 @@ import { bandTree, foldedRow, hudSvgTree, hudTerminalTree, isBandShown } from '.
 // The session state this mod owns (types/index.d.ts declares it).
 const viewAtom = atom({ plugin: 'jarvis', key: 'view' } as const, { phase: 'stopped' })
 const helperRefAtom = atom({ plugin: 'jarvis', key: 'helper' } as const, null)
+const handsRefAtom = atom({ plugin: 'jarvis', key: 'handsHelper' } as const, null)
 const hudAtom = atom({ plugin: 'jarvis', key: 'hud' } as const, { isThinking: false, actions: [] })
 const foldedAtom = atom({ plugin: 'jarvis', key: 'folded' } as const, false)
 
@@ -29,7 +32,7 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     // `$` is spelled out at each call (the engine reads calls off the source),
     // so the port is a set of closures over this hook's `$`.
-    const engine: Engine = {
+    const engine: HandsEngine = {
       pluginRoot: $.plugin.root,
       env: async () => ({
         OS: await $.env.get('OS'),
@@ -46,6 +49,7 @@ export const register: Register = (on, options) => {
       spawn: request => $.process.spawn(request),
       run: (argv, init) => $.process.run(argv, init),
       exists: path => $.fs.exists(path),
+      readFile: path => $.fs.read(path),
       writeFile: (path, text) => $.fs.write(path, text),
       storeGet: key => $.store.get(key),
       storeSet: (key, value) => $.store.set(key, value),
@@ -53,6 +57,10 @@ export const register: Register = (on, options) => {
       readHelperRef: () => read($, helperRefAtom),
       writeHelperRef: async ref => {
         await update($, helperRefAtom, () => ref)
+      },
+      readHandsRef: () => read($, handsRefAtom),
+      writeHandsRef: async ref => {
+        await update($, handsRefAtom, () => ref)
       },
       writeView: async view => {
         await update($, viewAtom, () => view)
@@ -84,8 +92,8 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, home',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|home]',
+      description: 'Jarvis voice and hand control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, hands, home',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|hands|home]',
       immediate: true,
     })
     // The home_control tool. A refused registration (a managed policy, a
@@ -105,6 +113,12 @@ export const register: Register = (on, options) => {
       await app.onSessionStart(engine, e.surface)
     } finally {
       await registerHomeTool()
+    }
+    // "Jarvis, turn on hand control": only where the hand helper can run.
+    if (app.isLocal) {
+      await $.tool.register(HANDS_TOOL).catch((error: unknown) => {
+        engine.debug(`jarvis: the hands tool was not registered: ${describeError(error)}`)
+      })
     }
     return started
   })
@@ -130,6 +144,10 @@ export const register: Register = (on, options) => {
 
   // The command opens the HUD through its own `$`: the person asked, so it is placed at any width.
   on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: size => $.ui.open({ ...HUD_OPEN, ...size }) }))
+
+  on('tool.call', { tool: 'mcp__jarvis__hands' }, async ($, e) => ({ result: await runHandsTool(app.hands, e) })).catch(() => ({
+    result: 'Hand control did not answer in time; /jarvis hands shows its state.',
+  }))
 
   on('turn.start', ($, e, next) => {
     app.voice?.onTurnStart(e)

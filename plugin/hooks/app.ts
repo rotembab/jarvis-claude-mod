@@ -1,12 +1,15 @@
 // The mod's session-wide coordinator: built in register() from the user's
 // settings, bound to the engine port at session.start, it owns the helper
-// supervisor, the voice controller and the view the status line and band draw.
+// supervisor, the voice controller, hand control and the view the status line
+// and band draw.
 
 import type { PluginOptions, RenderSurface, UiOpenResult } from 'claude-code'
 
 import type { JarvisPhase, JarvisView } from '../types'
 import type { Engine } from './engine'
 import { describeError } from './engine'
+import type { HandsEngine, HandsSettings } from './hands'
+import { Hands, readHandsSettings } from './hands'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
 import { HomeControl } from './home'
@@ -64,6 +67,7 @@ export type JarvisSettings = {
   /** The helper removes Jarvis's own voice from what the microphone hears. */
   echoCancelling: boolean
   modelRouting: RoutingMode
+  hands: HandsSettings
 }
 
 const optionString = (options: PluginOptions, key: string): string | undefined => {
@@ -90,6 +94,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
       'medium',
     echoCancelling: optionString(options, 'echoCancelling') !== 'off',
     modelRouting: ROUTING_MODES.find(mode => mode === optionString(options, 'modelRouting')) ?? 'auto',
+    hands: readHandsSettings(options),
   }
 }
 
@@ -125,6 +130,8 @@ export class Jarvis {
   platform: Platform | undefined
   helper: Helper | undefined
   voice: Voice | undefined
+  /** Hand control (hands.ts): its own helper, started only when the user turned it on. */
+  hands: Hands | undefined
   /** The HUD pane's ring and action log (local sessions). */
   hud: Hud | undefined
   /** The home_control tool and /jarvis home (home.ts). */
@@ -153,7 +160,7 @@ export class Jarvis {
   constructor(readonly settings: JarvisSettings) {}
 
   /** session.start: binds the port; starts the helper when a local surface draws. */
-  async onSessionStart(engine: Engine, surface: RenderSurface | null): Promise<void> {
+  async onSessionStart(engine: HandsEngine, surface: RenderSurface | null): Promise<void> {
     this.engine = engine
     const env = await engine.env()
     const platform = await detectPlatform(engine, env)
@@ -178,6 +185,14 @@ export class Jarvis {
       router: new ModelRouter(engine, { mode: () => this.routingMode(), complete: request => engine.complete(request) }),
     })
     this.isLocal = !isRemoteSession(env)
+    this.hands = new Hands(engine, {
+      platform,
+      settings: this.settings.hands,
+      isLocal: this.isLocal,
+      noProxy: env.NO_PROXY,
+      voice: () => this.helper,
+      onView: hands => this.patch({ hands }),
+    })
     if (!this.isLocal) {
       this.publish({ phase: 'unavailable' })
       return
@@ -380,7 +395,8 @@ export class Jarvis {
    * /jarvis setup after uv was found: stops the helper (Windows locks a
    * running venv), installs, downloads the model, starts the helper again.
    * A model named here (or pinned by `cpu`) is remembered, so the helper
-   * loads the one installed.
+   * loads the one installed. Then it updates the hand helper, when that is
+   * installed: so one /jarvis setup after a plugin update covers both.
    */
   async runSetup(uv: string, request: SetupOptions): Promise<void> {
     const { engine, platform, helper } = this
@@ -420,7 +436,19 @@ export class Jarvis {
       this.isSetupRunning = false
       this.publish({ ...this.view, phase: 'stopped', detail: undefined })
       helper.start({ userInitiated: true })
+      await this.refreshHands(uv)
     }
+  }
+
+  /**
+   * The hand helper's venv holds a copy of the plugin's hands package (a
+   * non-editable install), so an update reaches it only through a setup of
+   * its own: /jarvis setup runs that too while hand control is installed.
+   */
+  private async refreshHands(uv: string): Promise<void> {
+    const hands = this.hands
+    if (hands === undefined || !hands.isLocal || !(await hands.isInstalled())) return
+    await hands.runSetup(uv, { isRefresh: true })
   }
 
   /**
@@ -499,6 +527,7 @@ export class Jarvis {
     if (this.hasAutoStarted) return
     this.hasAutoStarted = true
     this.startHelper(false)
+    void this.hands?.autoStart()
   }
 
   private async initialConfig(): Promise<ConfigCommand> {

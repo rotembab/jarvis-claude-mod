@@ -106,8 +106,8 @@ describe('home_control: registration', () => {
     const w = world(on)
     on('tool.describe', ($, e) => ({ description: e.description }))
     await startWithoutHelper($, w)
-    expect(w.tools.map(tool => tool.name)).toEqual(['home_control'])
-    const [spec] = w.tools
+    expect(w.tools).toEqual(['home_control', 'hands'])
+    const spec = w.toolSpecs.find(tool => tool.name === 'home_control')
     expect(spec?.description.length).toBeLessThan(1500)
     expect(spec?.description).toContain('Never ask for a PIN, key, password or token in the chat')
     expect(spec?.description).toContain('"scan" looks for smart devices on the home network')

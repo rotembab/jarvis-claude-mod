@@ -18,6 +18,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - [Fish Audio key and voice](#fish-audio-key-and-voice)
 - [Local voice (optional)](#local-voice-optional)
 - [Using Jarvis](#using-jarvis)
+- [Hand control (preview)](#hand-control-preview)
 - [Home devices](#home-devices)
 - [Commands](#commands)
 - [Settings](#settings)
@@ -85,7 +86,7 @@ This creates `%USERPROFILE%\.jarvis`, makes a Python 3.12 environment there with
 claude plugin update jarvis@jarvis-claude-mod
 ```
 
-Then restart Claude Code and run `/jarvis setup`, which reinstalls the voice helper from the new version.
+Then restart Claude Code and run `/jarvis setup`, which reinstalls the voice helper from the new version, and the hand helper too if you set up hand control. Until then Jarvis says when the hand helper is from an older version; `/jarvis setup hands` updates only that one.
 
 ## Fish Audio key and voice
 
@@ -173,6 +174,36 @@ Under the ring are the last thing you said and the last six things Claude ran (`
 - In the desktop app focus mode does nothing yet.
 - `/jarvis focus off` turns it off. The choice is kept for new sessions.
 
+## Hand control (preview)
+
+Your webcam can drive the mouse and windows: point with your hand, pinch to click and drag files, make a fist to grab a window and fling it to another screen. It runs on Windows, needs a webcam, and is off until you turn it on.
+
+1. Install it once: `/jarvis setup hands` (about 500 MB: MediaPipe and OpenCV in `%USERPROFILE%\.jarvis\hands`, and an 8 MB hand model in `%USERPROFILE%\.jarvis\models\hands`).
+2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control". The camera light comes on.
+3. Hold an open palm toward the camera, still, for half a second. A cyan ring appears at the cursor, which now follows your hand.
+
+| Gesture | What it does |
+| --- | --- |
+| Open palm toward the camera, still for half a second | Take the cursor |
+| Move your hand | Move the cursor (it follows your knuckles, which stay put when you pinch) |
+| Pinch thumb and index finger | Click; pinch and move to drag; pinch twice to double-click |
+| Pinch thumb and middle finger | Right-click |
+| Index and middle finger up, then move | Scroll |
+| Fist over a window | Grab the window and move it |
+| A fist with each hand | Resize the grabbed window |
+| Fling a grabbed window | Left or right: to the next display that way, or that half of the screen when there is none. Up: maximize. Down: minimize |
+| Drop your hand out of view, or touch the mouse | Let go at once |
+
+- Sit so the camera sees your hand at chest height with your elbow down; small movements cover the whole screen.
+- `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
+- `/jarvis hands pause` turns the camera off without turning hand control off. It stays paused when the helper restarts and in new sessions, until `/jarvis hands resume`, `on` or `off`.
+- Some webcams take up to about 20 seconds to open. If the camera is still opening when `/jarvis hands resume` answers, it says so, and a message follows when the camera is on or why it could not open.
+- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand".
+- Hand control runs in one Claude Code window at a time, since one camera can serve only one. In another window `/jarvis hands` says where it runs; turning it off there and running `/jarvis hands restart` brings it to this window.
+- Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays (virtual display drivers and streaming dummies) are left out; USB display adapters count as real displays. `/jarvis hands display 1` keeps your hand on one display, and a display you leave out takes none of your reach.
+- Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.
+- `/jarvis hands` shows the camera, the displays and the gestures. The camera picture never leaves your computer.
+
 ## Home devices
 
 Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Tuya devices from the Tuya Smart or Smart Life app (Fingerbots too, through a Tuya gateway), and anything Home Assistant controls, and talks to them directly on your home network. It can't reach Apple Home from Windows; see [Siri and Apple Home](docs/HOME.md#siri-and-apple-home).
@@ -203,6 +234,13 @@ To see which smart devices are on your network and which ones Jarvis can control
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis home [setup\|list\|status\|do\|scan]` | Home devices: what is set up, open the setup window, list devices, show one device's state, run one command, or search your network for smart devices. See [docs/HOME.md](docs/HOME.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
+| `/jarvis setup hands` | Install hand control (MediaPipe, OpenCV and the hand model). |
+| `/jarvis hands [on\|off]` | Hand control status, or turn it (and the camera) on or off. |
+| `/jarvis hands calibrate [cancel]` | Fit hand control to your reach: an open palm on each corner target. |
+| `/jarvis hands display <n\|all>` | The displays your hand reaches (a list such as `1,2` works). |
+| `/jarvis hands engage <palm\|always>` | Start with an open palm (default), or let any hand take the cursor at once. |
+| `/jarvis hands camera <n\|name>` | The camera to use: its number or part of its name. |
+| `/jarvis hands pause\|resume\|restart` | Turn the camera off and on, or restart the hand helper. |
 
 ## Settings
 
@@ -223,6 +261,9 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
 | `sttModel` | `auto` | Speech-to-text model: `auto`, `base.en`, `small.en`, `small`, `medium` or `large-v3-turbo`. `auto` means `large-v3-turbo` on an NVIDIA GPU and `small.en` on the CPU. Run `/jarvis setup` after changing it. |
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |
+| `handControl` | `off` | `on` watches your hands through the webcam (after `/jarvis setup hands`). `/jarvis hands on\|off` changes it too. |
+| `handCamera` | empty | The webcam for hand control: its number or part of its name, such as `UGREEN`. Empty means the first camera. |
+| `handEngage` | `palm` | `palm`: hold an open palm still to take the cursor. `always`: any hand in view takes it at once. |
 
 ## How it works
 
@@ -263,8 +304,9 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 - **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message. With model routing on, each one also goes to Haiku, through the same Claude Code connection, to choose the model.
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
 - **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Tuya scenes, the one-time Tuya account link and, only if you turn it on, Tuya's cloud fallback for devices that don't answer at home. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
-- The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log`. API keys and tokens are masked in it.
-- Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word models from GitHub: openWakeWord's releases, and the plain "Jarvis" model from a community collection) and the helper fetching a wake word model that is missing (the "Hey Jarvis" model when it starts, the plain "Jarvis" model when you switch it on), Jarvis talks to nothing else.
+- **Hand control uses the camera only while it is on.** The hand helper reads each frame, finds your hands on your own computer (MediaPipe, on the CPU) and drops the frame; no picture is stored or sent anywhere. Jarvis pins MediaPipe 0.10.33, the newest version that sends Google no usage statistics. The camera light is on while hand control watches, and off after `/jarvis hands pause` or `off`.
+- The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log` (hand control: `hands.log`). API keys and tokens are masked in it.
+- Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word models from GitHub: openWakeWord's releases, and the plain "Jarvis" model from a community collection, and `/jarvis setup hands` downloads the hand model from Google's MediaPipe models) and the helper fetching a wake word model that is missing (the "Hey Jarvis" model when it starts, the plain "Jarvis" model when you switch it on), Jarvis talks to nothing else.
 
 ## Troubleshooting
 
@@ -280,6 +322,9 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | "Echo cancelling stopped working" | It loaded and ran, then failed; Jarvis now hears the microphone as it is. `/jarvis restart` tries again. Meanwhile, with speakers, `/jarvis bargein wake` stops Jarvis interrupting himself. |
 | Jarvis does not speak | Check the Fish Audio key (see above) and run `/jarvis test`. |
 | `JARVIS · active in another window` | Another Claude Code window has the helper. Close that window, then run `/jarvis` here. |
+| Hand control: "camera blocked" | Settings > Privacy & security > Camera: turn on **Camera access** and **Let desktop apps access your camera**, then `/jarvis hands restart`. |
+| Hand control: "camera in use" | Another app (Teams, Zoom, the Camera app, OBS) has the webcam. Close it, then `/jarvis hands restart`. |
+| Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
 
 More detail, including logs and running the helper by hand, is in [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -300,6 +345,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
+| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview). Next: tuning on a real desk, then a projector wall mode. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).
 
