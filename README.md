@@ -76,6 +76,14 @@ This creates `%USERPROFILE%\.jarvis`, makes a Python 3.12 environment there with
 - `/jarvis setup cpu` skips the CUDA libraries and, with the model on `auto`, installs the CPU model (`small.en`). `/jarvis setup small.en` (or another model name from [Settings](#settings)) installs a specific speech model, which Jarvis then uses until you change the `sttModel` setting.
 - Run `/jarvis setup` again at any time to repair the installation. It also reinstalls the voice helper from the plugin, so run it after updating Jarvis.
 
+### Update
+
+```text
+claude plugin update jarvis@jarvis-claude-mod
+```
+
+Then restart Claude Code and run `/jarvis setup`, which reinstalls the voice helper from the new version.
+
 ## Fish Audio key and voice
 
 Jarvis needs a Fish Audio API key to speak. Create one on the API keys page of your Fish Audio account, then give it to Jarvis in **one** of these ways:

@@ -108,6 +108,10 @@ tsc -p plugin                   # type-checks the mod (see below)
 
 [.github/workflows/ci.yml](../.github/workflows/ci.yml) runs the helper tests on Windows, macOS and Ubuntu, and the validate and test commands above on Ubuntu with the latest Claude Code from npm. It does not run `tsc -p plugin`: the declarations exist only once a Claude Code session has loaded the mod, and no command writes them without one (the runner has no login). Type-check locally before you push.
 
+## Releasing
+
+Users update with `claude plugin update jarvis@jarvis-claude-mod`, which installs a new copy only when `version` in `plugin\.claude-plugin\plugin.json` changes. Bump it with every push to main that changes anything under `plugin\`, together with `version` in `plugin\voice\pyproject.toml` and `__version__` in `plugin\voice\src\jarvis_voice\__init__.py`, then run `uv lock --project plugin\voice`. `tests\test_version.py` fails if the three differ. Use a patch bump (0.2.1) for fixes and a minor bump (0.3.0) for new features.
+
 ## Run the helper by hand
 
 The mod normally starts the helper; you can run it yourself to watch its events or poke its control server.
