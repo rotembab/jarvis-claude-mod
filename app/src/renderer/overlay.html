@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Jarvis</title>
+<link rel="stylesheet" href="style.css">
+<script src="overlay.js" defer></script>
+</head>
+<body class="overlay" data-mode="offline" data-visible="false">
+  <main id="hud">
+    <div id="ring" class="ring"></div>
+    <div id="label"></div>
+    <section id="panel" hidden>
+      <p id="utterance" hidden></p>
+      <p id="reply" hidden></p>
+      <ul id="actions"></ul>
+      <p id="note" hidden></p>
+    </section>
+  </main>
+</body>
+</html>

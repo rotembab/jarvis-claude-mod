@@ -12,8 +12,6 @@ import json
 import tomllib
 from pathlib import Path
 
-import pytest
-
 import jarvis_voice
 
 HELPER = Path(__file__).resolve().parents[1]
@@ -28,9 +26,6 @@ def test_helper_and_plugin_versions_match() -> None:
 
 
 def test_app_version_matches() -> None:
-    # A checkout without the app (it is optional) has nothing to compare.
-    if not (APP / "package.json").is_file():
-        pytest.skip("no app/package.json in this checkout")
     package = json.loads((APP / "package.json").read_text(encoding="utf-8"))["version"]
     lock = json.loads((APP / "package-lock.json").read_text(encoding="utf-8"))
     assert package == lock["version"] == lock["packages"][""]["version"] == jarvis_voice.__version__
