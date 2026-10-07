@@ -8,6 +8,7 @@ import time
 import numpy as np
 
 from .capture import STT_SAMPLERATE, BlockListener
+from .errors import AudioError
 from .playback import TTS_SAMPLERATE, PlaybackMixer
 
 
@@ -92,6 +93,8 @@ class FakePlayback:
         self.speed = speed
         self.block = int(TTS_SAMPLERATE * block_ms / 1000)
         self.fail_with = fail_with
+        self.open_error: AudioError | None = None  # a failed open, or a test: the device could not reopen
+        self.held = False
         self.effects_played = 0
         self.stops = 0
         self.ends = 0
@@ -124,7 +127,10 @@ class FakePlayback:
 
     def open(self) -> None:
         if self.fail_with is not None:
+            if isinstance(self.fail_with, AudioError):
+                self.open_error = self.fail_with
             raise self.fail_with
+        self.open_error = None
         if self._thread is not None and self._stop.is_set():
             self._thread.join()  # closed but maybe not exited yet: let it finish before restarting
         if self._thread is None or not self._thread.is_alive():
@@ -134,6 +140,9 @@ class FakePlayback:
 
     def close(self) -> None:
         self._stop.set()
+
+    def hold_open(self, held: bool) -> None:
+        self.held = held
 
     def _run(self) -> None:
         # Pace by the clock, not by wait() timeouts, the way a sound card does:

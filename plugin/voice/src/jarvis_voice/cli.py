@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -164,7 +165,7 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         capture = SoundDeviceCapture(args.input_device)
         playback = SoundDevicePlayback(args.output_device)
         ptt = PynputPushToTalk()
-        rescan = rescan_devices
+        rescan = partial(rescan_devices, capture, playback)  # closes both before PortAudio frees their streams
 
     if args.fake_stt:
         from .stt.fake import FakeTranscriber

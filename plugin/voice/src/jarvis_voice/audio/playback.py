@@ -8,6 +8,7 @@ from typing import Protocol
 
 import numpy as np
 
+from .errors import AudioError
 from .levels import meter
 
 TTS_SAMPLERATE = 24_000
@@ -42,11 +43,24 @@ class Playback(Protocol):
         """Speech is held (push-to-talk is down); its frames do not advance."""
         ...
 
+    @property
+    def open_error(self) -> AudioError | None:
+        """Why the last attempt to open the device failed; None once it opened."""
+        ...
+
     def open(self) -> None:
         """Open the device (idempotent). Raises AudioError."""
         ...
 
     def close(self) -> None: ...
+
+    def hold_open(self, held: bool) -> None:
+        """A reply is open (True) or every reply has finished (False).
+
+        While held, silences (Claude running a tool between sentences) do not
+        close the device, up to a cap; afterwards it may close when idle.
+        """
+        ...
 
     def add_speech(self, pcm: np.ndarray, generation: int | None = None) -> None: ...
 

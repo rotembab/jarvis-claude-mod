@@ -41,6 +41,7 @@ These are the traps found while researching Windows and the Mac port, written do
 | faster-whisper on NVIDIA | Pin `ctranslate2` 4.6.3 or later; cuDNN is optional from that version | RTX 50-series needs its CUDA 12.8 build |
 | Language | `.en` models for English only; multilingual `small`, `turbo` or `large-v3` for Hebrew or mixed speech | The `.en` models and the wake models are English-only |
 | Device changes | Re-open streams when the default device changes or a device is unplugged | WASAPI streams don't follow the Windows default by themselves |
+| Audio threads | Initialise COM (`CoInitializeEx`, multithreaded) on every thread before it opens, starts or restarts a stream | PortAudio's WASAPI start needs COM on the calling thread; without it the start fails with "Unanticipated host error" and stale WDM-KS text |
 | Mic errors | Tell a privacy block (three Windows toggles: Microphone access, apps, desktop apps) apart from another app holding the device exclusively | Each needs a different fix from you |
 | Ducking | Avoid Windows' communications audio category | Windows lowers other sounds by 80% while a communications stream is open |
 

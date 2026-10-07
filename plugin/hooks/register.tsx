@@ -61,6 +61,7 @@ export const register: Register = (on, options) => {
       debug: text => $.ui.log(text, { to: 'debug' }),
       submitPrompt: text => $.prompt.submit({ text, asUser: true }),
       complete: request => $.model.complete(request),
+      contextTokens: async () => (await $.session.usage()).context.tokens,
       abortTurn: turnId => $.turn.abort({ turnId }),
     }
     await $.command.register({

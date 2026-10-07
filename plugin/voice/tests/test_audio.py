@@ -226,6 +226,70 @@ def test_windows_mic_consent_reads_without_error() -> None:
     assert isinstance(windows.mic_access_denied(), bool)
 
 
+def test_windows_ensure_com_initialises_com_on_the_calling_thread() -> None:
+    import ctypes
+    import threading
+
+    from jarvis_voice.platform import windows
+
+    if plat_name() != "windows":
+        pytest.skip("calls ole32")
+    probe: list[int] = []
+
+    def run() -> None:
+        windows.ensure_com()
+        windows.ensure_com()  # once per thread: does nothing
+        ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        probe.append(ole32.CoInitializeEx(None, windows.COINIT_MULTITHREADED) & 0xFFFFFFFF)
+        ole32.CoUninitialize()  # balances the probe only
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(5.0)
+    assert probe == [windows.S_FALSE]  # COM was already up on that thread, multithreaded
+
+
+@pytest.mark.parametrize(
+    ("hresult", "ready"),
+    [(0x0, True), (0x1, True), (0x80010106, True), (0x80070057, False)],
+    ids=["S_OK", "S_FALSE", "RPC_E_CHANGED_MODE", "E_INVALIDARG"],
+)
+def test_windows_ensure_com_is_done_only_once_com_is_up(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, hresult: int, ready: bool
+) -> None:
+    import ctypes
+    import threading
+    import types
+
+    from jarvis_voice.platform import windows
+
+    calls: list[str] = []
+
+    def co_initialize_ex(reserved: object, coinit: int) -> int:
+        calls.append(threading.current_thread().name)
+        return hresult - (1 << 32) if hresult & 0x80000000 else hresult  # signed, as its c_long restype gives it
+
+    ole32 = types.SimpleNamespace(CoInitializeEx=co_initialize_ex)
+    fake_ctypes = types.SimpleNamespace(
+        WinDLL=lambda name: ole32, c_void_p=ctypes.c_void_p, c_ulong=ctypes.c_ulong, c_long=ctypes.c_long
+    )
+    monkeypatch.setattr(windows, "ctypes", fake_ctypes)
+    thread = threading.Thread(target=lambda: (windows.ensure_com(), windows.ensure_com()), name="com-probe")
+    with caplog.at_level("WARNING", logger="jarvis_voice.platform.windows"):
+        thread.start()
+        thread.join(5.0)
+    assert calls.count("com-probe") == (1 if ready else 2)  # a failure is tried again on the next call
+    assert len([r for r in caplog.records if "com-probe" in r.getMessage()]) == (0 if ready else 1)  # logged once
+
+
+def test_a_zero_host_error_code_is_left_out() -> None:
+    # What a start on a thread without COM raised on Windows: the WDM-KS text is stale, its code 0.
+    exc = FakePortAudioError("Error starting stream: Unanticipated host error", -9999, (11, 0, "WdmSyncIoctl: ..."))
+    err = classify_audio_error(exc, "output")
+    assert err.code == "no_output_device" and "host error 0x" not in err.message
+
+
 def test_output_errors_and_passthrough() -> None:
     assert classify_audio_error(FakePortAudioError("Invalid device", -9996), "output").code == "no_output_device"
     original = AudioError("mic_in_use", "busy")
@@ -260,6 +324,12 @@ def test_select_falls_back_to_hostapi_default() -> None:
     assert dev is not None and dev.index == 8
     dev = select_device(DEVICES, "output", wanted=None, hostapi="Windows WASAPI", default_index=5)
     assert dev is not None and dev.index == 5
+
+
+def test_select_never_leaves_the_preferred_hostapi_while_it_has_a_device() -> None:
+    # A default index that points outside WASAPI (stale) and a name only another host API has.
+    dev = select_device(DEVICES, "input", wanted="Sound Mapper", hostapi="Windows WASAPI", default_index=1)
+    assert dev is not None and (dev.index, dev.hostapi) == (7, "Windows WASAPI")
 
 
 def test_select_without_preferred_hostapi_or_devices() -> None:

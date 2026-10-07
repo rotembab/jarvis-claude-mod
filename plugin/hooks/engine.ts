@@ -67,6 +67,8 @@ export type Engine = {
   abortTurn: (turnId: string) => Promise<void>
   /** One completion through the session's own client and credentials. */
   complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
+  /** The conversation's size at the last response, in tokens; undefined before the first (or after a compaction). */
+  contextTokens: () => Promise<number | undefined>
 }
 
 /** Resolves after `ms` on the engine's clock (a hooks module has no timers). */

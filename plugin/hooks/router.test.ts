@@ -4,7 +4,9 @@ import type { Engine as TestEngine } from 'claude-code/testing'
 
 import type { FakeChild, World } from './test-harness'
 import { answered, completeTurn, failTurn, jarvis, runStep, startHelper, textChunks, world } from './test-harness'
-import { JUDGE_MODEL, JUDGE_WAIT_MS, parseTier, spokenTier, stepModel } from './router'
+import { familyFor, JUDGE_MODEL, JUDGE_WAIT_MS, MODEL_IDS, parseTier, spokenTier, stepModel } from './router'
+
+const { sonnet: SONNET, opus: OPUS, fable: FABLE } = MODEL_IDS
 
 /** The user says `text`: the helper's utterance, then the turn the engine starts for it. */
 async function voiceTurn($: TestEngine, w: World, helper: FakeChild, text: string, turnId: string): Promise<void> {
@@ -24,7 +26,7 @@ describe('model routing', () => {
     const helper = await startHelper($, w)
     await voiceTurn($, w, helper, 'What time is it in Tokyo?', 't1')
     await runStep($, w, 't1', textChunks('Half past nine, sir.'))
-    expect(models(w, 't1')).toEqual(['sonnet'])
+    expect(models(w, 't1')).toEqual([SONNET])
     expect(w.completions).toHaveLength(1)
     expect(w.completions[0]).toMatchObject({ model: JUDGE_MODEL, prompt: 'Request: What time is it in Tokyo?', maxTokens: 5 })
     expect(w.logs.filter(line => line.includes('taking this one'))).toEqual([])
@@ -37,7 +39,7 @@ describe('model routing', () => {
     await voiceTurn($, w, helper, 'Refactor the auth module and fix the failing tests', 't1')
     await runStep($, w, 't1', textChunks('Looking at the tests now.'))
     await runStep($, w, 't1', textChunks('Done.'), { index: 1 })
-    expect(models(w, 't1')).toEqual(['opus', 'opus'])
+    expect(models(w, 't1')).toEqual([OPUS, OPUS])
     expect(w.logs).toContain('Jarvis: Opus is taking this one.')
   })
 
@@ -49,8 +51,8 @@ describe('model routing', () => {
     await completeTurn($, 't1')
     await voiceTurn($, w, helper, 'Think hard about why the cache misses', 't2')
     await runStep($, w, 't2', textChunks('Right.'))
-    expect(models(w, 't1')).toEqual(['fable'])
-    expect(models(w, 't2')).toEqual(['opus'])
+    expect(models(w, 't1')).toEqual([FABLE])
+    expect(models(w, 't2')).toEqual([OPUS])
     expect(w.completions).toEqual([])
   })
 
@@ -80,14 +82,18 @@ describe('model routing', () => {
     judged(answered('complex'))
     await w.settle()
     await runStep($, w, 't1', textChunks('Found it.'), { index: 1 })
-    expect(models(w, 't1')).toEqual(['sonnet', 'opus'])
+    expect(models(w, 't1')).toEqual([SONNET, OPUS])
   })
 
-  test('the session model is kept when it is already the right family, and its 1M context is kept', () => {
-    expect(stepModel('claude-opus-5-5[1m]', 'complex')).toBeUndefined()
-    expect(stepModel('claude-opus-5-5[1m]', 'simple')).toBe('sonnet[1m]')
-    expect(stepModel('claude-sonnet-5-5', 'simple')).toBeUndefined()
-    expect(stepModel('claude-sonnet-5-5', 'hardest')).toBe('fable')
+  test('steps name full model ids, and keep the session model when it is already the right family', () => {
+    for (const id of Object.values(MODEL_IDS)) expect(id).toMatch(/^claude-[a-z]+-\d/)
+    expect(stepModel('claude-opus-5-5', 'opus')).toBeUndefined()
+    expect(stepModel('claude-opus-5-5', 'sonnet')).toBe(SONNET)
+    expect(stepModel('claude-sonnet-5-5', 'sonnet')).toBeUndefined()
+    expect(stepModel('claude-sonnet-5-5', 'fable')).toBe(FABLE)
+    expect(familyFor('hardest')).toBe('fable')
+    expect(familyFor('hardest', new Set(['fable']))).toBe('opus')
+    expect(familyFor('simple', new Set(['sonnet']))).toBeUndefined()
   })
 
   test('the follow-up of a complex request is judged with it as context', async ($, on) => {
@@ -112,18 +118,61 @@ describe('model routing', () => {
     expect(await jarvis($, 'routing')).toContain("Voice requests: your session's model")
   })
 
-  test('a model Claude Code refuses turns routing off for the session', async ($, on) => {
+  test('a model Claude Code refuses is not asked again; Opus takes the hardest requests instead of Fable', async ($, on) => {
     const w = world(on)
+    w.complete = () => answered('hardest')
     const helper = await startHelper($, w)
-    await voiceTurn($, w, helper, 'Hello there', 't1')
+    await voiceTurn($, w, helper, 'Redesign the sync engine', 't1')
     w.failedSteps.add('t1:0')
     await runStep($, w, 't1', [])
     await failTurn($, 't1')
     await w.settle()
-    expect(w.logs.some(line => line.includes('model routing is off for this session'))).toBe(true)
-    await voiceTurn($, w, helper, 'Hello again', 't2')
-    await runStep($, w, 't2', textChunks('Hello, sir.'))
+    expect(w.logs).toContain(
+      'Jarvis: Claude Code could not answer on Fable, so Opus takes its voice requests for the rest of this session. Please say that again.',
+    )
+    await voiceTurn($, w, helper, 'Redesign the sync engine', 't2')
+    await runStep($, w, 't2', textChunks('Very good, sir.'))
+    await completeTurn($, 't2')
+    w.complete = () => answered('simple')
+    await voiceTurn($, w, helper, 'What time is it?', 't3')
+    await runStep($, w, 't3', textChunks('Ten, sir.'))
+    expect(models(w, 't1')).toEqual([FABLE])
+    expect(models(w, 't2')).toEqual([OPUS])
+    expect(models(w, 't3')).toEqual([SONNET])
+  })
+
+  test('a long conversation keeps the session model, says so once, and routes again once it is short', async ($, on) => {
+    const w = world(on)
+    w.complete = () => answered('complex')
+    const helper = await startHelper($, w)
+    w.contextTokens = 607_400
+    await voiceTurn($, w, helper, 'Make Fable say hi', 't1')
+    await runStep($, w, 't1', textChunks('Hi.'))
+    await completeTurn($, 't1')
+    await voiceTurn($, w, helper, 'And again', 't2')
+    await runStep($, w, 't2', textChunks('Hi again.'))
+    await completeTurn($, 't2')
+    expect(models(w, 't1')).toEqual(['claude-test'])
     expect(models(w, 't2')).toEqual(['claude-test'])
+    expect(w.completions).toEqual([])
+    expect(w.logs.filter(line => line.includes('this conversation is long'))).toHaveLength(1)
+    w.contextTokens = undefined // after /compact or /clear
+    await voiceTurn($, w, helper, 'Plan the billing service', 't3')
+    await runStep($, w, 't3', textChunks('Right.'))
+    expect(models(w, 't3')).toEqual([OPUS])
+  })
+
+  test('a voice turn that grows past the routed window goes back to the session model', async ($, on) => {
+    const w = world(on)
+    w.complete = () => answered('complex')
+    const helper = await startHelper($, w)
+    await voiceTurn($, w, helper, 'Read every log file and explain the crash', 't1')
+    w.stepTokens.set('t1:0', 90_000)
+    await runStep($, w, 't1', textChunks('Reading.'))
+    w.stepTokens.set('t1:1', 170_000)
+    await runStep($, w, 't1', textChunks('Still reading.'), { index: 1 })
+    await runStep($, w, 't1', textChunks('Found it.'), { index: 2 })
+    expect(models(w, 't1')).toEqual([OPUS, OPUS, 'claude-test'])
   })
 
   test('an API error on a model that already answered leaves routing on', async ($, on) => {
@@ -138,12 +187,13 @@ describe('model routing', () => {
     await failTurn($, 't2')
     await voiceTurn($, w, helper, 'The weather, please', 't3')
     await runStep($, w, 't3', textChunks('Rain, sir.'))
-    expect(models(w, 't3')).toEqual(['sonnet'])
-    expect(w.logs.some(line => line.includes('model routing is off'))).toBe(false)
+    expect(models(w, 't3')).toEqual([SONNET])
+    expect(w.logs.some(line => line.includes('could not answer'))).toBe(false)
   })
 
   test('spoken choices and judge answers', () => {
     expect(spokenTier('Jarvis, use Opus for this')).toBe('complex')
+    expect(spokenTier('Make Fable say hi')).toBe('hardest')
     expect(spokenTier('switch to sonnet and list the files')).toBe('simple')
     expect(spokenTier('ultrathink: why does this deadlock?')).toBe('hardest')
     expect(spokenTier('Think carefully before you delete anything')).toBe('complex')

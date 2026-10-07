@@ -1,7 +1,8 @@
 """The sounddevice backend against an in-memory fake of the sounddevice module.
 
 No PortAudio is needed: the fake reproduces the parts of the API we use
-(query_*, InputStream/OutputStream with callbacks, WasapiSettings, PortAudioError).
+(query_*, InputStream/OutputStream with callbacks, WasapiSettings, PortAudioError),
+and, on any OS, that Windows' PortAudio only starts a stream on a thread with COM.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import sys
 import threading
 import time
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
@@ -19,10 +20,12 @@ import pytest
 from jarvis_voice import platform as plat
 from jarvis_voice.audio import sd_backend
 from jarvis_voice.audio.errors import AudioError
-from jarvis_voice.audio.sd_backend import SoundDeviceCapture, SoundDevicePlayback
+from jarvis_voice.audio.sd_backend import SoundDeviceCapture, SoundDevicePlayback, resolve_device
 from jarvis_voice.platform import windows
+from jarvis_voice.speech import SpeechPipeline
 
-from conftest import wait_until
+from conftest import RecordingSink, wait_until
+from fakes import FakeSynth
 
 
 class FakePortAudioError(Exception):
@@ -38,6 +41,7 @@ class FakeStream:
         self.active = False
         self.aborts = 0
         self.closed = False
+        self.closed_with_com = False  # close() ran on a thread set up for COM
         self._thread: threading.Thread | None = None
         failure = sd.fail_open.get((kind, self.samplerate))
         if failure is not None:
@@ -46,6 +50,13 @@ class FakeStream:
             raise failure
 
     def start(self) -> None:
+        if not getattr(self.sd.com, "ready", False):
+            # What PortAudio 19.7's WASAPI start raised on the Windows PC, on a thread without COM.
+            raise FakePortAudioError(
+                "Error starting stream: Unanticipated host error",
+                -9999,
+                (11, 0, "WdmSyncIoctl: DeviceIoControl GLE = 0x00000490"),
+            )
         self.active = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -81,6 +92,7 @@ class FakeStream:
         self.kwargs["finished_callback"]()
 
     def close(self) -> None:
+        self.closed_with_com = getattr(self.sd.com, "ready", False)
         self.closed = True
 
 
@@ -94,6 +106,16 @@ class FakeLib:
         return types.SimpleNamespace(hostApiType=13, errorCode=self.host_error, errorText=b"UNKNOWN ERROR")
 
 
+def dev(name: str, api: int, ins: int, outs: int) -> dict[str, Any]:
+    return {
+        "name": name,
+        "hostapi": api,
+        "max_input_channels": ins,
+        "max_output_channels": outs,
+        "default_samplerate": 48000.0,
+    }
+
+
 class FakeSD(types.ModuleType):
     def __init__(self) -> None:
         super().__init__("sounddevice")
@@ -105,6 +127,22 @@ class FakeSD(types.ModuleType):
         self.mute_input = False
         self.streams: list[FakeStream] = []
         self.rendered: list[np.ndarray] = []
+        self.com = threading.local()  # .ready: ensure_com ran on that thread
+        self.hostapis: list[dict[str, Any]] = [
+            {"name": "MME", "default_input_device": 0, "default_output_device": 1},
+            {"name": "Windows WASAPI", "default_input_device": 4, "default_output_device": 2},
+        ]
+        self.devices: list[dict[str, Any]] = [
+            dev("Microphone (PRO X Wireless Gaming Headset)", 0, 1, 0),
+            dev("Speakers (PRO X Wireless Gaming Headset)", 0, 0, 2),
+            dev("Speakers (Realtek(R) Audio)", 1, 0, 2),
+            dev("Headset Earphone (PRO X Wireless Gaming Headset)", 1, 0, 2),
+            dev("Microphone (Webcam)", 1, 2, 0),
+            dev("Headset Microphone (PRO X Wireless Gaming Headset)", 1, 1, 0),
+        ]
+        self.opens = {"input": 0, "output": 0}  # stream constructions, including ones that failed
+        self.terminations = 0
+        self.live_at_terminate: list[FakeStream] = []  # streams PortAudio would have freed under us
         sd = self
 
         class WasapiSettings:
@@ -115,6 +153,7 @@ class FakeSD(types.ModuleType):
 
         def make(kind: str) -> Any:
             def factory(**kwargs: Any) -> FakeStream:
+                sd.opens[kind] += 1
                 stream = FakeStream(sd, kind, **kwargs)
                 sd.streams.append(stream)
                 return stream
@@ -125,32 +164,42 @@ class FakeSD(types.ModuleType):
         self.InputStream = make("input")
         self.OutputStream = make("output")
 
-    @staticmethod
-    def query_hostapis() -> list[dict[str, Any]]:
-        return [
-            {"name": "MME", "default_input_device": 0, "default_output_device": 1},
-            {"name": "Windows WASAPI", "default_input_device": 4, "default_output_device": 2},
-        ]
+    def query_hostapis(self) -> list[dict[str, Any]]:
+        return self.hostapis
 
-    @staticmethod
-    def query_devices() -> list[dict[str, Any]]:
-        def dev(name: str, api: int, ins: int, outs: int) -> dict[str, Any]:
-            return {
-                "name": name,
-                "hostapi": api,
-                "max_input_channels": ins,
-                "max_output_channels": outs,
-                "default_samplerate": 48000.0,
-            }
+    def query_devices(self) -> list[dict[str, Any]]:
+        return self.devices
 
-        return [
-            dev("Microphone (PRO X Wireless Gaming Headset)", 0, 1, 0),
-            dev("Speakers (PRO X Wireless Gaming Headset)", 0, 0, 2),
-            dev("Speakers (Realtek(R) Audio)", 1, 0, 2),
-            dev("Headset Earphone (PRO X Wireless Gaming Headset)", 1, 0, 2),
-            dev("Microphone (Webcam)", 1, 2, 0),
-            dev("Headset Microphone (PRO X Wireless Gaming Headset)", 1, 1, 0),
-        ]
+    def _terminate(self) -> None:
+        self._require_com("_terminate")
+        self.terminations += 1
+        self.live_at_terminate += self.unclosed()
+        for stream in self.streams:
+            stream.active = False
+
+    def _initialize(self) -> None:
+        self._require_com("_initialize")
+
+    def _require_com(self, call: str) -> None:
+        # Re-initialising PortAudio is a WASAPI call like a stream start: only on a thread set up for COM.
+        if not getattr(self.com, "ready", False):
+            raise AssertionError(f"{call} on thread {threading.current_thread().name!r} without ensure_com")
+
+    def ensure_com(self) -> None:
+        """Stands in for platform.windows.ensure_com."""
+        self.com.ready = True
+
+    def unclosed(self) -> list[FakeStream]:
+        """Streams constructed and never closed: each one a PortAudio stream leaked."""
+        return [s for s in self.streams if not s.closed]
+
+    def outputs(self) -> list[FakeStream]:
+        return [s for s in self.streams if s.kind == "output"]
+
+    def unplug_output(self) -> None:
+        """Every output open fails, the way it does for a device that is gone."""
+        gone = FakePortAudioError("Error opening OutputStream: Invalid device", -9996)
+        self.fail_open[("output", 24_000)] = self.fail_open[("output", 48_000)] = gone
 
 
 @pytest.fixture
@@ -158,9 +207,27 @@ def sd(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeSD]:
     fake = FakeSD()
     monkeypatch.setitem(sys.modules, "sounddevice", fake)
     monkeypatch.setattr(plat, "current", lambda: windows)  # WASAPI-first selection, Windows hints
+    monkeypatch.setattr(windows, "ensure_com", fake.ensure_com)
     yield fake
     for stream in fake.streams:
         stream.active = False
+
+
+def on_worker(fn: Callable[[], object], name: str) -> None:
+    """Run ``fn`` on a new thread, the way the helper's worker threads call the backend."""
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, name=name)
+    thread.start()
+    thread.join(5.0)
+    if errors:
+        raise errors[0]
 
 
 def test_capture_prefers_wasapi_device_by_name_with_auto_convert(sd: FakeSD) -> None:
@@ -315,11 +382,252 @@ def test_playback_closes_when_idle_and_reopens_on_audio(sd: FakeSD) -> None:
     try:
         first = sd.streams[0]
         wait_until(lambda: first.closed, 3.0)
+        assert first.closed_with_com  # on the reaper's thread, which opened nothing
         pb.add_speech(np.full(240, 0.3, np.float32))
         assert len(sd.streams) == 2 and sd.streams[1].active
         wait_until(lambda: pb.speech_idle())
     finally:
         pb.close()
+
+
+def test_open_reply_holds_the_output_through_a_long_silence(sd: FakeSD, sink: RecordingSink) -> None:
+    """Claude runs a tool between two sentences: the idle close must not pull the output from under the reply."""
+    pb = SoundDevicePlayback(None, idle_close_s=0.2)
+    pipe = SpeechPipeline(FakeSynth(), pb, sink).start()
+    try:
+        pipe.speak("r1", 0, "Let me check.", False)
+        sink.wait_type("speech_started")
+        wait_until(pb.speech_idle)
+        stream = sd.outputs()[0]
+        time.sleep(0.8)  # four times idle_close_s without a sound
+        assert stream.active and not stream.closed
+        pipe.speak("r1", 1, "All tests pass.", False)
+        pipe.speak("r1", 2, "", True)
+        assert sink.wait_type("speech_done")["interrupted"] is False
+        assert sd.outputs() == [stream]  # the whole reply played on one stream
+        wait_until(lambda: stream.closed, 3.0)  # the reply is done: the headset may sleep again
+    finally:
+        pipe.close()
+        pb.close()
+
+
+def test_a_held_output_still_closes_after_the_cap(sd: FakeSD) -> None:
+    pb = SoundDevicePlayback(None, idle_close_s=0.2, hold_max_s=2.0)
+    pb.open()
+    pb.hold_open(True)  # a reply whose final never comes
+    try:
+        stream = sd.outputs()[0]
+        time.sleep(0.5)
+        assert not stream.closed
+        wait_until(lambda: stream.closed, 5.0)
+    finally:
+        pb.close()
+
+
+@pytest.mark.parametrize("com", [True, False], ids=["ensure_com", "without_com"])
+def test_output_reopened_mid_reply_from_a_worker_thread(
+    sd: FakeSD, sink: RecordingSink, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, com: bool
+) -> None:
+    """The voice.log case: the output closed mid-reply and a worker thread (not the one that opened it) reopened it."""
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    pb.open()  # on this thread, as the daemon does at start-up
+    if not com:
+        monkeypatch.setattr(windows, "ensure_com", lambda: None)  # the helper before the fix
+    pipe = SpeechPipeline(FakeSynth(), pb, sink).start()
+    try:
+        pipe.speak("r1", 0, "Let me check.", False)
+        sink.wait_type("speech_started")
+        wait_until(pb.speech_idle)
+        sd.outputs()[0].abort()  # the stream ended during the tool pause
+        with caplog.at_level("WARNING", logger="jarvis_voice.audio.sd_backend"):
+            pipe.speak("r1", 1, "All tests pass.", True)  # its audio reopens the output on the speech thread
+            done = sink.wait_type("speech_done")
+        if com:
+            assert done["interrupted"] is False and sink.of_type("error") == []
+            assert len(sd.outputs()) == 2 and sd.outputs()[1].active
+        else:
+            assert done["interrupted"] is True
+            [err] = sink.of_type("error")
+            assert err["code"] == "no_output_device"
+            assert err["message"] == "The audio output could not be reopened (headset disconnected or asleep?)."
+            assert err["hint"] == windows.no_output_device_hint()
+            assert "Unanticipated host error" in caplog.text  # PortAudio's own words stay in the log
+            assert "host error 0x00000000" not in caplog.text
+    finally:
+        pipe.close()
+        pb.close()
+
+
+def test_stop_restarts_the_output_from_another_thread(sd: FakeSD) -> None:
+    """stop() runs on the thread of the barge-in or command; the restart must start the stream there."""
+    pb = SoundDevicePlayback("PRO X", idle_close_s=None)
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        pb.add_speech(np.full(24_000, 0.3, np.float32), pb.speech_generation)
+        wait_until(lambda: pb.speech_frames_played > 1000)
+        on_worker(pb.stop_speech, "control-request")
+        assert stream.aborts == 1 and stream.active and pb.speech_idle()
+        pb.add_effect(np.full(240, 0.1, np.float32))
+        wait_until(lambda: any(block.any() for block in sd.rendered[-20:]))
+        assert len(sd.outputs()) == 1  # restarted, not reopened
+    finally:
+        pb.close()
+
+
+def test_stop_does_not_restart_a_stream_closed_under_it(sd: FakeSD) -> None:
+    """The reaper (or a reopen, or a rescan) closes the output just as a stop is about to restart it."""
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        pb.add_speech(np.full(24_000, 0.3, np.float32), pb.speech_generation)
+        wait_until(lambda: pb.speech_frames_played > 0)
+        stopper = threading.Thread(target=pb.stop_speech, name="control-request", daemon=True)
+        with pb._lock:  # what the reaper holds while it closes an idle output
+            stopper.start()
+            time.sleep(0.2)
+            assert stopper.is_alive() and stream.aborts == 0  # the stop waits for the lock
+            pb._close_locked()
+        stopper.join(2.0)
+        assert not stopper.is_alive()
+        assert stream.closed and not stream.active and stream.aborts == 1  # the close's abort, no restart after it
+    finally:
+        pb.close()
+
+
+def test_open_on_a_running_stream_does_not_wait_for_the_portaudio_lock(sd: FakeSD) -> None:
+    """A rescan or the other device's slow open holds the PortAudio lock; an open with nothing to do skips it."""
+    cap = SoundDeviceCapture(None)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    cap.open()
+    pb.open()
+    opener = threading.Thread(target=lambda: (cap.open(), pb.open()), name="speech", daemon=True)
+    try:
+        with sd_backend._PORTAUDIO_LOCK:
+            opener.start()
+            opener.join(2.0)
+            assert not opener.is_alive()
+        assert len(sd.streams) == 2
+    finally:
+        cap.close()
+        pb.close()
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+def test_a_stream_that_will_not_start_is_closed(sd: FakeSD, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    monkeypatch.setattr(windows, "ensure_com", lambda: None)  # every start fails, as on a thread without COM
+    owner = SoundDeviceCapture(None) if kind == "input" else SoundDevicePlayback(None, idle_close_s=None)
+    with pytest.raises(AudioError):
+        on_worker(owner.open, "speech")
+    assert sd.opens[kind] == 3 and sd.unclosed() == []  # each attempt opened, failed to start and was closed
+
+
+def test_capture_opens_from_a_worker_thread(sd: FakeSD) -> None:
+    cap = SoundDeviceCapture(None)
+    try:
+        on_worker(cap.open, "hands-free")
+        assert cap.is_open and sd.streams[0].active
+    finally:
+        cap.close()
+
+
+def test_rescan_closes_every_stream_before_portaudio_frees_them(sd: FakeSD) -> None:
+    cap = SoundDeviceCapture(None)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    cap.open()
+    pb.open()
+    try:
+
+        def rescan_and_reopen() -> None:
+            sd_backend.rescan_devices(cap, pb)
+            cap.open()  # what the daemon does next, on the same thread
+
+        on_worker(rescan_and_reopen, "control-request")
+        assert sd.terminations == 1 and sd.live_at_terminate == []
+        assert cap.is_open and [s.kind for s in sd.unclosed()] == ["input"]
+    finally:
+        cap.close()
+        pb.close()
+
+
+def test_rescan_sets_up_com_on_its_own_thread(sd: FakeSD) -> None:
+    # Nothing is open (the output idled out), so no stream close sets up COM on that thread first.
+    owners = SoundDeviceCapture(None), SoundDevicePlayback(None, idle_close_s=None)
+    on_worker(lambda: sd_backend.rescan_devices(*owners), "control-request")
+    assert sd.terminations == 1
+
+
+def test_output_lost_mid_reply_fails_it_once_without_hammering(sd: FakeSD, sink: RecordingSink) -> None:
+    """The output went away during a tool pause and cannot be reopened."""
+    pb = SoundDevicePlayback("PRO X", idle_close_s=None)
+    pipe = SpeechPipeline(FakeSynth(), pb, sink).start()
+    try:
+        pipe.speak("r1", 0, "Let me check.", False)
+        sink.wait_type("speech_started")
+        wait_until(pb.speech_idle)
+        sd.unplug_output()
+        sd.outputs()[0].abort()  # PortAudio ends the stream
+        before = sd.opens["output"]
+        pipe.speak("r1", 1, "All tests pass.", False)  # its audio arrives in pieces, each wanting the output
+        pipe.speak("r1", 2, "The build is green too.", False)
+        err = sink.wait_type("error", timeout=2.0)  # at once, not after the 5 s stall timeout
+        assert err["code"] == "no_output_device" and err["fatal"] is False
+        assert err["message"] == "The audio output could not be reopened (headset disconnected or asleep?)."
+        assert sink.wait_type("speech_done")["interrupted"] is True
+        time.sleep(0.3)
+        assert len(sink.of_type("error")) == 1 and len(sink.of_type("speech_done")) == 1
+        assert sd.opens["output"] - before == 3  # one open (its three attempts), not one per piece of audio
+        assert all(s.closed for s in sd.outputs())
+        # The headset is back: the next reply opens it and plays.
+        sd.fail_open.clear()
+        pipe.speak("r2", 0, "Back again.", True)
+        assert sink.wait_type("speech_done", replyId="r2")["interrupted"] is False
+    finally:
+        pipe.close()
+        pb.close()
+
+
+def test_new_audio_does_not_retry_a_failed_output_on_every_chunk(sd: FakeSD, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sd_backend, "OPEN_RETRY_S", 0.3)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    sd.unplug_output()
+    try:
+        for _ in range(20):
+            pb.add_speech(np.full(240, 0.3, np.float32))
+        assert sd.opens["output"] == 3
+        assert pb.open_error is not None and pb.open_error.code == "no_output_device"
+        assert pb.open_error.message == "The audio output could not be opened (headset disconnected or asleep?)."
+        sd.fail_open.clear()
+        time.sleep(0.4)  # past the back-off: the next chunk tries again
+        pb.add_speech(np.full(240, 0.3, np.float32))
+        assert sd.outputs()[-1].active and pb.open_error is None
+        wait_until(pb.speech_idle)  # what queued meanwhile plays
+    finally:
+        pb.close()
+
+
+def test_output_prefers_wasapi_when_another_host_api_has_the_same_name(sd: FakeSD) -> None:
+    sd.devices[3]["name"] = "Speakers (PRO X Wireless Gaming Headset)"  # as Windows names it in both lists
+    device = resolve_device(sd, "output", "Speakers (PRO X Wireless Gaming Headset)")
+    assert (device.index, device.hostapi) == (3, "Windows WASAPI")  # not the MME entry listed first
+
+
+def test_output_ignores_a_default_index_outside_wasapi(sd: FakeSD) -> None:
+    sd.hostapis[1]["default_output_device"] = 1  # a stale index: now an MME device
+    device = resolve_device(sd, "output", None)
+    assert device.hostapi == "Windows WASAPI"
+
+
+def test_output_falls_back_from_wasapi_only_when_it_has_none_and_says_so(
+    sd: FakeSD, caplog: pytest.LogCaptureFixture
+) -> None:
+    for d in sd.devices[2:4]:
+        d["max_output_channels"] = 0  # WASAPI lists no output
+    with caplog.at_level("WARNING", logger="jarvis_voice.audio.sd_backend"):
+        device = resolve_device(sd, "output", None)
+    assert (device.index, device.hostapi) == (1, "MME")
+    assert "no Windows WASAPI output device" in caplog.text and "(MME)" in caplog.text
 
 
 def test_missing_portaudio_is_an_audio_error(monkeypatch: pytest.MonkeyPatch) -> None:

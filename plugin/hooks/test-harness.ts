@@ -152,6 +152,10 @@ export type World = {
   stepInputs: TurnStepInput[]
   /** Steps (`${turnId}:${index}`) whose request gets no response, as when the API refused it. */
   failedSteps: Set<string>
+  /** The conversation's size each step (`${turnId}:${index}`) reports in its usage; none: no usage. */
+  stepTokens: Map<string, number>
+  /** What `$.session.usage()` says the conversation's size is (undefined: no response yet). */
+  contextTokens: number | undefined
   /** Every `$.model.complete` call. */
   completions: ModelCompleteInput[]
   /** Answers `$.model.complete` (default: the judge says "simple"). */
@@ -190,6 +194,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     steps: new Map(),
     stepInputs: [],
     failedSteps: new Set(),
+    stepTokens: new Map(),
+    contextTokens: undefined,
     completions: [],
     complete: () => answered('simple'),
     onSpawn: () => undefined,
@@ -303,6 +309,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     w.stepInputs.push(e)
     const key = `${e.turnId}:${e.index}`
     const isFailed = w.failedSteps.has(key)
+    const tokens = w.stepTokens.get(key)
     const chunks = isFailed ? [] : (w.steps.get(key) ?? [])
     for (const chunk of chunks) yield chunk
     const result: TurnStepResult = {
@@ -311,7 +318,10 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       answer: chunks.map(chunk => (chunk.kind === 'text' ? chunk.text : '')).join(''),
       toolUses: [],
       stopReason: isFailed ? null : 'end_turn',
-      usage: null,
+      usage:
+        tokens === undefined
+          ? null
+          : { input_tokens: tokens, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: e.model },
     }
     return result
   })
@@ -319,6 +329,13 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     w.completions.push(e)
     return { value: await w.complete(e) }
   })
+  on('session.usage', () => ({
+    value: {
+      startedAt: 0,
+      context: { window: 200_000, ...(w.contextTokens === undefined ? {} : { tokens: w.contextTokens }) },
+      rateLimits: [],
+    },
+  }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
   return w

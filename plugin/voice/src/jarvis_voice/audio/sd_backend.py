@@ -26,6 +26,16 @@ log = logging.getLogger(__name__)
 
 WASAPI = "Windows WASAPI"
 
+# Reopening the output for new audio after a failed open waits this long, doubling per failure.
+OPEN_RETRY_S = 1.0
+OPEN_RETRY_MAX_S = 16.0
+
+# PortAudio is process-wide: re-initialising it (rescan_devices) frees every
+# stream. Stream opens and the rescan hold this lock, always before a stream
+# object's own lock, so no stream opens between the rescan closing them and
+# PortAudio freeing them.
+_PORTAUDIO_LOCK = threading.Lock()
+
 
 PORTAUDIO_HINT = (
     "The PortAudio audio library could not be loaded. On Linux install it with your package manager "
@@ -62,7 +72,7 @@ def query_devices(sd: ModuleType) -> tuple[list[DeviceInfo], dict[str, tuple[int
 
 def resolve_device(sd: ModuleType, kind: Literal["input", "output"], wanted: str | None) -> DeviceInfo:
     devices, defaults = query_devices(sd)
-    hostapi = plat.current().PREFERRED_HOSTAPI
+    preferred = hostapi = plat.current().PREFERRED_HOSTAPI
     slot = 0 if kind == "input" else 1
     if hostapi and hostapi in defaults:
         default_index: int | None = defaults[hostapi][slot]
@@ -78,6 +88,9 @@ def resolve_device(sd: ModuleType, kind: Literal["input", "output"], wanted: str
         if kind == "input":
             raise AudioError("no_input_device", "No microphone was found.", hints.no_input_device_hint())
         raise AudioError("no_output_device", "No audio output device was found.", hints.no_output_device_hint())
+    if preferred and device.hostapi != preferred:
+        # select_device leaves the preferred host API only when it lists no device of this kind.
+        log.warning("no %s %s device is listed; falling back to %r (%s)", preferred, kind, device.name, device.hostapi)
     if wanted and wanted.casefold() not in device.name.casefold():
         log.warning("%s device %r not found; using %r", kind, wanted, device.name)
     return device
@@ -103,11 +116,39 @@ def last_host_error(sd: ModuleType) -> int | None:
     return code or None
 
 
-def rescan_devices() -> None:
-    """Re-initialise PortAudio so newly plugged devices appear (closes all streams)."""
+def _ensure_com() -> None:
+    """Set up the calling thread for PortAudio stream calls (opens, starts, restarts, closes).
+
+    PortAudio's WASAPI backend marshals COM interfaces in Pa_StartStream, and on
+    a thread without COM (every thread but the one that loaded PortAudio) the
+    start fails with an "Unanticipated host error" (-9999) and stale WDM-KS
+    text: the reply cut-offs seen after a reopen from the TTS reader thread.
+    """
+    plat.current().ensure_com()
+
+
+def _discard(stream: Any) -> None:
+    """Close a stream that opened but would not start, so the PortAudio stream isn't leaked."""
+    if stream is not None:
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001
+            log.debug("error closing a stream that failed to start", exc_info=True)
+
+
+def rescan_devices(*owners: SoundDeviceCapture | SoundDevicePlayback) -> None:
+    """Re-initialise PortAudio so newly plugged devices appear.
+
+    That frees every stream, so ``owners`` close theirs first, under the lock
+    their opens take: none can reopen in between and be freed under it.
+    """
     sd = load_sounddevice()
-    sd._terminate()
-    sd._initialize()
+    _ensure_com()
+    with _PORTAUDIO_LOCK:
+        for owner in owners:
+            owner.close()
+        sd._terminate()
+        sd._initialize()
 
 
 class SoundDeviceCapture:
@@ -152,11 +193,14 @@ class SoundDeviceCapture:
         self._dead = True
 
     def open(self) -> None:
-        with self._lock:
+        if self.is_open:
+            return  # without the PortAudio lock: a rescan or the output's slow open must not hold up a no-op
+        with _PORTAUDIO_LOCK, self._lock:
             if self.is_open:
                 return
             self._close_locked()
             sd = load_sounddevice("input")
+            _ensure_com()
             device = resolve_device(sd, "input", self._wanted)
             settings = _extra_settings(sd, device)
             native = int(device.default_samplerate) or 48_000
@@ -164,6 +208,7 @@ class SoundDeviceCapture:
             last_exc: BaseException | None = None
             last_host: int | None = None
             for rate, channels in dict.fromkeys(attempts):
+                stream: Any = None
                 try:
                     stream = sd.InputStream(
                         device=device.index,
@@ -180,6 +225,7 @@ class SoundDeviceCapture:
                     stream.start()
                 except Exception as exc:  # noqa: BLE001 - PortAudioError, or ValueError for bad parameters
                     last_exc, last_host = exc, last_host_error(sd)
+                    _discard(stream)
                     continue
                 self._stream, self._device, self._channels = stream, device, channels
                 log.info("microphone open: %r (%s) at %d Hz, %d ch", device.name, device.hostapi, rate, channels)
@@ -189,6 +235,7 @@ class SoundDeviceCapture:
 
     def _close_locked(self) -> None:
         if self._stream is not None:
+            _ensure_com()  # a rescan or a worker may close it, not the thread that opened it
             try:
                 self._stream.abort()
                 self._stream.close()
@@ -224,13 +271,20 @@ class SoundDeviceCapture:
 
 class SoundDevicePlayback:
     """Output stream fed by the mixer. Closed after ``idle_close_s`` of silence so
-    the headset can sleep; reopened on demand (open() or new audio)."""
+    the headset can sleep; reopened on demand (open() or new audio). While a
+    reply is open (``hold_open``) it stays open through silences of up to
+    ``hold_max_s``: Claude may run a tool between two sentences.
+    """
 
     samplerate = TTS_SAMPLERATE
 
-    def __init__(self, wanted: str | None = None, *, idle_close_s: float | None = 30.0) -> None:
+    def __init__(
+        self, wanted: str | None = None, *, idle_close_s: float | None = 30.0, hold_max_s: float = 300.0
+    ) -> None:
         self._wanted = wanted
         self._idle_close_s = idle_close_s
+        self._hold_max_s = hold_max_s
+        self._held = False
         self._last_active = time.monotonic()
         self._reaper: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -240,6 +294,9 @@ class SoundDevicePlayback:
         self._mixer = PlaybackMixer(TTS_SAMPLERATE)
         self._resampler: Any = None
         self._dead = False
+        self._open_error: AudioError | None = None
+        self._open_failures = 0
+        self._retry_at = 0.0
 
     # -- properties
 
@@ -275,6 +332,10 @@ class SoundDevicePlayback:
         except Exception:  # noqa: BLE001
             return 0.0
 
+    @property
+    def open_error(self) -> AudioError | None:
+        return self._open_error
+
     # -- device
 
     def _callback(self, outdata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
@@ -290,13 +351,27 @@ class SoundDevicePlayback:
         while True:
             time.sleep(min(2.0, self._idle_close_s / 2))
             with self._lock:
-                idle = time.monotonic() - self._last_active > self._idle_close_s
+                # An open reply keeps the output through long silences (a tool running between
+                # sentences), up to a cap so a stuck reply cannot keep the headset awake.
+                held = self._held
+                limit = max(self._idle_close_s, self._hold_max_s) if held else self._idle_close_s
+                idle = time.monotonic() - self._last_active > limit
                 if self._stream is not None and idle and self._mixer.idle():
-                    log.info("closing idle audio output")
+                    log.info("closing idle audio output%s", " (a reply is open but silent too long)" if held else "")
                     self._close_locked()
 
+    def hold_open(self, held: bool) -> None:
+        # No lock: the speech pipeline calls this under its own lock, and open()
+        # holds ours while a slow device opens.
+        self._held = held
+        self._last_active = time.monotonic()
+
     def open(self) -> None:
-        with self._lock:
+        with self._lock:  # ours only: a rescan or the mic's slow open may hold the PortAudio lock
+            self._last_active = time.monotonic()
+            if self._stream is not None and not self._dead:
+                return
+        with _PORTAUDIO_LOCK, self._lock:
             self._last_active = time.monotonic()
             if self._idle_close_s is not None and self._reaper is None:
                 self._reaper = threading.Thread(target=self._reap_idle, name="output-reaper", daemon=True)
@@ -304,43 +379,63 @@ class SoundDevicePlayback:
             if self._stream is not None and not self._dead:
                 return
             self._close_locked()
-            sd = load_sounddevice("output")
-            device = resolve_device(sd, "output", self._wanted)
-            settings = _extra_settings(sd, device)
-            native = int(device.default_samplerate) or 48_000
-            attempts = [(TTS_SAMPLERATE, 1), (native, 1), (native, min(2, device.max_output_channels))]
-            last_exc: BaseException | None = None
-            last_host: int | None = None
-            for rate, channels in dict.fromkeys(attempts):
-                try:
-                    stream = sd.OutputStream(
-                        device=device.index,
-                        samplerate=rate,
-                        channels=channels,
-                        dtype="float32",
-                        latency="low",
-                        callback=self._callback,
-                        finished_callback=self._finished,
-                        extra_settings=settings,
-                    )
-                    if rate != self._device_rate:
-                        # Keep the mixer (and its generation) so an in-flight reply survives a reopen.
-                        self._mixer.samplerate = rate
-                        self._device_rate = rate
-                        self._resampler = None
-                    self._dead = False
-                    stream.start()
-                except Exception as exc:  # noqa: BLE001
-                    last_exc, last_host = exc, last_host_error(sd)
-                    continue
-                self._stream, self._device = stream, device
-                log.info("audio output open: %r (%s) at %d Hz, %d ch", device.name, device.hostapi, rate, channels)
-                return
-            assert last_exc is not None
-            raise classify_audio_error(last_exc, "output", host_code=last_host) from last_exc
+            try:
+                self._open_locked()
+            except AudioError as exc:
+                self._open_error = exc
+                self._open_failures += 1
+                delay = min(OPEN_RETRY_MAX_S, OPEN_RETRY_S * 2 ** min(self._open_failures - 1, 8))
+                self._retry_at = time.monotonic() + delay
+                raise
+            self._open_error, self._open_failures, self._retry_at = None, 0, 0.0
+
+    def _open_locked(self) -> None:
+        sd = load_sounddevice("output")
+        _ensure_com()
+        device = resolve_device(sd, "output", self._wanted)
+        settings = _extra_settings(sd, device)
+        native = int(device.default_samplerate) or 48_000
+        attempts = [(TTS_SAMPLERATE, 1), (native, 1), (native, min(2, device.max_output_channels))]
+        last_exc: BaseException | None = None
+        last_host: int | None = None
+        for rate, channels in dict.fromkeys(attempts):
+            stream: Any = None
+            try:
+                stream = sd.OutputStream(
+                    device=device.index,
+                    samplerate=rate,
+                    channels=channels,
+                    dtype="float32",
+                    latency="low",
+                    callback=self._callback,
+                    finished_callback=self._finished,
+                    extra_settings=settings,
+                )
+                if rate != self._device_rate:
+                    # Keep the mixer (and its generation) so an in-flight reply survives a reopen.
+                    self._mixer.samplerate = rate
+                    self._device_rate = rate
+                    self._resampler = None
+                self._dead = False
+                stream.start()
+            except Exception as exc:  # noqa: BLE001
+                last_exc, last_host = exc, last_host_error(sd)
+                _discard(stream)
+                continue
+            self._stream, self._device = stream, device
+            log.info("audio output open: %r (%s) at %d Hz, %d ch", device.name, device.hostapi, rate, channels)
+            return
+        assert last_exc is not None
+        # PortAudio's text goes to the log; the user gets what to check.
+        error = classify_audio_error(last_exc, "output", host_code=last_host)
+        log.warning("audio output %r (%s) failed: %s", device.name, device.hostapi, error.message)
+        verb = "reopened" if self._device is not None else "opened"
+        message = f"The audio output could not be {verb} (headset disconnected or asleep?)."
+        raise AudioError("no_output_device", message, error.hint) from last_exc
 
     def _close_locked(self) -> None:
         if self._stream is not None:
+            _ensure_com()  # the reaper, a rescan or a worker may close it, not the thread that opened it
             try:
                 self._stream.abort()
                 self._stream.close()
@@ -366,11 +461,15 @@ class SoundDevicePlayback:
         return np.asarray(self._resampler.resample_chunk(pcm), dtype=np.float32)
 
     def _ensure_open(self) -> None:
-        if self._stream is None or self._dead:
-            try:
-                self.open()
-            except AudioError as exc:
-                log.warning("audio output unavailable: %s", exc.message)
+        if self._stream is not None and not self._dead:
+            return
+        if time.monotonic() < self._retry_at:
+            return  # the last open failed moments ago: don't retry it for every chunk of audio
+        try:
+            self.open()
+        except AudioError as exc:
+            wait = max(0.0, self._retry_at - time.monotonic())
+            log.warning("audio output unavailable (next try in %.0f s): %s", wait, exc.message)
 
     def add_speech(self, pcm: np.ndarray, generation: int | None = None) -> None:
         if generation is not None and generation != self._mixer.generation:
@@ -398,14 +497,20 @@ class SoundDevicePlayback:
             # Nothing left to cut (the device holds at most one buffer of tail).
             # Restarting a WASAPI stream can fail on some devices, so don't.
             return
-        try:
-            # abort() discards what the device already buffered; restart for chimes.
-            stream.abort()
-            stream.start()
-            self._dead = False  # abort() fired finished_callback; the stream is alive again
-        except Exception:
-            log.warning("output stream restart failed; will reopen", exc_info=True)
-            self._dead = True
+        # Under our lock, so the reaper, a reopen or a rescan cannot close the stream mid-restart.
+        # The PortAudio callbacks (_callback, _finished) take none of our locks.
+        with self._lock:
+            if self._stream is not stream:
+                return  # closed or replaced meanwhile: there is nothing of the old speech to cut
+            try:
+                # abort() discards what the device already buffered; restart for chimes.
+                _ensure_com()  # stop() runs on whichever thread the user's barge-in or command came from
+                stream.abort()
+                stream.start()
+                self._dead = False  # abort() fired finished_callback; the stream is alive again
+            except Exception:
+                log.warning("output stream restart failed; will reopen", exc_info=True)
+                self._dead = True
 
     def reset_speech_counters(self) -> None:
         self._mixer.reset_counters()
