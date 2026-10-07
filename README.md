@@ -147,11 +147,11 @@ A pane titled JARVIS opens beside the conversation when a session starts. Its ri
 
 | Ring | Means |
 | --- | --- |
-| Blue, turning slowly | Standing by for "Hey Jarvis" |
-| Bright cyan, with an arc that grows with your voice | Listening |
-| Orange arcs spinning | Thinking: transcribing you, or Claude working |
-| Gold rays pulsing with his voice | Speaking |
-| Gray | Offline: the voice helper is not running |
+| A glowing blue ring around JARVIS on a dark grid, its dots turning slowly | Standing by for "Hey Jarvis" |
+| The ring brightens and the white arc beside it sweeps round as you talk | Listening |
+| An orange sphere of glowing fragments, orbits spinning round its core | Thinking: transcribing you, or Claude working |
+| The sphere flares gold, streaks pulsing out with his voice | Speaking |
+| The blue ring in gray, still | Offline: the voice helper is not running |
 
 Under the ring are the last thing you said and the last six things Claude ran (`›` running, `✓` done, `✗` failed).
 

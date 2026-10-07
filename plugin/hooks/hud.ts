@@ -108,9 +108,9 @@ export class Hud {
     return hudMode(this.phase, this.isThinking, now < this.interruptedUntil)
   }
 
-  /** The levels as they arrived, for the desktop ring (its own motion smooths them). */
-  levels(): { mic: number; out: number } {
-    return { mic: this.mic, out: this.out }
+  /** The levels as they arrived, for the desktop ring (its own motion smooths them), and the time its motion has reached. */
+  levels(): { mic: number; out: number; t: number } {
+    return { mic: this.mic, out: this.out, t: performance.now() / 1000 }
   }
 
   // -- inputs

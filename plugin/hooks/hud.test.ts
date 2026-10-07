@@ -4,7 +4,7 @@ import type { RenderPropsOf } from 'claude-code'
 import { completeTurn, jarvis, startHelper, startSession, world } from './test-harness'
 import { actionLabel, FRAME_MS, HUD_PANE, hudMode, RING_KEY, ringSize } from './hud'
 import type { HudMode } from './hud'
-import { HUD_COLORS, ringCells, ringPixels, toBase64 } from './hud-ring'
+import { ringCells, ringPixels, toBase64 } from './hud-ring'
 import { ringSvg } from './hud-svg'
 
 const PANE: RenderPropsOf['Pane'] = {
@@ -31,7 +31,10 @@ function decodeCells(cells: string): [number, number, number][] {
   return triplets
 }
 
-const lit = (mode: HudMode, mic = 0, out = 0, t = 1) => ringPixels({ mode, t, mic, out }, 40, 40).filter(pixel => pixel >= 0).length
+/** How bright a frame is in all: the sum of its channels. */
+const brightness = (mode: HudMode, mic = 0, out = 0, t = 1) =>
+  ringPixels({ mode, t, mic, out }, 40, 40).reduce((sum, pixel) => sum + ((pixel >> 16) & 255) + ((pixel >> 8) & 255) + (pixel & 255), 0)
+const MODES: HudMode[] = ['offline', 'sleeping', 'listening', 'thinking', 'speaking', 'interrupted']
 
 describe('HUD ring', () => {
   test('the mode follows the helper and the turn', () => {
@@ -47,40 +50,61 @@ describe('HUD ring', () => {
     expect(hudMode('not_installed', false)).toBe('offline')
   })
 
-  test('a frame is a Raster of half blocks over the terminal background', () => {
-    const triplets = decodeCells(ringCells({ mode: 'listening', t: 1, mic: 0.5, out: 0 }, 40, 20))
-    expect(triplets).toHaveLength(40 * 20)
-    const glyphs = new Set(triplets.map(([glyph]) => glyph))
-    for (const glyph of glyphs) expect([0x20, 0x2580, 0x2584]).toContain(glyph)
-    expect(glyphs.has(0x2580)).toBe(true)
-    // Empty cells, and the corners, are the terminal's own colors.
-    expect(triplets[0]).toEqual([0x20, 0x01000000, 0x01000000])
-    for (const [, fg, bg] of triplets) {
-      expect(fg === 0x01000000 || fg <= 0xffffff).toBe(true)
-      expect(bg === 0x01000000 || bg <= 0xffffff).toBe(true)
+  test('a frame is a Raster of half blocks in well under 1,024 color pairs', () => {
+    for (const mode of MODES) {
+      const triplets = decodeCells(ringCells({ mode, t: 1.7, mic: 0.6, out: 0.6 }, 48, 24))
+      expect(triplets).toHaveLength(48 * 24)
+      const pairs = new Set<string>()
+      for (const [glyph, fg, bg] of triplets) {
+        expect(glyph).toBe(0x2580)
+        expect(fg).toBeLessThanOrEqual(0xffffff)
+        expect(bg).toBeLessThanOrEqual(0xffffff)
+        pairs.add(`${fg}:${bg}`)
+      }
+      expect(pairs.size).toBeLessThan(1024)
     }
   })
 
-  test('the inner arc swells with the voice and the bursts with Jarvis speaking', () => {
-    expect(lit('listening', 0.9)).toBeGreaterThan(lit('listening', 0.05))
-    expect(lit('speaking', 0, 0.9)).toBeGreaterThan(lit('speaking', 0, 0.05))
+  test('JARVIS sits inside the blue ring when there is room for it', () => {
+    const middle = (columns: number) => {
+      const pixels = ringPixels({ mode: 'sleeping', t: 0, mic: 0, out: 0 }, columns, columns)
+      const row = Math.floor(columns / 2) - 1
+      return Array.from(pixels.slice(row * columns, (row + 1) * columns))
+    }
+    expect(middle(48).filter(pixel => pixel === 0xffffff).length).toBeGreaterThan(5)
+    expect(middle(24)).not.toContain(0xffffff)
+  })
+
+  test('the white arc sweeps with your voice and the core flares with Jarvis speaking', () => {
+    expect(brightness('listening', 0.9)).toBeGreaterThan(brightness('listening', 0.05))
+    expect(brightness('speaking', 0, 0.9)).toBeGreaterThan(brightness('speaking', 0, 0.05))
   })
 
   test('the ring moves at rest and stands still when Jarvis is off', () => {
     const at = (mode: HudMode, t: number) => ringCells({ mode, t, mic: 0, out: 0 }, 32, 16)
-    expect(at('sleeping', 0)).not.toBe(at('sleeping', 3))
-    expect(at('thinking', 0)).not.toBe(at('thinking', 0.5))
-    expect(at('offline', 0)).toBe(at('offline', 3))
+    // Compared as booleans: a failure would print two frames of base64.
+    expect(at('sleeping', 0) === at('sleeping', 3)).toBe(false)
+    expect(at('thinking', 0) === at('thinking', 0.5)).toBe(false)
+    expect(at('offline', 0) === at('offline', 3)).toBe(true)
   })
 
-  test('each mode draws in its own color', () => {
-    const [r0, g0, b0] = [(HUD_COLORS.offline >> 16) & 255, (HUD_COLORS.offline >> 8) & 255, HUD_COLORS.offline & 255]
+  test('blue at rest, amber while thinking, gray when off', () => {
+    const tint = (mode: HudMode) => {
+      let [red, green, blue] = [0, 0, 0]
+      for (const pixel of ringPixels({ mode, t: 0, mic: 0, out: 0 }, 32, 32)) {
+        red += (pixel >> 16) & 255
+        green += (pixel >> 8) & 255
+        blue += pixel & 255
+      }
+      return { red, green, blue }
+    }
+    const resting = tint('sleeping')
+    expect(resting.blue).toBeGreaterThan(resting.red * 1.5)
+    const thinking = tint('thinking')
+    expect(thinking.red).toBeGreaterThan(thinking.blue * 3)
     for (const pixel of ringPixels({ mode: 'offline', t: 0, mic: 0, out: 0 }, 32, 32)) {
-      if (pixel < 0) continue
-      // A dimmed gray of the offline color: every channel scaled alike.
-      const scale = ((pixel >> 16) & 255) / r0
-      expect(Math.abs(((pixel >> 8) & 255) - g0 * scale)).toBeLessThan(2)
-      expect(Math.abs((pixel & 255) - b0 * scale)).toBeLessThan(2)
+      const channels = [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255]
+      expect(Math.max(...channels) - Math.min(...channels)).toBeLessThan(0x20)
     }
   })
 
@@ -99,8 +123,8 @@ describe('HUD ring', () => {
   })
 
   test('the desktop ring is an SVG for every mode', () => {
-    for (const mode of ['offline', 'sleeping', 'listening', 'thinking', 'speaking', 'interrupted'] as HudMode[]) {
-      const svg = ringSvg(mode, 0.5, 0.5)
+    for (const mode of MODES) {
+      const svg = ringSvg(mode, 0.5, 0.5, 1234.5)
       expect(svg.startsWith('<svg')).toBe(true)
       expect(svg.length).toBeLessThan(131_072)
       expect(svg).not.toContain('NaN')
