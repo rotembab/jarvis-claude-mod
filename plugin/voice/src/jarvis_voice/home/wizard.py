@@ -110,6 +110,11 @@ def _open_file(path: Path) -> None:
 def run_wizard(data_dir: Path, ui: Prompter | None = None, *, service: HomeService | None = None) -> int:
     """The interactive menu. Returns a process exit code."""
     console = ui is None
+    if console and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        # It asks for PINs, codes and keys: a person types them at a console,
+        # never a program (Claude's shell included) through a pipe.
+        print("Jarvis home setup asks for codes and keys: run it in a terminal window of your own.", file=sys.stderr)
+        return 2
     prompter: Any = ui if ui is not None else ConsolePrompter(Path(data_dir) / "home")
     home = service or HomeService(Path(data_dir))
     store = home.store

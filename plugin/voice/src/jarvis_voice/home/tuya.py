@@ -52,8 +52,10 @@ LOGIN_WAIT_S = 180.0
 LOGIN_POLL_S = 2.0
 # How long the setup scan listens (tinytuya's own default; it stops early once every device answered).
 SCAN_S = 18.0
-# A short scan from the helper when a device stops answering at its saved address, at most once per gap.
+# A short scan from the helper when a device stops answering at its saved address, at most once per gap;
+# never shorter than RESCAN_MIN_S (less hears too little), and only when the retry still fits after it.
 RESCAN_S = 6.0
+RESCAN_MIN_S = 3.0
 RESCAN_GAP_S = 120.0
 
 # Timing of local requests. With connection_retry_limit=1, one tinytuya request makes at most two
@@ -68,6 +70,8 @@ T_MIN = 0.6
 UNIT_SLACK_S = 0.3  # tinytuya's own short sleeps, per request
 RETRY_LIMIT = 1  # 0 would never connect at all (tinytuya returns 905 straight away)
 RETRY_DELAY_S = 0.5
+# Commands that make two requests' worth of work (a read and a write, or several values at once).
+TWO_REQUESTS = frozenset({"toggle", "set_brightness", "set_color", "set_color_temp"})
 
 # tinytuya's error numbers (core/error_helper.py).
 ERR_UNREACHABLE = frozenset({"901", "905"})
@@ -280,11 +284,32 @@ class _Link:
 
     def read(self, reserve: int = 0) -> dict[str, Any]:
         """The device's DPs, by number as text."""
-        result = self._request(1, reserve, lambda device: device.status())
+        result = self._request(1, reserve, lambda device: self._status(device, reserve))
         values = result.get("dps") if isinstance(result, dict) else None
         if not isinstance(values, dict):
             raise _Failure("nodata")
         return {str(k): v for k, v in values.items()}
+
+    def _status(self, device: Any, reserve: int) -> Any:
+        result = device.status()
+        # A "device22" reports only the DPs it is asked for. tinytuya spots the dialect in the first reply
+        # and asks again for DP 1 alone, so ask once more for the DPs Jarvis uses (power may be DP 20).
+        wanted = {str(dp): None for dp in self.conn.dps}
+        if (
+            _error_code(result) is not None
+            or getattr(device, "dev_type", None) != "device22"
+            or not wanted
+            or getattr(device, "dps_to_request", None) == wanted
+        ):
+            return result
+        timeout = self.budget.timeout(1, self.factor, reserve)  # a request of its own, sized to what is left
+        if timeout is None:
+            return result
+        for item in (device, getattr(device, "parent", None)):
+            if item is not None:
+                item.set_socketTimeout(timeout)
+        device.dps_to_request = wanted
+        return device.status()
 
     def write(self, values: Mapping[int, Any], reserve: int = 0) -> None:
         data = {str(dp): value for dp, value in values.items()}
@@ -333,6 +358,31 @@ class _TokenKeeper:
                 self.store.set_secret(CLOUD_SECRET, self.link)
             except (StoreError, OSError):
                 log.warning("could not save the renewed Smart Life sign-in")
+
+
+class _Late(Exception):
+    """A cloud call that did not finish within its time."""
+
+
+def _within(seconds: float, call: Callable[[], Any]) -> Any:
+    """``call()`` on a thread of its own, waited for at most ``seconds`` (then _Late). A blocking HTTP request
+    cannot be stopped, so a late call carries on in the background and its result is dropped."""
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = call()
+        except BaseException as exc:  # noqa: BLE001 - handed to the waiting caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, name="tuya-cloud", daemon=True)
+    thread.start()
+    thread.join(max(0.0, seconds))
+    if thread.is_alive():
+        raise _Late()
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
 
 
 def _usable_link(link: Any) -> dict[str, Any] | None:
@@ -430,7 +480,8 @@ class TuyaDriver(Driver):
             handler = functools.partial(self._vacuum, action="stop") if device.kind == "vacuum" else self._stop
         if handler is None:
             return Outcome.fail("unsupported", f"The {device.name} can't {command.replace('_', ' ')}.")
-        return self._with_link(device, lambda link: handler(device, link, value))
+        units = 2 if command in TWO_REQUESTS else 1
+        return self._with_link(device, lambda link: handler(device, link, value), units)
 
     def status(self, device: DeviceRecord) -> Outcome:
         if device.kind == "scene":
@@ -481,18 +532,26 @@ class TuyaDriver(Driver):
             )
         address = settings.get("address")
         parent, node_id = settings.get("parent"), settings.get("node_id")
+        parent = parent if isinstance(parent, str) and parent else None
+        node_id = str(node_id) if isinstance(node_id, (str, int)) and str(node_id) else None
+        if parent is not None and node_id is None:
+            # Sent without the sub-device's node id, a command would reach only the hub.
+            return Outcome.fail(
+                "needs_setup", f"The {device.name} is missing its Tuya details; refresh from Smart Life in home setup."
+            )
         return _Conn(
             tuya_id,
             address if isinstance(address, str) and address else None,
             _version(settings.get("version")),
             key,
-            parent if isinstance(parent, str) and parent else None,
-            str(node_id) if isinstance(node_id, (str, int)) and str(node_id) else None,
+            parent,
+            node_id,
             tuple(sorted({entry["dp"] for entry in tdp.dp_map(device).values()})),
         )
 
-    def _with_link(self, device: DeviceRecord, work: Callable[[_Link], Outcome]) -> Outcome:
-        """Runs ``work``; when the device does not answer at its saved address, looks for it once and retries."""
+    def _with_link(self, device: DeviceRecord, work: Callable[[_Link], Outcome], units: int = 1) -> Outcome:
+        """Runs ``work`` (``units`` requests at most); when the device does not answer at its saved address,
+        looks for it once and retries."""
         conn = self._conn(device)
         if isinstance(conn, Outcome):
             return conn
@@ -500,7 +559,7 @@ class TuyaDriver(Driver):
         rescanned = False
         if conn.address is None or conn.version is None:
             rescanned = True
-            found = self._rediscover(conn, budget)
+            found = self._rediscover(conn, budget, units)
             if found is None:
                 return self._failure(device, _Failure("noaddress"))
             conn = found
@@ -509,7 +568,7 @@ class TuyaDriver(Driver):
         except _Failure as failure:
             if rescanned or failure.err not in RESCAN_ERRORS:
                 return self._failure(device, failure)
-            fresh = self._rediscover(conn, budget)
+            fresh = self._rediscover(conn, budget, units)
             if fresh is None or (fresh.address, fresh.version) == (conn.address, conn.version):
                 return self._failure(device, failure)
             try:
@@ -517,11 +576,15 @@ class TuyaDriver(Driver):
             except _Failure as again:
                 return self._failure(device, again)
 
-    def _rediscover(self, conn: _Conn, budget: _Budget) -> _Conn | None:
-        """A short scan for the device (its gateway for a sub-device); saves a new address or version."""
+    def _rediscover(self, conn: _Conn, budget: _Budget, units: int = 1) -> _Conn | None:
+        """A short scan for the device (its gateway for a sub-device); saves a new address or version.
+
+        The scan is cut short so that the retry's ``units`` requests still fit at T_MIN afterwards (an unknown
+        version counts as v3.4+), and skipped when that leaves too little to hear anything."""
         target = conn.parent or conn.tuya_id
-        # Only when a retry still fits afterwards (8 x T_MIN covers one request of any version).
-        if budget.left() - (8 * T_MIN + UNIT_SLACK_S) - 1.0 < self.rescan_s:
+        factor = 8 if (conn.version or 3.4) >= 3.4 else 4
+        scan_s = min(self.rescan_s, budget.left() - units * (factor * T_MIN + UNIT_SLACK_S) - 1.0)
+        if scan_s < min(RESCAN_MIN_S, self.rescan_s):
             return None
         if not self._scan_lock.acquire(blocking=False):
             return None
@@ -529,8 +592,11 @@ class TuyaDriver(Driver):
             last = self._scanned.get(target)
             if last is not None and time.monotonic() - last < self.rescan_gap_s:
                 return None
-            self._scanned[target] = time.monotonic()
-            found = discover([target], self.rescan_s)
+            found = discover([target], scan_s)
+            if found is not None:
+                # Only a scan that listened counts: one that could not (the setup console's scan holds the
+                # UDP ports, and Windows does not share them) must not stop the next request from looking.
+                self._scanned[target] = time.monotonic()
         finally:
             self._scan_lock.release()
         hit = (found or {}).get(target)
@@ -559,10 +625,12 @@ class TuyaDriver(Driver):
         if err == "budget":
             return Outcome.fail("timeout", f"{the} did not answer in time.")
         if err in ERR_KEY:
+            # 904/914 also come from a device that took the connection and dropped it, because another app
+            # (Smart Life on a phone, a hub) holds its one local connection, or that was too slow to answer.
             return Outcome.fail(
                 "auth",
-                f"{the} did not accept Jarvis's key. The key may have changed after re-pairing: "
-                "refresh from Smart Life in home setup.",
+                f"{the} turned Jarvis away. It may be busy with another app, so try again in a moment. "
+                "If it keeps happening, its key may have changed: refresh from Smart Life in home setup.",
             )
         if err == ERR_RANGE:
             return Outcome.fail("bad_value", f"{the} refused that value.")
@@ -771,7 +839,11 @@ class TuyaDriver(Driver):
             return Outcome.fail("needs_setup", NOT_LINKED)
         try:
             manager = _manager(_sharing(), link, _TokenKeeper(self.ctx.store, link))
-            result = manager.trigger_scene(str(home_id), str(scene_id))
+            # A token renewal and the trigger, each with only per-step timeouts (and DNS with none): bound the whole.
+            result = _within(self._budget_s(), lambda: manager.trigger_scene(str(home_id), str(scene_id)))
+        except _Late:
+            log.warning("Smart Life did not answer a scene request in time")
+            return Outcome.fail("timeout", f"Smart Life did not answer in time; {device.name} may still run.")
         except Exception as exc:  # noqa: BLE001 - every cloud failure becomes a plain sentence
             return _cloud_failure(exc, f"run {device.name}")
         if result is False:
@@ -943,7 +1015,11 @@ def _read_device(manager: Any, device: Any) -> _Candidate | None:
         ),
         None,
     )
+    sub = bool(getattr(device, "sub", False))
     node_id = _text(getattr(device, "node_id", None)) or None
+    if sub and node_id is None:
+        # The SDK does not always pass node_id on; the hub knows a sub-device by its uuid then (as tuya-local).
+        node_id = _text(getattr(device, "uuid", None)) or None
     return _Candidate(
         tuya_id=tuya_id,
         name=_text(getattr(device, "name", None)) or "Tuya device",
@@ -951,12 +1027,12 @@ def _read_device(manager: Any, device: Any) -> _Candidate | None:
         product=_text(getattr(device, "product_name", None)),
         key=_text(getattr(device, "local_key", None)),
         dps=dps,
-        sub=bool(getattr(device, "sub", False)) or node_id is not None,
+        sub=sub or node_id is not None,
         node_id=node_id,
         parent_hint=parent_hint,
         room=room,
-        # As Home Assistant: curtains count the other way unless their motor says "back".
-        invert=category == "cl" or (category == "clkg" and status.get("control_back_mode") != "back"),
+        # As Home Assistant: curtains and curtain robots count the other way unless their motor says "back".
+        invert=category in ("cl", "jdcljqr") or (category == "clkg" and status.get("control_back_mode") != "back"),
         gang_names=_gang_names(device, dps),
     )
 
@@ -988,6 +1064,10 @@ def _settle(candidates: list[_Candidate]) -> None:
                 parent = same_key[0] if len(same_key) == 1 else None
             if parent is None:
                 candidate.reason = "paired to a hub Jarvis could not find"
+                continue
+            if candidate.node_id is None:
+                # Without it, commands would go to the hub itself and the device would never hear them.
+                candidate.reason = "Smart Life did not say how its hub addresses it"
                 continue
             candidate.parent, candidate.key = parent.tuya_id, parent.key
         if not candidate.key:

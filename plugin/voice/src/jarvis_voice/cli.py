@@ -413,7 +413,11 @@ def cmd_home(args: argparse.Namespace) -> int:
         setup_logging(data_dir, "WARNING")
         out.write(encode_line(call_once(data_dir, args.body)))
         out.flush()
-        return EXIT_OK
+        # A device call past its time limit still runs on a pool thread, which
+        # Python would wait for at exit (the mod would then time out and lose
+        # this answer). The answer is out: leave now.
+        logging.shutdown()
+        os._exit(EXIT_OK)
     setup_logging(data_dir, "WARNING")
     _quiet_stderr_logging()
     bodies: dict[str, dict[str, Any]] = {

@@ -64,6 +64,7 @@ export const register: Register = (on, options) => {
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
       ask: (question, askOptions) => $.ui.ask(question, askOptions),
+      checkTool: (tool, input) => $.tool.check({ tool, input }),
       openPane: () => $.ui.open(HUD_OPEN),
       closePane: () => $.ui.close({ id: HUD_PANE }),
       blit: args => $.ui.blit(args),
@@ -102,8 +103,10 @@ export const register: Register = (on, options) => {
 
   // The engine runs no permission check, schema check or plan-mode block for a
   // tool its plugin answers: HomeControl does all of that itself. A failure
-  // here refuses the call rather than falling through to the engine.
-  on('tool.call', { tool: 'mcp__jarvis__home_control' }, ($, e) => app.home.tool(e)).catch(($, e, next) =>
+  // here refuses the call rather than falling through to the engine. The
+  // call's signal goes along: a call abandoned while its dialog is open
+  // (Esc, a spoken stop) confirms nothing, whatever is clicked later.
+  on('tool.call', { tool: 'mcp__jarvis__home_control' }, ($, e, next) => app.home.tool(e, next.signal)).catch(($, e, next) =>
     next.called ? next(e) : { deny: `home_control failed: ${next.error.message ?? next.error.kind}` },
   )
 
@@ -165,7 +168,7 @@ export const register: Register = (on, options) => {
   // (Not at prompt.submit: a plugin's own hooks there skip its own prompts.)
   // It also records the permission mode the turn runs in: home control keeps plan mode read-only.
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    app.home.notePermissionMode(e.permission_mode)
+    app.home.notePermissionMode(e.permission_mode, e.agent_id)
     const result = await next(e)
     return app.voice?.markPrompt(e.prompt, result) ?? result
   }).catch(($, e, next) => next(e))
@@ -192,9 +195,10 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // Plan mode can also begin or end mid-turn, through these two tools.
-  on('classic.PostToolUse', { tool_name: ['EnterPlanMode', 'ExitPlanMode'] }, ($, e, next) => {
-    app.home.notePlanTool(e.tool_name, e.permission_mode)
+  // The mode can also change mid-turn: EnterPlanMode, ExitPlanMode, or a
+  // Shift+Tab that the next tool's PostToolUse reports (main loop only).
+  on('classic.PostToolUse', ($, e, next) => {
+    app.home.noteToolUse(e.tool_name, e.permission_mode, e.agent_id)
     return next(e)
   }).catch(($, e, next) => next(e))
 

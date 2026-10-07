@@ -7,6 +7,8 @@ import ast
 import importlib.util
 import json
 import logging
+import threading
+import time
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -39,6 +41,7 @@ KEYS = {
     "sensor": "FAKE-KEY-SENS-01",
     "porch": "FAKE-KEY-PRCH-01",
     "fan": "FAKE-KEY-FAN0-01",
+    "robot": "FAKE-KEY-ROBO-01",
 }
 SECRETS = [*KEYS.values(), "ACCESS-TOKEN-1", "REFRESH-TOKEN-1", "ACCESS-TOKEN-2", "REFRESH-TOKEN-2", "UC-TEST-0001"]
 LOGIN = {
@@ -74,6 +77,7 @@ class Phys:
     dps: dict[str, Any]
     children: dict[str, Phys] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)  # Err codes for the next requests
+    device22: bool = False  # answers a status query only for the DPs it is asked for
 
 
 class FakeNet:
@@ -121,6 +125,8 @@ class FakeDevice:
         self.id, self.address, self._key, self.parent = dev_id, address, local_key, parent
         self.version = parent.version if parent is not None else version
         self.cid = cid or node_id
+        self.dev_type = dev_type
+        self.timeout = connection_timeout
         self.dps_to_request: dict[str, None] = {}
         self.net.opened.append(
             {
@@ -142,6 +148,9 @@ class FakeDevice:
     def set_version(self, version: float) -> None:
         self.version = version
 
+    def set_socketTimeout(self, seconds: float) -> None:  # noqa: N802 - tinytuya's name
+        self.timeout = seconds
+
     def _target(self) -> Phys | dict[str, Any]:
         gateway = self.parent or self
         phys = self.net.devices.get(gateway.id)
@@ -159,7 +168,15 @@ class FakeDevice:
     def status(self) -> Any:
         self.net.calls.append((self.id, "status", None))
         target = self._target()
-        return target if isinstance(target, dict) else {"dps": dict(target.dps)}
+        if isinstance(target, dict):
+            return target
+        if target.device22:
+            if self.dev_type != "device22":
+                # As tinytuya: the reply says "data unvalid", so it switches dialect and asks again for DP 1 only.
+                self.dev_type, self.dps_to_request = "device22", {"1": None}
+                self.net.calls.append((self.id, "status", None))
+            return {"dps": {k: v for k, v in target.dps.items() if k in self.dps_to_request}}
+        return {"dps": dict(target.dps)}
 
     def set_value(self, index: str, value: Any) -> Any:
         self.net.calls.append((self.id, "set_value", {str(index): value}))
@@ -302,6 +319,7 @@ class FakeCloud:
         self.triggered: list[tuple[str, str]] = []
         self.trigger_error: BaseException | None = None
         self.renew_on_trigger: dict[str, Any] | None = None
+        self.trigger_hangs: threading.Event | None = None  # the trigger waits for this (a stuck connection)
 
     def module(self) -> Any:
         cloud = self
@@ -353,6 +371,8 @@ class FakeCloud:
                 return list(cloud.scenes)
 
             def trigger_scene(self, home_id: str, scene_id: str) -> Any:
+                if cloud.trigger_hangs is not None:
+                    cloud.trigger_hangs.wait(10)
                 if cloud.renew_on_trigger is not None:
                     self.listener.update_token(cloud.renew_on_trigger)
                 if cloud.trigger_error is not None:
@@ -387,12 +407,12 @@ PLUG_POINTS = [
 ]
 KITCHEN_POINTS = [dp(1, "switch_1", "Boolean"), dp(2, "switch_2", "Boolean")]
 CURTAIN_POINTS = [
-    # The motor speaks "0"/"1"/"2"; Smart Life maps them to open/stop/close.
+    # The motor speaks "0"/"1"/"2"; Smart Life lists the standard words and maps the motor's onto them.
     dp(
         1,
         "control",
         "Enum",
-        {"range": ["0", "1", "2"]},
+        {"range": ["open", "stop", "close"]},
         enum={"0": {"code": "control", "value": "open"}, "1": {"value": "stop"}, "2": {"value": "close"}},
     ),
     dp(2, "percent_control", "Integer", {"min": 0, "max": 100, "scale": 0, "step": 1, "unit": "%"}),
@@ -830,6 +850,13 @@ def test_curtain_uses_the_motors_own_words_and_counts_the_other_way(home: Home) 
     assert home.driver().status(home.device("Bedroom curtain")).text == "The Bedroom curtain is 30% open."
 
 
+def test_a_curtain_robot_counts_the_other_way_too(home: Home) -> None:
+    home.cloud.devices.append(cloud_device("robot-id", "Study curtain", "jdcljqr", KEYS["robot"], CURTAIN_POINTS))
+    link(home)
+    robot = home.device("Study curtain")
+    assert robot.kind == "cover" and robot.settings["invert"] is True  # as Home Assistant does for "jdcljqr"
+
+
 def test_climate_temperature_mode_and_fan(home: Home) -> None:
     link(home)
     assert run(home, "Living room AC", "set_temperature", 24.3).text == "The Living room AC is set to 24.5 degrees."
@@ -975,6 +1002,28 @@ def test_a_sub_device_goes_through_its_gateway(home: Home) -> None:
     assert home.net.devices["hub-id"].children["a4c1-garden"].dps["1"] is True
 
 
+def test_a_sub_device_without_a_node_id_is_reached_by_its_uuid(home: Home) -> None:
+    home.cloud.devices += [
+        cloud_device("spot-id", "Hall spot", "dj", KEYS["hub"], PORCH_POINTS, sub=True, uuid="uuid-spot"),
+        cloud_device("strip-id", "Hall strip", "dj", KEYS["hub"], PORCH_POINTS, sub=True),
+    ]
+    home.net.devices["hub-id"].children["uuid-spot"] = Phys("spot-id", "", KEYS["hub"], 3.3, {"20": False})
+    ui = link(home)
+    spot = home.device("Hall spot")
+    assert spot.settings["parent"] == "hub-id" and spot.settings["node_id"] == "uuid-spot"
+    # Without either, commands would reach only the hub: it is left out, saying why.
+    assert "Hall strip (Smart Life did not say how its hub addresses it)" in ui.text
+    assert all(d.name != "Hall strip" for d in home.store.load().devices)
+    home.net.opened.clear()
+    assert home.driver().run(spot, "turn_on", None).text == "The Hall spot is on."
+    assert home.net.opened[-1]["cid"] == "uuid-spot" and home.net.devices["hub-id"].children["uuid-spot"].dps["20"]
+    # A saved sub-device that lost it is not sent to the hub at all.
+    home.store.update(lambda c: c.device(spot.id).settings.pop("node_id"))
+    home.net.opened.clear()
+    outcome = home.driver().run(home.device("Hall spot"), "turn_on", None)
+    assert outcome.code == "needs_setup" and not home.net.opened
+
+
 def test_a_device_that_was_not_found_is_looked_for_again(home: Home) -> None:
     link(home)
     home.scanner.calls.clear()
@@ -994,6 +1043,46 @@ def test_a_device_that_was_not_found_is_looked_for_again(home: Home) -> None:
     assert len(home.scanner.calls) == scans + 1
 
 
+def forget_address(home: Home, name: str) -> None:
+    def mutate(config: Any) -> None:
+        for key in ("address", "version"):
+            config.device(home.device(name).id).settings.pop(key, None)
+
+    home.store.update(mutate)
+
+
+def test_a_rescan_leaves_room_for_the_retry(home: Home) -> None:
+    link(home)
+    home.scanner.answers["porch-id"] = ("192.168.1.27", "3.3")
+    one = 8 * tuya.T_MIN + tuya.UNIT_SLACK_S  # one request of a device whose version is not known yet
+    assert home.driver().run(home.device("Porch light"), "turn_on", None).text == "The Porch light is on."
+    assert home.scanner.calls[-1]["scantime"] == tuya.RESCAN_S  # one request leaves room for a full scan
+    # A toggle reads and then writes: the scan is cut so both still fit afterwards.
+    forget_address(home, "Porch light")
+    assert home.driver().run(home.device("Porch light"), "toggle", None).text == "The Porch light is now off."
+    scantime = home.scanner.calls[-1]["scantime"]
+    assert tuya.RESCAN_MIN_S <= scantime < tuya.RESCAN_S and scantime + 2 * one + 1.0 <= tuya.RUN_BUDGET_S
+    # With less time, a toggle does not scan at all; a single command still does, within what is left.
+    forget_address(home, "Porch light")
+    home.ctx.call_timeout = 14.0
+    scans = len(home.scanner.calls)
+    assert home.driver().run(home.device("Porch light"), "toggle", None).code == "unreachable"
+    assert len(home.scanner.calls) == scans
+    assert home.driver().run(home.device("Porch light"), "turn_on", None).text == "The Porch light is on."
+    assert home.scanner.calls[-1]["scantime"] + one + 1.0 <= 14.0 - tuya.CALL_MARGIN_S
+
+
+def test_a_scan_that_could_not_listen_does_not_hold_back_the_next(home: Home) -> None:
+    link(home)
+    driver = home.driver()
+    # The setup console's own scan holds the UDP ports (Windows does not share them).
+    home.scanner.error = OSError(10048, "Only one usage of each socket address is normally permitted")
+    assert driver.run(home.device("Porch light"), "turn_on", None).code == "unreachable"
+    home.scanner.error = None
+    home.scanner.answers["porch-id"] = ("192.168.1.27", "3.3")
+    assert driver.run(home.device("Porch light"), "turn_on", None).text == "The Porch light is on."
+
+
 @pytest.mark.parametrize(
     ("err", "code", "words"),
     [
@@ -1001,7 +1090,7 @@ def test_a_device_that_was_not_found_is_looked_for_again(home: Home) -> None:
         ("905", "unreachable", "Is it powered and on the home network?"),
         ("902", "timeout", "busy with another app"),
         ("914", "auth", "refresh from Smart Life in home setup"),
-        ("904", "auth", "may have changed after re-pairing"),
+        ("904", "auth", "busy with another app, so try again in a moment"),
         ("903", "bad_value", "refused that value"),
         ("906", "failed", "Controlling the Heater plug failed."),
     ],
@@ -1028,7 +1117,7 @@ def test_a_key_error_first_looks_for_a_new_version(home: Home) -> None:
     # A truly changed key still fails, saying what to do.
     home.net.devices["plug-id"].key = "FAKE-KEY-NEW0-01"
     outcome = home.driver().run(home.device("Heater plug"), "turn_on", None)
-    assert outcome.code == "auth" and "re-pairing" in outcome.text
+    assert outcome.code == "auth" and "its key may have changed" in outcome.text
 
 
 def test_a_device22_reply_is_sent_again_on_the_same_connection(home: Home) -> None:
@@ -1037,6 +1126,18 @@ def test_a_device22_reply_is_sent_again_on_the_same_connection(home: Home) -> No
     opened = len(home.net.opened)
     assert run(home, "Heater plug", "turn_off").text == "The Heater plug is off."
     assert len(home.net.opened) == opened + 1 and home.net.writes("plug-id")[-2:] == [{"1": False}, {"1": False}]
+
+
+def test_a_device22_is_asked_for_every_value_jarvis_uses(home: Home) -> None:
+    write_record(home, "Old bulb", "light", "dj", PORCH_POINTS)
+    bulb = home.net.devices["Old bulb-id"]
+    bulb.dps, bulb.device22 = {"20": False, "22": 505}, True  # power is DP 20, not DP 1
+    assert run(home, "Old bulb", "toggle").text == "The Old bulb is now on."
+    assert home.net.writes("Old bulb-id") == [{"20": True}]
+    home.net.calls.clear()
+    assert home.driver().status(home.device("Old bulb")).text == "The Old bulb is on, at 50% brightness."
+    # tinytuya's own second query (DP 1 only) after the first reply, then Jarvis's for its DPs.
+    assert [op for _, op, _ in home.net.calls] == ["status", "status", "status"]
 
 
 def test_missing_key_or_settings_need_setup(home: Home) -> None:
@@ -1078,6 +1179,48 @@ def test_an_expired_link_or_no_internet_is_said_plainly(home: Home, caplog: pyte
     assert run(home, "AC off", "activate") == Outcome.fail("needs_setup", tuya.NOT_LINKED)
     assert "scenes cannot run" in (home.driver().describe() or "")
     assert_no_secrets(*(r.getMessage() for r in caplog.records))
+
+
+def test_a_scene_that_hangs_is_answered_within_the_time_limit(home: Home) -> None:
+    link(home)
+    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 1.0  # one second for Smart Life
+    home.cloud.trigger_hangs = threading.Event()
+    try:
+        started = time.monotonic()
+        outcome = run(home, "AC off", "activate")
+        assert time.monotonic() - started < 3.0
+    finally:
+        home.cloud.trigger_hangs.set()
+    assert outcome == Outcome.fail("timeout", "Smart Life did not answer in time; AC off may still run.")
+
+
+def scene_tier(name: str, *aliases: str) -> str:
+    record = DeviceRecord(
+        "tuya-scene", "tuya", name, "scene", aliases=list(aliases), settings={"home_id": "h", "scene_id": "s"}
+    )
+    (spec,) = tdp.command_specs(record)
+    return spec.tier
+
+
+def test_scenes_that_open_up_the_house_ask_on_screen_first(home: Home) -> None:
+    gated = ["Open garage", "Garage", "Front gate", "Garage door 2", "Unlock front door", "Open the front door"]
+    gated += ["Disarm alarm", "פתח שער", "שער", "פתיחת חניה", "פתח את הדלת"]
+    assert {name: scene_tier(name) for name in gated} == dict.fromkeys(gated, "screen")
+    free = ["AC cool 24", "Close garage", "Shut the gate", "Garage lights on", "Lock front door", "Door light"]
+    free += ["סגור שער", "אורות מוסך", "מזגן 24"]
+    assert {name: scene_tier(name) for name in free} == dict.fromkeys(free, "free")
+    assert scene_tier("Car", "open garage") == "screen"
+
+    home.cloud.scenes.append(SimpleNamespace(scene_id="scene-garage", name="Open garage", home_id="home-1"))
+    link(home)
+    service = HomeService(home.ctx.data_dir, store=home.store, drivers={"tuya": TuyaDriver}, call_timeout=20.0)
+    try:
+        answer = service.handle({"action": "do", "device": "open garage", "command": "run"})
+        assert answer["result"] == "confirm" and home.cloud.triggered == []
+        answer = service.handle({"action": "do", "device": "open garage", "command": "run", "confirmed": True})
+        assert answer["text"] == "Ran Open garage." and home.cloud.triggered == [("home-1", "scene-garage")]
+    finally:
+        service.close()
 
 
 # --------------------------------------------------------------------------- through the service
@@ -1153,6 +1296,30 @@ def test_dp_map_from_dtos_skips_cloud_only_points_and_maps_vendor_words() -> Non
     assert dps["bright_value"]["min"] == 25 and dps["bright_value"]["max"] == 255  # the conversion's local range
     code, actions = tdp.cover_control(dps)
     assert code == "control" and actions == {"open": "FZ", "close": "ZZ", "stop": "STOP"}
+
+
+def test_enum_words_map_whichever_words_the_range_lists() -> None:
+    mapping = {"0": {"value": "open"}, "1": {"value": "stop"}, "2": {"value": "close"}}
+    # Smart Life lists the standard words; older or hand-made maps list the motor's own.
+    for listed in (["open", "stop", "close"], ["0", "1", "2"]):
+        relation = {
+            "dpId": 1,
+            "statusCode": "control",
+            "valueType": "Enum",
+            "valueDesc": json.dumps({"range": listed}),
+            "enumMappingMap": mapping,
+            "statusFormat": '{"control":"$"}',
+            "valueConvert": "enum",
+        }
+        dps = tdp.build_dp_map(tdp.relations_from_dtos([relation]), {}, {})
+        assert dps["control"]["range"] == ["open", "stop", "close"]
+        assert tdp.cover_control(dps) == ("control", {"open": "0", "close": "2", "stop": "1"})
+        assert tdp.enum_std(dps["control"], "2") == "close"
+    # With no range of its own, the cloud spec's (standard words) is read through the map just the same.
+    relation = {"dp": 4, "code": "mode", "type": "Enum", "enum": {"m1": {"value": "cold"}, "m2": {"value": "hot"}}}
+    dps = tdp.build_dp_map([relation], {"mode": {"type": "Enum", "values": '{"range":["cold","hot"]}'}}, {})
+    assert dps["mode"]["range"] == ["cold", "hot"] and tdp.enum_raw(dps["mode"], "hot") == "m2"
+    assert tdp.enum_std(dps["mode"], "M1") == "cold"  # matched in lower case too, as tuya_sharing does
 
 
 @pytest.mark.parametrize(

@@ -24,7 +24,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .model import CommandSpec, DeviceRecord, normalize
+from .model import CommandSpec, DeviceRecord, Tier, normalize
 
 DpEntry = dict[str, Any]
 DpMap = dict[str, DpEntry]
@@ -317,23 +317,26 @@ def _entry(code: str, dp: int, relation: Mapping[str, Any], cloud: Mapping[str, 
         if isinstance(unit, str) and unit.strip():
             entry["unit"] = unit.strip()[:8]
     elif kind == "enum":
+        # enumMappingMap maps the device's own words to the standard ones ({"0": {"value": "open"}}), and
+        # the range lists the standard words (tuya_sharing falls back to range[0] as a standard value);
+        # a range in the device's words is read through the map as well.
         raw_range = desc.get("range") or spec.get("range") or []
         mapping = relation.get("enum") if isinstance(relation.get("enum"), Mapping) else {}
         standard: dict[str, str] = {}
+        raw_of: dict[str, str] = {}
         for raw, target in mapping.items():
             value = target.get("value") if isinstance(target, Mapping) else None
             if isinstance(value, str) and value:
                 standard[str(raw)] = value
+                raw_of.setdefault(value, str(raw))  # the first device word for a standard one wins
         values: list[str] = []
-        raw_of: dict[str, str] = {}
-        for raw in [str(r) for r in raw_range if isinstance(r, (str, int))] or list(standard):
-            std = standard.get(raw, standard.get(raw.lower(), raw))
+        for item in [str(r) for r in raw_range if isinstance(r, (str, int))] or list(standard):
+            std = standard.get(item, standard.get(item.lower(), item))
             if std not in values:
                 values.append(std)
-            if std != raw:
-                raw_of[std] = raw
         if values:
             entry["range"] = values
+        raw_of = {std: raw for std, raw in raw_of.items() if std != raw}
         if raw_of:
             entry["raw"] = raw_of
     elif code in ("colour_data", "colour_data_v2"):
@@ -466,7 +469,8 @@ def enum_std(entry: DpEntry, raw: Any) -> str | None:
         return None
     mapping = entry.get("raw") if isinstance(entry.get("raw"), dict) else {}
     inverse = {str(v): k for k, v in mapping.items()}
-    return inverse.get(str(raw), str(raw))
+    # tuya_sharing matches the device's word as sent, then in lower case.
+    return inverse.get(str(raw), inverse.get(str(raw).lower(), str(raw)))
 
 
 def choices(entry: DpEntry) -> tuple[str, ...]:
@@ -748,12 +752,52 @@ def mode_code(dps: DpMap) -> str | None:
 
 # --------------------------------------------------------------------------- commands
 
+# Jarvis cannot see what a Smart Life scene does, and the wizard sends what it cannot drive (an RF garage
+# remote on an IR/RF hub, say) to scenes. So a scene that says it unlocks, disarms, or opens a garage, gate
+# or door asks on screen first, as those commands do on a device, and so does one named only for a garage
+# or gate ("Garage", "Front gate 2"), a remote's button that may well open it. "Close garage" or "Garage
+# lights" stay free (a tier can be raised in setup, never lowered). English words, and Hebrew stems
+# (Hebrew glues "the", "and", "to" onto the front of a word, so those match inside a word).
+_SCENE_ALWAYS = frozenset({"unlock", "unlocks", "unlocking", "disarm", "disarms", "disarming"})
+_SCENE_GATES = frozenset({"garage", "garages", "gate", "gates"})
+_SCENE_DOORS = frozenset({"door", "doors", "lock", "locks"})
+_SCENE_OPEN = frozenset({"open", "opens", "opening"})
+_SCENE_PLAIN = frozenset({"front", "back", "rear", "main", "side", "car", "driveway", "entrance", "button", "remote"})
+_HE_ALWAYS = ("נטרל", "נטרול")
+_HE_GATES = ("שער", "מוסך", "חני")
+_HE_DOORS = ("דלת", "מנעול")
+_HE_OPEN = ("פתח", "פתיח", "פתו")
+_HE_PLAIN = ("ראשי", "קדמי", "אחורי", "כניס", "רכב")
+
+
+def _scene_gated(name: str) -> bool:
+    words = normalize(name).split()
+
+    def word_is(word: str, english: frozenset[str], hebrew: tuple[str, ...]) -> bool:
+        return word in english or any(stem in word for stem in hebrew)
+
+    def has(english: frozenset[str], hebrew: tuple[str, ...]) -> bool:
+        return any(word_is(word, english, hebrew) for word in words)
+
+    if has(_SCENE_ALWAYS, _HE_ALWAYS):
+        return True
+    gates = has(_SCENE_GATES, _HE_GATES)
+    if (gates or has(_SCENE_DOORS, _HE_DOORS)) and has(_SCENE_OPEN, _HE_OPEN):
+        return True
+    plain_english, plain_hebrew = _SCENE_GATES | _SCENE_DOORS | _SCENE_PLAIN, _HE_GATES + _HE_DOORS + _HE_PLAIN
+    return gates and all(word.isdigit() or word_is(word, plain_english, plain_hebrew) for word in words)
+
+
+def scene_tier(device: DeviceRecord) -> Tier:
+    """The tier of a scene's activate: screen when its name (or an alias) sounds like opening up the house."""
+    return "screen" if any(_scene_gated(name) for name in (device.name, *device.aliases)) else "free"
+
 
 def command_specs(device: DeviceRecord) -> list[CommandSpec]:
     """What the device can do, from its saved map alone."""
     kind = device.kind
     if kind == "scene":
-        return [CommandSpec("activate")] if device.settings.get("scene_id") else []
+        return [CommandSpec("activate", tier=scene_tier(device))] if device.settings.get("scene_id") else []
     dps = dp_map(device)
     specs: list[CommandSpec] = []
     if kind in ("cover", "garage"):

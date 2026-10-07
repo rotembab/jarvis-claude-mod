@@ -535,6 +535,14 @@ def test_console_do_confirms_only_at_a_terminal(tmp_path: Path) -> None:
     assert done["result"] == "done" and asked == ["Let Jarvis unlock the Front door? [y/N]: "]
 
 
+def test_the_wizard_wants_a_person_at_a_console(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
+    from jarvis_voice.home.wizard import run_wizard
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO("1234\n"))
+    assert run_wizard(tmp_path) == 2
+    assert "terminal window of your own" in capsys.readouterr().err
+
+
 def test_home_call_runs_as_a_one_shot_process(tmp_path: Path) -> None:
     result = subprocess.run(
         [sys.executable, "-m", "jarvis_voice", "home", "call", '{"action": "info"}', "--data-dir", str(tmp_path)],

@@ -10,6 +10,7 @@ import asyncio
 import copy
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 from ipaddress import IPv4Address
@@ -110,6 +111,9 @@ class FakePyatv:
         self.pairings: list[FakePairing] = []
         self.pair_rp_ids: list[str | None] = []
         self.begin_error: BaseException | None = None
+        self.backoff_s = 0.0  # how long a wrong PIN makes the TV refuse a new pairing
+        self.backoff_until = 0.0
+        self.drop_new = False  # the Apple TV drops each new session as soon as it opens
 
     async def scan(
         self, *, hosts: list[str] | None = None, identifier: set[str] | None = None, timeout: int = 3
@@ -146,6 +150,8 @@ class FakePyatv:
         self.connected.append(atv)
         self.connect_done += 1
         loop = asyncio.get_running_loop()
+        if self.drop_new:
+            loop.call_soon(atv.drop)
         for delay, action in self.later:
             loop.call_later(delay, action)
         return atv
@@ -159,6 +165,8 @@ class FakePyatv:
     async def hit(self, atv: FakeAtv, name: str, *args: Any) -> None:
         atv.calls.append((name, *args))
         self.calls.append(name)
+        if atv.dropped:
+            raise lost()
         queue = self.failures.get(name)
         if queue:
             raise queue.pop(0)
@@ -171,6 +179,7 @@ class FakeAtv:
         self.world = world
         self.calls: list[tuple[Any, ...]] = []
         self.closed = False
+        self.dropped = False
         self.listener: Any = None
         self.power = _Power(self)
         self.remote_control = _Remote(self)
@@ -186,6 +195,12 @@ class FakeAtv:
             await asyncio.sleep(self.world.close_delay)
 
         return {asyncio.get_running_loop().create_task(goodbye())}
+
+    def drop(self) -> None:
+        """The Apple TV ends the session: pyatv tells the listener."""
+        self.dropped = True
+        if self.listener is not None:
+            self.listener.connection_lost(ConnectionResetError())
 
 
 class _Part:
@@ -272,6 +287,9 @@ class FakePairing:
     async def begin(self) -> None:
         if self.world.begin_error is not None:
             raise self.world.begin_error
+        if time.monotonic() < self.world.backoff_until:
+            # How pyatv reports the TV's TLV back-off: an AuthenticationError re-raised as PairingError.
+            raise atv_errors.PairingError("Error=BackOff, BackOff=1s")
         self.began = True
 
     def pin(self, pin: int) -> None:
@@ -279,6 +297,7 @@ class FakePairing:
 
     async def finish(self) -> None:
         if self.closed or self.pin_code != self.world.pin:
+            self.world.backoff_until = time.monotonic() + self.world.backoff_s
             raise atv_errors.PairingError("pairing failed")
         self.service.credentials = CREDS
         self.has_paired = True
@@ -349,6 +368,17 @@ class Rig:
     def close(self) -> None:
         self.driver.close()
         self.ctx.close()
+
+
+def age(rig: Rig, atv: FakeAtv, seconds: float = 60.0) -> None:
+    """Makes the connection to ``atv`` look ``seconds`` older."""
+    conn = atv.listener
+    rig.on_loop(lambda: setattr(conn, "opened_at", conn.opened_at - seconds))
+
+
+@pytest.fixture(autouse=True)
+def quick_pin_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(appletv, "PIN_RETRY_WAIT_S", 0.01)
 
 
 @pytest.fixture
@@ -636,6 +666,38 @@ def test_status_waits_a_moment_for_a_fresh_connection_to_report_power(rig: Rig, 
     assert rig.status() == Outcome.done("The Apple TV is asleep.")
 
 
+def test_status_on_an_older_connection_first_checks_that_it_still_answers(rig: Rig, world: FakePyatv) -> None:
+    assert rig.status() == Outcome.done("The Apple TV is on.")
+    assert world.calls == []  # the connect has just proved the link
+    age(rig, world.connected[0])
+    assert rig.status() == Outcome.done("The Apple TV is on.")
+    world.failures["app_list"] = [refused()]  # a refusal is still an answer
+    assert rig.status() == Outcome.done("The Apple TV is on.")
+    assert world.calls == ["app_list", "app_list"] and world.connects == 1
+    # Unplugged without a goodbye: the link is half-open and the pushed "on" is stale.
+    world.devices.clear()
+    world.failures["app_list"] = [lost()]
+    out = rig.status()
+    assert out == Outcome.fail("unreachable", "The Apple TV isn't answering. It may be asleep or off the network.")
+    wait_until(lambda: world.connected[0].closed)
+
+
+def test_status_sends_nothing_to_a_sleeping_apple_tv(rig: Rig, world: FakePyatv) -> None:
+    world.power_state = PowerState.Off
+    assert rig.status() == Outcome.done("The Apple TV is asleep.")
+    age(rig, world.connected[0])
+    assert rig.status() == Outcome.done("The Apple TV is asleep.")
+    assert world.calls == [] and world.connects == 1
+    # Put to sleep by Jarvis, but tvOS never pushed "asleep": the stale "on" is not checked with a request.
+    world.power_state = PowerState.On
+    assert rig.run("turn_off").ok
+    assert rig.status() == Outcome.done("The Apple TV is on.")
+    assert world.calls == ["turn_off"]
+    assert rig.run("turn_on").ok
+    assert rig.status().ok
+    assert world.calls == ["turn_off", "turn_on", "app_list"]
+
+
 def test_app_names_are_matched_loosely() -> None:
     def name(wanted: str) -> str | None:
         app, _ = match_app(APPS, wanted)
@@ -764,6 +826,35 @@ def test_a_connect_landing_after_close_is_closed_too(tmp_path: Path, world: Fake
         rig.close()
 
 
+def test_a_close_while_a_command_waits_for_its_connect_starts_no_more(tmp_path: Path, world: FakePyatv) -> None:
+    rig = Rig(tmp_path, world, call_timeout=4.0)
+    try:
+        world.connect_delay = 0.5
+        result: dict[str, Outcome] = {}
+        worker = threading.Thread(target=lambda: result.update(out=rig.run("play")))
+        worker.start()
+        wait_until(lambda: world.connects == 1)
+        rig.driver.close()  # a reload, or the helper stopping
+        worker.join(5.0)
+        assert result["out"] == Outcome.fail(
+            "failed", "Home control was restarting, so the Apple TV didn't get that. Ask again."
+        )
+        wait_until(lambda: world.connected[0].closed)
+        assert world.connects == 1 and world.calls == []
+    finally:
+        rig.close()
+
+
+def test_an_apple_tv_dropping_each_new_session_is_not_reconnected_over_and_over(rig: Rig, world: FakePyatv) -> None:
+    world.drop_new = True
+    started = time.monotonic()
+    out = rig.run("play")
+    assert out == Outcome.fail("unreachable", "The Apple TV stopped answering. Try again in a moment.")
+    assert world.connects <= 2  # its own connect, and at most one for the single retry
+    assert time.monotonic() - started < 2.0
+    wait_until(lambda: all(atv.closed for atv in world.connected))
+
+
 def test_close_without_any_use_starts_nothing(tmp_path: Path, world: FakePyatv) -> None:
     ctx = DriverContext(make_store(tmp_path), tmp_path)
     AppleTvDriver(ctx, api=world).close()
@@ -875,12 +966,35 @@ def test_wizard_finds_pairs_names_and_saves_an_apple_tv(tmp_path: Path, world: F
 def test_wizard_lets_a_wrong_pin_be_retyped(tmp_path: Path, world: FakePyatv) -> None:
     ctx = wizard_ctx(tmp_path)
     ui = run_wizard(ctx, world, [0, "Apple TV", "", "0000", "12", "1234", False])
-    assert "That code didn't work. The TV will show a new one." in ui.text
+    assert "That code didn't work. The TV will show a new one in a few seconds." in ui.text
     assert "The code is the 4 digits on the TV screen." in ui.said
     assert len(world.pairings) == 2 and all(p.closed for p in world.pairings)
     [device] = ctx.store.load().devices
     assert device.name == "Apple TV" and device.room is None
     assert ctx.store.secret(device.secret_key) == {"companion": CREDS}
+
+
+def test_wizard_waits_out_the_back_off_after_a_wrong_pin(
+    tmp_path: Path, world: FakePyatv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world.backoff_s = 0.2
+    monkeypatch.setattr(appletv, "PIN_RETRY_WAIT_S", 0.4)
+    ctx = wizard_ctx(tmp_path)
+    ui = run_wizard(ctx, world, [0, "", "", "0000", "1234", False])
+    assert "refused" not in ui.text and "holding off" not in ui.text
+    assert len(world.pairings) == 2 and all(p.closed for p in world.pairings)
+    [device] = ctx.store.load().devices
+    assert ctx.store.secret(device.secret_key) == {"companion": CREDS}
+
+
+def test_wizard_says_to_wait_when_the_back_off_outlasts_the_pause(tmp_path: Path, world: FakePyatv) -> None:
+    world.backoff_s = 60.0
+    ctx = wizard_ctx(tmp_path)
+    ui = run_wizard(ctx, world, [0, "", "", "0000"])
+    assert "The Apple TV is holding off pairing after the wrong code. Wait a minute" in ui.text
+    assert "refused to start pairing" not in ui.text
+    assert len(world.pairings) == 2 and all(p.closed for p in world.pairings)
+    assert ctx.store.load().devices == [] and ctx.store.secret_keys() == []
 
 
 def test_wizard_stops_after_three_wrong_pins_and_saves_nothing(tmp_path: Path, world: FakePyatv) -> None:

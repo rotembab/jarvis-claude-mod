@@ -25,9 +25,12 @@ import contextlib
 import difflib
 import functools
 import html
+import ipaddress
 import logging
 import re
+import select
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -52,7 +55,8 @@ CALL_MARGIN_S = 1.5  # kept free below ctx.call_timeout
 TURN_ON_BUDGET_S = 15.0
 TURN_ON_RESERVE_S = 3.5  # left after polling, for setPowerStatus and the WakeUp button
 PROBE_BUDGET_S = 20.0
-REST_TIMEOUT_S = 4.0
+# pybravia's default: a Google TV can take several seconds to list its apps or to start one.
+REST_TIMEOUT_S = 10.0
 STATUS_TIMEOUT_S = 3.0
 POLL_TIMEOUT_S = 2.0
 POLL_GAP_S = 0.5
@@ -132,13 +136,24 @@ class BraviaError(Exception):
     HTTP answer), restarting (HTTP 404), http (another status), rpc (a
     JSON-RPC error, see ``code``), off ("not power-on"), bad_reply, budget
     (no time left in this call), bad_key (the saved key cannot be sent).
+    ``late``: the TV had already answered an earlier request of this call, so
+    a timeout means it is slow, not off.
     """
 
-    def __init__(self, kind: str, message: str = "", *, code: int | None = None, status: int | None = None) -> None:
+    def __init__(
+        self,
+        kind: str,
+        message: str = "",
+        *,
+        code: int | None = None,
+        status: int | None = None,
+        late: bool = False,
+    ) -> None:
         super().__init__(message or kind)
         self.kind = kind
         self.code = code
         self.status = status
+        self.late = late
 
 
 def usable_key(psk: str) -> bool:
@@ -191,6 +206,7 @@ class BraviaClient:
         self.deadline = time.monotonic() + budget
         self.retry_wait = retry_wait
         self.retry_kinds = RETRYABLE
+        self.answered = False  # any HTTP answer yet in this call
         self._psk = psk
         self._id = 0
 
@@ -262,7 +278,8 @@ class BraviaClient:
                 verify_tls=self.verify_tls,
             )
         except net.HttpError as exc:
-            raise BraviaError(_failure_kind(exc), str(exc)) from None
+            raise BraviaError(_failure_kind(exc), str(exc), late=self.answered) from None
+        self.answered = True
         if response.status in (401, 403):
             raise BraviaError("auth", f"{path}: HTTP {response.status}", status=response.status)
         if response.status == 404:
@@ -666,7 +683,7 @@ class BraviaDriver(Driver):
         try:
             return self._status(session)
         except BraviaError as err:
-            return self._failure(device, err)
+            return self._failure(device, err, action=False)
 
     def describe(self) -> str | None:
         try:
@@ -727,11 +744,16 @@ class BraviaDriver(Driver):
         except (StoreError, OSError) as exc:
             log.warning("could not save what the %s reported: %s", device.id, type(exc).__name__)
 
-    def _failure(self, device: DeviceRecord, err: BraviaError) -> Outcome:
+    def _failure(self, device: DeviceRecord, err: BraviaError, *, action: bool = True) -> Outcome:
         log.debug("%s: %s (%s)", device.id, err.kind, err)
         name, kind = device.name, err.kind
         if kind == "auth":
             return Outcome.fail("auth", f"The {name} refused the pre-shared key; re-enter it in home setup.")
+        if kind == "timeout" and err.late:
+            # It answered a moment ago, so it is on and slow (starting an app, say), not off.
+            return Outcome.fail(
+                "timeout", f"The {name} did not answer in time" + ("; it may still act on it." if action else ".")
+            )
         if kind in ("unreachable", "timeout", "refused"):
             return Outcome.fail("unreachable", f"The {name} is off or unreachable.")
         if kind == "restarting":
@@ -804,9 +826,13 @@ class BraviaDriver(Driver):
     def _turn_on(self, s: _Session, _value: Value = None) -> Outcome:
         """Wake-on-LAN, then wait for the API, then setPowerStatus, with the remote's
         WakeUp button as the last resort (after Sony's own procedure)."""
+        # Whether the TV may be booting when the polling below runs out: a magic
+        # packet went out, or its web server answered while its API restarted.
+        # A Google TV can take 15-30 s to answer after a magic packet, longer than a call may last.
+        stirring = False
         if s.mac:
             try:
-                net.wake_on_lan(s.mac, s.host)
+                stirring = net.wake_on_lan(s.mac, s.host) > 0
             except (OSError, ValueError) as exc:
                 log.debug("%s: Wake-on-LAN failed: %s", s.device.id, type(exc).__name__)
         reserve = min(TURN_ON_RESERVE_S, (s.client.deadline - time.monotonic()) / 4)
@@ -823,10 +849,17 @@ class BraviaDriver(Driver):
                 if err.kind not in GONE | {"restarting", "budget"}:
                     power = "unknown"  # it answers, if oddly ("not power-on"): ask it to turn on
                     break
+                stirring = stirring or err.kind == "restarting"
             missed += 1
             if time.monotonic() + self.poll_gap_s >= poll_until:
                 break
             time.sleep(self.poll_gap_s)
+        if power is None and stirring:
+            return Outcome.fail(
+                "timeout",
+                f"The {s.name} has not answered yet; it may still be starting. "
+                "If it stays off, check that Remote start is on in the TV's settings.",
+            )
         if power is None:
             return Outcome.fail(
                 "unreachable", f"The {s.name} did not wake up. Check that Remote start is on in the TV's settings."
@@ -945,10 +978,25 @@ class BraviaDriver(Driver):
         try:
             s.client.call("audio", "setAudioMute", [{"status": on}])
         except BraviaError as err:
-            if not _no_speaker(err) or not s.press(("Mute",)):
+            if not _no_speaker(err):
                 raise
-            return Outcome.done(f"Pressed Mute on the {s.name}.")
+            return self._mute_by_key(s, on)
         return Outcome.done(f"{'Muted' if on else 'Unmuted'} the {s.name}.")
+
+    def _mute_by_key(self, s: _Session, on: bool) -> Outcome:
+        """The sound goes to an external audio system. The remote's Mute button
+        toggles, so it is pressed only when that system's reported state is not
+        the one asked for. The speakers' entry says nothing about it, so without
+        the system's own entry the press is a guess, and the answer says so."""
+        external = _external(s.volume_entries())
+        muted = external.get("mute") if external is not None else None
+        if isinstance(muted, bool) and muted == on:
+            return Outcome.done(f"The {s.name}'s sound system is {'already' if on else 'not'} muted.")
+        if not s.press(("Mute",)):
+            return Outcome.fail("unsupported", f"The {s.name} can't mute its sound system.")
+        if isinstance(muted, bool):
+            return Outcome.done(f"{'Muted' if on else 'Unmuted'} the {s.name}'s sound system.")
+        return Outcome.done(f"Pressed Mute on the {s.name}. It can't say whether its sound system is now muted.")
 
     # ------------------------------------------------------------------ buttons
 
@@ -1084,40 +1132,100 @@ def discover_tvs(timeout: float = DISCOVERY_S, *, target: tuple[str, int] | None
 
     Soundbars answer the same search, so only devices whose description lists
     the ``videoScreen`` service count. Firewalls often block the replies,
-    which is why typing the address stays the main path.
+    which is why typing the address stays the main path. A multicast leaves
+    through one network adapter only, which on a PC with a VPN, WSL, Hyper-V
+    or Docker may not be the home network's, so the search also goes out from
+    each of the computer's private addresses.
     """
     where = target or SSDP_ADDRESS
     message = (
         f'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\nST: {SSDP_ST}\r\n\r\n'
     ).encode("ascii")
     locations: dict[str, str] = {}
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as sock:
-            with contextlib.suppress(OSError):  # the default TTL of 1 reaches the TV's own network too
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-            for _ in range(2):  # UDP gets lost; ask twice
-                sock.sendto(message, where)
-            deadline = time.monotonic() + timeout
-            while (left := deadline - time.monotonic()) > 0:
-                sock.settimeout(left)
+    with contextlib.ExitStack() as stack:
+        sockets: list[socket.socket] = []
+        for local in [None, *(_lan_addresses() if target is None else [])]:
+            sock = _ssdp_socket(local)
+            if sock is None:
+                continue
+            stack.enter_context(sock)
+            try:
+                for _ in range(2):  # UDP gets lost; ask twice
+                    sock.sendto(message, where)
+            except OSError as exc:
+                log.debug("SSDP search failed: %s", type(exc).__name__)
+                continue
+            sock.setblocking(False)  # select() can wake for a datagram that then proves bad
+            sockets.append(sock)
+        deadline = time.monotonic() + timeout
+        while sockets and (left := deadline - time.monotonic()) > 0:
+            try:
+                readable, _, _ = select.select(sockets, [], [], left)
+            except (OSError, ValueError):
+                break
+            if not readable:
+                break  # the time is up
+            for sock in readable:
                 try:
                     data, sender = sock.recvfrom(4096)
-                except ConnectionResetError:
-                    continue  # Windows reports an earlier ICMP "port unreachable" this way
-                except OSError:  # including the timeout
-                    break
+                except (BlockingIOError, ConnectionResetError):
+                    continue  # nothing after all, or (Windows) an earlier ICMP "port unreachable"
+                except OSError:
+                    sockets.remove(sock)
+                    continue
                 location = _ssdp_header(data, "location")
                 # Only descriptions on the device that answered: nothing else on the network gets fetched.
                 if location and urlsplit(location).hostname == sender[0] and len(locations) < 16:
                     locations.setdefault(location, sender[0])
-    except OSError as exc:
-        log.debug("SSDP search failed: %s", type(exc).__name__)
     found: list[FoundTv] = []
     for location, host in locations.items():
         tv = _describe_tv(location, host)
         if tv is not None and all(f.address != tv.address for f in found):
             found.append(tv)
     return found
+
+
+def _ssdp_socket(local: str | None) -> socket.socket | None:
+    """A UDP socket for the search; with ``local``, bound to that adapter's
+    address and sending its multicast through that adapter."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    except OSError as exc:
+        log.debug("SSDP search failed: %s", type(exc).__name__)
+        return None
+    try:
+        if local is not None:
+            sock.bind((local, 0))
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local))
+    except OSError:
+        sock.close()
+        return None
+    with contextlib.suppress(OSError):  # the default TTL of 1 reaches the TV's own network too
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    return sock
+
+
+def _lan_addresses() -> list[str]:
+    """This computer's private IPv4 addresses, one per network adapter. Only on
+    Windows, which answers its own host name with every adapter's address and
+    without asking the network; elsewhere the default search is all there is."""
+    if sys.platform != "win32":
+        return []
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_DGRAM)
+    except (OSError, UnicodeError):
+        return []
+    found: list[str] = []
+    for info in infos:
+        address = str(info[4][0])
+        try:
+            ip = ipaddress.IPv4Address(address)
+        except ValueError:
+            continue
+        if ip.is_private and not ip.is_loopback and not ip.is_link_local and address not in found:
+            found.append(address)
+    return found[:8]
 
 
 def _ssdp_header(data: bytes, name: str) -> str | None:
@@ -1252,6 +1360,10 @@ def probe_tv(address: str, psk: str, *, retry_wait: float | None = None) -> TvPr
         if err.kind == "auth":
             probe.problem = _probe_problem(err, address)
             return probe
+    # Home Assistant does this too: with the TV's Wake-on-LAN mode off, it ignores the
+    # magic packet that turn_on sends when the TV is off the network.
+    with contextlib.suppress(BraviaError):
+        client.call("system", "setWolMode", [{"enabled": True}], timeout=5.0, retry=False)
     probe.ircc_path = _find_ircc_path(client)
     with contextlib.suppress(BraviaError):
         probe.codes = _parse_codes(client.call("system", "getRemoteControllerInfo"))

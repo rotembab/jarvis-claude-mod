@@ -1,16 +1,18 @@
 // Home control: the `home_control` tool the model calls, and /jarvis home.
 //
 // A tool the mod answers itself skips the engine's whole permission path (no
-// prompt, no input-schema check, no plan-mode block), so this module is the
-// guard: it checks every argument, keeps plan mode read-only, and asks the
-// user on screen (never by voice) before a command the helper answers with
-// "confirm". The voice helper, or a one-shot `jarvis_voice home call` when it
-// is not running, finds the device and runs the command.
+// prompt, no input-schema check, no plan-mode block, no allow/ask rules), so
+// this module is the guard: it checks every argument, keeps plan mode
+// read-only, honours the user's own rules for the tool (`$.tool.check`), and
+// asks the user on screen (never by voice) before a command the helper answers
+// with "confirm". The voice helper, or a one-shot `jarvis_voice home call` when
+// it is not running, finds the device and runs the command.
 
 import type { ToolSpec } from 'claude-code'
 
 import type { Jarvis } from './app'
 import { describeError } from './engine'
+import type { ToolVerdict } from './engine'
 import { shellCommandLine } from './platform'
 import { HOME_DEVICE_MAX, HOME_VALUE_MAX } from './protocol'
 import type { HomeCommand, HomeResponse } from './protocol'
@@ -27,15 +29,20 @@ export const HOME_COMMAND_MAX = 64
 export const HOME_QUERY_MAX = 200
 
 /**
- * The one-shot command: Python's start-up, then the helper's 20 s per device
- * (a little more for a busy device), with room to spare.
+ * The helper's worst case for one request: up to 20 s for Home Assistant's
+ * device list (its hub listing), then up to 22 s for the device (20 s plus
+ * the lock wait's margin), so its own "timeout" answer arrives before ours.
  */
-export const HOME_CALL_TIMEOUT_MS = 35_000
+export const HOME_HELPER_TIMEOUT_MS = 50_000
+/** The one-shot command: the same, after Python's start-up, with room to spare. */
+export const HOME_CALL_TIMEOUT_MS = 60_000
 /** `home open-setup` only starts a window and exits. */
 export const HOME_SETUP_TIMEOUT_MS = 20_000
 
+/** The on-screen answers; the safe one first, as the dialog highlights the first. */
 export const CONFIRM_YES = 'Yes, do it'
 export const CONFIRM_NO = 'No'
+const CONFIRM_OPTIONS = [CONFIRM_NO, CONFIRM_YES]
 
 const DESCRIPTION = [
   "Controls the user's home devices on their own network through Jarvis on this computer: TVs and the Apple TV, lights, plugs, blinds, climate, locks, scenes.",
@@ -80,7 +87,21 @@ const DO_USAGE =
 const PLAN_MODE =
   'Plan mode is on, so Jarvis does not change devices or open windows now. Describe what you would do in the plan instead; list and status still work.'
 
+/** Before the first prompt, and after the module was reloaded: plan mode may be on. */
+const MODE_UNKNOWN =
+  "Jarvis cannot tell yet whether plan mode is on (it has not seen a prompt since it started), so it does not change devices or open windows until the user's next message. list and status still work."
+
 const NOT_READY = 'Home control is not ready yet: Jarvis is still starting. Try again in a moment.'
+
+/** After a time-out the command may still run: a blind retry would toggle twice. */
+const CHECK_FIRST = 'Check its status before trying again.'
+
+/** The call was abandoned (Esc, a spoken stop) while it waited: nothing more is sent. */
+const INTERRUPTED = 'The request was interrupted, so nothing was done.'
+
+/** How the model tells the user to start setup by hand: never by running it itself. */
+const SETUP_BY_HAND =
+  'Ask the user to run that in a terminal of their own. Do not run it yourself: it asks for PINs, codes and keys, which the user types there, never in the chat.'
 
 /** Who reads a home answer: the model (the tool) or the user (/jarvis home). */
 type Audience = 'model' | 'user'
@@ -197,7 +218,7 @@ export function parseHomeToolInput(input: Record<string, unknown>): HomeToolRequ
 /** The home fields of a helper answer; undefined when it is not one. */
 export function readHomeResponse(value: unknown): HomeResponse | undefined {
   if (!isRecord(value) || value.ok !== true) return undefined
-  const { result, code, text } = value
+  const { result, code, text, device } = value
   if (result !== 'done' && result !== 'failed' && result !== 'confirm') return undefined
   if (typeof text !== 'string') return undefined
   return {
@@ -206,7 +227,33 @@ export function readHomeResponse(value: unknown): HomeResponse | undefined {
     code: typeof code === 'string' ? code : result === 'done' ? 'ok' : result,
     text,
     ...(typeof value.prompt === 'string' ? { prompt: value.prompt } : {}),
+    // The device the helper found: a confirmation is sent for this one, by id.
+    ...(isRecord(device) && typeof device.id === 'string' && device.id !== '' && typeof device.name === 'string'
+      ? { device: { id: device.id, name: device.name } }
+      : {}),
   }
+}
+
+const ABORTED = Symbol('aborted')
+
+/** `promise`, or ABORTED as soon as `signal` aborts (what it would settle to is then dropped). */
+function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
+  if (signal === undefined) return promise
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(ABORTED)
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      },
+    )
+  })
 }
 
 /** The last stdout line that is a JSON object (the helper's answer), if any. */
@@ -236,31 +283,47 @@ function describeAnswer(response: HomeResponse, audience: Audience): string {
 }
 
 export class HomeControl {
-  /** The permission mode the last prompt ran in (classic UserPromptSubmit); undefined before the first. */
+  /**
+   * The main loop's permission mode, as the latest classic hook input told
+   * it (a prompt, or a tool that ran). Undefined until one has: before the
+   * first prompt, and after a reload or a lost hooks worker built this anew,
+   * so do and setup are held then rather than run in a plan-mode turn.
+   */
   private permissionMode: string | undefined
 
   constructor(private readonly app: Jarvis) {}
 
-  get isPlanMode(): boolean {
-    return this.permissionMode === 'plan'
-  }
-
-  /** classic.UserPromptSubmit: the mode the prompt's turn runs in. */
-  notePermissionMode(mode: string | undefined): void {
+  /** classic.UserPromptSubmit: the mode the prompt's turn runs in. A subagent's or teammate's is not the main loop's. */
+  notePermissionMode(mode: string | undefined, agentId?: string): void {
+    if (agentId !== undefined) return
     if (mode !== undefined && mode !== '') this.permissionMode = mode
   }
 
-  /** classic.PostToolUse of EnterPlanMode or ExitPlanMode: plan mode began or ended mid-turn. */
-  notePlanTool(tool: string, mode: string | undefined): void {
+  /**
+   * classic.PostToolUse of any tool in the main loop: the mode now, which a
+   * Shift+Tab may have changed mid-turn. EnterPlanMode and ExitPlanMode
+   * report the mode they were called in, so they set it themselves.
+   */
+  noteToolUse(tool: string, mode: string | undefined, agentId?: string): void {
+    if (agentId !== undefined) return
     if (tool === 'EnterPlanMode') this.permissionMode = 'plan'
-    else if (tool === 'ExitPlanMode') this.permissionMode = mode !== undefined && mode !== 'plan' ? mode : 'default'
+    else if (tool === 'ExitPlanMode') this.permissionMode = mode !== undefined && mode !== '' && mode !== 'plan' ? mode : 'default'
+    else if (mode !== undefined && mode !== '') this.permissionMode = mode
+  }
+
+  /** Why do and setup are held now (plan mode, or a mode not known yet); undefined when they may run. */
+  private heldByMode(): string | undefined {
+    if (this.permissionMode === undefined) return MODE_UNKNOWN
+    return this.permissionMode === 'plan' ? PLAN_MODE : undefined
   }
 
   /**
    * The model's call: `{ result }` in words, or `{ deny }` for arguments it
-   * must fix. Never throws for a device's failure (that is a result).
+   * must fix or a call the user's permission rules refuse. Never throws for
+   * a device's failure (that is a result). `signal` is the call's own: once
+   * it aborts (the user interrupted), nothing more is sent or confirmed.
    */
-  async tool(input: Record<string, unknown>): Promise<{ result: string } | { deny: string }> {
+  async tool(input: Record<string, unknown>, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
     let request: HomeToolRequest
     try {
       request = parseHomeToolInput(input)
@@ -268,10 +331,58 @@ export class HomeControl {
       if (error instanceof BadHomeInput) return { deny: `home_control: ${error.message}.` }
       throw error
     }
-    // Plan mode reads only: the engine's own plan-mode block never sees this tool.
-    if (this.isPlanMode && (request.action === 'do' || request.action === 'setup')) return { result: PLAN_MODE }
+    if (request.action === 'do' || request.action === 'setup') {
+      // Plan mode reads only: the engine's own plan-mode block never sees this tool.
+      const held = this.heldByMode()
+      if (held !== undefined) return { result: held }
+      const unavailable = this.unavailable('model')
+      if (unavailable !== undefined) return { result: unavailable }
+      const gate = await this.checkRules(request)
+      if (typeof gate === 'object') return gate
+      if (gate === 'ask') {
+        // In the model's words: the helper has not looked the device up yet.
+        const { command = '', device = '', value } = request.action === 'do' ? request.body : {}
+        const question =
+          request.action === 'setup'
+            ? 'Let Jarvis open the home setup window?'
+            : `Let Jarvis run ${command}${value === undefined ? '' : ` (${clip(String(value), 60)})`} on "${clip(device, 80)}"?`
+        const refused = await this.askOnScreen(question, 'model', signal)
+        if (refused !== undefined) return { result: refused }
+      }
+    }
     if (request.action === 'setup') return { result: await this.openSetup('model') }
-    return { result: await this.request(request.body, 'model') }
+    return { result: await this.request(request.body, 'model', signal) }
+  }
+
+  /**
+   * The user's own permission rules for the tool (`$.tool.check`), which the
+   * engine never applies to a tool its plugin answers: a deny (a deny rule,
+   * dontAsk without an allow rule, an organization's ceiling) refuses; an ask
+   * rule the user wrote, or an `ask` ceiling, needs a yes on screen first.
+   * The engine's plain "ask" with no rule behind it is its default for any
+   * tool not allowed yet, which the helper's own tiers stand in for here.
+   */
+  private async checkRules(request: HomeToolRequest): Promise<'allow' | 'ask' | { deny: string }> {
+    const engine = this.app.engine
+    if (engine === undefined) return 'ask'
+    const input = request.action === 'setup' ? { action: 'setup' } : { ...request.body }
+    let verdict: ToolVerdict
+    try {
+      verdict = await engine.checkTool(HOME_TOOL, input)
+    } catch (error) {
+      // The rules could not be read: ask rather than guess.
+      engine.debug(`jarvis: home_control permission check failed: ${describeError(error)}`)
+      return 'ask'
+    }
+    const why = verdict.reason === undefined || verdict.reason === '' ? '' : ` (${clip(verdict.reason, 200)})`
+    const refused = {
+      deny: `The user's permission settings do not let home_control ${request.action === 'setup' ? 'open the setup window' : 'change devices'} here${why}.`,
+    }
+    if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
+    if (verdict.decision === 'allow') return verdict.ceiling === 'ask' ? 'ask' : 'allow'
+    // dontAsk: what is not allowed beforehand is refused, never asked.
+    if (this.permissionMode === 'dontAsk') return refused
+    return verdict.rule !== undefined || verdict.ceiling === 'ask' ? 'ask' : 'allow'
   }
 
   /** `/jarvis home [setup|list|status|do] ...`, the words after `home`. */
@@ -321,7 +432,7 @@ export class HomeControl {
   }
 
   /** Sends one request; on "confirm", asks the user on screen and only on a yes sends it again, confirmed. */
-  private async request(body: HomeCommand, audience: Audience): Promise<string> {
+  private async request(body: HomeCommand, audience: Audience, signal?: AbortSignal): Promise<string> {
     const unavailable = this.unavailable(audience)
     if (unavailable !== undefined) return unavailable
     const sent = await this.send(body, audience)
@@ -331,34 +442,55 @@ export class HomeControl {
     // The one-shot command never takes a confirmation (anyone's shell could
     // run it), and its text says to start the helper.
     if (via === 'cli') return audience === 'model' ? `${response.text} Nothing was done.` : response.text
-    return await this.confirm(body, response, audience)
+    return await this.confirm(body, response, audience, signal)
   }
 
-  private async confirm(body: HomeCommand, asked: HomeResponse, audience: Audience): Promise<string> {
+  /**
+   * Asks `question` on screen with No (first) and "Yes, do it": undefined on
+   * a yes, else what to say. Never by voice, and a dialog still open when
+   * the call is abandoned counts for nothing, whatever is clicked later.
+   */
+  private async askOnScreen(question: string, audience: Audience, signal?: AbortSignal): Promise<string | undefined> {
     const engine = this.app.engine
     if (engine === undefined) return NOT_READY
-    const question = asked.prompt ?? `${asked.text.replace(/[.\s]+$/, '')}. Go ahead?`
-    let answer: string
+    if (signal?.aborted === true) return INTERRUPTED
+    let answer: string | typeof ABORTED
     try {
-      answer = await engine.ask(question, { options: [CONFIRM_YES, CONFIRM_NO], header: 'Jarvis home' })
+      answer = await unlessAborted(engine.ask(question, { options: CONFIRM_OPTIONS, header: 'Jarvis home' }), signal)
     } catch (error) {
       engine.debug(`jarvis: home confirmation not answered: ${describeError(error)}`)
       return audience === 'model'
         ? 'The user could not be asked on screen (the question was dismissed, or nobody is at this session), so nothing was done.'
         : 'Not confirmed, so nothing was done.'
     }
-    if (answer !== CONFIRM_YES) {
-      if (audience === 'user') return 'Nothing was done.'
-      return answer === CONFIRM_NO
-        ? 'The user said no on screen, so nothing was done. Do not try again unless they ask.'
-        : `The user did not confirm on screen; they wrote instead: "${clip(answer.trim(), 200)}". Nothing was done.`
+    if (answer === ABORTED) {
+      engine.debug('jarvis: home confirmation abandoned: the call was interrupted')
+      return INTERRUPTED
     }
+    if (answer === CONFIRM_YES) return undefined
+    if (audience === 'user') return 'Nothing was done.'
+    return answer === CONFIRM_NO
+      ? 'The user said no on screen, so nothing was done. Do not try again unless they ask.'
+      : `The user did not confirm on screen; they wrote instead: "${clip(answer.trim(), 200)}". Nothing was done.`
+  }
+
+  private async confirm(body: HomeCommand, asked: HomeResponse, audience: Audience, signal?: AbortSignal): Promise<string> {
+    // The yes is for the device the dialog names: the request goes again by
+    // its id, so the helper cannot find another one by the same words.
+    const device = asked.device
+    if (device === undefined) {
+      return 'The Jarvis helper did not say which device it meant, so nothing was done. Run /jarvis setup to update it.'
+    }
+    const question = asked.prompt ?? `${asked.text.replace(/[.\s]+$/, '')}. Go ahead?`
+    const refused = await this.askOnScreen(question, audience, signal)
+    if (refused !== undefined) return refused
+    if (signal?.aborted === true) return INTERRUPTED
     // Only the running helper takes `confirmed`; it shares a secret with this mod.
     const helper = this.app.helper
     if (helper?.isRunning !== true) {
       return 'The Jarvis helper stopped before it could do it, so nothing was done. Try again once it runs (/jarvis starts it).'
     }
-    const outcome = await helper.send('home', { ...body, confirmed: true })
+    const outcome = await helper.send('home', { ...body, device: device.id, confirmed: true }, HOME_HELPER_TIMEOUT_MS)
     if (!outcome.ok) return this.helperFailure(outcome.code, outcome.message)
     const response = readHomeResponse(outcome.response)
     if (response === undefined) return this.notUnderstood()
@@ -370,7 +502,7 @@ export class HomeControl {
   private async send(body: HomeCommand, audience: Audience): Promise<Sent> {
     const helper = this.app.helper
     if (helper?.isRunning === true) {
-      const outcome = await helper.send('home', body)
+      const outcome = await helper.send('home', body, HOME_HELPER_TIMEOUT_MS)
       if (outcome.ok) {
         const response = readHomeResponse(outcome.response)
         return response === undefined ? failed(this.notUnderstood()) : { kind: 'answered', via: 'helper', response }
@@ -395,7 +527,7 @@ export class HomeControl {
       engine.debug(`jarvis: home ${body.action} (one-shot) failed: ${why}`)
       return failed(
         /still running/.test(why)
-          ? 'Home control did not finish in time; the device may still act on it.'
+          ? `Home control did not finish in time; the device may still act on it. ${CHECK_FIRST}`
           : 'Home control could not start the Jarvis helper. Run /jarvis setup to repair it.',
       )
     }
@@ -424,14 +556,20 @@ export class HomeControl {
       )
       const answer = lastJsonLine(run.stdout)
       if (typeof answer?.text === 'string' && answer.text.trim() !== '') {
-        if (answer.opened !== true || audience === 'user') return answer.text
-        return `${answer.text} The user adds or pairs devices there and types any PIN, key or token there, not in the chat.`
+        if (audience === 'user') return answer.text
+        if (answer.opened === true) {
+          return `${answer.text} The user adds or pairs devices there and types any PIN, key or token there, not in the chat.`
+        }
+        // The helper's own words name the command to run by hand.
+        return `The home setup window did not open. ${answer.text.trim()}\n${SETUP_BY_HAND}`
       }
       engine.debug(`jarvis: home open-setup exited ${run.exitCode} with no answer`)
     } catch (error) {
       engine.debug(`jarvis: home open-setup failed: ${describeError(error)}`)
     }
-    return `The home setup window did not open. To open it yourself, run this in a terminal: ${manual}`
+    return audience === 'user'
+      ? `The home setup window did not open. To open it yourself, run this in a terminal: ${manual}`
+      : `The home setup window did not open. It can be opened by hand, in a terminal: ${manual}\n${SETUP_BY_HAND}`
   }
 
   private unavailable(audience: Audience): string | undefined {
@@ -446,7 +584,7 @@ export class HomeControl {
   }
 
   private helperFailure(code: string, message: string): string {
-    if (code === 'timeout') return 'The Jarvis helper did not answer in time; the device may still act on it.'
+    if (code === 'timeout') return `The Jarvis helper did not answer in time; the device may still act on it. ${CHECK_FIRST}`
     // An older helper refuses a command it does not know.
     const update = code === 'bad_request' ? ' Run /jarvis setup to update the Jarvis helper.' : ''
     return `Home control failed: ${sentence(clip(message, 300))}${update}`

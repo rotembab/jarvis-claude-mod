@@ -10,6 +10,7 @@ import socket
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ from jarvis_voice.home.base import DriverContext
 from jarvis_voice.home.bravia import KEYS, BraviaClient, BraviaDriver, discover_tvs
 from jarvis_voice.home.model import DeviceRecord, Outcome, Value
 from jarvis_voice.home.service import HomeService
-from jarvis_voice.home.store import HomeStore
+from jarvis_voice.home.store import HomeStore, StoreError
 
 from home_fakes import ScriptedPrompter, make_store
 
@@ -93,6 +94,10 @@ class FakeBravia:
         self.muted = False
         self.speaker_ok = True  # False: the sound goes to an external audio system (40800)
         self.external_volume: int | None = None  # an "audioSystem" volume entry when set
+        self.external_muted = False  # that system's mute, which the remote's Mute button toggles
+        self.wol: bool | None = None  # what setWolMode last set
+        self.stall: set[str] = set()  # methods the TV takes in but never answers
+        self.released = threading.Event()  # lets stalled requests go when the fake stops
         self.asleep = False  # True: no Remote start, the TV is off the network
         self.not_found = 0  # how many requests get a 404 (WebApiCore restarting)
         self.auth_shape = "http"  # how a wrong key is refused: "http" 403 or "json" error 403
@@ -149,6 +154,10 @@ class FakeBravia:
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 with tv.lock:
                     answer = tv.answer(self.path, list(self.headers.items()), body)
+                if answer == "stall":
+                    tv.released.wait(10)
+                    self.close_connection = True
+                    return
                 if answer is None:
                     self.close_connection = True  # asleep: drop the connection unanswered
                     return
@@ -171,6 +180,7 @@ class FakeBravia:
         self._thread.start()
 
     def stop(self) -> None:
+        self.released.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -179,7 +189,7 @@ class FakeBravia:
 
     # -- requests
 
-    def answer(self, path: str, headers: list[tuple[str, str]], body: bytes) -> tuple[int, bytes, str] | None:
+    def answer(self, path: str, headers: list[tuple[str, str]], body: bytes) -> tuple[int, bytes, str] | str | None:
         names = [name for name, _ in headers]
         self.paths.append(path)
         self.header_names.append(names)
@@ -202,6 +212,8 @@ class FakeBravia:
         if not isinstance(params, list) or not isinstance(ident, int) or ident < 1 or "version" not in request:
             self.problems.append(f"malformed request {request}")
         self.calls.append((path.removeprefix("/sony/"), method, params))
+        if method in self.stall:
+            return "stall"
         if not key_ok:
             if self.auth_shape == "http":
                 return 403, b"Forbidden", "text/plain"
@@ -235,6 +247,8 @@ class FakeBravia:
             self.power = "standby"
         if self.external_volume is not None and code in (CODES["VolumeUp"], CODES["VolumeDown"]):
             self.external_volume += 1 if code == CODES["VolumeUp"] else -1
+        if code == CODES["Mute"]:
+            self.external_muted = not self.external_muted
         return 200, b"", "text/xml"
 
     def _rpc(self, service: str, method: str, params: list[Any], version: str) -> Any:
@@ -248,6 +262,11 @@ class FakeBravia:
                 return 3
             self.power = "active" if first["status"] else "standby"
             return []
+        if (service, method) == ("system", "setWolMode"):
+            if not isinstance(first.get("enabled"), bool):
+                return 3
+            self.wol = first["enabled"]
+            return []
         if (service, method) == ("system", "getSystemInformation"):
             return [{"product": "TV", "model": "KD-55X85J", "macAddr": MAC.upper(), "name": "BRAVIA", "serial": "0"}]
         if (service, method) == ("system", "getRemoteControllerInfo"):
@@ -258,7 +277,14 @@ class FakeBravia:
                 {"target": "headphone", "volume": 5, "mute": False, "maxVolume": 100, "minVolume": 0},
             ]
             if self.external_volume is not None:
-                entries.append({"target": "audioSystem", "volume": self.external_volume, "maxVolume": 50})
+                entries.append(
+                    {
+                        "target": "audioSystem",
+                        "volume": self.external_volume,
+                        "mute": self.external_muted,
+                        "maxVolume": 50,
+                    }
+                )
             return [entries]
         if (service, method) == ("audio", "setAudioVolume"):
             wanted = first.get("volume")
@@ -274,6 +300,8 @@ class FakeBravia:
         if (service, method) == ("audio", "setAudioMute"):
             if not isinstance(first.get("status"), bool):
                 return 3
+            if not self.speaker_ok:
+                return 40800
             self.muted = first["status"]
             return [0]
         if (service, method) == ("avContent", "getPlayingContentInfo"):
@@ -506,6 +534,28 @@ def test_turn_on_gives_up_in_time_when_the_tv_never_answers(
     assert len(tv.paths) >= 2  # it kept asking until its time was up
 
 
+def test_turn_on_says_a_woken_tv_may_still_be_starting(
+    tmp_path: Path, tv: FakeBravia, woken: list[tuple[str, str | None]]
+) -> None:
+    """The magic packet went out, or the API answered 404 while it restarted, but the TV did
+    not answer before the call's time ran out: a Google TV can take 15-30 s to boot."""
+    starting = Outcome.fail(
+        "timeout",
+        "The Sony TV has not answered yet; it may still be starting. "
+        "If it stays off, check that Remote start is on in the TV's settings.",
+    )
+    driver, store = add_tv(tmp_path, tv)
+    driver.turn_on_budget_s = 0.8
+    tv.asleep = True
+    assert run(driver, store, "turn_on") == starting
+    assert woken == [(MAC, "127.0.0.1")]
+    driver, store = add_tv(tmp_path, tv, mac=None)
+    driver.turn_on_budget_s = 0.8
+    tv.asleep, tv.not_found = False, 1000
+    assert run(driver, store, "turn_on") == starting
+    assert len(woken) == 1  # no MAC this time
+
+
 def test_turn_on_falls_back_to_the_wakeup_button(
     tmp_path: Path, tv: FakeBravia, woken: list[tuple[str, str | None]]
 ) -> None:
@@ -561,6 +611,29 @@ def test_volume_on_an_external_audio_system_uses_the_remote_buttons(tmp_path: Pa
     tv.external_volume = 10  # of 50
     assert run(driver, store, "set_volume", 30) == Outcome.done("Set the Sony TV's sound system to about 30%.")
     assert tv.external_volume == 15
+
+
+def test_mute_on_an_external_audio_system_presses_mute_only_when_needed(tmp_path: Path, tv: FakeBravia) -> None:
+    """The remote's Mute button toggles, so it is pressed only when the audio system's own
+    state is not the one asked for."""
+    driver, store = add_tv(tmp_path, tv, ircc_codes=CODES)
+    tv.speaker_ok, tv.external_volume = False, 10  # setAudioMute answers 40800 too
+    assert run(driver, store, "unmute") == Outcome.done("The Sony TV's sound system is not muted.")
+    assert CODES["Mute"] not in tv.ircc and tv.external_muted is False
+    assert run(driver, store, "mute") == Outcome.done("Muted the Sony TV's sound system.")
+    assert tv.external_muted is True
+    assert run(driver, store, "mute") == Outcome.done("The Sony TV's sound system is already muted.")
+    assert run(driver, store, "unmute") == Outcome.done("Unmuted the Sony TV's sound system.")
+    assert tv.external_muted is False and tv.ircc.count(CODES["Mute"]) == 2
+    # Without the system's own entry its state is unknown: one press, and the answer says so.
+    tv.external_volume = None
+    assert run(driver, store, "unmute") == Outcome.done(
+        "Pressed Mute on the Sony TV. It can't say whether its sound system is now muted."
+    )
+    assert tv.ircc.count(CODES["Mute"]) == 3
+    del tv.codes["Mute"]
+    driver, store = add_tv(tmp_path, tv, ircc_codes={"Home": CODES["Home"]})
+    assert run(driver, store, "mute") == Outcome.fail("unsupported", "The Sony TV can't mute its sound system.")
 
 
 # --------------------------------------------------------------------------- remote buttons
@@ -706,6 +779,93 @@ def test_an_unreachable_tv_is_off_or_unreachable(tmp_path: Path, tv: FakeBravia)
     assert run(driver, store, "set_input", "HDMI 1") == gone
 
 
+class SilentTv:
+    """Takes connections in and never answers: a frozen WebApiCore, or a TV in Wi-Fi standby."""
+
+    def __init__(self) -> None:
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.05)
+        self.address = f"127.0.0.1:{self.sock.getsockname()[1]}"
+        self.held: list[socket.socket] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.held.append(connection)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(2)
+        for connection in self.held:
+            connection.close()
+        self.sock.close()
+
+
+def test_a_silent_tv_never_holds_a_call_past_its_budget(
+    tmp_path: Path, tv: FakeBravia, woken: list[tuple[str, str | None]]
+) -> None:
+    """Each request's timeout is clamped to what is left of the call's budget, which stays
+    CALL_MARGIN_S under the service's limit. Scaled down here: a 2.5 s limit, so a 1 s budget;
+    without the clamp a 2 s poll or a 10 s REST timeout would run past it."""
+    silent = SilentTv()
+    driver, store = add_tv(tmp_path, tv, address=silent.address, ircc_codes=CODES)
+    driver.ctx.call_timeout = 2.5
+    driver.turn_on_budget_s = bravia.TURN_ON_BUDGET_S
+    device = device_of(store)
+
+    def timed(command: str) -> tuple[Outcome, float]:
+        started = time.monotonic()
+        if command == "status":
+            outcome = driver.status(device)
+        else:
+            outcome = driver.run(device, command, "Netflix" if command == "launch_app" else None)
+        return checked(outcome), time.monotonic() - started
+
+    commands = ["status", "turn_on", "toggle", "launch_app", "home"]
+    try:
+        with ThreadPoolExecutor(len(commands)) as pool:  # side by side, to keep the test short
+            results = dict(zip(commands, pool.map(timed, commands), strict=True))
+    finally:
+        silent.close()
+    assert len(silent.held) >= len(commands)  # every connection was taken in, then left unanswered
+    for command, (outcome, elapsed) in results.items():
+        assert elapsed < 1.0 + 0.7, command
+        if command in ("turn_on", "toggle"):
+            assert outcome.code == "timeout" and "may still be starting" in outcome.text
+        else:
+            assert outcome == Outcome.fail("unreachable", "The Sony TV is off or unreachable."), command
+
+
+def test_call_budgets_stay_under_the_service_limit(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    limit = driver.ctx.call_timeout - bravia.CALL_MARGIN_S
+    for budget in (bravia.CALL_BUDGET_S, bravia.TURN_ON_BUDGET_S, 60.0):
+        session = driver._open(device_of(store), budget)
+        assert isinstance(session, bravia._Session) and session.client.remaining() <= limit
+
+
+def test_a_timeout_after_the_tv_answered_is_not_called_off(tmp_path: Path, tv: FakeBravia) -> None:
+    """It listed its apps, then took too long to start one: it is on and slow, not off."""
+    driver, store = add_tv(tmp_path, tv)
+    driver.ctx.call_timeout = 2.5  # a 1 s budget
+    tv.stall = {"setActiveApp"}
+    assert run(driver, store, "launch_app", "Netflix") == Outcome.fail(
+        "timeout", "The Sony TV did not answer in time; it may still act on it."
+    )
+    tv.stall = {"getPlayingContentInfo"}
+    assert status(driver, store) == Outcome.fail("timeout", "The Sony TV did not answer in time.")
+
+
 def test_a_restarting_api_gets_one_more_try(tmp_path: Path, tv: FakeBravia) -> None:
     driver, store = add_tv(tmp_path, tv)
     tv.not_found = 1
@@ -762,6 +922,7 @@ class FakeSsdp:
         self.sock.settimeout(0.05)
         self.address = self.sock.getsockname()
         self.searches: list[bytes] = []
+        self.senders: list[tuple[str, int]] = []
         self.replies = [
             f"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:{tv.port}/dmr.xml\r\nST: {bravia.SSDP_ST}\r\n\r\n",
             f"HTTP/1.1 200 OK\r\nLocation: http://127.0.0.1:{tv.port}/soundbar.xml\r\nST: {bravia.SSDP_ST}\r\n\r\n",
@@ -781,6 +942,7 @@ class FakeSsdp:
             except OSError:
                 return
             self.searches.append(data)
+            self.senders.append(sender)
             for reply in self.replies:
                 self.sock.sendto(reply.encode(), sender)
 
@@ -800,6 +962,20 @@ def test_discovery_keeps_only_tvs(tv: FakeBravia) -> None:
     assert responder.searches and b"ST: urn:schemas-sony-com:service:ScalarWebAPI:1" in responder.searches[0]
 
 
+def test_discovery_also_searches_from_each_adapter(tv: FakeBravia, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multicast leaves through one adapter only, so the search also goes out from each of the
+    computer's private addresses (the loopback stands in for one here)."""
+    responder = FakeSsdp(tv)
+    monkeypatch.setattr(bravia, "SSDP_ADDRESS", responder.address)
+    monkeypatch.setattr(bravia, "_lan_addresses", lambda: ["127.0.0.1"])
+    try:
+        found = discover_tvs(0.5)
+    finally:
+        responder.close()
+    assert len(set(responder.senders)) == 2 and len(responder.searches) == 4
+    assert [f.address for f in found] == ["127.0.0.1"]  # answered on both sockets, listed once
+
+
 def wizard_ctx(tmp_path: Path) -> DriverContext:
     return DriverContext(make_store(tmp_path), tmp_path)
 
@@ -808,6 +984,7 @@ def wizard_ctx(tmp_path: Path) -> DriverContext:
 def fast_setup(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bravia, "RETRY_WAIT_S", 0.05)
     monkeypatch.setattr(bravia, "DISCOVERY_S", 0.5)
+    monkeypatch.setattr(bravia, "_lan_addresses", lambda: [])  # never from the real adapters in tests
 
 
 def test_wizard_adds_a_tv(tmp_path: Path, tv: FakeBravia, fast_setup: None) -> None:
@@ -821,6 +998,7 @@ def test_wizard_adds_a_tv(tmp_path: Path, tv: FakeBravia, fast_setup: None) -> N
     assert device.settings["ircc_path"] == "/sony/IRCC" and device.settings["scheme"] == "http"
     assert device.settings["ircc_codes"] == CODES
     assert device.settings["inputs"][1]["label"] == "Apple TV"
+    assert tv.wol is True  # Wake-on-LAN switched on, as Home Assistant does
     assert ctx.store.secret("bravia:bravia-sony-tv") == {"psk": PSK}
     assert PSK not in ctx.store.devices_path.read_text(encoding="utf-8")
     assert "Connected to the Sony KD-55X85J. It is on." in ui.said
@@ -905,6 +1083,27 @@ def test_wizard_stopped_halfway_saves_nothing(tmp_path: Path, tv: FakeBravia, fa
     with pytest.raises(EOFError):
         bravia.wizard(ui, ctx)
     assert ctx.store.load().devices == [] and ctx.store.secret_keys() == []
+
+
+def test_wizard_leaves_no_key_behind_when_the_tv_cannot_be_saved(
+    tmp_path: Path, tv: FakeBravia, fast_setup: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = wizard_ctx(tmp_path)
+
+    def cannot_write(_mutate: Any) -> None:
+        raise StoreError("could not write the devices file")
+
+    monkeypatch.setattr(ctx.store, "update", cannot_write)
+    ui = ScriptedPrompter([False, tv.address, PSK, "", "Lounge"])
+    with pytest.raises(StoreError):
+        bravia.wizard(ui, ctx)
+    assert ctx.store.secret_keys() == []
+    # A TV set up before keeps its old key.
+    record = DeviceRecord(TV_ID, "bravia", "Sony TV", "tv", settings={"address": tv.address})
+    ctx.store.set_secret(record.secret_key, {"psk": "the-old-fake-psk"})
+    with pytest.raises(StoreError):
+        bravia._save(ctx, record, PSK)
+    assert ctx.store.secret(record.secret_key) == {"psk": "the-old-fake-psk"}
 
 
 def test_wizard_rejects_bad_addresses_and_keys(tmp_path: Path, tv: FakeBravia, fast_setup: None) -> None:

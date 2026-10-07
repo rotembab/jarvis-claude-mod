@@ -21,6 +21,8 @@ import type {
   UiBlitArgs,
 } from 'claude-code'
 
+import type { ToolVerdict } from './engine'
+
 export const WINDOWS_ENV = {
   OS: 'Windows_NT',
   USERPROFILE: 'C:\\Users\\Rotem',
@@ -172,13 +174,25 @@ export type World = {
   toolRefusal: string | undefined
   /** The questions `$.ui.ask` put to the user (AskUserQuestion). */
   asked: string[]
+  /** Each of those dialogs as drawn: its header, its option labels in order, and whether it took several. */
+  dialogs: AskedDialog[]
   /** The user's answer to `$.ui.ask`: a label, or text typed under "Other"; undefined dismisses the dialog. */
   askAnswer: string | undefined
+  /** When set, the answer comes this long after the dialog opened, on the mocked clock. */
+  askDelayMs: number | undefined
+  /** Every `$.tool.check` question, and the verdict it gets (default: the engine's plain "ask"). */
+  checks: { tool: string; input: unknown }[]
+  toolCheck: (tool: string, input: unknown) => ToolVerdict | Promise<ToolVerdict>
+  /** When set, the helper answers a `home` command this long after it came, on the mocked clock. */
+  homeDelayMs: number | undefined
   /** Every `$.process.run` the mod made. */
   runs: RunCall[]
   /** Answers a `$.process.run` the world does not know; undefined: exit 127 (no such program). */
   onRun: (call: RunCall) => RunAnswer | undefined
 }
+
+/** One question dialog, as `$.ui.ask` raised it. */
+export type AskedDialog = { question: string; header: string | undefined; options: string[]; multiSelect: boolean }
 
 export type WorldOptions = {
   env?: Record<string, string>
@@ -235,7 +249,12 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     tools: [],
     toolRefusal: undefined,
     asked: [],
+    dialogs: [],
     askAnswer: undefined,
+    askDelayMs: undefined,
+    checks: [],
+    toolCheck: () => ({ decision: 'ask' }),
+    homeDelayMs: undefined,
     runs: [],
     onRun: () => undefined,
   }
@@ -250,11 +269,25 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     return { value: { tool: `mcp__jarvis__${e.name}` } }
   })
   // `$.ui.ask` is a call of the AskUserQuestion tool: the person's answer, or a dismissal.
-  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
-    const question = e.questions[0]?.question ?? ''
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+    const [first] = e.questions
+    const question = first?.question ?? ''
     w.asked.push(question)
+    w.dialogs.push({
+      question,
+      header: first?.header,
+      options: (first?.options ?? []).map(option => option.label),
+      multiSelect: first?.multiSelect === true,
+    })
+    if (w.askDelayMs !== undefined) await clock.sleep(w.askDelayMs)
     if (w.askAnswer === undefined) return { deny: 'dismissed' }
     return { result: { questions: e.questions, answers: { [question]: w.askAnswer } } }
+  })
+  // The engine's verdict for the session's rules and mode; the default is its
+  // plain "ask" for a tool nothing allows yet (default mode, no rule).
+  on('tool.check', async ($, e) => {
+    w.checks.push({ tool: e.tool, input: e.input })
+    return await w.toolCheck(e.tool, e.input)
   })
   on('ui.status', ($, e) => {
     w.statuses.push(e.text)
@@ -321,7 +354,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     const code = yield* child.chunks()
     return { value: { code, signal: null } }
   })
-  on('http.fetch', ($, e) => {
+  on('http.fetch', async ($, e) => {
     const url = new URL(e.url)
     const command: SentCommand = {
       name: url.pathname.replace(/^\/v1\//, ''),
@@ -330,6 +363,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       headers: e.init?.headers ?? {},
     }
     w.commands.push(command)
+    if (command.name === 'home' && w.homeDelayMs !== undefined) await clock.sleep(w.homeDelayMs)
     const { status, body } = w.respond(command)
     return { value: { status, ok: status < 300, headers: {}, text: JSON.stringify(body) } }
   })

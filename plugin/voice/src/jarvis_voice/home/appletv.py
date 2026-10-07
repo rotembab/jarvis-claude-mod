@@ -26,6 +26,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -58,6 +59,7 @@ FRESH_S = 3.0  # a connection this young may not have reported them yet
 APPS_TTL_S = 600.0  # how long the app list is reused before asking again
 PIN_TRIES = 3  # more failed PINs can lock pairing until the Apple TV restarts
 PIN_WAIT_S = 180.0  # an abandoned PIN dialog is closed after this long
+PIN_RETRY_WAIT_S = 3.0  # after a wrong PIN the Apple TV turns new pairings away for a moment (HAP back-off)
 PAIR_STEP_S = 20.0
 
 ALLOW_ACCESS = (
@@ -123,6 +125,10 @@ class _StillConnecting(Exception):
     """The connect is still running in the background when the caller's time is up."""
 
 
+class _Closed(Exception):
+    """The driver was closed (a reload, or the helper stopping) while the command waited for its connection."""
+
+
 def _is_connection_loss(exc: BaseException) -> bool:
     """Whether ``exc`` means the link is gone (reconnect), rather than the Apple TV refusing a command.
 
@@ -155,6 +161,8 @@ def _failure(exc: BaseException, device: DeviceRecord, command: str) -> Outcome:
     name = device.name
     if isinstance(exc, _NotFound):
         return _unreachable(device, command)
+    if isinstance(exc, _Closed):
+        return Outcome.fail("failed", f"Home control was restarting, so the {name} didn't get that. Ask again.")
     if isinstance(exc, _NoRemote):
         return Outcome.fail(
             "unreachable",
@@ -204,6 +212,7 @@ class _Conn(DeviceListener):
         self.creds = creds
         self.opened_at = opened_at
         self.alive = True
+        self.put_to_sleep = False  # Jarvis sent Sleep on it (and no Wake since)
 
     def connection_lost(self, exception: Exception) -> None:
         self._gone("lost")
@@ -304,9 +313,16 @@ class _Link:
         return _unreachable(device, command)  # not reached: the loop always returns
 
     async def _ready(self, device: DeviceRecord, creds: str, deadline: float) -> _Conn:
-        """The open connection, or a new one; waits for a connect only as long as the caller can."""
+        """The open connection, or a new one; waits for a connect only as long as the caller can.
+
+        Joins a connect already running and starts at most one of its own, so a link closed meanwhile,
+        or an Apple TV that drops each new session, cannot set off one connect after another.
+        """
         loop = asyncio.get_running_loop()
+        started = False
         while True:
+            if self.closed:
+                raise _Closed
             conn = self.conn
             if conn is not None and conn.alive and conn.creds == creds:
                 return conn
@@ -314,9 +330,13 @@ class _Link:
                 self.discard(conn)  # dead, or the Apple TV was paired again since it opened
             task = self.opening
             if task is None:
+                if started:
+                    # The connection this call opened was gone before it could be used.
+                    raise atv_errors.ConnectionLostError("the new connection was dropped")
                 task = loop.create_task(self._open(device, creds))
                 task.add_done_callback(self._opened)
                 self.opening = task
+                started = True
             left = deadline - loop.time()
             wait = left - min(COMMAND_RESERVE_S, left / 4)
             if wait <= 0:
@@ -466,6 +486,9 @@ async def _has_feature(conn: _Conn, feature: Any) -> bool:
 
 async def _status(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
     state = await _settled(conn, lambda: conn.atv.power.power_state, lambda s: s is not PowerState.Unknown)
+    old = asyncio.get_running_loop().time() - conn.opened_at > FRESH_S
+    if state is PowerState.On and old and not conn.put_to_sleep:
+        await _still_answers(conn)
     if state is PowerState.On:
         return Outcome.done(f"The {device.name} is on.")
     if state is PowerState.Off:
@@ -474,13 +497,30 @@ async def _status(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
     return Outcome.done(f"I can't tell whether the {device.name} is on: it didn't report its power state.")
 
 
+async def _still_answers(conn: _Conn) -> None:
+    """Proves an older connection still answers before its pushed "on" is believed.
+
+    Companion has no keepalive, so a link left half-open (the Apple TV unplugged or off the
+    network) keeps the last pushed state. Only a connection loss counts: any reply, even a
+    refusal, proves the link. A request wakes a sleeping Apple TV, so this runs only when it
+    says "on" and Jarvis has not put it to sleep (a missed "asleep" push would leave "on").
+    """
+    try:
+        await _app_list(conn, fresh=True)  # read-only, and what launch_app asks anyway
+    except Exception as exc:
+        if _is_connection_loss(exc):
+            raise
+
+
 async def _turn_on(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
     await conn.atv.power.turn_on()
+    conn.put_to_sleep = False
     return Outcome.done(f"The {device.name} is waking up.")
 
 
 async def _turn_off(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
     await conn.atv.power.turn_off()
+    conn.put_to_sleep = True
     return Outcome.done(f"The {device.name} is going to sleep.")
 
 
@@ -702,6 +742,8 @@ class AppleTvDriver(Driver):
         return self._call(device, op, value, command=command, retry=retry)
 
     def status(self, device: DeviceRecord) -> Outcome:
+        # With no open connection this connects, and the Apple TV wakes for any request (and the TV
+        # with it over HDMI-CEC): there is no passive way to ask. Hence on demand only, never polled.
         return self._call(device, _status, None, command="status", retry=True)
 
     def describe(self) -> str | None:
@@ -922,6 +964,9 @@ def _pair(ui: Prompter, runner: AsyncRunner, api: Any, conf: Any, rp_id: str) ->
     """Pairs Companion: the TV shows a PIN, the user types it. Returns the credentials, or None."""
     companion = conf.get_service(Protocol.Companion)
     for attempt in range(1, PIN_TRIES + 1):
+        if attempt > 1:
+            # Started straight after a wrong PIN, a new pairing meets the Apple TV's back-off and is refused.
+            time.sleep(PIN_RETRY_WAIT_S)
         # Stale credentials would make pairing start with a verify that fails.
         companion.credentials = None
         try:
@@ -935,7 +980,7 @@ def _pair(ui: Prompter, runner: AsyncRunner, api: Any, conf: Any, rp_id: str) ->
                 runner.call(handler.begin(), PAIR_STEP_S)
             except Exception as exc:  # noqa: BLE001 - said in words
                 log.info("apple tv setup: the Apple TV did not start pairing (%s)", type(exc).__name__)
-                ui.say(_begin_failure(exc))
+                ui.say(_begin_failure(exc, after_wrong_pin=attempt > 1))
                 return None
             ui.say(
                 "The TV now shows a 4-digit code. If no code appears, press Enter to stop, "
@@ -958,8 +1003,8 @@ def _pair(ui: Prompter, runner: AsyncRunner, api: Any, conf: Any, rp_id: str) ->
             except (atv_errors.PairingError, atv_errors.AuthenticationError):
                 if attempt < PIN_TRIES:
                     ui.say(
-                        "That code didn't work. The TV will show a new one. Careful: several wrong codes "
-                        "can block pairing until the Apple TV restarts."
+                        "That code didn't work. The TV will show a new one in a few seconds. Careful: several "
+                        "wrong codes can block pairing until the Apple TV restarts."
                     )
                     continue
                 ui.say(
@@ -981,9 +1026,15 @@ def _pair(ui: Prompter, runner: AsyncRunner, api: Any, conf: Any, rp_id: str) ->
     return None
 
 
-def _begin_failure(exc: BaseException) -> str:
+def _begin_failure(exc: BaseException, *, after_wrong_pin: bool = False) -> str:
     if isinstance(exc, atv_errors.ConnectionFailedError | OSError):
         return "Couldn't reach the Apple TV to pair. Check it is on and on the same network, then try again."
+    if after_wrong_pin:
+        # Its back-off after a wrong PIN grows with each one; pyatv reports it as a plain refusal.
+        return (
+            "The Apple TV is holding off pairing after the wrong code. Wait a minute, then add it again. "
+            f"If it still refuses: {RESTART_HINT}"
+        )
     return f"The Apple TV refused to start pairing. {ALLOW_ACCESS} If it still fails: {RESTART_HINT}"
 
 
