@@ -44,6 +44,8 @@ KEYS = {
     "fan": "FAKE-KEY-FAN0-01",
     "robot": "FAKE-KEY-ROBO-01",
     "lost": "FAKE-KEY-LOST-01",
+    "fbot": "FAKE-KEY-FBOT-01",
+    "hub2": "FAKE-KEY-HUB2-01",
 }
 SECRETS = [*KEYS.values(), "ACCESS-TOKEN-1", "REFRESH-TOKEN-1", "ACCESS-TOKEN-2", "REFRESH-TOKEN-2", "UC-TEST-0001"]
 LOGIN = {
@@ -81,6 +83,11 @@ class Phys:
     errors: list[str] = field(default_factory=list)  # Err codes for the next requests
     write_errors: list[str] = field(default_factory=list)  # Err codes for the next writes only
     device22: bool = False  # answers a status query only for the DPs it is asked for
+    # A device behind a hub: whether the hub reports a write back for it, takes writes without passing them on,
+    # and answers a status query for it at all (many hubs never do for a Bluetooth device).
+    echoes: bool = True
+    ignores_writes: bool = False
+    reads: bool = True
 
 
 class FakeClock:
@@ -99,6 +106,8 @@ class FakeNet:
         self.calls: list[tuple[str, str, Any]] = []
         self.opened: list[dict[str, Any]] = []
         self.closed = 0
+        self.nowait: list[tuple[str, dict[str, Any]]] = []  # writes sent once, without waiting for a reply
+        self.probes: list[str] = []  # devices that probed their DPs over the network (set_version(3.2), none known)
         # When set, a request to an address where nothing answers takes its worst case on this clock: two
         # attempts, each a connect and receives of up to T (4T in all, 8T for v3.4+, as tuya.py counts).
         self.clock: FakeClock | None = None
@@ -108,7 +117,7 @@ class FakeNet:
         return phys
 
     def writes(self, tuya_id: str) -> list[Any]:
-        return [payload for device, op, payload in self.calls if device == tuya_id and op != "status"]
+        return [payload for device, op, payload in self.calls if device == tuya_id and op.startswith("set_")]
 
 
 def _error(code: str, key: str) -> dict[str, Any]:
@@ -139,11 +148,14 @@ class FakeDevice:
         max_simultaneous_dps: int = 0,
     ) -> None:
         self.id, self.address, self._key, self.parent = dev_id, address, local_key, parent
-        self.version = parent.version if parent is not None else version
         self.cid = cid or node_id
         self.dev_type = dev_type
         self.timeout = connection_timeout
         self.dps_to_request: dict[str, None] = {}
+        self.echoes: deque[dict[str, Any]] = deque()  # what the hub reported back on this session
+        # As tinytuya: a child takes its parent's version as it is built, through set_version.
+        self.version = version
+        self.set_version(parent.version if parent is not None else version)
         self.net.opened.append(
             {
                 "id": dev_id,
@@ -163,9 +175,23 @@ class FakeDevice:
 
     def set_version(self, version: float) -> None:
         self.version = version
+        if float(version) == 3.2:
+            # As tinytuya: 3.2 is 3.3 with the device22 dialect, and with no DPs to ask for it probes for them.
+            self.dev_type = "device22"
+            if not self.dps_to_request:
+                self.net.probes.append(self.id)
 
     def set_socketTimeout(self, seconds: float) -> None:  # noqa: N802 - tinytuya's name
         self.timeout = seconds
+
+    def receive(self) -> Any:
+        """A read that never sends: what the hub reported back, or None after the socket's timeout."""
+        self.net.calls.append((self.id, "receive", None))
+        if self.echoes:
+            return self.echoes.popleft()
+        if self.net.clock is not None:
+            self.net.clock.now += self.timeout
+        return None
 
     def _target(self) -> Phys | dict[str, Any]:
         gateway = self.parent or self
@@ -188,6 +214,8 @@ class FakeDevice:
         target = self._target()
         if isinstance(target, dict):
             return target
+        if not target.reads:
+            return None  # as tinytuya, when the hub answers only for another device, or not at all
         if target.device22:
             if self.dev_type != "device22":
                 # As tinytuya: the reply says "data unvalid", so it switches dialect and asks again for DP 1 only.
@@ -201,13 +229,20 @@ class FakeDevice:
         phys = self.net.devices.get(gateway.id)
         return _error(phys.write_errors.pop(0), gateway._key) if phys is not None and phys.write_errors else None
 
-    def set_value(self, index: str, value: Any) -> Any:
+    def set_value(self, index: str, value: Any, nowait: bool = False) -> Any:
         self.net.calls.append((self.id, "set_value", {str(index): value}))
+        if nowait:
+            self.net.nowait.append((self.id, {str(index): value}))
         target = self._write_error() or self._target()
         if isinstance(target, dict):
-            return target
-        target.dps[str(index)] = value
-        return {"dps": {str(index): value}}
+            return target  # nothing went out: tinytuya returns its error even with nowait
+        if not target.ignores_writes:
+            target.dps[str(index)] = value
+        if not nowait:
+            return {"dps": {str(index): value}}
+        if target.echoes and not target.ignores_writes:
+            self.echoes.append({"dps": {str(index): value}})
+        return None
 
     def set_multiple_values(self, data: dict[str, Any]) -> Any:
         self.net.calls.append((self.id, "set_multiple_values", dict(data)))
@@ -501,13 +536,15 @@ FAN_POINTS = [
     dp(2, "mode", "Enum", {"range": ["normal", "nature", "sleep"]}),
     dp(3, "fan_speed", "Enum", {"range": ["1", "2", "3", "4"]}),
 ]
-# A Fingerbot: a robot finger on a wall switch. In click mode each change of "switch" is one press.
+# A Fingerbot (its Bluetooth data points): a robot finger on a wall switch. In click mode each change of "switch"
+# is one press; in switch mode the arm stays where "switch" sends it.
 FINGER_POINTS = [
-    dp(1, "switch", "Boolean"),
-    dp(2, "mode", "Enum", {"range": ["click", "switch", "program"]}),
-    dp(3, "click_sustain_time", "Integer", {"min": 2, "max": 10}),
+    dp(2, "switch", "Boolean"),
+    dp(8, "mode", "Enum", {"range": ["click", "switch", "program"]}),
     dp(9, "arm_down_percent", "Integer", {"min": 51, "max": 100}),
+    dp(10, "click_sustain_time", "Integer", {"min": 0, "max": 10}),
     dp(12, "battery_percentage", "Integer", {"min": 0, "max": 100, "unit": "%"}, ro=True),
+    dp(15, "arm_up_percent", "Integer", {"min": 0, "max": 50}),
 ]
 
 
@@ -1128,15 +1165,45 @@ def test_a_sub_device_without_a_node_id_is_reached_by_its_uuid(home: Home) -> No
     assert outcome.code == "needs_setup" and not home.net.opened
 
 
-def add_fingerbots(home: Home) -> None:
-    """A Fingerbot behind the Zigbee hub's Bluetooth side (reachable), and one paired to the phone only."""
+def add_fingerbots(home: Home, mode: str | None = "click") -> Phys:
+    """A Fingerbot behind the Zigbee hub's Bluetooth side (reachable), and one paired to the phone only. ``mode``:
+    the mode the cloud reports and the device is in (None: neither says)."""
+    status = {"mode": mode} if mode else {}
     home.cloud.devices += [
-        cloud_device("finger-id", "Bedroom Fingerbot", "szjqr", KEYS["hub"], FINGER_POINTS, sub=True, node_id="f1"),
-        cloud_device("ble-id", "Desk Fingerbot", "szjqr", "FAKE-KEY-BLE0-01", FINGER_POINTS),
+        cloud_device(
+            "finger-id", "Bedroom Fingerbot", "szjqr", KEYS["hub"], FINGER_POINTS, sub=True, node_id="f1", status=status
+        ),
+        cloud_device("ble-id", "Desk Fingerbot", "szjqr", "FAKE-KEY-BLE0-01", FINGER_POINTS, status=status),
     ]
     home.cloud.rooms["finger-id"] = "Bedroom"
-    child = Phys("finger-id", "", KEYS["hub"], 3.3, {"1": False, "2": "click", "3": 2, "9": 80, "12": 80})
+    values: dict[str, Any] = {"2": False, "9": 80, "10": 0, "12": 80, "15": 0}
+    if mode:
+        values["8"] = mode
+    child = Phys("finger-id", "", KEYS["hub"], 3.3, values)
     home.net.devices["hub-id"].children["f1"] = child
+    return child
+
+
+def link_fingerbot(
+    home: Home,
+    mode: str | None = "switch",
+    *,
+    alias: str = "bedroom light",
+    lit: str = "",
+    cloud: bool = False,
+    check: bool = False,
+) -> tuple[ScriptedPrompter, Phys]:
+    """Links the account with the Fingerbots in ``mode``; ``lit``: the answer to whether what it switches is on
+    when the app shows On (asked in switch mode only; empty keeps the default); ``check``: run the check after
+    saving."""
+    child = add_fingerbots(home, mode)
+    answers: list[Any] = ["UC-TEST-0001", cloud, "Kitchen light", "", alias]
+    if mode == "switch":
+        answers.append(lit)
+    ui = ScriptedPrompter([*answers, True, check])
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers, f"unused answers: {list(ui.answers)}"
+    return ui, child
 
 
 def test_a_fingerbot_is_a_button_named_for_what_it_presses(home: Home) -> None:
@@ -1145,12 +1212,19 @@ def test_a_fingerbot_is_a_button_named_for_what_it_presses(home: Home) -> None:
     tuya.wizard(ui, home.ctx)
     assert not ui.answers
     assert "What does the Bedroom Fingerbot switch on and off? For example: bedroom light (empty to skip)" in ui.asked
+    assert not any("In the Tuya app" in question for question in ui.asked)  # asked in switch mode only
     finger = home.device("Bedroom Fingerbot")
     assert finger.kind == "button" and finger.aliases == ["bedroom light"] and finger.room == "Bedroom"
     assert finger.settings["parent"] == "hub-id" and finger.settings["node_id"] == "f1"
-    assert {"switch", "mode", "click_sustain_time", "arm_down_percent", "battery_percentage"} <= set(
+    assert finger.settings["button_mode"] == "click" and finger.settings["hub_name"] == "Zigbee hub"
+    assert "switch_inverted" not in finger.settings
+    assert {"switch", "mode", "click_sustain_time", "arm_down_percent", "arm_up_percent", "battery_percentage"} <= set(
         finger.settings["dps"]
     )
+    line = (
+        "  Bedroom Fingerbot (button, Bedroom): through the Zigbee hub at 192.168.1.26; click mode: Jarvis presses it"
+    )
+    assert line in ui.said and tuya.HUB_TIP in ui.said  # the cloud fallback is off
     # Bluetooth only, with no gateway: nothing on the network reaches it, so it is left out, saying why.
     assert "Desk Fingerbot (a Bluetooth device, which Jarvis can reach only through a Tuya Bluetooth" in ui.text
     assert all(d.name != "Desk Fingerbot" for d in home.store.load().devices)
@@ -1167,27 +1241,36 @@ def test_a_fingerbot_is_a_button_named_for_what_it_presses(home: Home) -> None:
 
 
 def test_a_button_presses_and_never_claims_the_light_is_on(home: Home) -> None:
-    add_fingerbots(home)
-    tuya.wizard(ScriptedPrompter(["UC-TEST-0001", False, "Kitchen light", "", "bedroom light", True, False]), home.ctx)
+    _, child = link_fingerbot(home, "click")
     finger = home.device("Bedroom Fingerbot")
-    child = home.net.devices["hub-id"].children["f1"]
     assert command_names(home, "Bedroom Fingerbot") == ["press"]
     (spec,) = home.driver().commands(finger)
-    assert "cannot see the light" in spec.hint
+    assert "cannot see what it switches" in spec.hint
     pressed = (
-        "The Bedroom Fingerbot pressed the bedroom light switch. Jarvis cannot see the light, so it cannot tell "
-        "whether it is now on or off."
+        "The Bedroom Fingerbot pressed the bedroom light switch. Jarvis cannot see the bedroom light, so it cannot "
+        "tell whether it is now on or off."
     )
-    # Each press writes the opposite of what the switch reports, so the finger always sees a change.
+    # Each press writes the opposite of what the switch reports, so the finger always sees a change; each is one
+    # frame, sent once, on a session the hub keeps open to echo it back.
+    home.net.opened.clear()
     assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(pressed)
+    assert [o["persist"] for o in home.net.opened] == [False, False, True, True]  # the read, then the press
     assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(pressed)
-    assert [payload for device, op, payload in home.net.calls if op != "status"][-2:] == [{"1": True}, {"1": False}]
-    # No value to read, or a read that times out: it presses with True.
-    del child.dps["1"]
-    assert run(home, "Bedroom Fingerbot", "press").ok and child.dps["1"] is True
-    child.dps["1"] = True
+    assert home.net.nowait == [("finger-id", {"2": True}), ("finger-id", {"2": False})]
+    assert home.net.writes("finger-id") == [{"2": True}, {"2": False}]
+    # No value to read, or a read that times out: it presses with True, which moves the arm only if the switch was
+    # off, so it does not say for certain that it pressed.
+    blind = (
+        "Jarvis sent the Bedroom Fingerbot a press of the bedroom light switch. It could not read the switch first, "
+        "so the arm may not have moved. Jarvis cannot see the bedroom light, so it cannot tell whether it is now on "
+        "or off."
+    )
+    del child.dps["2"]
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(blind)
+    assert child.dps["2"] is True
     home.net.devices["hub-id"].errors = ["902"]
-    assert run(home, "Bedroom Fingerbot", "press").ok and child.dps["1"] is True
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(blind)
+    assert home.net.nowait[-1] == ("finger-id", {"2": True})
     # A hub that cannot be reached at all is not sent a press that cannot arrive either.
     writes = len(home.net.writes("finger-id"))
     home.net.devices["hub-id"].errors = ["905"]
@@ -1197,7 +1280,7 @@ def test_a_button_presses_and_never_claims_the_light_is_on(home: Home) -> None:
     status = home.driver().status(finger).text
     assert status == (
         "The Bedroom Fingerbot presses the bedroom light switch. It is in click mode. Its battery is at 80%. "
-        "Jarvis cannot see whether the light is on."
+        "Jarvis cannot see whether the bedroom light is on."
     )
     # Through the service: the light's name finds the button, and "click" means press.
     service = HomeService(home.ctx.data_dir, store=home.store, drivers={"tuya": TuyaDriver}, call_timeout=20.0)
@@ -1206,10 +1289,503 @@ def test_a_button_presses_and_never_claims_the_light_is_on(home: Home) -> None:
         assert answer["result"] == "done" and answer["text"] == pressed
         answer = service.handle({"action": "do", "device": "the clicker", "command": "push"})
         assert answer["result"] == "done" and " is on" not in answer["text"]
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "turn on"})
+        assert answer["code"] == "unsupported" and answer["text"].endswith("It can: press.")
         listed = service.handle({"action": "list"})["text"]
         assert "Bedroom Fingerbot (button, Bedroom)" in listed
     finally:
         service.close()
+
+
+def test_button_words_fit_what_it_switches(home: Home) -> None:
+    # Whatever the alias names, not always a light; the sentences add their own "the" and "switch".
+    def button(*aliases: str, mode: str | None = None) -> DeviceRecord:
+        dps = {"switch": {"dp": 2, "type": "bool"}}
+        settings: dict[str, Any] = {"dps": dps, **({"button_mode": mode} if mode else {})}
+        return DeviceRecord("tuya-finger", "tuya", "Fingerbot", "button", aliases=list(aliases), settings=settings)
+
+    assert [tdp.presses(button(a)) for a in ("the hall lamp", "bedroom light switch", "Switch", "lightswitch")] == [
+        "hall lamp",
+        "bedroom light",
+        None,
+        "lightswitch",
+    ]
+    coffee = button("coffee machine")
+    assert tdp.describe_state(coffee, {"2": True}) == (
+        "The Fingerbot presses the coffee machine switch. Jarvis cannot see whether the coffee machine is on."
+    )
+    assert tdp.describe_state(button("The hall lamp switch"), {}) == (
+        "The Fingerbot presses the hall lamp switch. Jarvis cannot see whether the hall lamp is on."
+    )
+    assert tuya._pressed(coffee, read=True) == (
+        "The Fingerbot pressed the coffee machine switch. Jarvis cannot see the coffee machine, so it cannot tell "
+        "whether it is now on or off."
+    )
+    assert tuya._pressed(button(), read=True) == (
+        "The Fingerbot pressed its switch. Jarvis cannot see what it switches, so it cannot tell whether it is now on "
+        "or off."
+    )
+    assert tuya._switched(coffee, True) == "The Fingerbot switched the coffee machine on."
+    assert tuya._switched(button(), False) == "The Fingerbot turned off what it switches."
+    assert tuya._unmoved(button("the fan"), True) == "The Fingerbot did not move: the fan is already on."
+    assert tdp.describe_state(button(mode="switch"), {"2": False}) == (
+        "The Fingerbot is in switch mode, and what it switches is off."
+    )
+    hints = {s.name: s.hint for s in tdp.command_specs(button("coffee machine", mode="switch"))}
+    assert hints["turn_on"] == "switch mode: switches the coffee machine on"
+    assert hints["turn_off"] == "switch mode: switches the coffee machine off"
+    assert "light" not in tdp.command_specs(coffee)[0].hint
+
+
+@pytest.mark.parametrize(
+    ("mode", "commands", "line"),
+    [
+        ("switch", ["turn_on", "turn_off", "toggle"], "switch mode: Jarvis turns it on and off"),
+        ("click", ["press"], "click mode: Jarvis presses it"),
+        ("program", [], "program mode: Jarvis can only read it until you put it in click or switch mode in the app"),
+        (None, ["press"], "Tuya did not say its mode, so Jarvis presses it as in click mode"),
+    ],
+)
+def test_the_mode_is_learnt_at_import(home: Home, mode: str | None, commands: list[str], line: str) -> None:
+    ui, _ = link_fingerbot(home, mode)
+    finger = home.device("Bedroom Fingerbot")
+    assert finger.settings.get("button_mode") == mode
+    assert command_names(home, "Bedroom Fingerbot") == commands
+    assert f"  Bedroom Fingerbot (button, Bedroom): through the Zigbee hub at 192.168.1.26; {line}" in ui.said
+    assert_no_secrets(home.config_text(), ui.text)
+
+
+def test_a_refresh_follows_a_mode_changed_in_the_app(home: Home) -> None:
+    _, child = link_fingerbot(home, "click")
+    cloud = next(d for d in home.cloud.devices if d.id == "finger-id")
+    cloud.status, child.dps["8"] = {"mode": "switch"}, "switch"
+    ui = ScriptedPrompter(["Refresh", "", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers and "is the bedroom light on or off? (on/off)" in ui.asked[-3]
+    assert home.device("Bedroom Fingerbot").settings["button_mode"] == "switch"
+    assert command_names(home, "Bedroom Fingerbot") == ["turn_on", "turn_off", "toggle"]
+    cloud.status, child.dps["8"] = {"mode": "click"}, "click"
+    ui = ScriptedPrompter(["Refresh", True, False])  # click mode: not asked which way round
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers and command_names(home, "Bedroom Fingerbot") == ["press"]
+
+
+def test_switch_mode_turns_on_and_off_and_skips_a_move_when_already_there(home: Home) -> None:
+    ui, child = link_fingerbot(home, check=True)
+    question = "In the Tuya app, when the Bedroom Fingerbot shows On, is the bedroom light on or off? (on/off)"
+    assert question in ui.asked and "switch_inverted" not in home.device("Bedroom Fingerbot").settings
+    # The setup check reads it through the hub, in switch mode's words.
+    assert "  The Bedroom Fingerbot is in switch mode and has the bedroom light off. Its battery is at 80%." in ui.said
+    home.net.opened.clear()
+    assert run(home, "Bedroom Fingerbot", "turn_on") == Outcome.done(
+        "The Bedroom Fingerbot switched the bedroom light on."
+    )
+    assert home.net.nowait == [("finger-id", {"2": True})] and child.dps["2"] is True
+    assert [o["persist"] for o in home.net.opened] == [False, False, True, True]
+    # Already there: nothing is sent.
+    unmoved = "The Bedroom Fingerbot did not move: the bedroom light is already on."
+    assert run(home, "Bedroom Fingerbot", "turn_on") == Outcome.done(unmoved)
+    assert len(home.net.nowait) == 1
+    assert run(home, "Bedroom Fingerbot", "turn_off").text == "The Bedroom Fingerbot switched the bedroom light off."
+    assert run(home, "Bedroom Fingerbot", "toggle").text == "The Bedroom Fingerbot switched the bedroom light on."
+    assert [w for _, w in home.net.nowait] == [{"2": True}, {"2": False}, {"2": True}]
+    status = home.driver().status(home.device("Bedroom Fingerbot")).text
+    assert status == "The Bedroom Fingerbot is in switch mode and has the bedroom light on. Its battery is at 80%."
+    # Through the service: what it switches finds it, by its name or its room and a light's words.
+    service = HomeService(home.ctx.data_dir, store=home.store, drivers={"tuya": TuyaDriver}, call_timeout=20.0)
+    try:
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "power off"})
+        assert answer["text"] == "The Bedroom Fingerbot switched the bedroom light off."
+        answer = service.handle({"action": "do", "device": "the bedroom lamp", "command": "switch on"})
+        assert answer["text"] == "The Bedroom Fingerbot switched the bedroom light on."
+        listed = service.handle({"action": "list", "query": "light"})["text"]
+        assert "turn_on (switch mode: switches the bedroom light on)" in listed
+    finally:
+        service.close()
+    assert [w for _, w in home.net.nowait][-2:] == [{"2": False}, {"2": True}]
+
+
+def test_an_inverted_fingerbot_says_what_the_light_does(home: Home) -> None:
+    # Rotem's: arm up is on. In switch mode the app's On puts the arm down, so the light is on while it is off.
+    ui, child = link_fingerbot(home, lit="off", check=True)
+    finger = home.device("Bedroom Fingerbot")
+    assert finger.settings["switch_inverted"] is True  # a setting in devices.json, not a secret
+    assert "  The Bedroom Fingerbot is in switch mode and has the bedroom light on. Its battery is at 80%." in ui.said
+    service = HomeService(home.ctx.data_dir, store=home.store, drivers={"tuya": TuyaDriver}, call_timeout=20.0)
+    try:
+        # On already (its switch is off): nothing is sent.
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "turn on"})
+        assert answer["text"] == "The Bedroom Fingerbot did not move: the bedroom light is already on."
+        assert home.net.nowait == []
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "turn off"})
+        assert answer["text"] == "The Bedroom Fingerbot switched the bedroom light off."
+        assert home.net.nowait == [("finger-id", {"2": True})]
+        status = service.handle({"action": "status", "device": "bedroom light"})["text"]
+        assert status == "The Bedroom Fingerbot is in switch mode and has the bedroom light off. Its battery is at 80%."
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "turn on"})
+        assert answer["text"] == "The Bedroom Fingerbot switched the bedroom light on."
+        assert home.net.nowait[-1] == ("finger-id", {"2": False}) and child.dps["2"] is False
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "toggle"})
+        assert answer["text"] == "The Bedroom Fingerbot switched the bedroom light off."
+        assert home.net.nowait[-1] == ("finger-id", {"2": True})
+    finally:
+        service.close()
+    # A refresh asks again, with the saved answer as the default: Enter keeps it; anything but on or off asks again.
+    ui = ScriptedPrompter(["Refresh", "maybe", "", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers and "Type on or off." in ui.said
+    assert (
+        ui.asked.count("In the Tuya app, when the Bedroom Fingerbot shows On, is the bedroom light on or off? (on/off)")
+        == 2
+    )
+    assert home.device("Bedroom Fingerbot").settings["switch_inverted"] is True
+    tuya.wizard(ScriptedPrompter(["Refresh", "on", True, False]), home.ctx)
+    assert "switch_inverted" not in home.device("Bedroom Fingerbot").settings
+    assert_no_secrets(home.config_text())
+
+
+def test_switch_mode_writes_the_absolute_value_when_the_hub_will_not_say(home: Home) -> None:
+    _, child = link_fingerbot(home)
+    child.reads = False  # many hubs never answer a status query for a Bluetooth device
+    assert run(home, "Bedroom Fingerbot", "turn_on").text == "The Bedroom Fingerbot switched the bedroom light on."
+    assert run(home, "Bedroom Fingerbot", "turn_off").text == "The Bedroom Fingerbot switched the bedroom light off."
+    assert [w for _, w in home.net.nowait] == [{"2": True}, {"2": False}]
+    # A toggle needs to know where it is: it is left alone.
+    nodata = (
+        "The Bedroom Fingerbot's hub, the Zigbee hub, answered without passing on the Bedroom Fingerbot's state. "
+        "Some hubs never do, and a device out of the hub's range cannot answer."
+    )
+    assert run(home, "Bedroom Fingerbot", "toggle") == Outcome.fail("failed", nodata)
+    assert home.driver().status(home.device("Bedroom Fingerbot")) == Outcome.fail("failed", nodata)
+    assert len(home.net.nowait) == 2
+    # One that answers without the switch: the same.
+    child.reads = True
+    del child.dps["2"]
+    outcome = run(home, "Bedroom Fingerbot", "toggle")
+    assert outcome == Outcome.fail(
+        "failed", "The Bedroom Fingerbot did not say whether the bedroom light is on, so Jarvis left it alone."
+    )
+    status = home.driver().status(home.device("Bedroom Fingerbot")).text
+    assert status.startswith(
+        "The Bedroom Fingerbot is in switch mode, but did not say whether the bedroom light is on."
+    )
+    assert len(home.net.nowait) == 2
+
+
+def test_a_mode_changed_in_the_app_is_caught_before_moving(home: Home) -> None:
+    _, child = link_fingerbot(home)
+    finger = home.device("Bedroom Fingerbot")
+    child.dps["8"] = "click"
+    outcome = run(home, "Bedroom Fingerbot", "turn_on")
+    assert outcome == Outcome.fail(
+        "needs_setup",
+        "The Bedroom Fingerbot is in click mode now, not switch mode, so Jarvis left it alone. Refresh your Tuya "
+        "devices in home setup so Jarvis follows the change; it will then press it instead.",
+    )
+    assert home.driver().status(finger).text == (
+        "The Bedroom Fingerbot presses the bedroom light switch. It is in click mode. Its battery is at 80%. Jarvis "
+        "cannot see whether the bedroom light is on. Jarvis has it saved in switch mode: refresh your Tuya devices in "
+        "home setup so Jarvis follows the change."
+    )
+    program = (
+        "The Bedroom Fingerbot is in program mode, which Jarvis does not drive, so it left it alone. Put it in click "
+        "or switch mode in the Tuya Smart or Smart Life app, then refresh your Tuya devices in home setup."
+    )
+    child.dps["8"] = 2  # the Bluetooth enum's index, as a hub may pass it on
+    assert run(home, "Bedroom Fingerbot", "toggle") == Outcome.fail("needs_setup", program)
+    assert home.driver().status(finger).text == (
+        "The Bedroom Fingerbot is in program mode, which Jarvis does not drive. Its battery is at 80%. Put it in "
+        "click or switch mode in the Tuya Smart or Smart Life app, then refresh your Tuya devices in home setup."
+    )
+    # Saved in click mode, switched to switch mode in the app: no press.
+    home.store.update(lambda c: c.device(finger.id).settings.update(button_mode="click"))
+    child.dps["8"] = "switch"
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.fail(
+        "needs_setup",
+        "The Bedroom Fingerbot is in switch mode now, so Jarvis did not press it. Refresh your Tuya devices in home "
+        "setup, and Jarvis can then turn it on and off.",
+    )
+    assert (
+        home.driver()
+        .status(home.device("Bedroom Fingerbot"))
+        .text.endswith(
+            "has the bedroom light off. Its battery is at 80%. Refresh your Tuya devices in home setup, and Jarvis can "
+            "then turn it on and off."
+        )
+    )
+    child.dps["8"] = "program"
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.fail("needs_setup", program)
+    assert home.net.nowait == []
+
+
+def test_the_mode_reads_as_a_word_or_an_index() -> None:
+    dps = {"mode": {"dp": 8, "type": "enum", "range": ["click", "switch", "program"]}}
+    for raw, mode in [("switch", "switch"), ("Switch", "switch"), (1, "switch"), ("1", "switch"), ("push", "click")]:
+        assert tdp.button_mode(dps, raw) == mode
+    assert [tdp.button_mode(dps, raw) for raw in (0, 2, True, None, 7, "auto")] == [
+        "click",
+        "program",
+        None,
+        None,
+        None,
+        None,
+    ]
+    # The device's own words, mapped to the standard ones; and no mode DP at all.
+    worded = {"mode": {**dps["mode"], "raw": {"click": "m0", "switch": "m1"}}}
+    assert tdp.button_mode(worded, "m1") == "switch" and tdp.button_mode({}, "click") == "click"
+
+
+def test_a_press_is_sent_once_and_never_repeated(home: Home) -> None:
+    ui, child = link_fingerbot(home, "click", cloud=True)
+    # Even with the cloud on, a Bluetooth device with no gateway is left out: the cloud cannot reach it either.
+    assert "Desk Fingerbot (a Bluetooth device" in ui.text and tuya.HUB_TIP not in ui.said
+    hub = home.net.devices["hub-id"]
+    # The hub took it but never said so: one frame, no second press from tinytuya or the cloud.
+    child.echoes = False
+    outcome = run(home, "Bedroom Fingerbot", "press")
+    assert outcome == Outcome.fail(
+        "timeout",
+        "The Bedroom Fingerbot's hub, the Zigbee hub, took the press but did not confirm it, so Jarvis cannot tell "
+        "whether the Bedroom Fingerbot pressed. Check the bedroom light before asking again: a second press would "
+        "undo the first.",
+    )
+    assert home.net.nowait == [("finger-id", {"2": True})] and home.net.writes("finger-id") == [{"2": True}]
+    assert home.cloud.requests == []
+    # Nothing went out locally: the cloud presses once, with the value the local read chose.
+    child.echoes = True
+    hub.write_errors = ["902"]
+    outcome = run(home, "Bedroom Fingerbot", "press")
+    assert outcome == Outcome.done(
+        "The Bedroom Fingerbot pressed the bedroom light switch, through Tuya's cloud. Jarvis cannot see the bedroom "
+        "light, so it cannot tell whether it is now on or off."
+    )
+    assert home.cloud.commands == [("finger-id", [{"code": "switch", "value": False}])]
+    # The local read failed too: the press it tried (True) is the one the cloud sends, not a fresh opposite, and
+    # with nothing read, the answer does not say for certain that it pressed.
+    child.dps["2"] = True
+    hub.errors, hub.write_errors = ["902"], ["902"]
+    outcome = run(home, "Bedroom Fingerbot", "press")
+    assert outcome == Outcome.done(
+        "Jarvis sent the Bedroom Fingerbot a press of the bedroom light switch, through Tuya's cloud. It could not "
+        "read the switch first, so the arm may not have moved. Jarvis cannot see the bedroom light, so it cannot tell "
+        "whether it is now on or off."
+    )
+    assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": True}])
+    assert [method for method, _ in home.cloud.requests] == ["POST", "POST"]
+
+
+def test_an_unconfirmed_switch_command_goes_through_the_cloud_once(home: Home) -> None:
+    _, child = link_fingerbot(home, cloud=True)
+    child.echoes = False
+    assert run(home, "Bedroom Fingerbot", "turn_on") == Outcome.done(
+        "The Bedroom Fingerbot switched the bedroom light on, through Tuya's cloud."
+    )
+    # The same absolute value, from what the local attempt read (no cloud read).
+    assert home.net.nowait == [("finger-id", {"2": True})]
+    assert home.cloud.commands == [("finger-id", [{"code": "switch", "value": True}])]
+    # A toggle that was not confirmed is finished with the value it sent, never flipped a second time.
+    assert run(home, "Bedroom Fingerbot", "toggle").text == (
+        "The Bedroom Fingerbot switched the bedroom light off, through Tuya's cloud."
+    )
+    assert home.net.nowait[-1] == ("finger-id", {"2": False})
+    assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": False}])
+    assert [method for method, _ in home.cloud.requests] == ["POST", "POST"]
+    # Inverted, the cloud sends the value the local attempt chose: off for "on".
+    finger = home.device("Bedroom Fingerbot")
+    home.store.update(lambda c: c.device(finger.id).settings.update(switch_inverted=True))
+    child.dps["2"] = True
+    assert run(home, "Bedroom Fingerbot", "turn_on").text.endswith(
+        "switched the bedroom light on, through Tuya's cloud."
+    )
+    assert home.net.nowait[-1] == ("finger-id", {"2": False})
+    assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": False}])
+    # Without the cloud: it may still move, and asking again is safe.
+    home.store.set_secret(CLOUD_SECRET, {**saved_link(home), tuya.FALLBACK: False})
+    sent = len(home.cloud.commands)
+    assert run(home, "Bedroom Fingerbot", "turn_off") == Outcome.fail(
+        "timeout",
+        "The Bedroom Fingerbot's hub, the Zigbee hub, took the command but did not confirm it, so the Bedroom "
+        "Fingerbot may still move. If it does not, ask again.",
+    )
+    assert len(home.cloud.commands) == sent
+
+
+def test_hub_errors_name_the_hub(home: Home) -> None:
+    link_fingerbot(home, "click")
+    hub = home.net.devices["hub-id"]
+    subject = "The Bedroom Fingerbot's hub, the Zigbee hub,"
+    for errors, code, text in [
+        (
+            ["905", "905"],
+            "unreachable",
+            f"{subject} did not answer. Is it powered and on the home network? The Tuya app open on a phone nearby "
+            "can also keep Jarvis out.",
+        ),
+        (
+            ["914", "914"],
+            "auth",
+            f"{subject} turned Jarvis away. A Tuya hub takes only a few connections at a time: close the Tuya app on "
+            "phones nearby and try again. If it keeps happening, open the Bedroom Fingerbot once in the Tuya app, or "
+            "refresh your Tuya devices in home setup.",
+        ),
+        (
+            ["902", "902", "902"],
+            "timeout",
+            f"{subject} did not answer in time; it may be busy with another app. Try again in a moment.",
+        ),
+    ]:
+        hub.errors = list(errors)
+        assert run(home, "Bedroom Fingerbot", "press") == Outcome.fail(code, text)  # type: ignore[arg-type]
+    # A hub that answers for another device only ("json obj data unvalid"): nothing about this one.
+    hub.errors = ["900"]
+    outcome = home.driver().status(home.device("Bedroom Fingerbot"))
+    assert outcome.code == "failed" and outcome.text.startswith(f"{subject} answered without passing on the Bedroom")
+    # Other sub-devices too; a device with no hub keeps its own words.
+    hub.errors = ["905", "905"]
+    outcome = run(home, "Garden plug", "turn_on")
+    assert outcome.text.startswith("The Garden plug's hub, the Zigbee hub, did not answer.")
+    home.net.devices["plug-id"].errors = ["905", "905"]
+    assert (
+        run(home, "Heater plug", "turn_on").text
+        == "The Heater plug did not answer. Is it powered and on the home network?"
+    )
+    # Too little time left.
+    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 0.5
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.fail("timeout", f"{subject} did not answer in time.")
+    home.ctx.call_timeout = 20.0
+    # Never found on the network.
+    finger = home.device("Bedroom Fingerbot")
+    home.store.update(lambda c: [c.device(finger.id).settings.pop(k) for k in ("address", "version")])
+    del home.scanner.answers["hub-id"]
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.fail(
+        "unreachable",
+        f"{subject} has not been found on the home network. If it is powered, choose Find my Tuya devices in home "
+        "setup.",
+    )
+    # Saved before the hub's name was: "its hub".
+    home.store.update(lambda c: c.device(finger.id).settings.pop("hub_name"))
+    outcome = run(home, "Bedroom Fingerbot", "press")
+    assert outcome.text.startswith("The Bedroom Fingerbot's hub has not been found on the home network.")
+
+
+def test_a_hub_listed_as_a_sub_device_is_still_a_parent(home: Home) -> None:
+    # Most hubs are: Tuya marks them "sub" (6 of Home Assistant's 7 recorded wg2 hubs), some with a uuid.
+    hub = next(d for d in home.cloud.devices if d.id == "hub-id")
+    hub.sub, hub.uuid = True, "uuid-hub"
+    ui, _ = link_fingerbot(home, "click")
+    garden, finger = home.device("Garden plug"), home.device("Bedroom Fingerbot")
+    assert garden.settings["parent"] == finger.settings["parent"] == "hub-id"
+    assert garden.settings["hub_name"] == "Zigbee hub" and garden.settings["node_id"] == "a4c1-garden"
+    assert "  Garden plug (plug, Garden): through the Zigbee hub at 192.168.1.26" in ui.said
+    assert "Zigbee hub (a hub: the devices paired to it are added on their own)" in ui.text
+    assert all(d.name != "Zigbee hub" for d in home.store.load().devices)
+    assert run(home, "Garden plug", "turn_on").text == "The Garden plug is on."
+    assert_no_secrets(home.config_text(), ui.text)
+
+
+def test_a_fingerbot_with_its_own_key_goes_to_the_only_hub(home: Home) -> None:
+    def fingerbot(key: str) -> None:
+        home.cloud.devices = [d for d in home.cloud.devices if d.id not in ("finger-id", "ble-id")]
+        add_fingerbots(home)
+        next(d for d in home.cloud.devices if d.id == "finger-id").local_key = key
+
+    fingerbot(KEYS["fbot"])
+    ui = ScriptedPrompter(["UC-TEST-0001", False, "Kitchen light", "", "bedroom light", True, False])
+    tuya.wizard(ui, home.ctx)
+    finger = home.device("Bedroom Fingerbot")
+    assert finger.settings["parent"] == "hub-id" and home.store.secret(finger.secret_key) == {"local_key": KEYS["hub"]}
+    assert (
+        "Bedroom Fingerbot: Tuya gave it a different key from the Zigbee hub's, so Jarvis paired it to the Zigbee hub, "
+        "the only hub in your account. The check below shows whether the Zigbee hub answers for it."
+    ) in ui.said
+    assert run(home, "Bedroom Fingerbot", "press").ok
+    assert_no_secrets(home.config_text(), ui.text)
+    # Another device with the hub's key: the hub still wins.
+    home.cloud.devices.append(cloud_device("twin-id", "Twin plug", "cz", KEYS["hub"], GARDEN_POINTS))
+    fingerbot(KEYS["hub"])
+    ui = ScriptedPrompter(["Refresh", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert home.device("Bedroom Fingerbot").settings["parent"] == "hub-id" and "different key" not in ui.text
+    # With two hubs, Jarvis cannot tell which: left out, or through the cloud when that is on.
+    home.cloud.devices.append(cloud_device("hub2-id", "Attic hub", "wg2", KEYS["hub2"], []))
+    fingerbot(KEYS["fbot"])
+    ui = ScriptedPrompter(["Refresh", False, True, False])  # keep the saved one for now
+    tuya.wizard(ui, home.ctx)
+    assert f"Saved before, but Jarvis cannot use them now: Bedroom Fingerbot ({tuya.SEVERAL_HUBS})" in ui.said
+    assert "Kept: Bedroom Fingerbot. Jarvis cannot use it until that is fixed." in ui.said
+    ui = ScriptedPrompter(["(now off)", True])
+    tuya.wizard(ui, home.ctx)
+    tuya.wizard(ScriptedPrompter(["Refresh", True, False]), home.ctx)
+    assert home.device("Bedroom Fingerbot").settings["cloud_only"] is True
+    # A sub-device that is not a button pusher is never guessed onto a hub.
+    home.cloud.devices.append(
+        cloud_device("lost-id", "Lost bulb", "dj", KEYS["lost"], PORCH_POINTS, sub=True, node_id="n9")
+    )
+    home.cloud.devices = [d for d in home.cloud.devices if d.id != "hub2-id"]
+    tuya.wizard(ScriptedPrompter(["Refresh", True, False]), home.ctx)
+    assert "parent" not in home.device("Lost bulb").settings and home.device("Lost bulb").settings["cloud_only"]
+    assert home.device("Bedroom Fingerbot").settings["parent"] == "hub-id"
+
+
+def test_a_v32_hub_never_probes_through_the_child(home: Home) -> None:
+    link_fingerbot(home, "click")
+    home.net.devices["hub-id"].version = 3.2
+    for name in ("Bedroom Fingerbot", "Garden plug"):
+        record = home.device(name)
+        home.store.update(lambda c, r=record: c.device(r.id).settings.update(version="3.2"))
+    home.net.probes.clear()
+    status = home.driver().status(home.device("Bedroom Fingerbot")).text
+    assert status.startswith("The Bedroom Fingerbot presses the bedroom light switch. It is in click mode.")
+    assert run(home, "Bedroom Fingerbot", "press").ok and run(home, "Garden plug", "turn_on").ok
+    assert home.net.probes == []
+
+
+def test_a_button_with_no_switch_point_is_left_out(home: Home) -> None:
+    points = [p for p in FINGER_POINTS if p["code"] != "switch"]
+    home.cloud.devices.append(cloud_device("arm-id", "Arm", "szjqr", KEYS["hub"], points, sub=True, node_id="a1"))
+    ui = link(home)
+    assert f"Arm ({tuya.NO_SWITCH_POINT})" in ui.text and all(d.name != "Arm" for d in home.store.load().devices)
+    ui = ScriptedPrompter(["(now off)", True])
+    tuya.wizard(ui, home.ctx)
+    ui = ScriptedPrompter(["Refresh", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert f"Arm ({tuya.NO_SWITCH_POINT})" in ui.text and all(d.name != "Arm" for d in home.store.load().devices)
+
+
+def test_a_fingerbot_saved_as_a_switch_before_is_offered_for_removal(home: Home) -> None:
+    # Before Jarvis knew button pushers, a Fingerbot paired to the phone only was saved as a plain switch.
+    link_fingerbot(home, "click")
+    old = DeviceRecord(
+        "tuya-desk-fingerbot",
+        "tuya",
+        "Desk Fingerbot",
+        "switch",
+        settings={"tuya_id": "ble-id", "category": "szjqr", "dps": {"switch": {"dp": 2, "type": "bool"}}},
+    )
+    home.store.update(lambda c: c.upsert(old))
+    home.store.set_secret(old.secret_key, {"local_key": "FAKE-KEY-BLE0-01"})
+    reason = "Desk Fingerbot (a Bluetooth device, which Jarvis can reach only through a Tuya Bluetooth"
+    # Declined: it stays, and setup says so instead of calling it not added.
+    ui = ScriptedPrompter(["Refresh", False, True, False])
+    tuya.wizard(ui, home.ctx)
+    assert "Remove Desk Fingerbot from Jarvis?" in ui.asked
+    assert f"Saved before, but Jarvis cannot use them now: {reason}" in ui.text
+    assert not any(line.startswith("Not added") and "Desk Fingerbot" in line for line in ui.said)
+    assert "Kept: Desk Fingerbot. Jarvis cannot use it until that is fixed." in ui.said
+    assert home.device("Desk Fingerbot").kind == "switch"
+    ui = ScriptedPrompter(["Refresh", True, True, False])
+    tuya.wizard(ui, home.ctx)
+    assert all(d.name != "Desk Fingerbot" for d in home.store.load().devices)
+    assert home.store.secret(old.secret_key) is None and home.device("Bedroom Fingerbot").kind == "button"
+    # When nothing else is left to save, it is still offered.
+    home.store.update(lambda c: c.upsert(old))
+    home.cloud.devices = [d for d in home.cloud.devices if d.id == "ble-id"]
+    home.cloud.scenes = []
+    ui = ScriptedPrompter(["Refresh", True])
+    tuya.wizard(ui, home.ctx)
+    assert "Remove Desk Fingerbot from Jarvis?" in ui.asked
+    assert "Removed Desk Fingerbot. Your Tuya account has no other devices or scenes Jarvis can use." in ui.said
+    assert all(d.name != "Desk Fingerbot" for d in home.store.load().devices)
 
 
 def test_a_device_that_was_not_found_is_looked_for_again(home: Home) -> None:
@@ -1564,27 +2140,6 @@ def test_a_toggle_that_timed_out_locally_is_finished_once_through_the_cloud(home
     assert [method for method, _ in home.cloud.requests] == ["POST"]
 
 
-def test_a_press_is_never_sent_twice(home: Home) -> None:
-    add_fingerbots(home)
-    ui = ScriptedPrompter(["UC-TEST-0001", True, "Kitchen light", "", "bedroom light", True, False])
-    tuya.wizard(ui, home.ctx)
-    # Even with the cloud on, a Bluetooth device with no gateway is left out: the cloud cannot reach it either.
-    assert "Desk Fingerbot (a Bluetooth device" in ui.text
-    hub = home.net.devices["hub-id"]
-    hub.write_errors = ["902"]
-    outcome = run(home, "Bedroom Fingerbot", "press")
-    assert outcome.ok and outcome.text.startswith(
-        "The Bedroom Fingerbot pressed the bedroom light switch, through Tuya's cloud. Jarvis cannot see"
-    )
-    assert home.cloud.commands == [("finger-id", [{"code": "switch", "value": True}])]
-    # The local read failed too: the press it tried (True) is the one the cloud sends, not a fresh opposite.
-    hub.children["f1"].dps["1"] = True
-    hub.errors, hub.write_errors = ["902"], ["902"]
-    assert run(home, "Bedroom Fingerbot", "press").ok
-    assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": True}])
-    assert [method for method, _ in home.cloud.requests] == ["POST", "POST"]
-
-
 def test_through_the_cloud_follows_a_name_with_a_full_stop_in_it(home: Home) -> None:
     add_fingerbots(home)
     tuya.wizard(ScriptedPrompter(["UC-TEST-0001", True, "Kitchen light", "", "Mr. Lamp", True, False]), home.ctx)
@@ -1607,7 +2162,7 @@ def test_through_the_cloud_follows_a_name_with_a_full_stop_in_it(home: Home) -> 
     home.cloud.state["finger-id"] = {"switch": False, "mode": "click"}
     assert home.driver().status(home.device("Bedroom Fingerbot")).text == (
         "The Bedroom Fingerbot presses the ceiling lamp switch, through Tuya's cloud. It is in click mode. "
-        "Jarvis cannot see whether the light is on."
+        "Jarvis cannot see whether the ceiling lamp is on."
     )
 
 
@@ -1923,7 +2478,7 @@ def test_a_button_without_a_name_or_battery_still_never_says_on() -> None:
     )
     assert tdp.power_code(record) is None and [s.name for s in tdp.command_specs(record)] == ["press"]
     text = tdp.describe_state(record, {"1": True})
-    assert text == "The Fingerbot presses a wall switch. Jarvis cannot see whether the light is on."
+    assert text == "The Fingerbot presses a wall switch. Jarvis cannot see whether what it switches is on."
 
 
 def test_cloud_values_round_trip() -> None:

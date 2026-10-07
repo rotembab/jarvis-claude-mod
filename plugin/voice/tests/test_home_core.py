@@ -349,6 +349,31 @@ def test_ambiguous_and_unknown_devices(tmp_path: Path) -> None:
     assert drivers.get("fake") is None or drivers["fake"].calls == []
 
 
+def test_a_button_is_found_by_what_its_alias_says_it_presses(tmp_path: Path) -> None:
+    # A Fingerbot on the bedroom light's switch answers to a light's words, in its room and alone.
+    button = DeviceRecord("fake-finger", "fake", "Fingerbot", "button", "Bedroom", aliases=["bedroom light"])
+    service, _ = make_service(tmp_path / "with-a-lamp", [button, LAMP_1])
+    for wanted in ("bedroom light", "the bedroom lamp", "bedroom bulb"):
+        reply = service.handle({"action": "do", "device": wanted, "command": "turn_on"})
+        assert reply["device"] == {"id": button.id, "name": "Fingerbot"}, wanted
+    # "The light" could be either.
+    reply = service.handle({"action": "do", "device": "the light", "command": "turn_on"})
+    assert reply["code"] == "ambiguous" and "Fingerbot (Bedroom)" in reply["text"] and "Desk lamp" in reply["text"]
+    service.close()
+    service, _ = make_service(tmp_path / "alone", [button])
+    for wanted in ("the light", "the lamp"):
+        reply = service.handle({"action": "do", "device": wanted, "command": "turn_on"})
+        assert reply["device"] == {"id": button.id, "name": "Fingerbot"}, wanted
+    service.close()
+    # Only a light's or a fan's words: a button on a gate's switch never takes a garage's.
+    gate = DeviceRecord("fake-yard-finger", "fake", "Yard Fingerbot", "button", aliases=["garage door"])
+    assert "garage" not in HomeService._kind_words(gate) and "gate" not in HomeService._kind_words(gate)
+    service, _ = make_service(tmp_path / "gate", [gate, LAMP_1])
+    assert service.handle({"action": "do", "device": "gate", "command": "turn_on"})["code"] == "not_found"
+    assert service.handle({"action": "do", "device": "the lamp", "command": "turn_on"})["device"]["id"] == LAMP_1.id
+    service.close()
+
+
 def test_commands_values_and_synonyms(tmp_path: Path) -> None:
     service, drivers = make_service(tmp_path, ALL)
     assert service.handle({"action": "do", "device": "Sony TV", "command": "power off"})["text"] == "Sony TV: turn_off"

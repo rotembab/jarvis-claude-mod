@@ -84,8 +84,13 @@ T_MIN = 0.6
 UNIT_SLACK_S = 0.3  # tinytuya's own short sleeps, per request
 RETRY_LIMIT = 1  # 0 would never connect at all (tinytuya returns 905 straight away)
 RETRY_DELAY_S = 0.5
+LOCAL_PORT = 6668  # tinytuya's TCPPORT (core/const.py), named so a test can point it at a hub on 127.0.0.1
+# The longest Jarvis waits for a hub to echo a button's command back (a guess: not measured on a real hub).
+CONFIRM_MAX_S = 4.0
 # Commands that make two requests' worth of work (a read and a write, or several values at once).
 TWO_REQUESTS = frozenset({"toggle", "press", "set_brightness", "set_color", "set_color_temp"})
+# A switch-mode button pusher's commands, and the action each one is.
+BUTTON_SWITCH = {"turn_on": "on", "turn_off": "off", "toggle": "toggle"}
 
 # tinytuya's error numbers (core/error_helper.py).
 ERR_UNREACHABLE = frozenset({"901", "905"})
@@ -108,8 +113,10 @@ BUSY_ERRORS = ("API_QPS_LIMIT_OR_DEGRADE", "SYSTEM_ERROR")
 CLOUD_SLICE_S = 6.0
 CLOUD_MIN_S = 2.5
 CLOUD_PAUSE_S = 60.0
-# Local failures after which a command is tried again through the cloud; never after a refused value (903).
-FALLBACK_ERRORS = ERR_UNREACHABLE | ERR_KEY | {ERR_TIMEOUT, "error", "nodata", "noaddress", "budget"}
+# Local failures after which a command is tried again through the cloud; never after a refused value (903), and
+# never after a button's press that went out unconfirmed ("unconfirmed_press"): a second press would undo the first.
+# A switch-mode command that went out unconfirmed ("unconfirmed") is an absolute value, so the cloud may send it.
+FALLBACK_ERRORS = ERR_UNREACHABLE | ERR_KEY | {ERR_TIMEOUT, "error", "nodata", "noaddress", "budget", "unconfirmed"}
 
 EXPIRED = "The Tuya link has expired. Open home setup and choose Link your Tuya account to scan a new code."
 NOT_LINKED = "Your Tuya account is not linked, so Jarvis cannot run its scenes. Link it in home setup."
@@ -147,6 +154,20 @@ BLUETOOTH_ONLY = (
     "a Bluetooth device, which Jarvis can reach only through a Tuya Bluetooth or multi-mode gateway: "
     "add one in the Tuya Smart or Smart Life app, then refresh here"
 )
+NO_SWITCH_POINT = "Tuya did not give the data point that moves its arm, so Jarvis cannot drive it; refresh again later"
+SEVERAL_HUBS = "paired to a hub, and your account has more than one, so Jarvis could not tell which"
+HUB_TIP = (
+    "Tip: some Tuya hubs do not pass commands on over the home network. If a Fingerbot does not respond to Jarvis, "
+    "turn on Use Tuya's cloud when a device does not answer on the network, so Jarvis can send its commands through "
+    "Tuya's cloud when the hub does not."
+)
+# A button pusher's mode, as the setup report gives it.
+MODE_LINES = {
+    "switch": "switch mode: Jarvis turns it on and off",
+    "click": "click mode: Jarvis presses it",
+    "program": "program mode: Jarvis can only read it until you put it in click or switch mode in the app",
+    None: "Tuya did not say its mode, so Jarvis presses it as in click mode",
+}
 FIREWALL_HINT = "If your firewall asks about Python, allow it on private (home) networks only."
 
 
@@ -275,27 +296,30 @@ class _Budget:
         return min(T_MAX, seconds) if seconds >= T_MIN else None
 
 
-def _open_device(conn: _Conn, timeout: float) -> Any:
-    """A fresh tinytuya device, never persistent, with the version always given (else it assumes 3.1)."""
+def _open_device(conn: _Conn, timeout: float, *, persist: bool = False) -> Any:
+    """A fresh tinytuya device, with the version always given (else it assumes 3.1). Persistent only for a
+    button's command, whose hub keeps the session open to echo it back (see _Link.send_once)."""
     tinytuya = _tinytuya()
     assert conn.address is not None and conn.version is not None
     options = {
         "connection_timeout": timeout,
         "connection_retry_limit": RETRY_LIMIT,
         "connection_retry_delay": RETRY_DELAY_S,
-        "persist": False,
+        "persist": persist,
+        "port": LOCAL_PORT,
     }
     gateway_id = conn.parent or conn.tuya_id
+    version = 3.3 if conn.version == 3.2 else conn.version
+    gateway = tinytuya.Device(gateway_id, conn.address, conn.key, version=version, **options)
+    # A child takes its parent's version as it is built, so it is built while the parent is still at 3.3.
+    child = None if conn.parent is None else tinytuya.Device(conn.tuya_id, cid=conn.node_id, parent=gateway, **options)
     if conn.version == 3.2:
-        # set_version(3.2) probes the DPs over the network unless it knows which to ask for.
-        gateway = tinytuya.Device(gateway_id, conn.address, conn.key, version=3.3, **options)
-        gateway.dps_to_request = {str(dp): None for dp in conn.dps} or {"1": None}
-        gateway.set_version(3.2)
-    else:
-        gateway = tinytuya.Device(gateway_id, conn.address, conn.key, version=conn.version, **options)
-    if conn.parent is None:
-        return gateway
-    return tinytuya.Device(conn.tuya_id, cid=conn.node_id, parent=gateway, **options)
+        # set_version(3.2) probes the DPs over the network unless it knows which to ask for: each is told first.
+        for item in (gateway, child):
+            if item is not None:
+                item.dps_to_request = {str(dp): None for dp in conn.dps} or {"1": None}
+                item.set_version(3.2)
+    return gateway if child is None else child
 
 
 def _close(device: Any) -> None:
@@ -317,7 +341,7 @@ def _error_code(result: Any) -> str | None:
 class _Link:
     """One command's requests to one device, each on a fresh tinytuya object, within the command's budget."""
 
-    def __init__(self, conn: _Conn, budget: _Budget, open_device: Callable[[_Conn, float], Any]) -> None:
+    def __init__(self, conn: _Conn, budget: _Budget, open_device: Callable[..., Any]) -> None:
         self.conn = conn
         self.budget = budget
         self._open = open_device
@@ -338,7 +362,13 @@ class _Link:
 
     def read(self, reserve: int = 0) -> dict[str, Any]:
         """The device's DPs, by number as text."""
-        result = self._request(1, reserve, lambda device: self._status(device, reserve))
+        try:
+            result = self._request(1, reserve, lambda device: self._status(device, reserve))
+        except _Failure as failure:
+            if failure.err == "900" and self.conn.parent is not None:
+                # A hub that will not answer for this device ("json obj data unvalid"): it said nothing about it.
+                raise _Failure("nodata") from None
+            raise
         values = result.get("dps") if isinstance(result, dict) else None
         if not isinstance(values, dict):
             raise _Failure("nodata")
@@ -374,6 +404,57 @@ class _Link:
             self._request(1, reserve, lambda device: device.set_value(dp, value))
         elif data:
             self._request(2, reserve, lambda device: device.set_multiple_values(data))
+
+    def send_once(self, dp: int, value: Any, reserve: int = 0) -> bool:
+        """One value in exactly one frame, then a wait for the device's own echo of it: True when echoed, False
+        when sent but not confirmed (it may still act on it). Raises _Failure only when nothing went out, so a
+        fallback is safe. Never write()'s request, which tinytuya sends again after a silent timeout."""
+        timeout = self.budget.timeout(1, self.factor, reserve)
+        if timeout is None:
+            raise _Failure("budget")
+        self.wrote = True
+        index = str(dp)
+        device = self._open(self.conn, timeout, persist=True)  # the hub keeps the session open for the echo
+        try:
+            try:
+                result = device.set_value(index, value, nowait=True)
+            except Exception as exc:  # noqa: BLE001 - a library error must not take the command down
+                log.warning("a command to Tuya device %s raised %s", self.conn.tuya_id, type(exc).__name__)
+                return False  # it may have gone out
+            err = _error_code(result)
+            if err is not None:
+                raise _Failure(err)  # tinytuya says so only when no whole frame went out
+            return self._echoed(device, index, value, self._confirm_wait(reserve))
+        finally:
+            _close(device)
+
+    def _confirm_wait(self, reserve: int) -> float:
+        """How long to wait for an echo: what the budget holds after ``reserve`` requests, up to CONFIRM_MAX_S."""
+        spare = self.budget.left() - reserve * (self.factor * T_MIN + UNIT_SLACK_S) - UNIT_SLACK_S
+        return max(0.0, min(CONFIRM_MAX_S, spare))
+
+    def _echoed(self, device: Any, index: str, value: Any, wait: float) -> bool:
+        """Receive-only reads (they never send) until this device reports ``value`` at ``index``. The replies
+        are never logged: tinytuya puts the device object, and so its key, in them."""
+        deadline = time.monotonic() + wait
+        for _ in range(8):  # an ack, other devices' reports, then this one's; never an endless loop
+            left = deadline - time.monotonic()
+            if left < 0.05:
+                return False
+            for item in (device, getattr(device, "parent", None)):
+                if item is not None:
+                    item.set_socketTimeout(left)
+            try:
+                reply = device.receive()
+            except Exception as exc:  # noqa: BLE001 - a library error must not take the command down
+                log.warning("waiting for Tuya device %s raised %s", self.conn.tuya_id, type(exc).__name__)
+                return False
+            if _error_code(reply) is not None:
+                return False
+            values = reply.get("dps") if isinstance(reply, dict) else None
+            if isinstance(values, dict) and values.get(index) == value:
+                return True
+        return False
 
     def _request(self, units: int, reserve: int, action: Callable[[Any], Any]) -> Any:
         timeout = self.budget.timeout(units, self.factor, reserve)
@@ -697,6 +778,11 @@ class _CloudLink:
             # Every value in one request, as Home Assistant sends a light's power, mode and colour together.
             self._call(reserve, lambda manager: _cloud_send(manager, self.tuya_id, commands), sending=True)
 
+    def send_once(self, dp: int, value: Any, reserve: int = 0) -> bool:
+        """_Link.send_once through the cloud: one request, which Tuya's answer confirms (a failure raises)."""
+        self.write({dp: value}, reserve)
+        return True
+
     def _call(self, reserve: int, action: Callable[[Any], Any], *, sending: bool = False) -> Any:
         seconds = self.budget.left() - reserve * CLOUD_MIN_S
         if seconds < CLOUD_MIN_S:
@@ -720,6 +806,69 @@ class _CloudLink:
             raise _CloudFailure(kind) from None
         self.sent = self.sent or sending
         return result
+
+
+# --------------------------------------------------------------------------- button pushers
+
+
+def _live_mode(dps: DpMap, values: Mapping[str, Any] | None) -> str | None:
+    """The mode a button pusher reports now; None when it was not read or has no mode DP."""
+    code = tdp.find(dps, ("mode",), "enum", writable=False)
+    if code is None or not values:
+        return None
+    return tdp.button_mode(dps, values.get(str(dps[code]["dp"])))
+
+
+def _mode_refusal(device: DeviceRecord, live: str) -> Outcome:
+    """A command for the mode setup saved, refused because the device is in another one now."""
+    name = device.name
+    if live == "program":
+        text = (
+            f"The {name} is in program mode, which Jarvis does not drive, so it left it alone. Put it in click or "
+            "switch mode in the Tuya Smart or Smart Life app, then refresh your Tuya devices in home setup."
+        )
+    elif live == "switch":
+        text = (
+            f"The {name} is in switch mode now, so Jarvis did not press it. Refresh your Tuya devices in home setup, "
+            "and Jarvis can then turn it on and off."
+        )
+    else:
+        text = (
+            f"The {name} is in click mode now, not switch mode, so Jarvis left it alone. Refresh your Tuya devices in "
+            "home setup so Jarvis follows the change; it will then press it instead."
+        )
+    return Outcome.fail("needs_setup", text)
+
+
+def _switched(device: DeviceRecord, on: bool) -> str:
+    state, what = "on" if on else "off", tdp.presses(device)
+    return (
+        f"The {device.name} switched the {what} {state}."
+        if what
+        else f"The {device.name} turned {state} what it switches."
+    )
+
+
+def _unmoved(device: DeviceRecord, on: bool) -> str:
+    return f"The {device.name} did not move: {tdp.switched(device)} is already {'on' if on else 'off'}."
+
+
+def _pressed(device: DeviceRecord, *, read: bool) -> str:
+    """A press that went out. Without a read first, it wrote True, which moves the arm only if the switch was off."""
+    what, thing = tdp.presses(device), tdp.switched(device)
+    target = f"the {what} switch" if what else "its switch"
+    unseen = f"Jarvis cannot see {thing}, so it cannot tell whether it is now on or off."
+    if not read:
+        return (
+            f"Jarvis sent the {device.name} a press of {target}. It could not read the switch first, so the arm may "
+            f"not have moved. {unseen}"
+        )
+    return f"The {device.name} pressed {target}. {unseen}"
+
+
+def _check_first(device: DeviceRecord) -> str:
+    what = tdp.presses(device)
+    return f"Check {f'the {what}' if what else 'the switch'} before asking again: a second press would undo the first."
 
 
 # --------------------------------------------------------------------------- the driver
@@ -783,9 +932,12 @@ class TuyaDriver(Driver):
         handler = self._handlers.get(command)
         if command == "stop":
             handler = functools.partial(self._vacuum, action="stop") if device.kind == "vacuum" else self._stop
+        if device.kind == "button" and command in BUTTON_SWITCH:
+            handler = functools.partial(self._switch, action=BUTTON_SWITCH[command])
         if handler is None:
             return Outcome.fail("unsupported", f"The {device.name} can't {command.replace('_', ' ')}.")
-        units = 2 if command in TWO_REQUESTS else 1
+        # A button's every command reads (its mode, and where its switch is) and then writes.
+        units = 2 if command in TWO_REQUESTS or device.kind == "button" else 1
         return self._with_link(device, lambda link: handler(device, link, value), units)
 
     def status(self, device: DeviceRecord) -> Outcome:
@@ -1048,6 +1200,24 @@ class TuyaDriver(Driver):
 
     def _failure(self, device: DeviceRecord, failure: _Failure) -> Outcome:
         the, err = f"The {device.name}", failure.err
+        hub_name = device.settings.get("hub_name")
+        if device.settings.get("parent"):
+            # Through a hub, the network failed between Jarvis and the hub: name it.
+            hub = f"{the}'s hub, the {hub_name}," if isinstance(hub_name, str) and hub_name else f"{the}'s hub"
+            texts = self._hub_failures(device, hub)
+            if err in texts:
+                return texts[err]
+        if err == "unconfirmed":
+            return Outcome.fail(
+                "timeout",
+                f"{the} took the command but did not confirm it, so it may still move. If it does not, ask again.",
+            )
+        if err == "unconfirmed_press":
+            return Outcome.fail(
+                "timeout",
+                f"{the} took the press but did not confirm it, so Jarvis cannot tell whether it pressed. "
+                f"{_check_first(device)}",
+            )
         if err in ERR_UNREACHABLE:
             return Outcome.fail("unreachable", f"{the} did not answer. Is it powered and on the home network?")
         if err == "noaddress":
@@ -1076,6 +1246,51 @@ class TuyaDriver(Driver):
             return Outcome.fail("failed", f"{the} answered without saying what state it is in.")
         return Outcome.fail("failed", f"Controlling the {device.name} failed.")
 
+    @staticmethod
+    def _hub_failures(device: DeviceRecord, hub: str) -> dict[str, Outcome]:
+        """The failures of a device behind a hub, said of the hub (``hub``: "The X's hub, the Zigbee hub,")."""
+        name = device.name
+        unreachable = Outcome.fail(
+            "unreachable",
+            f"{hub} did not answer. Is it powered and on the home network? The Tuya app open on a phone nearby can "
+            "also keep Jarvis out.",
+        )
+        # 904/914 from a hub: no free connection (it takes only a few), or a stale link to the device behind it.
+        refused = Outcome.fail(
+            "auth",
+            f"{hub} turned Jarvis away. A Tuya hub takes only a few connections at a time: close the Tuya app on "
+            f"phones nearby and try again. If it keeps happening, open the {name} once in the Tuya app, or refresh "
+            "your Tuya devices in home setup.",
+        )
+        return {
+            **dict.fromkeys(ERR_UNREACHABLE, unreachable),
+            **dict.fromkeys(ERR_KEY, refused),
+            "noaddress": Outcome.fail(
+                "unreachable",
+                f"{hub} has not been found on the home network. If it is powered, choose Find my Tuya devices in "
+                "home setup.",
+            ),
+            ERR_TIMEOUT: Outcome.fail(
+                "timeout", f"{hub} did not answer in time; it may be busy with another app. Try again in a moment."
+            ),
+            "budget": Outcome.fail("timeout", f"{hub} did not answer in time."),
+            "nodata": Outcome.fail(
+                "failed",
+                f"{hub} answered without passing on the {name}'s state. Some hubs never do, and a device out of the "
+                "hub's range cannot answer.",
+            ),
+            "unconfirmed": Outcome.fail(
+                "timeout",
+                f"{hub} took the command but did not confirm it, so the {name} may still move. If it does not, "
+                "ask again.",
+            ),
+            "unconfirmed_press": Outcome.fail(
+                "timeout",
+                f"{hub} took the press but did not confirm it, so Jarvis cannot tell whether the {name} pressed. "
+                f"{_check_first(device)}",
+            ),
+        }
+
     # ------------------------------------------------------------------ commands
 
     @staticmethod
@@ -1097,26 +1312,64 @@ class TuyaDriver(Driver):
         link.write({dp: not current})
         return Outcome.done(f"The {device.name} is now {'off' if current else 'on'}.")
 
-    def _press(self, device: DeviceRecord, link: _AnyLink, _value: Value = None) -> Outcome:
+    @staticmethod
+    def _button_values(link: _AnyLink, *, required: bool) -> dict[str, Any] | None:
+        """What a button pusher reports (its mode and its switch), when there is time to ask. A device or hub that
+        cannot be reached, or turns Jarvis away, fails the command here (so it is looked for again, or goes to the
+        cloud) instead of being sent a command that cannot arrive either; so does any cloud read that failed (an
+        offline device, say), and, when ``required``, every failed read."""
+        if not link.affordable(1, reserve=1):
+            if required:
+                raise _Failure("budget")
+            return None
+        try:
+            return link.read(reserve=1)
+        except _Failure as failure:
+            if required or failure.err in ERR_UNREACHABLE | ERR_KEY or isinstance(failure, _CloudFailure):
+                raise
+            return None
+
+    def _switch(self, device: DeviceRecord, link: _AnyLink, _value: Value = None, *, action: str) -> Outcome:
+        """A switch-mode button pusher: its arm stays where it is sent, so the switch DP is where it stands. On and
+        off are about what it switches, through the saved inversion; every write is an absolute value."""
         dps = tdp.dp_map(device)
         dp = self._dp(dps, tdp.press_code(dps))
+        values = self._button_values(link, required=action == "toggle")
+        live = _live_mode(dps, values)
+        if live is not None and live != "switch":
+            return _mode_refusal(device, live)
+        inverted = tdp.switch_inverted(device)
+        current = (values or {}).get(str(dp))
+        if action == "toggle":
+            if not isinstance(current, bool):
+                return Outcome.fail(
+                    "failed",
+                    f"The {device.name} did not say whether {tdp.switched(device)} is on, so Jarvis left it alone.",
+                )
+            on = current == inverted
+        else:
+            on = action == "on"
+            if isinstance(current, bool) and (current != inverted) == on:
+                return Outcome.done(_unmoved(device, on))
+        if not link.send_once(dp, on != inverted):
+            raise _Failure("unconfirmed")
+        return Outcome.done(_switched(device, on))
+
+    def _press(self, device: DeviceRecord, link: _AnyLink, _value: Value = None) -> Outcome:
+        """A click-mode button pusher (or one whose mode Tuya did not say): one press, sent once."""
+        dps = tdp.dp_map(device)
+        dp = self._dp(dps, tdp.press_code(dps))
+        values = self._button_values(link, required=False)
+        live = _live_mode(dps, values)
+        if live is not None and live != "click":
+            return _mode_refusal(device, live)
         # In click mode each change of the switch value is one press, so write the opposite of what it reports
-        # (as ha_tuya_ble does), or True when it does not say. A device that cannot be reached at all fails
-        # here, so the command looks for it again instead of sending a write that cannot arrive either; so does
-        # any cloud read that failed (an offline device, say).
-        current = None
-        if link.affordable(1, reserve=1):
-            try:
-                current = link.read(reserve=1).get(str(dp))
-            except _Failure as failure:
-                if failure.err in ERR_UNREACHABLE | ERR_KEY or isinstance(failure, _CloudFailure):
-                    raise
-        link.write({dp: not current if isinstance(current, bool) else True})
-        what = tdp.presses(device)
-        return Outcome.done(
-            f"The {device.name} pressed {f'the {what} switch' if what else 'its switch'}. Jarvis cannot see the "
-            "light, so it cannot tell whether it is now on or off."
-        )
+        # (as ha_tuya_ble does), or True when it does not say: that moves the arm only if the switch was off, so
+        # the answer says it may not have.
+        current = (values or {}).get(str(dp))
+        if not link.send_once(dp, not current if isinstance(current, bool) else True):
+            raise _Failure("unconfirmed_press")
+        return Outcome.done(_pressed(device, read=isinstance(current, bool)))
 
     def _light_now(
         self, link: _AnyLink, dps: DpMap, parts: tdp.LightParts, reserve: int
@@ -1405,6 +1658,10 @@ class _Candidate:
     # Reached only through Tuya's cloud (no local key, or a hub Jarvis could not match): with the fallback on.
     cloud_only: bool = False
     online: bool = True
+    hub: bool = False  # a hub or gateway by its category (tdp.HUB_CATEGORIES)
+    hub_name: str | None = None  # the parent's name, for the setup report and spoken errors
+    matched_by: str | None = None  # how the parent was found: "hint", "key" or "only_hub"
+    button_mode: str | None = None  # "click", "switch" or "program", from the cloud's status
 
     def __repr__(self) -> str:  # never the key
         return f"_Candidate({self.tuya_id!r}, {self.name!r})"
@@ -1483,8 +1740,10 @@ def _read_device(manager: Any, device: Any) -> _Candidate | None:
         ),
         None,
     )
-    sub = bool(getattr(device, "sub", False))
-    node_id = _text(getattr(device, "node_id", None)) or None
+    # A hub is never a sub-device, whatever its "sub" flag says: Tuya lists most hubs as sub-devices themselves.
+    hub = category in tdp.HUB_CATEGORIES
+    sub = bool(getattr(device, "sub", False)) and not hub
+    node_id = None if hub else (_text(getattr(device, "node_id", None)) or None)
     if sub and node_id is None:
         # The SDK does not always pass node_id on; the hub knows a sub-device by its uuid then (as tuya-local).
         node_id = _text(getattr(device, "uuid", None)) or None
@@ -1503,6 +1762,9 @@ def _read_device(manager: Any, device: Any) -> _Candidate | None:
         invert=category in ("cl", "jdcljqr") or (category == "clkg" and status.get("control_back_mode") != "back"),
         gang_names=_gang_names(device, dps),
         online=getattr(device, "online", True) is not False,
+        hub=hub,
+        # The SDK's status is {code: value}, so this is the cloud's word ("click", "switch").
+        button_mode=tdp.button_mode(dps, status.get("mode")),
     )
 
 
@@ -1522,29 +1784,55 @@ def _read_cloud(manager: Any, cloud: bool = False) -> tuple[list[_Candidate], li
     return candidates, scenes, has_ir
 
 
+def _parent_of(
+    candidate: _Candidate, by_id: Mapping[str, _Candidate], pool: list[_Candidate], only_hub: _Candidate | None
+) -> tuple[_Candidate | None, str | None]:
+    """The hub a sub-device talks through, and how it was found: its hint; else the one device with its key (a hub
+    first, when several have it); else ``only_hub`` (given for a button pusher only: the account's one hub)."""
+    hinted = by_id.get(candidate.parent_hint or "")
+    if hinted is not None and any(hinted is g for g in pool):
+        return hinted, "hint"
+    same_key = [g for g in pool if candidate.key and g.key == candidate.key]
+    if len(same_key) > 1:
+        same_key = [g for g in same_key if g.hub]
+    if len(same_key) == 1:
+        return same_key[0], "key"
+    if not same_key and only_hub is not None:
+        return only_hub, "only_hub"
+    return None, None
+
+
 def _settle(candidates: list[_Candidate], cloud: bool = False) -> None:
     """Finds each sub-device's gateway (it shares the gateway's key) and decides every device's kind. With
     ``cloud``, a device with no key or no usable hub is kept as reachable only through the cloud."""
     by_id = {c.tuya_id: c for c in candidates}
-    gateways = [c for c in candidates if not c.sub and c.key]
+    # A parent is a hub by its category, or any device that is not a sub-device; never chosen by "sub" alone.
+    pool = [c for c in candidates if c.key and (c.hub or not c.sub)]
+    hubs = [c for c in pool if c.hub]
     for candidate in candidates:
-        if not candidate.sub and tdp.kind_for(candidate.category, candidate.dps) == "button":
+        button = tdp.kind_for(candidate.category, candidate.dps) == "button"
+        if button and tdp.press_code(candidate.dps) is None:
+            # Saved like this it would have no commands at all, through the cloud as well.
+            candidate.reason = NO_SWITCH_POINT
+            continue
+        if button and not candidate.sub:
             # A button pusher talks Bluetooth: with no gateway to pass commands on, nothing on the network
             # reaches it (tuya_sharing says nothing more about its radio than sub and node_id).
             candidate.reason = BLUETOOTH_ONLY
             continue
         if candidate.sub:
-            parent = by_id.get(candidate.parent_hint or "")
-            if parent is None or parent.sub:
-                same_key = [g for g in gateways if candidate.key and g.key == candidate.key]
-                parent = same_key[0] if len(same_key) == 1 else None
+            # A button pusher's key may be its own Bluetooth key, matching no hub: with one hub in the account,
+            # that is the hub (setup says so, and its check shows whether the hub answers for it). Never for
+            # other devices, where a wrong guess would turn "through Tuya's cloud" into a device that never answers.
+            parent, how = _parent_of(candidate, by_id, pool, hubs[0] if button and len(hubs) == 1 else None)
             if parent is None:
-                candidate.reason = "paired to a hub Jarvis could not find"
+                candidate.reason = SEVERAL_HUBS if button and len(hubs) > 1 else "paired to a hub Jarvis could not find"
             elif candidate.node_id is None:
                 # Without it, commands would go to the hub itself and the device would never hear them.
                 candidate.reason = "Tuya did not say how its hub addresses it"
             else:
                 candidate.parent, candidate.key = parent.tuya_id, parent.key
+                candidate.hub_name, candidate.matched_by = parent.name, how
         if candidate.reason is None and not candidate.key:
             candidate.reason = "Tuya gave no local key for it (shared devices sometimes have none)"
         if candidate.reason is not None:
@@ -1774,14 +2062,34 @@ def _import(ui: Prompter, ctx: DriverContext, sharing: Any, link: dict[str, Any]
     records = _plan(ui, config, usable, scenes, found)
     removed = _gone(config, records, {c.tuya_id for c in candidates})
     offline = [c.tuya_id for c in usable if c.cloud_only and not c.online]
-    _report(ui, records, [c for c in candidates if c.kind is None], has_ir, offline)
+    left_out = [c for c in candidates if c.kind is None]
+    # A button pusher saved before (as a plain switch, before Jarvis knew them) and left out now must not stay
+    # saved as if it worked while setup says it was not added: it is offered for removal.
+    buttons = {c.tuya_id for c in left_out if tdp.kind_for(c.category, c.dps) == "button"}
+    stale = [
+        d
+        for d in config.devices
+        if d.driver == TuyaDriver.name and d.kind != "scene" and d.settings.get("tuya_id") in buttons
+    ]
+    notes = [_only_hub_note(c) for c in usable if c.matched_by == "only_hub"]
+    _report(ui, records, left_out, has_ir, offline, notes, link.get(FALLBACK) is True, stale)
+    stale_names = ", ".join(d.name for d in stale)
     if not records:
-        ui.say("Your Tuya account has no devices or scenes Jarvis can use. Nothing was changed.")
+        if stale and ui.confirm(f"Remove {stale_names} from Jarvis?", default=True):
+            _save_all(ctx, [], stale, None)
+            ui.say(f"Removed {stale_names}. Your Tuya account has no other devices or scenes Jarvis can use.")
+        else:
+            ui.say("Your Tuya account has no devices or scenes Jarvis can use. Nothing was changed.")
         return
     if removed and not ui.confirm(
         f"No longer in your Tuya account: {', '.join(d.name for d in removed)}. Remove them from Jarvis?", default=True
     ):
         removed = []
+    if stale:
+        if ui.confirm(f"Remove {stale_names} from Jarvis?", default=True):
+            removed += stale
+        else:
+            ui.say(f"Kept: {stale_names}. Jarvis cannot use {'it' if len(stale) == 1 else 'them'} until that is fixed.")
     device_count = sum(1 for r, _ in records if r.kind != "scene")
     scene_count = len(records) - device_count
     if not ui.confirm(f"Save {_count(device_count, 'device')} and {_count(scene_count, 'scene')}?", default=True):
@@ -1882,6 +2190,10 @@ def _plan(
                 settings["parent"] = candidate.parent
                 if candidate.node_id:
                     settings["node_id"] = candidate.node_id
+                if candidate.hub_name:
+                    settings["hub_name"] = candidate.hub_name
+            if candidate.kind == "button" and candidate.button_mode:
+                settings["button_mode"] = candidate.button_mode
             if power:
                 settings["power"] = power
             if candidate.kind == "cover":
@@ -1907,6 +2219,12 @@ def _plan(
                 ).strip()
                 if presses:
                     record.aliases.append(presses)
+            if candidate.kind == "button" and candidate.button_mode == "switch":
+                # Asked on every refresh, with the saved answer as the default, as the arm's positions are the
+                # user's to change in the app.
+                was = old is not None and tdp.switch_inverted(old)
+                if _ask_inverted(ui, record, was):
+                    record.settings["switch_inverted"] = True
             records.append((record, None if candidate.cloud_only else {"local_key": candidate.key}))
     for scene in scenes:
         old = existing.get((scene.scene_id,))
@@ -1916,41 +2234,83 @@ def _plan(
     return records
 
 
+def _ask_inverted(ui: Prompter, record: DeviceRecord, inverted: bool) -> bool:
+    """Whether what a switch-mode button pusher switches is on while the app shows it Off. Asked in the app's terms
+    (its On and Off), so the answer holds whichever way the app's reverse setting moves the arm."""
+    question = f"In the Tuya app, when the {record.name} shows On, is {tdp.switched(record)} on or off? (on/off)"
+    while True:
+        answer = ui.ask(question, "off" if inverted else "on").strip().lower()
+        if answer in ("on", "off"):
+            return answer == "off"
+        ui.say("Type on or off.")
+
+
 def _report(
     ui: Prompter,
     records: list[tuple[DeviceRecord, dict[str, Any] | None]],
     left_out: list[_Candidate],
     has_ir: bool,
     offline: Iterable[str] = (),
+    notes: Iterable[str] = (),
+    fallback: bool = False,
+    stale: Iterable[DeviceRecord] = (),
 ) -> None:
-    """What the import found. ``offline``: the Tuya ids of cloud-only devices the cloud says are offline."""
+    """What the import found. ``offline``: the Tuya ids of cloud-only devices the cloud says are offline; ``notes``:
+    lines to add after the devices; ``fallback``: whether the cloud fallback is on; ``stale``: saved records of
+    devices now left out, which setup offers to remove."""
     devices = [r for r, _ in records if r.kind != "scene"]
     scenes = [r for r, _ in records if r.kind == "scene"]
     offline = set(offline)
     if devices:
         ui.say(f"{_count(len(devices), 'device')}:")
         for record in devices:
-            if record.settings.get("cloud_only"):
+            settings = record.settings
+            hub = f"the {settings['hub_name']}" if settings.get("hub_name") else None
+            if settings.get("cloud_only"):
                 where = "through Tuya's cloud only"
-                if record.settings.get("tuya_id") in offline:
+                if settings.get("tuya_id") in offline:
                     # A Bluetooth device the cloud lists but cannot reach has no gateway (Tuya's support says so).
                     where += " (Tuya's cloud says it is offline; Bluetooth devices need a Tuya gateway to be reached)"
-            elif record.settings.get("address"):
-                where = f"at {record.settings['address']}"
+            elif settings.get("parent") and settings.get("address"):
+                where = f"through {hub or 'its hub'} at {settings['address']}"
+            elif settings.get("parent"):
+                where = (
+                    f"its hub, {hub}, was not found on the network" if hub else "its hub was not found on the network"
+                )
+            elif settings.get("address"):
+                where = f"at {settings['address']}"
             else:
                 where = "not found on the network"
+            if record.kind == "button":
+                where += f"; {MODE_LINES[tdp.saved_mode(record)]}"
             room = f", {record.room}" if record.room else ""
             ui.say(f"  {record.name} ({record.kind}{room}): {where}")
     if scenes:
         ui.say(f"{_count(len(scenes), 'scene')}: {', '.join(r.name for r in scenes)}")
-    if left_out:
-        ui.say("Not added: " + "; ".join(f"{c.name} ({c.reason})" for c in left_out))
-    missing = [r.name for r in devices if not r.settings.get("address") and not r.settings.get("cloud_only")]
+    for note in notes:
+        ui.say(note)
+    saved = {d.settings.get("tuya_id") for d in stale}
+    not_added = [c for c in left_out if c.tuya_id not in saved]
+    if not_added:
+        ui.say("Not added: " + "; ".join(f"{c.name} ({c.reason})" for c in not_added))
+    if len(not_added) < len(left_out):
+        ui.say(
+            "Saved before, but Jarvis cannot use them now: "
+            + "; ".join(f"{c.name} ({c.reason})" for c in left_out if c.tuya_id in saved)
+        )
+    # A device behind a hub says so on its own line; the others may be asleep or off.
+    missing = [
+        r.name
+        for r in devices
+        if not r.settings.get("address") and not r.settings.get("cloud_only") and not r.settings.get("parent")
+    ]
     if missing:
         ui.say(
             f"Not found on your home network: {', '.join(missing)}. They are saved anyway: battery devices sleep "
             "and others may be switched off. Jarvis looks for them again when they are used."
         )
+    if not fallback and any(r.kind == "button" and r.settings.get("parent") for r in devices):
+        ui.say(HUB_TIP)
     if has_ir:
         ui.say(IR_ADVICE)
     elif not scenes:
@@ -1958,6 +2318,14 @@ def _report(
             "Tip: Tap-to-Run scenes you make in the Tuya Smart or Smart Life app appear here after Refresh devices "
             "and scenes."
         )
+
+
+def _only_hub_note(candidate: _Candidate) -> str:
+    return (
+        f"{candidate.name}: Tuya gave it a different key from the {candidate.hub_name}'s, so Jarvis paired it to the "
+        f"{candidate.hub_name}, the only hub in your account. The check below shows whether the {candidate.hub_name} "
+        "answers for it."
+    )
 
 
 def _check(ui: Prompter, ctx: DriverContext, records: list[DeviceRecord]) -> None:

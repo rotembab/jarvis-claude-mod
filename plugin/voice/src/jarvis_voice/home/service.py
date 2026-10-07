@@ -66,6 +66,20 @@ KIND_WORDS: dict[str, tuple[str, ...]] = {
     "vacuum": ("vacuum", "robot", "hoover"),
     "scene": ("scene",),
 }
+# Kinds a button pusher's alias may name, so "the bedroom lamp" or "the light" finds the Fingerbot on that switch.
+# Only these: a kind word must never steer a plain request to a door, a lock or an alarm.
+BUTTON_KINDS = ("light", "fan")
+
+
+def _spoken_kinds(device: DeviceRecord) -> tuple[str, ...]:
+    """The device's kind, and for a button pusher the kind its alias names ("bedroom light": a light)."""
+    kinds = [device.kind]
+    if device.kind == "button":
+        for alias in map(normalize, device.aliases):
+            for kind in BUTTON_KINDS:
+                if any(alias == word or alias.endswith(f" {word}") for word in KIND_WORDS[kind]):
+                    kinds.append(kind)
+    return tuple(dict.fromkeys(kinds))
 
 
 def _reply(result: str, code: Code, text: str, **extra: Any) -> dict[str, Any]:
@@ -441,13 +455,15 @@ class HomeService:
             room = normalize(device.room)
             labels |= {f"{room} {n}" for n in names}
             labels |= {f"{n} in {room}" for n in names}
-            labels |= {f"{room} {w}" for w in KIND_WORDS.get(device.kind, ())}
+            labels |= {f"{room} {w}" for kind in _spoken_kinds(device) for w in KIND_WORDS.get(kind, ())}
         return {label for label in labels if label}
 
     @staticmethod
     def _kind_words(device: DeviceRecord) -> set[str]:
-        words = set(KIND_WORDS.get(device.kind, ()))
-        words.add(normalize(device.kind.replace("_", " ")))
+        words: set[str] = set()
+        for kind in _spoken_kinds(device):
+            words |= set(KIND_WORDS.get(kind, ()))
+            words.add(normalize(kind.replace("_", " ")))
         return words
 
     def _filter(self, devices: Iterable[DeviceRecord], query: str) -> list[DeviceRecord]:

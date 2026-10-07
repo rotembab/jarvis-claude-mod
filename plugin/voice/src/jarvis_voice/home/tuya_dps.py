@@ -120,6 +120,30 @@ SKIP_REASONS: dict[str, str] = {
     "camera": "a camera",
     "none": "nothing Jarvis can control on it over the home network",
 }
+# Tuya categories that are hubs or gateways, whatever their "sub" flag says (tuya-local's list, plus "wg"): Tuya
+# lists many hubs as sub-devices themselves. Only finding a sub-device's hub uses it; SKIP_CATEGORIES decides what
+# is left out.
+HUB_CATEGORIES = frozenset(
+    {
+        "wgsxj",
+        "lyqwg",
+        "bywg",
+        "zigbee",
+        "wg2",
+        "wg",
+        "dgnzk",
+        "videohub",
+        "xnwg",
+        "qtyycp",
+        "alexa_yywg",
+        "gywg",
+        "cnwg",
+        "wfcon",
+    }
+)
+# A button pusher's modes, in the order of its Bluetooth enum (0, 1, 2), which a hub may pass on as it is.
+BUTTON_MODES = ("click", "switch", "program")
+_MODE_WORDS = {"click": "click", "push": "click", "switch": "switch", "program": "program"}
 
 # --------------------------------------------------------------------------- the saved map
 
@@ -760,13 +784,56 @@ def power_code(device: DeviceRecord, dps: DpMap | None = None) -> str | None:
 
 
 def press_code(dps: DpMap) -> str | None:
-    """The DP that makes a button pusher press: in click mode, each change of its value is one press."""
+    """The DP that moves a button pusher's arm: in click mode each change of its value is one press; in switch
+    mode it is where the arm stays."""
     return find(dps, ("switch", "switch_1"), "bool")
 
 
 def presses(device: DeviceRecord) -> str | None:
-    """What a button pusher switches on and off, as the user named it in setup (its first alias)."""
-    return device.aliases[0] if device.aliases else None
+    """What a button pusher switches on and off, as the user named it in setup (its first alias), without a
+    leading "the" or a trailing "switch", as the sentences add their own."""
+    if not device.aliases:
+        return None
+    what = re.sub(r"^\s*the\s+", "", device.aliases[0], flags=re.IGNORECASE)
+    what = re.sub(r"\s*\bswitch\s*$", "", what, flags=re.IGNORECASE).strip()
+    return what or None
+
+
+def switched(device: DeviceRecord) -> str:
+    """What a button pusher switches, for a sentence: "the bedroom light", or "what it switches" with no name."""
+    what = presses(device)
+    return f"the {what}" if what else "what it switches"
+
+
+def button_mode(dps: DpMap, raw: Any) -> str | None:
+    """A button pusher's mode as "click", "switch" or "program": from a cloud word, the device's own word or the
+    Bluetooth enum's index (a hub may pass that on); None when it did not say or said something else."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    code = find(dps, ("mode",), "enum", writable=False)
+    word = str(enum_std(dps[code], raw) if code else raw).strip().lower()
+    if word in _MODE_WORDS:
+        return _MODE_WORDS[word]
+    return BUTTON_MODES[int(word)] if word.isdigit() and int(word) < len(BUTTON_MODES) else None
+
+
+def saved_mode(device: DeviceRecord) -> str | None:
+    """The mode setup saved for a button pusher; None when Tuya did not say (it is then pressed as in click mode)."""
+    mode = device.settings.get("button_mode")
+    return mode if mode in BUTTON_MODES else None
+
+
+def switch_inverted(device: DeviceRecord) -> bool:
+    """Whether what a switch-mode button pusher switches is on while its switch is off (setup asks, in the app's
+    terms: whether the light is on or off when the app shows On)."""
+    return device.settings.get("switch_inverted") is True
+
+
+def switch_words(device: DeviceRecord, on: bool) -> str:
+    """ "switches the bedroom light on", or "turns on what it switches" with no name."""
+    state = "on" if on else "off"
+    what = presses(device)
+    return f"switches the {what} {state}" if what else f"turns {state} what it switches"
 
 
 @dataclass(frozen=True)
@@ -922,8 +989,21 @@ def command_specs(device: DeviceRecord) -> list[CommandSpec]:
             specs.append(CommandSpec("set_position", "percent", hint="0 closed, 100 open"))
         return specs
     if kind == "button":
-        if press_code(dps):
-            specs.append(CommandSpec("press", hint="presses the wall switch it sits on; Jarvis cannot see the light"))
+        # By the mode setup saved: switch mode turns what it switches on and off; click mode (or a mode Tuya did
+        # not say) presses; program mode is not driven.
+        if not press_code(dps):
+            return specs
+        mode = saved_mode(device)
+        if mode == "switch":
+            specs += [
+                CommandSpec("turn_on", hint=f"switch mode: {switch_words(device, True)}"),
+                CommandSpec("turn_off", hint=f"switch mode: {switch_words(device, False)}"),
+                CommandSpec("toggle"),
+            ]
+        elif mode != "program":
+            specs.append(
+                CommandSpec("press", hint="presses the wall switch it sits on; Jarvis cannot see what it switches")
+            )
         return specs
     if kind == "vacuum":
         if find(dps, ("power_go",), "bool"):
@@ -1056,22 +1136,54 @@ def describe_state(device: DeviceRecord, values: Mapping[str, Any]) -> str:
 
 
 def _button_state(device: DeviceRecord, dps: DpMap, values: Mapping[str, Any]) -> str:
-    """Never on or off: Jarvis knows what the arm did, not what the light it presses is doing."""
+    """On or off only in switch mode, where the arm stays put (read through the saved inversion); otherwise
+    Jarvis knows what the arm did, not what the light it presses is doing."""
 
     def raw(code: str | None) -> Any:
         return None if code is None else values.get(str(dps[code]["dp"]))
 
-    what = presses(device)
-    sentences = [f"The {device.name} presses {f'the {what} switch' if what else 'a wall switch'}."]
-    mode = find(dps, ("mode",), "enum", writable=False)
-    if mode and raw(mode) is not None:
-        sentences.append(f"It is in {words(enum_std(dps[mode], raw(mode)) or '')} mode.")
+    name, what, thing = device.name, presses(device), switched(device)
+    live = button_mode(dps, raw(find(dps, ("mode",), "enum", writable=False)))
+    saved = saved_mode(device)
+    mode = live or saved
+    if mode == "switch":
+        switch = raw(press_code(dps))
+        state = "on" if switch != switch_inverted(device) else "off"
+        if not isinstance(switch, bool):
+            sentences = [f"The {name} is in switch mode, but did not say whether {thing} is on."]
+        elif what:
+            sentences = [f"The {name} is in switch mode and has the {what} {state}."]
+        else:
+            sentences = [f"The {name} is in switch mode, and what it switches is {state}."]
+    elif mode == "program":
+        sentences = [f"The {name} is in program mode, which Jarvis does not drive."]
+    else:
+        sentences = [f"The {name} presses {f'the {what} switch' if what else 'a wall switch'}."]
+        if mode == "click":
+            sentences.append("It is in click mode.")
     battery = find(dps, ("battery_percentage",), "int", writable=False)
     level = _number(raw(battery))
     if level is not None:
         sentences.append(f"Its battery is at {number_words(level)}%.")
-    sentences.append("Jarvis cannot see whether the light is on.")
-    return " ".join(sentences)
+    if mode not in ("switch", "program"):
+        sentences.append(f"Jarvis cannot see whether {thing} is on.")
+    if live is not None and live != saved:
+        sentences.append(_mode_note(live, saved))
+    return " ".join(s for s in sentences if s)
+
+
+def _mode_note(live: str, saved: str | None) -> str:
+    """What to do about a mode changed in the app since setup saved it ("" when nothing needs doing)."""
+    if live == "switch":
+        return "Refresh your Tuya devices in home setup, and Jarvis can then turn it on and off."
+    if live == "program":
+        return (
+            "Put it in click or switch mode in the Tuya Smart or Smart Life app, then refresh your Tuya devices in "
+            "home setup."
+        )
+    if saved is None:
+        return ""  # click mode, and none saved: it is pressed as in click mode already
+    return f"Jarvis has it saved in {saved} mode: refresh your Tuya devices in home setup so Jarvis follows the change."
 
 
 def _light_details(dps: DpMap, values: Mapping[str, Any]) -> list[str]:
