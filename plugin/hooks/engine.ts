@@ -52,6 +52,10 @@ export type Engine = {
   run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult>
   exists: (path: string) => Promise<boolean>
   writeFile: (path: string, text: string) => Promise<void>
+  /** A file's text, or null when it cannot be read (missing, too big, or refused): the guard reads a script it is about to run. */
+  readFileText: (path: string) => Promise<string | null>
+  /** Where a path lands, every link and `..` folded, or null when it cannot be placed: the guard resolves an 8.3 short name before judging a Write. */
+  realPath: (path: string) => Promise<string | null>
 
   storeGet: (key: string) => Promise<unknown>
   storeSet: (key: string, value: unknown) => Promise<void>
