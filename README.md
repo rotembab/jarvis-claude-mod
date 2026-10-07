@@ -4,11 +4,12 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 
 - **Push-to-talk now.** Hold Right Ctrl, speak, release. Speech is transcribed on your own machine with faster-whisper (on an NVIDIA GPU when there is one).
 - **Fish Audio voice.** Replies are spoken sentence by sentence as Claude writes them, through Fish Audio's streaming text-to-speech, in the voice you pick.
-- **Wake word "Jarvis" and barge-in next.** Hands-free listening and interrupting Jarvis by voice are phase 2.
+- **Hands-free.** Say "Hey Jarvis" and talk; talk over him to interrupt.
+- **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
 - **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant, over your home network. See [docs/HOME.md](docs/HOME.md).
-- **Later:** a holographic HUD, and control of your PC with permission tiers.
+- **Later:** control of your PC with permission tiers.
 
-> **Status: phase 1 of 4 ("Talking Jarvis").** Push-to-talk, local speech-to-text and Fish Audio speech work on Windows. Expect rough edges; see the [roadmap](#roadmap).
+> **Status: phase 3 of 4 ("HUD").** Hands-free voice, barge-in and the HUD work on Windows; echo cancelling and a plain "Jarvis" wake word are in progress. Expect rough edges; see the [roadmap](#roadmap).
 
 ## Contents
 
@@ -142,6 +143,24 @@ Sonnet answers what you say, so replies start quickly. Before each voice request
 - `/jarvis routing off` makes your session's model answer voice requests too.
 - Moving between models costs some prompt caching: the first request on a model that has not answered for a while reads the conversation again.
 
+### The HUD
+
+A pane titled JARVIS opens beside the conversation when a session starts. Its ring shows what Jarvis is doing:
+
+| Ring | Means |
+| --- | --- |
+| A glowing blue ring around JARVIS on a dark grid, its dots turning slowly | Standing by for "Hey Jarvis" |
+| The ring brightens, grows a little and the white arc beside it sweeps round as you talk | Listening |
+| An orange globe of glowing fragments turning in 3D, orbits spinning round its core | Thinking: transcribing you, or Claude working |
+| The globe flares gold and swells and shrinks with his voice | Speaking |
+| The blue ring in gray, still | Offline: the voice helper is not running |
+
+Under the ring are the last thing you said and the last six things Claude ran (`›` running, `✓` done, `✗` failed).
+
+- In the terminal the ring is drawn in block characters. A pane opens by itself only in a window at least 144 columns wide; in a narrower one it waits for room, and `/jarvis hud` opens it at any width.
+- In the desktop app's Code tab the ring is a vector drawing.
+- `/jarvis hud off` closes it and keeps it closed in new sessions; `/jarvis hud on` brings it back.
+
 ## Home devices
 
 Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Smart Life and Tuya devices, and anything Home Assistant controls, and talks to them directly on your home network.
@@ -165,6 +184,7 @@ Run `/jarvis home setup`, or say "open home setup". A setup window opens where y
 | `/jarvis bargein <speech\|wake\|off>` | What interrupts Jarvis while he speaks: any speech (default), only "Hey Jarvis", or nothing. |
 | `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
+| `/jarvis hud [on\|off]` | Open the HUD pane. `off` closes it and keeps it closed in new sessions; `on` opens it with each session again. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis home [setup\|list\|status\|do]` | Home devices: what is set up, open the setup window, list devices, show one device's state, or run one command. See [docs/HOME.md](docs/HOME.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
@@ -259,7 +279,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | --- | --- | --- |
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
 | 2 (now) | Always listening | Done: "Hey Jarvis", end-of-speech detection, the follow-up window, barge-in, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: echo cancelling for speakers, and a custom plain "Jarvis" wake word. |
-| 3 | HUD | A holographic heads-up display that shows Jarvis listening, thinking and speaking. |
+| 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).

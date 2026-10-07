@@ -40,6 +40,22 @@ export type JarvisView = {
   micLevel?: number
 }
 
+/** One line of the HUD's action log: a tool call Claude made. */
+export type HudAction = {
+  id: number
+  /** The tool and what it worked on ("Bash npm test"). */
+  label: string
+  status: 'running' | 'done' | 'failed'
+}
+
+/** What the HUD pane's texts show beside the view. */
+export type JarvisHud = {
+  /** Claude is working on a turn. */
+  isThinking: boolean
+  /** The latest tool calls, newest first. */
+  actions: HudAction[]
+}
+
 /**
  * The running helper's control address. Kept in session state so a reloaded
  * module can ask an orphaned helper (killed parent, live grandchild on
@@ -56,6 +72,7 @@ declare module 'claude-code' {
     jarvis: {
       view: JarvisView
       helper: JarvisHelperRef | null
+      hud: JarvisHud
     }
   }
 }

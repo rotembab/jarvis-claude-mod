@@ -18,9 +18,12 @@ import type {
   PromptSubmitResult,
   Timer,
   ToastOptions,
+  UiBlitArgs,
+  UiBlitResult,
+  UiOpenResult,
 } from 'claude-code'
 
-import type { JarvisHelperRef, JarvisView } from '../types'
+import type { JarvisHelperRef, JarvisHud, JarvisView } from '../types'
 
 /** The environment variables the mod reads (each read by its literal name). */
 export type EnvSnapshot = {
@@ -53,6 +56,7 @@ export type Engine = {
   readHelperRef: () => Promise<JarvisHelperRef | null>
   writeHelperRef: (ref: JarvisHelperRef | null) => Promise<void>
   writeView: (view: JarvisView) => Promise<void>
+  writeHud: (hud: JarvisHud) => Promise<void>
 
   status: (text: string | undefined) => void
   toast: (text: string, options?: ToastOptions) => void
@@ -60,6 +64,13 @@ export type Engine = {
   log: (text: string) => void
   /** A line in the debug log only. */
   debug: (text: string) => void
+  /** Opens the HUD pane (placed at any width when the person asked for it, from 144 columns when not). */
+  openPane: () => Promise<UiOpenResult>
+  closePane: () => Promise<void>
+  /** Repaints the pane's ring in place. */
+  blit: (args: UiBlitArgs) => Promise<UiBlitResult>
+  /** Redraws this plugin's drawings (the desktop ring follows the levels this way). */
+  invalidate: () => void
   /**
    * Asks the user in the engine's on-screen question dialog; resolves to the
    * label chosen or the text typed under "Other". Rejects when the dialog is
