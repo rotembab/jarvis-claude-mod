@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 
@@ -309,5 +310,84 @@ def test_paused_output_is_not_a_stall(sink: RecordingSink, playback: FakePlaybac
         assert sink.of_type("error") == []
         playback.set_paused(False)
         assert sink.wait_type("speech_done")["interrupted"] is False
+    finally:
+        pipe.close()
+
+
+def test_prewarm_opens_the_stream_the_first_sentence_then_uses(sink: RecordingSink, playback: FakePlayback) -> None:
+    pipe, synth, _ = make(sink, playback)
+    try:
+        pipe.prewarm()
+        wait_until(lambda: len(synth.streams) == 1)
+        assert synth.streams[0].sentences == []  # opened, nothing sent yet
+        pipe.speak("r1", 0, "Hello there.", True)
+        done = sink.wait_type("speech_done", replyId="r1")
+        assert done["interrupted"] is False and done["spokenText"] == "Hello there."
+        assert len(synth.streams) == 1 and synth.streams[0].sentences == ["Hello there."]
+        pipe.prewarm()  # the next utterance warms a new one
+        wait_until(lambda: len(synth.streams) == 2)
+    finally:
+        pipe.close()
+    assert synth.streams[1].cancelled  # closing drops an unused pre-opened stream
+
+
+def test_unused_prewarm_expires_and_the_reply_opens_its_own(sink: RecordingSink, playback: FakePlayback) -> None:
+    pipe, synth, _ = make(sink, playback, warm_ttl=0.2)
+    try:
+        pipe.prewarm()
+        wait_until(lambda: len(synth.streams) == 1)
+        wait_until(lambda: synth.streams[0].cancelled, timeout=3.0)
+        pipe.speak("r1", 0, "Fresh stream.", True)
+        assert sink.wait_type("speech_done", replyId="r1")["interrupted"] is False
+        assert len(synth.streams) == 2 and synth.streams[1].sentences == ["Fresh stream."]
+    finally:
+        pipe.close()
+
+
+def test_prewarm_for_another_voice_is_not_used(sink: RecordingSink, playback: FakePlayback) -> None:
+    voice = ["voice-1"]
+    synth = FakeSynth()
+    pipe = SpeechPipeline(synth, playback, sink, voice_id=lambda: voice[0]).start()  # type: ignore[arg-type]
+    try:
+        pipe.prewarm()
+        wait_until(lambda: len(synth.streams) == 1)
+        voice[0] = "voice-2"
+        pipe.speak("r1", 0, "New voice.", True)
+        sink.wait_type("speech_done", replyId="r1")
+        assert synth.streams[0].cancelled and synth.streams[1].voice_id == "voice-2"
+    finally:
+        pipe.close()
+
+
+def test_prewarm_without_a_key_does_nothing(sink: RecordingSink, playback: FakePlayback) -> None:
+    missing = SynthError("fish_key_missing", "No Fish Audio API key is configured.")
+    pipe, synth, _ = make(sink, playback, FakeSynth(fail_open=missing))
+    try:
+        pipe.prewarm()
+        time.sleep(0.1)
+        assert synth.streams == [] and sink.types() == []
+    finally:
+        pipe.close()
+
+
+def test_a_reply_waits_for_a_stream_still_connecting(sink: RecordingSink, playback: FakePlayback) -> None:
+    synth = FakeSynth()
+    gate = threading.Event()
+    real_open = synth.open_stream
+
+    def slow_open(on_audio, *, voice_id):  # type: ignore[no-untyped-def]
+        gate.wait(2.0)
+        return real_open(on_audio, voice_id=voice_id)
+
+    synth.open_stream = slow_open  # type: ignore[method-assign]
+    pipe = SpeechPipeline(synth, playback, sink, voice_id=lambda: None).start()  # type: ignore[arg-type]
+    try:
+        pipe.prewarm()
+        time.sleep(0.05)
+        pipe.speak("r1", 0, "Only one connection.", True)
+        time.sleep(0.1)
+        gate.set()
+        assert sink.wait_type("speech_done", replyId="r1")["interrupted"] is False
+        assert len(synth.streams) == 1
     finally:
         pipe.close()

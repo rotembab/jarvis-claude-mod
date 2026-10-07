@@ -327,6 +327,7 @@ class Daemon:
             self._refresh_state()
             return protocol.error_response(exc.code, exc.message)
         self._chime("stop")
+        queued = False
         duration_s = pcm.size / STT_SAMPLERATE
         if duration_s < self.config.min_clip_s:
             log.info("ignoring %.0f ms clip (too short)", duration_s * 1000)
@@ -339,7 +340,10 @@ class Daemon:
             with self._lock:
                 self._transcribing += 1
             self._clips.put(_Clip(pcm, source, round(duration_s * 1000)))
+            queued = True
         self._refresh_state()
+        if queued:
+            self.pipeline.prewarm()  # a reply is coming: connect to the voice service meanwhile
         return {"ok": True}
 
     # ------------------------------------------------------------------ speech-to-text

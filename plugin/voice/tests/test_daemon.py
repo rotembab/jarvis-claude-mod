@@ -496,3 +496,16 @@ def test_config_before_the_model_loads_shapes_the_first_ready(sink: RecordingSin
         rig.daemon.request_exit(0)
         assert rig.thread is not None
         rig.thread.join(5)
+
+
+def test_utterance_prewarms_the_voice_stream(rig: Rig) -> None:
+    wait_ready(rig)
+    rig.ptt.press()
+    time.sleep(0.3)
+    rig.ptt.release()
+    rig.sink.wait_type("utterance")
+    wait_until(lambda: len(rig.synth.streams) == 1)  # connected while Claude thinks
+    reply = rig.command("speak", {"replyId": "r1", "seq": 0, "text": "Right away, sir.", "final": True})
+    assert reply == {"ok": True}
+    rig.sink.wait_type("speech_done", replyId="r1")
+    assert len(rig.synth.streams) == 1 and rig.synth.streams[0].sentences == ["Right away, sir."]

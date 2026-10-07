@@ -12,6 +12,10 @@ is closed as interrupted. A lone open reply is left alone, because a voice
 turn may run tools for minutes between sentences. If queued audio stops
 playing (dead output device), the reply ends with ``no_output_device``.
 
+``prewarm()`` (called when the user has just spoken) opens the output and a
+TTS stream ahead of the reply, so the first sentence skips the handshake; an
+unused pre-opened stream is closed after ``warm_ttl`` seconds.
+
 Locking: all reply state and every event this module emits are guarded by
 ``self._cond`` so events come out in a consistent order. Callbacks into the
 daemon (``on_speaking``) run under that lock; the daemon must therefore never
@@ -41,6 +45,8 @@ log = logging.getLogger(__name__)
 DEFAULT_CHARS_PER_SECOND = 14.0  # typical TTS speaking rate, used until the real rate is known
 MAX_PENDING_PER_REPLY = 2000
 MAX_QUEUED_REPLIES = 16
+WARM_TTL_S = 20.0
+WARM_CONNECT_WAIT_S = 10.0
 
 
 def estimate_spoken_text(sentences: list[str], played_s: float, chars_per_second: float) -> str:
@@ -59,6 +65,26 @@ def estimate_spoken_text(sentences: list[str], played_s: float, chars_per_second
         spoken.append(sentence)
         start += len(sentence) / rate
     return " ".join(spoken)
+
+
+class _AudioRelay:
+    """Audio callback of a pre-opened stream: forwards to the reply that adopts it."""
+
+    def __init__(self) -> None:
+        self.target: Callable[[bytes], None] | None = None
+
+    def __call__(self, chunk: bytes) -> None:
+        target = self.target
+        if target is not None:
+            target(chunk)
+
+
+@dataclass(eq=False)
+class _Warm:
+    stream: SynthStream
+    relay: _AudioRelay
+    voice_id: str | None
+    opened_at: float
 
 
 @dataclass(eq=False)
@@ -99,6 +125,7 @@ class SpeechPipeline:
         gap_timeout: float = 3.0,
         stale_after: float = 3.0,
         stall_timeout: float = 5.0,
+        warm_ttl: float = WARM_TTL_S,
         poll: float = 0.01,
     ) -> None:
         self._synth = synth
@@ -109,12 +136,15 @@ class SpeechPipeline:
         self._gap_timeout = gap_timeout
         self._stale_after = stale_after
         self._stall_timeout = stall_timeout
+        self._warm_ttl = warm_ttl
         self._poll = poll
         self._cond = threading.Condition()
         self._replies: dict[str, _Reply] = {}
         self._order: deque[str] = deque()
         self._closed_ids: OrderedDict[str, None] = OrderedDict()
         self._shutdown = False
+        self._warm: _Warm | None = None
+        self._warming = False
         self._thread = threading.Thread(target=self._worker, name="speech", daemon=True)
 
     # ------------------------------------------------------------------ public API
@@ -127,7 +157,10 @@ class SpeechPipeline:
         self.stop("shutdown")
         with self._cond:
             self._shutdown = True
+            warm, self._warm = self._warm, None
             self._cond.notify_all()
+        if warm is not None:
+            warm.stream.cancel()
         if self._thread.is_alive():
             self._thread.join(2.0)
 
@@ -163,6 +196,16 @@ class SpeechPipeline:
     @property
     def synth_configured(self) -> bool:
         return bool(self._synth.configured)
+
+    def prewarm(self) -> None:
+        """A reply is probably coming: open the output and a TTS stream now, in the background."""
+        if not self.synth_configured:
+            return
+        with self._cond:
+            if self._shutdown or self._warming or self._warm is not None:
+                return
+            self._warming = True
+        threading.Thread(target=self._open_warm, name="speech-prewarm", daemon=True).start()
 
     def speak_now(self, text: str) -> str:
         """Speak a one-off line (test_voice) as its own reply; returns the replyId."""
@@ -226,13 +269,65 @@ class SpeechPipeline:
             log.warning("reply %s: sentence %d never arrived; skipping to %d", reply.id, missing, reply.next_seq)
             self._advance(reply)
 
+    # ------------------------------------------------------------------ pre-opened stream
+
+    def _open_warm(self) -> None:
+        warm: _Warm | None = None
+        try:
+            try:
+                self._playback.open()
+            except AudioError:
+                pass  # the reply reports it
+            relay = _AudioRelay()
+            voice = self._voice_id()
+            try:
+                stream = self._synth.open_stream(relay, voice_id=voice)
+            except SynthError as exc:
+                log.debug("could not pre-open the TTS stream: %s", exc.message)  # the reply reports it
+                return
+            warm = _Warm(stream, relay, voice, time.monotonic())
+        finally:
+            with self._cond:
+                self._warming = False
+                if warm is not None and not self._shutdown and self._warm is None:
+                    self._warm, warm = warm, None
+                self._cond.notify_all()
+        if warm is not None:  # shut down meanwhile
+            warm.stream.cancel()
+
+    def _take_warm(self, on_audio: Callable[[bytes], None]) -> SynthStream | None:
+        """The pre-opened stream, now feeding ``on_audio``; None when there is no fresh one."""
+        with self._cond:
+            # One still connecting gets there no later than a new connection would.
+            self._cond.wait_for(lambda: not self._warming or self._shutdown, timeout=WARM_CONNECT_WAIT_S)
+            warm, self._warm = self._warm, None
+        if warm is None:
+            return None
+        fresh = time.monotonic() - warm.opened_at < self._warm_ttl
+        if not fresh or warm.stream.closed or warm.stream.error is not None or warm.voice_id != self._voice_id():
+            warm.stream.cancel()
+            return None
+        warm.relay.target = on_audio
+        return warm.stream
+
+    def _expire_warm(self) -> None:
+        with self._cond:
+            warm = self._warm
+            if warm is None or (time.monotonic() - warm.opened_at < self._warm_ttl and not warm.stream.closed):
+                return
+            self._warm = None
+        log.debug("closing an unused pre-opened TTS stream")
+        warm.stream.cancel()
+
     # ------------------------------------------------------------------ worker
 
     def _worker(self) -> None:
         while True:
+            self._expire_warm()
             with self._cond:
-                while not self._shutdown and not self._order:
+                if not self._shutdown and not self._order:
                     self._cond.wait(0.5)
+                    continue
                 if self._shutdown:
                     return
                 reply = self._replies.get(self._order[0])
@@ -348,10 +443,12 @@ class SpeechPipeline:
                 if not reply.cancelled:
                     self._playback.add_speech(decoder.feed(chunk), generation)
 
-            try:
-                stream = self._synth.open_stream(on_audio, voice_id=self._voice_id())
-            except SynthError as exc:
-                return exc
+            stream = self._take_warm(on_audio)
+            if stream is None:
+                try:
+                    stream = self._synth.open_stream(on_audio, voice_id=self._voice_id())
+                except SynthError as exc:
+                    return exc
             with self._cond:
                 cancelled = reply.cancelled
                 if not cancelled:
