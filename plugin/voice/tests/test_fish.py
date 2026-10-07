@@ -127,8 +127,12 @@ def test_no_credit_is_reported_as_billing_not_a_bad_key() -> None:
         with pytest.raises(SynthError) as info:
             FishLiveSynth(settings(fish.url)).open_stream(Collector(), voice_id=None)
         assert info.value.code == "fish_auth_failed" and "402" in info.value.message
-        assert "credit" in (info.value.hint or "")
-        assert probe(settings(fish.url))["status"] == "no_credit"
+        assert info.value.message.endswith(
+            "Fish Audio says: Insufficient API credit. API credit is managed independently."
+        )
+        assert "fish.audio/app/developers" in (info.value.hint or "")
+        result = probe(settings(fish.url))
+        assert result["status"] == "no_credit" and "Insufficient API credit" in result["message"]
 
 
 def test_missing_key_maps_to_fish_key_missing() -> None:

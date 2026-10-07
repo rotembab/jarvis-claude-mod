@@ -90,7 +90,8 @@ class FakeFishServer:
             return connection.respond(HTTPStatus.UNAUTHORIZED, "invalid api key\n")
         if self.no_credit:
             self.rejected += 1
-            return connection.respond(HTTPStatus.PAYMENT_REQUIRED, "insufficient balance\n")
+            body = '{"status": 402, "message": "Insufficient API credit. API credit is managed independently."}'
+            return connection.respond(HTTPStatus.PAYMENT_REQUIRED, body)
         return None
 
     def pcm_for(self, text: str, sample_rate: int) -> bytes:

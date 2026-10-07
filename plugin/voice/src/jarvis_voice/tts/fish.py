@@ -41,7 +41,9 @@ DEFAULT_MODEL = "s2.1-pro"
 SAMPLE_RATE = 24_000
 
 AUTH_HINT = "Check the Fish Audio API key (and account balance) at fish.audio, then update fishApiKey."
-CREDIT_HINT = "Add API credit to your Fish Audio account at fish.audio, then try again."
+CREDIT_HINT = (
+    "Add API credit at https://fish.audio/app/developers (it is separate from the app's plan credits), then try again."
+)
 NET_HINT = "Check your internet connection or proxy; Jarvis will keep trying on the next reply."
 
 _AUTH_WORDS = ("unauthor", "forbidden", "api key", "apikey", "invalid key", "authentication", "token")
@@ -91,6 +93,25 @@ def _is_loopback(url: str) -> bool:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def _server_message(body: bytes | None) -> str:
+    """Fish's own explanation from an HTTP error body (JSON ``message``/``detail``, or plain text)."""
+    text = (body or b"")[:2000].decode("utf-8", "replace").strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for field in ("message", "detail", "error"):
+            if isinstance(parsed.get(field), str):
+                text = parsed[field]
+                break
+    return " ".join(text.split())[:300]
+
+
+def _with_reason(message: str, reason: str) -> str:
+    return f"{message} Fish Audio says: {reason}" if reason else message
 
 
 def _classify_text(text: str, default: str = "fish_unreachable") -> tuple[str, str]:
@@ -163,16 +184,13 @@ class FishLiveSynth:
         except InvalidStatus as exc:
             status = exc.response.status_code
             body = (exc.response.body or b"")[:300].decode("utf-8", "replace")
+            reason = _server_message(exc.response.body)
             if status in (401, 403):
-                raise SynthError(
-                    "fish_auth_failed", f"Fish Audio rejected the API key (HTTP {status}).", AUTH_HINT
-                ) from exc
+                message = _with_reason(f"Fish Audio rejected the API key (HTTP {status}).", reason)
+                raise SynthError("fish_auth_failed", message, AUTH_HINT) from exc
             if status == 402:
-                raise SynthError(
-                    "fish_auth_failed",
-                    "Fish Audio says the account has no API credit (HTTP 402, payment required).",
-                    CREDIT_HINT,
-                ) from exc
+                message = _with_reason("The Fish Audio account has no API credit (HTTP 402).", reason)
+                raise SynthError("fish_auth_failed", message, CREDIT_HINT) from exc
             code, hint = _classify_text(body)
             raise SynthError(code, f"Fish Audio refused the connection (HTTP {status}) {body}".strip(), hint) from exc  # type: ignore[arg-type]
         except (OSError, TimeoutError, InvalidHandshake, InvalidURI) as exc:
@@ -372,13 +390,15 @@ def probe(settings: FishSettings, timeout: float = 6.0) -> dict[str, Any]:
             pass  # the handshake is the whole test
     except InvalidStatus as exc:
         status = exc.response.status_code
+        reason = _server_message(exc.response.body)
+        detail = f"HTTP {status}: {reason}" if reason else f"HTTP {status}"
         if status in (401, 402, 403):
             if not settings.api_key:
-                return {"reachable": True, "status": "key_missing", "message": f"HTTP {status} without a key"}
+                return {"reachable": True, "status": "key_missing", "message": f"{detail} (no key sent)"}
             if status == 402:
-                return {"reachable": True, "status": "no_credit", "message": "HTTP 402: the key works, add API credit"}
-            return {"reachable": True, "status": "auth_failed", "message": f"HTTP {status}"}
-        return {"reachable": True, "status": "error", "message": f"HTTP {status}"}
+                return {"reachable": True, "status": "no_credit", "message": detail, "hint": CREDIT_HINT}
+            return {"reachable": True, "status": "auth_failed", "message": detail}
+        return {"reachable": True, "status": "error", "message": detail}
     except (OSError, TimeoutError, InvalidHandshake, InvalidURI) as exc:
         return {"reachable": False, "status": "unreachable", "message": str(exc)}
     return {"reachable": True, "status": "ok" if settings.api_key else "key_missing", "message": "handshake accepted"}
