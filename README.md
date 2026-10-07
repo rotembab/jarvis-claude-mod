@@ -84,7 +84,7 @@ This creates `%USERPROFILE%\.jarvis`, makes a Python 3.12 environment there with
 claude plugin update jarvis@jarvis-claude-mod
 ```
 
-Then restart Claude Code and run `/jarvis setup`, which reinstalls the voice helper from the new version.
+Then restart Claude Code and run `/jarvis setup`, which reinstalls the voice helper from the new version, and the hand helper too if you set up hand control. Until then Jarvis says when the hand helper is from an older version; `/jarvis setup hands` updates only that one.
 
 ## Fish Audio key and voice
 
@@ -194,8 +194,11 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 
 - Sit so the camera sees your hand at chest height with your elbow down; small movements cover the whole screen.
 - `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
-- `/jarvis hands pause` turns the camera off without turning hand control off; `/jarvis hands resume` turns it back on.
-- Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays are left out. `/jarvis hands display 1` keeps your hand on one display.
+- `/jarvis hands pause` turns the camera off without turning hand control off. It stays paused when the helper restarts and in new sessions, until `/jarvis hands resume`, `on` or `off`.
+- Some webcams take up to about 20 seconds to open. If the camera is still opening when `/jarvis hands resume` answers, it says so, and a message follows when the camera is on or why it could not open.
+- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand".
+- Hand control runs in one Claude Code window at a time, since one camera can serve only one. In another window `/jarvis hands` says where it runs; turning it off there and running `/jarvis hands restart` brings it to this window.
+- Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays (virtual display drivers and streaming dummies) are left out; USB display adapters count as real displays. `/jarvis hands display 1` keeps your hand on one display, and a display you leave out takes none of your reach.
 - Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.
 - `/jarvis hands` shows the camera, the displays and the gestures. The camera picture never leaves your computer.
 

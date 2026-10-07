@@ -114,7 +114,7 @@ The **anchor**, the one point that drives the cursor, is the mean of the index a
 ## Mapping (mapping.py)
 
 1. **Calibration** maps camera space to target space `[0, 1]^2` with a homography `H` (3x3). The default is the box `x 0.20..0.80, y 0.20..0.70` of the mirrored frame (`u = (x - 0.2) / 0.6`, `v = (y - 0.2) / 0.5`). `/jarvis hands calibrate` replaces it with one fitted to the four corners you show (cv2.getPerspectiveTransform). The default box is small on purpose: less reach, less "gorilla arm".
-2. **Target region**: the bounding rect of the chosen displays (default all displays except ones whose adapter or monitor name says it is virtual; `/jarvis hands display <n|all>` chooses). `p = region.origin + (u * region.w, v * region.h)`.
+2. **Target region**: the chosen displays (`/jarvis hands display <n|all>` chooses; the default is every display that is not virtual, or all of them when every one is). A display is virtual when Windows reports its output technology as `INDIRECT_VIRTUAL` (17) or its adapter or monitor name contains "virtual" or "IddSampleDriver"; USB display adapters (`INDIRECT_WIRED`) are real. The unit square spans the chosen displays laid end to end: on each axis the desktop spans no chosen display covers are taken out, so a display left out, or the gap beside a shorter display, costs no reach. `p = (xs.to_desktop(u * xs.length), ys.to_desktop(v * ys.length))`.
 3. **Clamp** `p` into the nearest chosen display (gaps between displays of different heights). Points past the edges clamp to the edge, so overshooting reaches the taskbar and screen corners.
 4. **Filter** `p` with a One Euro filter in desktop pixels (`min_cutoff 1.0 Hz`, `beta 0.004`, `d_cutoff 1.0 Hz`, tuned on the PC), then a 1 px dead zone.
 
@@ -133,7 +133,7 @@ A raw pose must hold for 2 frames (`confirm_frames`) before the engine acts on i
 - **Pointer hand tracking**: the observation whose anchor is nearest the pointer's last anchor (within 0.25), else the one with the same handedness. The other hand, if any, is the helper hand.
 - **Hand lost**: for `hold_s` = 0.25 s nothing changes (a dropped frame must not end a drag). After that every held button is released and any window grab ends. After `lost_s` = 1.5 s without the pointer hand the engine disengages.
 - **Real mouse**: when the executor sees the cursor where it did not put it, the engine releases everything and disengages (`engine.on_user_input()`). Touching the mouse always wins.
-- **Commands**: `engage` and `disengage` from the mod (a voice request) work from any state; `engage` still needs a hand to follow.
+- **Commands**: `engage` and `disengage` come from the mod's `hands` tool ("let my hand take the cursor", by voice or typed) and work from any state; `engage` still needs a hand to follow.
 
 ### While engaged
 
@@ -201,7 +201,7 @@ class Desktop(Protocol):
 
 ## Camera and tracker
 
-- `camera/opencv_camera.py`: `cv2.VideoCapture` on Media Foundation (DirectShow as fallback), 1280 x 720 at 30 fps requested; a reader thread keeps only the newest frame. `--camera` takes an index or part of a camera's name. Errors become `camera_blocked` (Windows privacy switch), `camera_in_use`, `no_camera` or `camera_lost` with a hint.
+- `camera/opencv_camera.py`: `cv2.VideoCapture` on Media Foundation (DirectShow as fallback), 1280 x 720 at 30 fps requested; a reader thread keeps only the newest frame. `--camera` takes an index or part of a camera's name. The two backends number cameras differently (DirectShow's list also holds filter-based virtual cameras), so before DirectShow opens one the camera is matched by its device interface path, or a name only one device has; when nothing tells it apart, DirectShow is skipped rather than opening another device. About 2 s without a frame reopens the device with backoff; once that keeps failing, `read()` raises `camera_lost`, and so does every later read. Errors become `camera_blocked` (Windows privacy switch), `camera_in_use`, `no_camera` or `camera_lost` with a hint.
 - `tracker/mediapipe_tracker.py`: `HandLandmarker` in VIDEO mode on the raw frame (BGR to RGB with `cv2.cvtColor`, never a strided view), then mirrors the landmarks (see Coordinates). One hand by default; the runtime asks for two only while a window is grabbed (two-hand resize), because with two requested the palm detector runs on every frame while one hand is in view (about twice the CPU). Closed explicitly on exit.
 - Fakes replay scripted frames so the whole runtime runs in tests without a camera or a model.
 
@@ -233,18 +233,18 @@ Commands (mod -> helper, `POST /v1/<name>`):
 | `heartbeat` | `{}` | keeps it alive |
 | `status` | `{}` | state, camera, fps, inference ms, engaged, displays, settings |
 | `config` | `{engage?, displays?, hand?, anchor?, overlay?, scrollSpeed?}` | live settings |
-| `pause` / `resume` | `{}` | release / reopen the camera |
-| `engage` / `disengage` | `{}` | voice control of engagement |
+| `pause` / `resume` | `{}` | release / reopen the camera; `{ok: true, pending: true}` while the camera is still opening |
+| `engage` / `disengage` | `{}` | take or drop the cursor (the `hands` tool) |
 | `calibrate` | `{action: "start" \| "cancel"}` | calibration |
 | `shutdown` | `{}` | exit cleanly |
 
 ## The mod side (plugin/hooks/hands.ts)
 
 - `HandsHelper`: the supervisor (spawn, hello, heartbeats, backoff, stop), reusing helper.ts's `LineReader` and timing constants.
-- `Hands`: on/off kept in `$.store` (`handsEnabled`), the chosen camera, engage mode and displays; starts the helper at session start when on and installed; turns events into the `hands` part of the view and the status line (`JARVIS · ready · … · hands active`).
+- `Hands`: on/off kept in `$.store` (`handsEnabled`, `{isOn, setting}`: `/jarvis hands on|off`'s choice with the `handControl` setting it overrode, dropped once the setting changes, so the setting has the last word), pause kept there too (`handsPaused`, sent right after `hello` so a restarted helper never opens the camera while paused), the chosen camera, engage mode and displays; starts the helper at session start when on and installed; turns events into the `hands` part of the view and the status line (`JARVIS · ready · … · hands active`).
 - `/jarvis hands [on|off|status|calibrate|display <n|all>|engage <palm|always>|restart|setup]`, and `/jarvis setup hands`.
-- A model tool `hands` (`mcp__jarvis__hands`, input `{action: on|off|status|calibrate|pause|resume, display?}`) so "Jarvis, turn on hand control" works by voice or typing.
-- Setup: `uv sync --project <plugin>/hands --frozen --no-dev --no-editable --reinstall-package jarvis-hands` with `UV_PROJECT_ENVIRONMENT=<dataDir>\hands\venv`, then `python -m jarvis_hands setup --data-dir <dataDir>` for the model (JSON progress lines, as the voice setup).
+- A model tool `hands` (`mcp__jarvis__hands`, input `{action?: on|off|status|calibrate|pause|resume|engage|disengage, display?: "all" | "2" | "1,2"}`; `display` alone, or applied before the action) so "Jarvis, turn on hand control" works by voice or typing. The helper's other live settings (`hand`, `anchor`, `overlay`, `scrollSpeed`) are not exposed.
+- Setup: `uv sync --project <plugin>/hands --frozen --no-dev --no-editable --reinstall-package jarvis-hands` with `UV_PROJECT_ENVIRONMENT=<dataDir>\hands\venv`, then `python -m jarvis_hands setup --data-dir <dataDir>` for the model (JSON progress lines, as the voice setup). It writes `<dataDir>\hands\installed.json` (`{pluginVersion}`); a start whose record names another version says once to run `/jarvis setup hands`. Plain `/jarvis setup` refreshes an installed hand helper along with the voice helper, leaving alone one that another window runs.
 
 ## Tests
 
