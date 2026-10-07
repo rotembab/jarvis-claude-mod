@@ -1,6 +1,6 @@
 {
   "name": "jarvis",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A JARVIS-style voice for Claude Code: say \"Hey Jarvis\" (or hold push-to-talk) to speak, hear the reply, talk over it to interrupt. Local wake word and speech-to-text, Fish Audio speech.",
   "author": { "name": "Rotem" },
   "license": "MIT",
@@ -60,6 +60,13 @@
       "description": "high wakes more easily but also more often by mistake (TV, other people); low needs a clearer \"Hey Jarvis\". Run /jarvis restart after changing it.",
       "options": ["low", "medium", "high"],
       "default": "medium"
+    },
+    "modelRouting": {
+      "type": "string",
+      "title": "Models for voice requests",
+      "description": "auto: Sonnet answers what you say, so replies start quickly; a quick Haiku check sends complex requests to Opus and the hardest to Fable. Say \"use Opus\" or \"think hard\" to choose yourself. off: your session's model answers. Typed messages always use your session's model. /jarvis routing auto|off switches it.",
+      "options": ["auto", "off"],
+      "default": "auto"
     },
     "pttKey": {
       "type": "string",

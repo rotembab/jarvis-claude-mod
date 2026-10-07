@@ -8,6 +8,7 @@ import type { Jarvis, SttModel, VoiceEngine } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
+import { ROUTING_MODES } from './router'
 import { uvMissingMessage } from './setup'
 import { statusLine } from './ui'
 
@@ -17,6 +18,7 @@ const HELP = [
   '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
   '/jarvis wake <on|off>            listen for "Hey Jarvis" (push-to-talk always works)',
   '/jarvis bargein <speech|wake|off>  what interrupts Jarvis: any speech, "Hey Jarvis", or nothing',
+  '/jarvis routing <auto|off>       Sonnet answers voice requests, Opus or Fable the hard ones; off: your model',
   '/jarvis stop                     stop speaking and cancel the spoken reply',
   '/jarvis talk                     start or stop listening without the push-to-talk key',
   '/jarvis test                     speak a test line',
@@ -57,6 +59,9 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
       case 'bargein':
       case 'barge-in':
         return { text: await bargeIn(app, rest[0]) }
+      case 'routing':
+      case 'models':
+        return { text: await routing(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
       default:
@@ -83,6 +88,7 @@ async function status(app: Jarvis): Promise<string> {
     const voiceId = (await app.voiceEngine()) === 'local' ? 'local' : ((await app.voiceId()) ?? 'Fish Audio default')
     lines.push(`Helper ${hello.version} (pid ${hello.pid}) · ${model} · voice ${voiceId}`)
     lines.push(await handsFreeLine(app))
+    lines.push(await routingLine(app))
   } else if (isRetry) {
     lines.push('Starting the voice helper…')
   }
@@ -210,6 +216,22 @@ async function bargeIn(app: Jarvis, choice: string | undefined): Promise<string>
   if (refused) return `Saved, but the helper refused it: ${refused}`
   const note = mode === 'speech' ? ' With speakers instead of a headset, Jarvis may hear himself: use /jarvis bargein wake there.' : ''
   return `Now ${BARGE_IN_LABELS[mode]}.${note}`
+}
+
+async function routingLine(app: Jarvis): Promise<string> {
+  return (await app.routingMode()) === 'auto'
+    ? 'Voice requests: Sonnet, or Opus and Fable for hard ones (say "use Opus" or "think hard" to choose)'
+    : "Voice requests: your session's model"
+}
+
+async function routing(app: Jarvis, choice: string | undefined): Promise<string> {
+  if (choice === undefined) return `${await routingLine(app)}. Switch with /jarvis routing auto or /jarvis routing off.`
+  const mode = ROUTING_MODES.find(one => one === choice.toLowerCase())
+  if (mode === undefined) return `Unknown choice "${choice}". Use /jarvis routing auto or /jarvis routing off.`
+  await app.setRoutingMode(mode)
+  return mode === 'auto'
+    ? 'Sonnet answers voice requests; a quick check sends complex ones to Opus and the hardest to Fable. Typed messages keep your model.'
+    : "Your session's model answers voice requests."
 }
 
 async function stop(app: Jarvis): Promise<string> {

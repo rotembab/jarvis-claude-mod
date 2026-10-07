@@ -20,6 +20,7 @@ import type { CommandOutcome } from './helper'
 import type { Platform } from './platform'
 import type { CommandBodies, HelperEvent, UtteranceEvent } from './protocol'
 import { SPEAK_TEXT_MAX } from './protocol'
+import type { ModelRouter } from './router'
 import { SentenceSplitter } from './sentences'
 
 /** What voice needs of the helper: sending commands. */
@@ -32,6 +33,8 @@ export type VoiceOptions = {
   helper: CommandSender
   /** Told when the user's words were submitted (the band shows them). */
   onSubmitted?: (text: string) => void
+  /** Picks the model for each step of a voice turn. */
+  router?: ModelRouter
 }
 
 /** The note a voice prompt carries (classic UserPromptSubmit additionalContext). */
@@ -245,6 +248,10 @@ export class Voice {
     const entry: PendingPrompt = { key: normalize(text), hasNote: false }
     this.pending = [...this.pending, entry].slice(-5)
     this.options.onSubmitted?.(text)
+    // The model judgement runs while the engine sets the turn up.
+    await this.options.router?.judge(text).catch((error: unknown) => {
+      this.engine.debug(`jarvis: model routing skipped: ${describeError(error)}`)
+    })
     const forget = (): void => {
       this.pending = this.pending.filter(one => one !== entry)
     }
@@ -315,6 +322,7 @@ export class Voice {
     }
     const entry = this.pending[index]
     this.pending = this.pending.slice(index + 1)
+    this.options.router?.onVoiceTurn(e.turnId, e.text)
     this.turn = {
       turnId: e.turnId,
       reply: new VoiceReply(e.turnId, this.options.helper, line => this.engine.debug(`jarvis: ${line}`)),
@@ -324,15 +332,38 @@ export class Voice {
 
   /**
    * turn.step: forwards every chunk unchanged; for the main loop's voice turn
-   * it also feeds the visible text to the reply. Tool calls, their JSON input
-   * and thinking are never spoken.
+   * it names the routed model and feeds the visible text to the reply. Tool
+   * calls, their JSON input and thinking are never spoken.
    */
   async *step(
     e: TurnStepInput,
-    stream: HookStream<TurnStepChunk, TurnStepResult>,
+    next: (input: TurnStepInput) => HookStream<TurnStepChunk, TurnStepResult>,
   ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
     const turn = e.agentId === undefined && this.turn?.turnId === e.turnId ? this.turn : undefined
-    if (turn === undefined) return yield* stream
+    if (turn === undefined) return yield* next(e)
+    const router = this.options.router
+    let model: string | undefined
+    try {
+      model = await router?.modelFor(e)
+    } catch (error) {
+      this.engine.debug(`jarvis: model routing skipped: ${describeError(error)}`)
+    }
+    const input = model === undefined ? e : { ...e, model }
+    const stream = next(input)
+    let result: TurnStepResult | undefined
+    try {
+      result = yield* this.speakStep(input, turn, stream)
+      return result
+    } finally {
+      router?.onStepResult(input, result)
+    }
+  }
+
+  private async *speakStep(
+    e: TurnStepInput,
+    turn: VoiceTurn,
+    stream: HookStream<TurnStepChunk, TurnStepResult>,
+  ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
     let lineOpen = false
     for await (const chunk of stream) {
       if (chunk.kind === 'text') {
@@ -356,6 +387,7 @@ export class Voice {
 
   onTurnComplete(e: TurnCompleteInput): void {
     if (e.agentId !== undefined) return
+    this.options.router?.onTurnComplete(e)
     const turn = this.turn
     if (turn !== undefined && turn.turnId === e.turnId) {
       this.turn = undefined

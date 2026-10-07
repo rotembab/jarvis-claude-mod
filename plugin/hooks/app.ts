@@ -12,6 +12,8 @@ import type { HelperPhase } from './helper'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
+import type { RoutingMode } from './router'
+import { ModelRouter, ROUTING_MODES } from './router'
 import { hasNvidiaGpu, runLocalVoiceSetup, runSetup } from './setup'
 import { statusLine } from './ui'
 import { Voice } from './voice'
@@ -50,6 +52,7 @@ export type JarvisSettings = {
   wakeWord: boolean
   bargeIn: BargeInMode
   wakeSensitivity: WakeSensitivity
+  modelRouting: RoutingMode
 }
 
 const optionString = (options: PluginOptions, key: string): string | undefined => {
@@ -74,6 +77,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     wakeSensitivity:
       (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
       'medium',
+    modelRouting: ROUTING_MODES.find(mode => mode === optionString(options, 'modelRouting')) ?? 'auto',
   }
 }
 
@@ -91,6 +95,7 @@ const VOICE_OVERRIDE_KEY = 'voiceId'
 const ENGINE_OVERRIDE_KEY = 'voiceEngine'
 const WAKE_OVERRIDE_KEY = 'wakeWord'
 const BARGE_IN_OVERRIDE_KEY = 'bargeIn'
+const ROUTING_OVERRIDE_KEY = 'modelRouting'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -143,6 +148,7 @@ export class Jarvis {
       platform,
       helper,
       onSubmitted: text => this.patch({ lastUtterance: text }),
+      router: new ModelRouter(engine, { mode: () => this.routingMode(), complete: request => engine.complete(request) }),
     })
     this.isLocal = !isRemoteSession(env)
     if (!this.isLocal) {
@@ -206,6 +212,16 @@ export class Jarvis {
 
   async setBargeIn(mode: BargeInMode): Promise<void> {
     await this.engine?.storeSet(BARGE_IN_OVERRIDE_KEY, mode)
+  }
+
+  /** Whether voice requests are routed between Sonnet, Opus and Fable: /jarvis routing's choice, else the setting. */
+  async routingMode(): Promise<RoutingMode> {
+    const stored = await this.engine?.storeGet(ROUTING_OVERRIDE_KEY).catch(() => undefined)
+    return ROUTING_MODES.find(mode => mode === stored) ?? this.settings.modelRouting
+  }
+
+  async setRoutingMode(mode: RoutingMode): Promise<void> {
+    await this.engine?.storeSet(ROUTING_OVERRIDE_KEY, mode)
   }
 
   /**

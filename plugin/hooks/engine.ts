@@ -7,6 +7,8 @@ import type {
   HookStream,
   HttpInit,
   HttpResponse,
+  ModelCompleteRequest,
+  ModelCompleteResult,
   ProcessRunInit,
   ProcessRunResult,
   ProcessSpawnChunk,
@@ -61,6 +63,8 @@ export type Engine = {
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>
   abortTurn: (turnId: string) => Promise<void>
+  /** One completion through the session's own client and credentials. */
+  complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
 }
 
 /** Resolves after `ms` on the engine's clock (a hooks module has no timers). */

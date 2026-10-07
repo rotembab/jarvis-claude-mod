@@ -6,12 +6,15 @@
 import { mock } from 'claude-code/testing'
 import type { Engine as TestEngine, MockClock } from 'claude-code/testing'
 import type {
+  ModelCompleteInput,
+  ModelCompleteResult,
   On,
   ProcessSpawnChunk,
   ProcessSpawnRequest,
   PromptSubmitInput,
   TurnCompleteInput,
   TurnStepChunk,
+  TurnStepInput,
   TurnStepResult,
 } from 'claude-code'
 
@@ -132,6 +135,14 @@ export type World = {
   status: () => string | undefined
   /** Model responses served beneath `turn.step`, by `${turnId}:${index}`. */
   steps: Map<string, TurnStepChunk[]>
+  /** Every `turn.step` request as it reached the engine (the model it names). */
+  stepInputs: TurnStepInput[]
+  /** Steps (`${turnId}:${index}`) whose request gets no response, as when the API refused it. */
+  failedSteps: Set<string>
+  /** Every `$.model.complete` call. */
+  completions: ModelCompleteInput[]
+  /** Answers `$.model.complete` (default: the judge says "simple"). */
+  complete: (input: ModelCompleteInput) => ModelCompleteResult | Promise<ModelCompleteResult>
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
 }
@@ -164,6 +175,10 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     exists: path => w.existing.has(path),
     uvOnPath: undefined,
     steps: new Map(),
+    stepInputs: [],
+    failedSteps: new Set(),
+    completions: [],
+    complete: () => answered('simple'),
     onSpawn: () => undefined,
     respond: () => ({ status: 200, body: { ok: true } }),
     helpers: () => w.children.filter(child => child.isHelperRun),
@@ -260,17 +275,24 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('turn.step', async function* ($, e) {
-    const chunks = w.steps.get(`${e.turnId}:${e.index}`) ?? []
+    w.stepInputs.push(e)
+    const key = `${e.turnId}:${e.index}`
+    const isFailed = w.failedSteps.has(key)
+    const chunks = isFailed ? [] : (w.steps.get(key) ?? [])
     for (const chunk of chunks) yield chunk
     const result: TurnStepResult = {
       turnId: e.turnId,
       index: e.index,
       answer: chunks.map(chunk => (chunk.kind === 'text' ? chunk.text : '')).join(''),
       toolUses: [],
-      stopReason: 'end_turn',
+      stopReason: isFailed ? null : 'end_turn',
       usage: null,
     }
     return result
+  })
+  on('model.complete', async ($, e) => {
+    w.completions.push(e)
+    return { value: await w.complete(e) }
   })
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
@@ -283,6 +305,15 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
  */
 function windowsPath(path: string): string {
   return path.replace(/^.*?(?=[A-Za-z]:\\)/, '')
+}
+
+/** A completion that answered `text`. */
+export function answered(text: string): ModelCompleteResult {
+  return {
+    isAnswered: true,
+    text,
+    usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+  }
 }
 
 function run(exitCode: number, stdout: string) {
@@ -334,7 +365,7 @@ export async function runStep(
   w: World,
   turnId: string,
   chunks: TurnStepChunk[],
-  options: { index?: number; agentId?: string } = {},
+  options: { index?: number; agentId?: string; model?: string } = {},
 ): Promise<TurnStepChunk[]> {
   const index = options.index ?? 0
   w.steps.set(`${turnId}:${index}`, chunks)
@@ -342,7 +373,7 @@ export async function runStep(
   const stream = $.turn.step({
     turnId,
     index,
-    model: 'claude-test',
+    model: options.model ?? 'claude-test',
     messageCount: 1,
     ...(options.agentId === undefined ? {} : { agentId: options.agentId }),
   })
@@ -356,4 +387,9 @@ export function completeTurn($: TestEngine, turnId: string, isAborted = false) {
     ? { turnId, answer: '', durationMs: 10, isAborted: true, reason: 'aborted' }
     : { turnId, answer: 'done', durationMs: 10, isAborted: false, reason: 'answer' }
   return $.turn.complete(input)
+}
+
+/** Ends a main-loop turn on an API error, as when its request was refused. */
+export function failTurn($: TestEngine, turnId: string) {
+  return $.turn.complete({ turnId, answer: '', durationMs: 10, isAborted: false, reason: 'error' })
 }

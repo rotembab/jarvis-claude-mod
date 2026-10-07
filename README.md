@@ -129,6 +129,15 @@ Push-to-talk still works the whole time: hold the key (Right Ctrl by default), s
 
 Messages you type are answered in Claude's normal style and are not read aloud; the Jarvis persona applies to voice messages only.
 
+### Which model answers
+
+Sonnet answers what you say, so replies start quickly. Before each voice request reaches Claude, a quick Haiku check rates it. Complex work (multi-step coding, debugging, changes across files) goes to Opus. The hardest problems (architecture, subtle bugs, large migrations) go to Fable. A follow-up such as "go ahead" is rated with the request before it. When Opus or Fable takes a request, the transcript says so.
+
+- Choose yourself by saying so: "use Opus", "with Fable", "switch to Sonnet", or "think hard" (Opus) and "ultrathink" (Fable).
+- Messages you type, and subagents, always use your session's model (`/model`).
+- `/jarvis routing off` makes your session's model answer voice requests too.
+- Moving between models costs some prompt caching: the first request on a model that has not answered for a while reads the conversation again.
+
 ## Commands
 
 | Command | What it does |
@@ -142,6 +151,7 @@ Messages you type are answered in Claude's normal style and are not read aloud; 
 | `/jarvis engine <fish\|local>` | Speak with Fish Audio or with the local voice. |
 | `/jarvis wake <on\|off>` | Listen for "Hey Jarvis", or use push-to-talk only. |
 | `/jarvis bargein <speech\|wake\|off>` | What interrupts Jarvis while he speaks: any speech (default), only "Hey Jarvis", or nothing. |
+| `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis restart` | Restart the voice helper. |
@@ -159,6 +169,7 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `localVoiceClip` | empty | A 10 to 20 second recording for the local voice to copy. Empty means its built-in voice. Run `/jarvis restart` after changing it. |
 | `wakeWord` | `on` | `on` listens for "Hey Jarvis"; `off` is push-to-talk only. `/jarvis wake` changes it too. |
 | `bargeIn` | `speech` | What interrupts Jarvis: `speech` (talking over him, best with a headset), `wake` (only "Hey Jarvis", for speakers or a noisy room) or `off`. `/jarvis bargein` changes it too. |
+| `modelRouting` | `auto` | `auto`: Sonnet answers voice requests, Opus complex ones and Fable the hardest ([Which model answers](#which-model-answers)). `off`: your session's model. `/jarvis routing` changes it too. |
 | `wakeSensitivity` | `medium` | `high` wakes more easily and more often by mistake; `low` needs a clearer "Hey Jarvis". Run `/jarvis restart` after changing it. |
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
 | `sttModel` | `auto` | Speech-to-text model: `auto`, `base.en`, `small.en`, `small`, `medium` or `large-v3-turbo`. `auto` means `large-v3-turbo` on an NVIDIA GPU and `small.en` on the CPU. Run `/jarvis setup` after changing it. |
@@ -200,7 +211,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 ## Privacy
 
 - **Your audio stays on your computer.** The wake word, speech detection and transcription all run locally. While Jarvis runs, the helper keeps the microphone open (Windows shows Python using the microphone) and listens for "Hey Jarvis", holding only the last 2 seconds in memory. Nothing is recorded, transcribed or kept until it hears the wake word, you hold push-to-talk, you speak in the few seconds after a reply, or you talk over Jarvis while he speaks. Audio is never written to disk. `/jarvis wake off` turns the wake word off.
-- **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message.
+- **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message. With model routing on, each one also goes to Haiku, through the same Claude Code connection, to choose the model.
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log`. API keys and tokens are masked in it.
 - Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word model from openWakeWord's GitHub releases), Jarvis talks to nothing else.
@@ -233,7 +244,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | Phase | Name | What it adds |
 | --- | --- | --- |
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
-| 2 (now) | Always listening | Done: "Hey Jarvis", end-of-speech detection, the follow-up window, barge-in, spoken "stop". Next: echo cancelling for speakers, and a custom plain "Jarvis" wake word. |
+| 2 (now) | Always listening | Done: "Hey Jarvis", end-of-speech detection, the follow-up window, barge-in, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: echo cancelling for speakers, and a custom plain "Jarvis" wake word. |
 | 3 | HUD | A holographic heads-up display that shows Jarvis listening, thinking and speaking. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
 

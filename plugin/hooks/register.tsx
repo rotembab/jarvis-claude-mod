@@ -53,12 +53,13 @@ export const register: Register = (on, options) => {
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
       submitPrompt: text => $.prompt.submit({ text, asUser: true }),
+      complete: request => $.model.complete(request),
       abortTurn: turnId => $.turn.abort({ turnId }),
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, devices',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|devices]',
+      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices]',
       immediate: true,
     })
     await app.onSessionStart(engine, e.surface)
@@ -81,7 +82,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const voice = app.voice
     if (voice === undefined) return yield* next(e)
-    return yield* voice.step(e, next(e))
+    return yield* voice.step(e, input => next(input))
   })
 
   on('turn.complete', ($, e, next) => {

@@ -9,7 +9,7 @@ Commands below are for PowerShell (Windows Terminal). Git Bash is not needed.
 ```text
 .claude-plugin/marketplace.json   makes the repo a plugin marketplace listing "jarvis" at ./plugin
 plugin/                           the plugin, the only folder that ships
-  .claude-plugin/plugin.json      manifest and userConfig (Fish Audio, voice engine, wake word, barge-in, push-to-talk, speech model)
+  .claude-plugin/plugin.json      manifest and userConfig (Fish Audio, voice engine, wake word, barge-in, model routing, push-to-talk, speech model)
   hooks/                          the mod: TypeScript hooks module (register.tsx) and its *.test.ts
   types/index.d.ts                the mod's $.state contract
   tsconfig.json                   type-checks the mod (tsc -p plugin)
