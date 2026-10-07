@@ -2,7 +2,8 @@
 // words come quickly; Opus takes complex requests and Fable the hardest.
 // The user's own words decide first ("use Opus", "think hard"), else a quick
 // Haiku judgement of the request. Typed turns and subagents keep the
-// session's model.
+// session's model, and so does a long conversation: the routed models have
+// the standard context window, and moving one there re-reads it uncached.
 
 import type { ModelCompleteRequest, ModelCompleteResult, TurnCompleteInput, TurnStepInput, TurnStepResult } from 'claude-code'
 
@@ -13,10 +14,27 @@ export const ROUTING_MODES = ['auto', 'off'] as const
 export type RoutingMode = (typeof ROUTING_MODES)[number]
 
 export type Tier = 'simple' | 'complex' | 'hardest'
+export type Family = 'sonnet' | 'opus' | 'fable'
 
-/** The model alias each tier names. */
-export const TIER_MODELS: Record<Tier, string> = { simple: 'sonnet', complex: 'opus', hardest: 'fable' }
-export const TIER_NAMES: Record<Tier, string> = { simple: 'Sonnet', complex: 'Opus', hardest: 'Fable' }
+/**
+ * The model id a step names for each family. `turn.step` hands the name to
+ * the API as it is, so an alias such as `sonnet` is refused there and a full
+ * id is needed. (`$.model.complete` resolves aliases, so the judge keeps one.)
+ */
+export const MODEL_IDS: Record<Family, string> = {
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
+  fable: 'claude-fable-5-1',
+}
+export const FAMILY_NAMES: Record<Family, string> = { sonnet: 'Sonnet', opus: 'Opus', fable: 'Fable' }
+/** The families a tier tries, in order: the hardest requests fall back to Opus where Fable is not offered. */
+const TIER_FAMILIES: Record<Tier, readonly Family[]> = { simple: ['sonnet'], complex: ['opus'], hardest: ['fable', 'opus'] }
+const SPOKEN_TIERS: Record<Family, Tier> = { sonnet: 'simple', opus: 'complex', fable: 'hardest' }
+
+/** A voice turn is routed only while the conversation is at most this many tokens. */
+export const ROUTE_LIMIT_TOKENS = 100_000
+/** A later step stays routed only while the step before it was at most this many: the routed models' window is 200,000. */
+export const STEP_LIMIT_TOKENS = 160_000
 
 /** The judge: small and fast. */
 export const JUDGE_MODEL = 'haiku'
@@ -32,14 +50,14 @@ export const JUDGE_SYSTEM = [
   'A short follow-up ("yes", "do it", "go ahead", "continue") has the level of the previous request.',
 ].join('\n')
 
-const SPOKEN_MODEL = /\b(?:use|using|with|on|switch to|ask|try)\s+(sonnet|opus|fable)\b/i
+const SPOKEN_MODEL = /\b(?:use|using|with|on|switch to|ask|try|make|have|let|get)\s+(sonnet|opus|fable)\b/i
 const THINK_HARDEST = /\b(?:ultrathink|think (?:as hard as (?:you|ye) can|really hard|very hard|hardest))\b/i
 const THINK_HARD = /\bthink (?:hard|harder|carefully|deeply|it through|this through)\b/i
 
 /** The tier the user asked for in so many words ("use Opus", "think hard"), if any. */
 export function spokenTier(text: string): Tier | undefined {
-  const named = SPOKEN_MODEL.exec(text)?.[1]?.toLowerCase()
-  if (named !== undefined) return (Object.keys(TIER_MODELS) as Tier[]).find(tier => TIER_MODELS[tier] === named)
+  const named = SPOKEN_MODEL.exec(text)?.[1]?.toLowerCase() as Family | undefined
+  if (named !== undefined) return SPOKEN_TIERS[named]
   if (THINK_HARDEST.test(text)) return 'hardest'
   if (THINK_HARD.test(text)) return 'complex'
   return undefined
@@ -51,15 +69,14 @@ export function parseTier(answer: string): Tier | undefined {
   return word === 'simple' || word === 'complex' || word === 'hardest' ? word : undefined
 }
 
-/**
- * The model a step should name for a tier, or undefined to keep the
- * session's: it already runs that family. The session's 1M-context suffix
- * is kept, so a long conversation still fits.
- */
-export function stepModel(sessionModel: string, tier: Tier): string | undefined {
-  const family = TIER_MODELS[tier]
-  if (sessionModel.toLowerCase().includes(family)) return undefined
-  return /\[1m\]$/i.test(sessionModel) ? `${family}[1m]` : family
+/** The family a tier's steps run on: the first it tries that was not refused this session, if any. */
+export function familyFor(tier: Tier, refused: ReadonlySet<Family> = new Set()): Family | undefined {
+  return TIER_FAMILIES[tier].find(family => !refused.has(family))
+}
+
+/** The model a step names for `family`, or undefined to keep the session's: it already runs that family. */
+export function stepModel(sessionModel: string, family: Family): string | undefined {
+  return sessionModel.toLowerCase().includes(family) ? undefined : MODEL_IDS[family]
 }
 
 export type RouterOptions = {
@@ -80,11 +97,14 @@ type Judgement = {
 
 type RoutedTurn = {
   judgement: Judgement
-  /** The model the last routed step named. */
+  /** The family and model the last step named; undefined when it kept the session's. */
+  family: Family | undefined
   model: string | undefined
   isAnnounced: boolean
-  /** A routed step got no response: the model may not have been accepted. */
-  hasFailedStep: boolean
+  /** The conversation's size at the last step, in tokens. */
+  tokens: number
+  /** A routed step got no response from a family that never answered: it may not be offered. */
+  failed: Family | undefined
 }
 
 const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim()
@@ -96,10 +116,12 @@ export class ModelRouter {
   private pending: Judgement[] = []
   private turns = new Map<string, RoutedTurn>()
   private previous: { text: string; tier: Tier } | undefined
-  /** Routed models that have answered at least once this session. */
+  /** Models that have answered a routed step this session. */
   private answered = new Set<string>()
-  /** Set when a routed model was refused: the session's model answers from then on. */
-  private isOff = false
+  /** Families Claude Code could not answer on this session: their requests go elsewhere. */
+  private refused = new Set<Family>()
+  /** Whether the transcript already says the conversation is too long to route. */
+  private hasSaidLong = false
 
   constructor(
     private readonly engine: Engine,
@@ -108,7 +130,7 @@ export class ModelRouter {
 
   /** The user's words were heard: start judging them while the turn is set up. */
   async judge(text: string): Promise<void> {
-    if (this.isOff || (await this.options.mode().catch(() => 'auto' as const)) === 'off') return
+    if ((await this.options.mode().catch(() => 'auto' as const)) === 'off' || (await this.isLong())) return
     const startedAt = await this.engine.now()
     const spoken = spokenTier(text)
     const judgement: Judgement = {
@@ -134,17 +156,23 @@ export class ModelRouter {
     if (index === -1) return
     const judgement = this.pending[index] as Judgement
     this.pending = this.pending.slice(index + 1)
-    this.turns.set(turnId, { judgement, model: undefined, isAnnounced: false, hasFailedStep: false })
+    this.turns.set(turnId, { judgement, family: undefined, model: undefined, isAnnounced: false, tokens: 0, failed: undefined })
   }
 
   /**
    * The model a main-loop step of a voice turn names; undefined keeps the
    * engine's. The first step waits a moment for the judgement; a later one
-   * takes it as soon as it is in.
+   * takes it as soon as it is in, unless the turn outgrew the routed window.
    */
   async modelFor(e: TurnStepInput): Promise<string | undefined> {
-    const turn = e.agentId === undefined && !this.isOff ? this.turns.get(e.turnId) : undefined
+    const turn = e.agentId === undefined ? this.turns.get(e.turnId) : undefined
     if (turn === undefined) return undefined
+    if (e.index > 0 && turn.tokens > STEP_LIMIT_TOKENS) {
+      if (turn.model !== undefined) this.engine.debug(`jarvis: turn ${e.turnId} reached ${turn.tokens} tokens; the session's model takes it on`)
+      turn.family = undefined
+      turn.model = undefined
+      return undefined
+    }
     const { judgement } = turn
     let tier = judgement.tier
     if (tier === undefined && e.index === 0) {
@@ -155,23 +183,28 @@ export class ModelRouter {
       }
     }
     tier ??= 'simple'
-    const model = stepModel(e.model, tier)
+    const family = familyFor(tier, this.refused)
+    const model = family === undefined ? undefined : stepModel(e.model, family)
+    turn.family = model === undefined ? undefined : family
     turn.model = model
-    if (tier !== 'simple' && !turn.isAnnounced) {
+    if (family !== undefined && tier !== 'simple' && !turn.isAnnounced) {
       turn.isAnnounced = true
-      this.engine.log(`Jarvis: ${TIER_NAMES[tier]} is taking this one.`)
+      this.engine.log(`Jarvis: ${FAMILY_NAMES[family]} is taking this one.`)
     }
     if (model !== undefined) this.engine.debug(`jarvis: turn ${e.turnId} step ${e.index} → ${model} (${tier})`)
     return model
   }
 
-  /** A routed step ended: no response at all, from a model that never answered, may mean it was not accepted. */
+  /** A step of a voice turn ended: its size, and whether a routed model answered. */
   onStepResult(e: TurnStepInput, result: TurnStepResult | undefined): void {
-    const turn = this.turns.get(e.turnId)
-    const model = turn?.model
-    if (turn === undefined || model === undefined || e.agentId !== undefined) return
+    const turn = e.agentId === undefined ? this.turns.get(e.turnId) : undefined
+    if (turn === undefined) return
+    const usage = result?.usage
+    if (usage) turn.tokens = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
+    const { family, model } = turn
+    if (family === undefined || model === undefined) return
     if (result !== undefined && result.stopReason !== null) this.answered.add(model)
-    else if (!this.answered.has(model)) turn.hasFailedStep = true
+    else if (!this.answered.has(model)) turn.failed = family
   }
 
   onTurnComplete(e: TurnCompleteInput): void {
@@ -181,12 +214,37 @@ export class ModelRouter {
     this.turns.delete(e.turnId)
     const tier = turn.judgement.tier ?? 'simple'
     this.previous = { text: turn.judgement.text, tier }
-    if (e.reason === 'error' && turn.hasFailedStep && turn.model !== undefined && !this.isOff) {
-      this.isOff = true
+    const { failed } = turn
+    if (e.reason === 'error' && failed !== undefined && !this.refused.has(failed)) {
+      this.refused.add(failed)
+      const instead = failed === 'fable' ? 'Opus' : "your session's model"
       this.engine.log(
-        `Jarvis: Claude Code could not answer on "${turn.model}", so model routing is off for this session and your session's model answers voice requests. /jarvis routing off turns it off for good.`,
+        `Jarvis: Claude Code could not answer on ${FAMILY_NAMES[failed]}, so ${instead} takes its voice requests for the rest of this session. Please say that again.`,
       )
     }
+  }
+
+  /** Whether the conversation is too long to route; the transcript says so once each time it gets there. */
+  private async isLong(): Promise<boolean> {
+    let tokens: number | undefined
+    try {
+      tokens = await this.engine.contextTokens()
+    } catch (error) {
+      this.engine.debug(`jarvis: model routing skipped: no context size (${describeError(error)})`)
+      return true
+    }
+    if ((tokens ?? 0) <= ROUTE_LIMIT_TOKENS) {
+      this.hasSaidLong = false
+      return false
+    }
+    this.engine.debug(`jarvis: model routing skipped: the conversation is ${tokens} tokens`)
+    if (!this.hasSaidLong) {
+      this.hasSaidLong = true
+      this.engine.log(
+        "Jarvis: this conversation is long, so your session's model answers voice requests. Sonnet, Opus and Fable take over again after /compact or /clear, or in a new session.",
+      )
+    }
+    return true
   }
 
   private async ask(text: string): Promise<Tier> {

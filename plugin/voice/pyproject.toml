@@ -1,6 +1,6 @@
 [project]
 name = "jarvis-voice"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local voice helper for the Jarvis Claude Code mod: wake word, push-to-talk, faster-whisper STT, Fish Audio live TTS."
 readme = "README.md"
 license = "MIT"

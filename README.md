@@ -133,8 +133,10 @@ Messages you type are answered in Claude's normal style and are not read aloud; 
 
 Sonnet answers what you say, so replies start quickly. Before each voice request reaches Claude, a quick Haiku check rates it. Complex work (multi-step coding, debugging, changes across files) goes to Opus. The hardest problems (architecture, subtle bugs, large migrations) go to Fable. A follow-up such as "go ahead" is rated with the request before it. When Opus or Fable takes a request, the transcript says so.
 
-- Choose yourself by saying so: "use Opus", "with Fable", "switch to Sonnet", or "think hard" (Opus) and "ultrathink" (Fable).
+- Choose yourself by saying so: "use Opus", "make Fable do it", "switch to Sonnet", or "think hard" (Opus) and "ultrathink" (Fable).
 - Messages you type, and subagents, always use your session's model (`/model`).
+- In a long conversation (over about 100,000 tokens) your session's model answers voice requests, because Sonnet, Opus and Fable have a smaller context window than a 1M-context session and moving a long conversation to another model is slow. The transcript says so once. Routing starts again after `/compact` or `/clear`, or in a new session, so Jarvis works best in a session of its own.
+- If Claude Code can't answer on a model (your plan may not offer Fable), Jarvis stops using it for the rest of the session: Opus takes Fable's requests, and your session's model takes Sonnet's or Opus's. The transcript says so; say the request again.
 - `/jarvis routing off` makes your session's model answer voice requests too.
 - Moving between models costs some prompt caching: the first request on a model that has not answered for a while reads the conversation again.
 
