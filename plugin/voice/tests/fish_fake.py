@@ -48,8 +48,10 @@ class FakeFishServer:
         chunk_ms: float = 40.0,
         chunk_delay: float = 0.0,
         odd_chunks: bool = False,
+        no_credit: bool = False,
     ) -> None:
         self.api_key = api_key
+        self.no_credit = no_credit  # a valid key on an account without API credit: HTTP 402
         self.mode = mode
         self.ms_per_char = ms_per_char
         self.chunk_ms = chunk_ms
@@ -86,6 +88,9 @@ class FakeFishServer:
         if request.headers.get("Authorization") != f"Bearer {self.api_key}":
             self.rejected += 1
             return connection.respond(HTTPStatus.UNAUTHORIZED, "invalid api key\n")
+        if self.no_credit:
+            self.rejected += 1
+            return connection.respond(HTTPStatus.PAYMENT_REQUIRED, "insufficient balance\n")
         return None
 
     def pcm_for(self, text: str, sample_rate: int) -> bytes:

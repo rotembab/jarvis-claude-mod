@@ -188,7 +188,7 @@ The helper reports `mic_blocked` when Windows denies microphone access. Open Set
 | Error | Meaning |
 | --- | --- |
 | `fish_key_missing` | No key: set the plugin's **Fish Audio API key** option or `FISH_AUDIO_API_KEY` (see the README). |
-| `fish_auth_failed` | Fish Audio rejected the key: check it was copied whole and has not been revoked. |
+| `fish_auth_failed` | Fish Audio rejected the key (HTTP 401/403: check it was copied whole and has not been revoked), or the key works but the account has no API credit (HTTP 402, doctor status `no_credit`: add credit at fish.audio). |
 | `fish_unreachable` | No connection to `api.fish.audio`: check the network, a firewall, or a proxy. |
 
 `/jarvis test` speaks a test line, and the doctor checks the key without speaking. The helper reads the key when it starts: after changing it, run `/jarvis restart`, and restart Claude Code if the key is in `settings.json` (Claude Code reads its `env` block at startup). Without a `voiceId`, Fish Audio's default voice is used.

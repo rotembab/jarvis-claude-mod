@@ -41,6 +41,7 @@ DEFAULT_MODEL = "s2.1-pro"
 SAMPLE_RATE = 24_000
 
 AUTH_HINT = "Check the Fish Audio API key (and account balance) at fish.audio, then update fishApiKey."
+CREDIT_HINT = "Add API credit to your Fish Audio account at fish.audio, then try again."
 NET_HINT = "Check your internet connection or proxy; Jarvis will keep trying on the next reply."
 
 _AUTH_WORDS = ("unauthor", "forbidden", "api key", "apikey", "invalid key", "authentication", "token")
@@ -95,7 +96,7 @@ def _is_loopback(url: str) -> bool:
 def _classify_text(text: str, default: str = "fish_unreachable") -> tuple[str, str]:
     lowered = text.lower()
     if any(w in lowered for w in _BALANCE_WORDS):
-        return "fish_auth_failed", "Check your Fish Audio account balance."
+        return "fish_auth_failed", CREDIT_HINT
     if any(w in lowered for w in _AUTH_WORDS):
         return "fish_auth_failed", AUTH_HINT
     return default, NET_HINT
@@ -169,8 +170,8 @@ class FishLiveSynth:
             if status == 402:
                 raise SynthError(
                     "fish_auth_failed",
-                    "Fish Audio says payment is required (HTTP 402).",
-                    "Check your Fish Audio account balance.",
+                    "Fish Audio says the account has no API credit (HTTP 402, payment required).",
+                    CREDIT_HINT,
                 ) from exc
             code, hint = _classify_text(body)
             raise SynthError(code, f"Fish Audio refused the connection (HTTP {status}) {body}".strip(), hint) from exc  # type: ignore[arg-type]
@@ -374,6 +375,8 @@ def probe(settings: FishSettings, timeout: float = 6.0) -> dict[str, Any]:
         if status in (401, 402, 403):
             if not settings.api_key:
                 return {"reachable": True, "status": "key_missing", "message": f"HTTP {status} without a key"}
+            if status == 402:
+                return {"reachable": True, "status": "no_credit", "message": "HTTP 402: the key works, add API credit"}
             return {"reachable": True, "status": "auth_failed", "message": f"HTTP {status}"}
         return {"reachable": True, "status": "error", "message": f"HTTP {status}"}
     except (OSError, TimeoutError, InvalidHandshake, InvalidURI) as exc:

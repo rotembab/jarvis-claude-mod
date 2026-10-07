@@ -122,6 +122,15 @@ def test_bad_key_maps_to_fish_auth_failed() -> None:
         assert fish.rejected == 1
 
 
+def test_no_credit_is_reported_as_billing_not_a_bad_key() -> None:
+    with FakeFishServer(no_credit=True) as fish:
+        with pytest.raises(SynthError) as info:
+            FishLiveSynth(settings(fish.url)).open_stream(Collector(), voice_id=None)
+        assert info.value.code == "fish_auth_failed" and "402" in info.value.message
+        assert "credit" in (info.value.hint or "")
+        assert probe(settings(fish.url))["status"] == "no_credit"
+
+
 def test_missing_key_maps_to_fish_key_missing() -> None:
     with pytest.raises(SynthError) as info:
         FishLiveSynth(settings("ws://127.0.0.1:9", key=None)).open_stream(Collector(), voice_id=None)
