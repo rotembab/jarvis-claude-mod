@@ -1595,6 +1595,20 @@ def test_through_the_cloud_follows_a_name_with_a_full_stop_in_it(home: Home) -> 
     assert run(home, "Bedroom Fingerbot", "press").text.startswith(
         "The Bedroom Fingerbot pressed the Mr. Lamp switch, through Tuya's cloud. Jarvis cannot see"
     )
+    # Another alias said later in the reply ("the light") does not move it past the first sentence.
+    finger = home.device("Bedroom Fingerbot")
+    home.store.update(lambda c: setattr(c.device(finger.id), "aliases", ["ceiling lamp", "light"]))
+    hub = home.net.devices["hub-id"]
+    hub.write_errors = ["902"]
+    assert run(home, "Bedroom Fingerbot", "press").text.startswith(
+        "The Bedroom Fingerbot pressed the ceiling lamp switch, through Tuya's cloud. Jarvis cannot see"
+    )
+    hub.errors = ["902"]
+    home.cloud.state["finger-id"] = {"switch": False, "mode": "click"}
+    assert home.driver().status(home.device("Bedroom Fingerbot")).text == (
+        "The Bedroom Fingerbot presses the ceiling lamp switch, through Tuya's cloud. It is in click mode. "
+        "Jarvis cannot see whether the light is on."
+    )
 
 
 def test_a_refused_value_or_command_does_not_go_to_the_cloud(home: Home) -> None:

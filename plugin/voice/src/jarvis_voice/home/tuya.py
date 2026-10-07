@@ -965,10 +965,13 @@ class TuyaDriver(Driver):
             return self._cloud_outcome(device, failure, local, link.sent)
         if not outcome.ok or local is None:
             return outcome
-        # After the first sentence, which holds the user's own words: past them, as a name may have a full stop
-        # in it ("St. Mary lamp").
-        text = outcome.text
-        start = max((text.find(w) + len(w) for w in (device.name, *device.aliases) if w and w in text), default=0)
+        # After the first sentence, which holds the user's own words (the device's name, then what a button
+        # presses): past them, as a name may have a full stop in it ("St. Mary lamp"). Only those, as another
+        # alias ("light") may come up in a later sentence.
+        text, start = outcome.text, 0
+        for words in filter(None, (device.name, tdp.presses(device) if device.kind == "button" else None)):
+            at = text.find(words, start)
+            start = at + len(words) if at >= 0 else start
         cut = text.find(". ", start)
         if cut < 0:
             return Outcome.done(f"{text.rstrip('.')}, through Tuya's cloud.")
