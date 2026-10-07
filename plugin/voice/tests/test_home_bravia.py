@@ -894,31 +894,54 @@ def test_a_kick_link_opens_kick_and_says_the_channel_needs_typing(
     assert run(driver, store, "launch_app", "kick.com/xqc") == failed
 
 
-def test_a_kick_link_finds_kick_by_its_package_before_its_title(tmp_path: Path, tv: FakeBravia) -> None:
+def test_a_kick_link_finds_kick_by_its_package_before_its_title(
+    tmp_path: Path, tv: FakeBravia, monkeypatch: pytest.MonkeyPatch
+) -> None:
     driver, store = add_tv(tmp_path, tv)
     tv.apps += [
         {"title": "Kickboxing Coach", "uri": "com.sony.dtv.com.example.kickboxing.Main", "icon": ""},
         {"title": "Kick: Live Streaming", "uri": KICK_URI, "icon": ""},
     ]
-    assert run(driver, store, "launch_app", "kick.com/xqc").ok
-    assert tv.active_app == KICK_URI
-    # With no uri of Kick's package, the titles decide, and two of them could be Kick.
-    tv.apps[-1]["uri"] = "com.sony.dtv.com.example.streaming.Main"
-    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
-        "ambiguous", "Which app: Kickboxing Coach, Kick: Live Streaming?"
+    # The answer names the app the TV opened, by the TV's own title.
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.done(
+        f"Opened Kick: Live Streaming on the Sony TV. {NO_LINKS}, so it can't open xqc's channel. "
+        "Select Kick's search box and I'll type the name."
     )
-    del tv.apps[-2]
-    assert run(driver, store, "launch_app", "kick.com/xqc").ok
+    assert tv.active_app == KICK_URI
+    # With no uri of Kick's package, a title must be Kick's name or start with it as a word.
+    tv.apps[-1]["uri"] = "com.sony.dtv.com.example.streaming.Main"
+    assert run(driver, store, "launch_app", "kick.com") == Outcome.done("Opened Kick: Live Streaming on the Sony TV.")
     assert tv.active_app == "com.sony.dtv.com.example.streaming.Main"
+    tv.apps.append({"title": "Kick Boxing Workout", "uri": "com.sony.dtv.com.example.workout.Main", "icon": ""})
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+        "ambiguous", "Which app: Kick: Live Streaming, Kick Boxing Workout?"
+    )
+    # A title that is Kick's name alone wins over those that only start with it.
+    tv.apps.append({"title": "KICK", "uri": "com.sony.dtv.com.example.kick.Main", "icon": ""})
+    assert run(driver, store, "launch_app", "kick.com").ok
+    assert tv.active_app == "com.sony.dtv.com.example.kick.Main"
+    del tv.apps[-2:]
+    original = tv._rpc
+    monkeypatch.setattr(tv, "_rpc", lambda *a: 41401 if a[1] == "setActiveApp" else original(*a))
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+        "failed", "The Sony TV could not open Kick: Live Streaming."
+    )
 
 
 def test_a_kick_link_without_kick_installed_opens_nothing(tmp_path: Path, tv: FakeBravia) -> None:
     driver, store = add_tv(tmp_path, tv)
-    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+    missing = Outcome.fail(
         "bad_value",
         "Kick isn't installed on the Sony TV. Install it from the Google Play Store on the TV "
         "(it needs Android 8 or later), then ask again.",
     )
+    assert run(driver, store, "launch_app", "kick.com/xqc") == missing
+    # An app whose title only looks like Kick's is not Kick: one spelled close to it, one whose
+    # title starts with or contains those letters, or one that names Kick in a later word.
+    for title in ("Nick", "Kik", "Tick", "Kicker", "Kickstarter", "Kickboxing Coach", "Sidekick TV", "Power Kick"):
+        tv.apps.append({"title": title, "uri": "com.sony.dtv.com.example.lookalike.Main", "icon": ""})
+        assert run(driver, store, "launch_app", "kick.com/xqc") == missing, title
+        del tv.apps[-1]
     tv.apps = []
     assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
         "failed", "The Sony TV did not list any apps."

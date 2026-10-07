@@ -1175,10 +1175,11 @@ class BraviaDriver(Driver):
             )
         if isinstance(found, list):
             return Outcome.fail("ambiguous", f"Which app: {', '.join(found[:6])}?")
-        failed = self._start_app(s, app.name, found[1])
+        title, uri = found  # the TV's own title: say what it opened
+        failed = self._start_app(s, title, uri)
         if failed is not None:
             return failed
-        opened = f"Opened {app.name} on the {s.name}."
+        opened = f"Opened {title} on the {s.name}."
         if link.bare:
             return Outcome.done(opened)
         limit = "Sony's documented control API only starts apps"
@@ -1296,8 +1297,15 @@ def _package_app(apps: list[tuple[str, str]], package: str) -> tuple[str, str] |
 
 
 def _title_app(apps: list[tuple[str, str]], name: str) -> tuple[str, str] | list[str] | None:
-    """The one app whose title best matches ``name``, the titles when several do, or None."""
-    chosen = [apps[i] for i in _best([title for title, _ in apps], name)]
+    """The one app titled ``name`` ("KICK"), else the one whose title starts with it as whole
+    words ("Kick: Live Streaming"); the titles when several do, or None. Stricter than _best:
+    "Nick", "Kickboxing Coach" or "Sidekick TV" isn't Kick, and opening it would be wrong."""
+    wanted = normalize(name).split()
+    if not wanted:
+        return None
+    titled = [(app, normalize(app[0]).split()) for app in apps]
+    chosen = [app for app, words in titled if words == wanted]
+    chosen = chosen or [app for app, words in titled if words[: len(wanted)] == wanted]
     if len(chosen) == 1:
         return chosen[0]
     return [title for title, _ in chosen] or None
