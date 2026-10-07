@@ -124,9 +124,10 @@ In plan mode, Jarvis only looks at devices and doesn't change them.
 | `/jarvis home` | What is set up, and where it is saved |
 | `/jarvis home setup` | Opens the setup window |
 | `/jarvis home list [words]` | Your devices and what each one can do; words filter by name, room or kind |
-| `/jarvis home status <device>` | A device's state ("Sony TV is on, volume 20, HDMI 2 (Apple TV)") |
+| `/jarvis home status <device>` | A device's state ("The Sony TV is on, showing Apple TV (HDMI 2), volume 20%.") |
+| `/jarvis home do <device> -- <command> [value]` | Runs one command, for example `/jarvis home do Sony TV -- set_volume 20`. Asks on screen first where the device needs it. |
 
-From a terminal on the PC, the same commands work without Claude Code, for example to try a device:
+From a terminal on the PC, the same commands work without Claude Code, for example to try a device. There, a command that needs confirming asks you to type yes:
 
 ```powershell
 & "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice home list

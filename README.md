@@ -166,7 +166,7 @@ Run `/jarvis home setup`, or say "open home setup". A setup window opens where y
 | `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
-| `/jarvis home [setup\|list\|status <device>]` | Home devices: what is set up, open the setup window, list devices, or show one device's state. See [docs/HOME.md](docs/HOME.md). |
+| `/jarvis home [setup\|list\|status\|do]` | Home devices: what is set up, open the setup window, list devices, show one device's state, or run one command. See [docs/HOME.md](docs/HOME.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
 
 ## Settings
