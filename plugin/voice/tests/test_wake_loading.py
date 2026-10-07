@@ -60,7 +60,9 @@ def downloads(monkeypatch: pytest.MonkeyPatch) -> Iterator[Downloads]:
         deadline: float | None = None,
     ) -> Path:
         if deadline is not None:
-            assert 0 < deadline - time.monotonic() <= wake_models.PLAIN_FETCH_DEADLINE_S
+            # Windows' monotonic clock ticks every 15.6 ms: read twice in one tick,
+            # (now + limit) - now can round to a hair over the limit.
+            assert 0 < deadline - time.monotonic() <= wake_models.PLAIN_FETCH_DEADLINE_S + 1e-6
         calls.append((names(files), timeout, deadline is not None))
         put(folder, files)
         return folder
