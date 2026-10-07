@@ -4,6 +4,7 @@ import itertools
 import logging
 import math
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -130,11 +131,12 @@ def test_stop_releases_and_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_the_thread_glides_the_cursor_in_real_time() -> None:
     h = Harness()
+    h.ex.frame_interval = 0.4  # long enough for several ticks even where sleeps overshoot by tens of ms
     h.ex.start()
     try:
         h.ex.submit([MoveCursor(400, 300)])
-        deadline = time.monotonic() + 2
-        while h.desktop.cursor() != (400, 300) and time.monotonic() < deadline:
+        deadline = time.perf_counter() + 3
+        while h.desktop.cursor() != (400, 300) and time.perf_counter() < deadline:
             time.sleep(0.005)
         assert h.desktop.cursor() == (400, 300)
         assert len(h.desktop.calls_named("move_cursor")) >= 2  # interpolated, not one jump
@@ -273,17 +275,88 @@ def test_a_tick_that_keeps_failing_logs_once_a_minute_and_replays_nothing(caplog
     assert desktop.buttons_down == set() and desktop.calls_named("button") == []
 
 
-def test_the_loop_keeps_its_rate_when_timed_waits_are_coarse(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows rounds Event and lock wait timeouts up to its 15.6 ms timer tick; time.sleep is precise."""
+class SimulatedTime:
+    """A clock and a sleep for ``Executor._run``: each sleep takes ``oversleep(requested)`` simulated seconds."""
+
+    def __init__(self, oversleep: Callable[[float], float] = lambda d: d) -> None:
+        self.t = 0.0
+        self.oversleep = oversleep
+
+    def clock(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0
+        self.t += self.oversleep(seconds)
+
+
+def tick_times(sim: SimulatedTime, count: int = 200, tick_s: Callable[[int], float] = lambda i: 0.0) -> list[float]:
+    """Runs the loop on this thread for ``count`` ticks; tick ``i`` takes ``tick_s(i)`` seconds."""
+    ex = Executor(FakeDesktop(), displays=list, clock=sim.clock, sleep=sim.sleep)
+    times: list[float] = []
+
+    def tick(now: float | None = None) -> None:
+        times.append(sim.t)
+        sim.t += tick_s(len(times))
+        if len(times) == count:
+            ex._stop_event.set()
+
+    ex.tick = tick  # type: ignore[method-assign]
+    ex._run()
+    return times
+
+
+PERIOD = 1 / 120
+
+
+def gaps_of(times: list[float]) -> list[float]:
+    return [b - a for a, b in itertools.pairwise(times)]
+
+
+def test_the_loop_ticks_at_its_rate() -> None:
+    gaps = gaps_of(tick_times(SimulatedTime()))
+    assert all(gap == pytest.approx(PERIOD) for gap in gaps)
+
+
+def test_sleeps_that_overshoot_a_little_do_not_slow_the_rate() -> None:
+    gaps = gaps_of(tick_times(SimulatedTime(lambda d: d + 0.003)))
+    assert sum(gaps) / len(gaps) == pytest.approx(PERIOD, rel=0.01)
+    assert min(gaps) > PERIOD / 2
+
+
+@pytest.mark.parametrize(
+    "oversleep",
+    [
+        pytest.param(lambda d: math.ceil(d / 0.0156) * 0.0156, id="windows-timer-tick"),
+        pytest.param(lambda d: d + 0.040, id="tens-of-ms-late"),
+    ],
+)
+def test_after_a_long_oversleep_missed_ticks_are_dropped_not_sent_back_to_back(
+    oversleep: Callable[[float], float],
+) -> None:
+    gaps = gaps_of(tick_times(SimulatedTime(oversleep)))
+    assert min(gaps) >= PERIOD / 2 - 1e-12
+
+
+def test_a_slow_tick_is_not_followed_by_catch_up_ticks() -> None:
+    gaps = gaps_of(tick_times(SimulatedTime(), tick_s=lambda i: 0.050 if i % 20 == 0 else 0.0))
+    assert min(gaps) >= PERIOD / 2 - 1e-12
+    assert max(gaps) == pytest.approx(0.050)
+
+
+def test_the_thread_waits_with_sleep_not_a_timed_event_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows rounds Event and lock wait timeouts up to its 15.6 ms timer tick (64 Hz); time.sleep is precise."""
     h = Harness()
     stop_event = h.ex._stop_event
+    timed_waits: list[float] = []
+    real_wait = stop_event.wait
 
-    def coarse_wait(timeout: float | None = None) -> bool:
+    def wait(timeout: float | None = None) -> bool:
         if timeout:
-            time.sleep(math.ceil(timeout / 0.0156) * 0.0156)
-        return stop_event.is_set()
+            timed_waits.append(timeout)
+        return real_wait(timeout)
 
-    monkeypatch.setattr(stop_event, "wait", coarse_wait)
+    monkeypatch.setattr(stop_event, "wait", wait)
     ticks: list[float] = []
     real_tick = h.ex.tick
 
@@ -297,13 +370,9 @@ def test_the_loop_keeps_its_rate_when_timed_waits_are_coarse(monkeypatch: pytest
         time.sleep(0.5)
     finally:
         h.ex.stop()
-    # 120 Hz asked: 8.3 ms apart. A coarse wait or a coarse clock keeps the count up through the deadline
-    # catch-up, but in pairs (15.6 ms, then 0 ms), so the cursor only gets 64 distinct steps a second. A busy
-    # machine stretches some gaps (and the catch-up then sends a few back to back), which is not pairing.
-    gaps = sorted(b - a for a, b in itertools.pairwise(ticks))
-    assert len(gaps) > 40
-    assert 0.004 < gaps[len(gaps) // 2] < 0.014
-    assert sum(gap < 0.001 for gap in gaps) < len(gaps) // 4
+    assert timed_waits == []
+    assert len(ticks) >= 5  # loose: CI machines oversleep by tens of ms; the rate itself is tested above
+    assert min(gaps_of(ticks)) > PERIOD / 4  # never back to back
 
 
 def test_the_clock_is_fine_grained() -> None:
