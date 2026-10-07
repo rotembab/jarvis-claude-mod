@@ -1136,8 +1136,8 @@ def describe_state(device: DeviceRecord, values: Mapping[str, Any]) -> str:
 
 
 def _button_state(device: DeviceRecord, dps: DpMap, values: Mapping[str, Any]) -> str:
-    """On or off only in switch mode, where the arm stays put (read through the saved inversion); otherwise
-    Jarvis knows what the arm did, not what the light it presses is doing."""
+    """On or off only in the switch mode setup saved, where the arm stays put (read through the inversion setup
+    asked then); otherwise Jarvis knows what the arm did, not what the light it presses is doing."""
 
     def raw(code: str | None) -> Any:
         return None if code is None else values.get(str(dps[code]["dp"]))
@@ -1146,7 +1146,10 @@ def _button_state(device: DeviceRecord, dps: DpMap, values: Mapping[str, Any]) -
     live = button_mode(dps, raw(find(dps, ("mode",), "enum", writable=False)))
     saved = saved_mode(device)
     mode = live or saved
-    if mode == "switch":
+    if mode == "switch" and saved != "switch":
+        # Put in switch mode since setup, which has not asked which way round it is: no on or off until a refresh.
+        sentences = [f"The {name} is in switch mode now."]
+    elif mode == "switch":
         switch = raw(press_code(dps))
         state = "on" if switch != switch_inverted(device) else "off"
         if not isinstance(switch, bool):

@@ -154,12 +154,14 @@ BLUETOOTH_ONLY = (
     "a Bluetooth device, which Jarvis can reach only through a Tuya Bluetooth or multi-mode gateway: "
     "add one in the Tuya Smart or Smart Life app, then refresh here"
 )
-NO_SWITCH_POINT = "Tuya did not give the data point that moves its arm, so Jarvis cannot drive it; refresh again later"
+NO_SWITCH_POINT = "Tuya did not give the data point that moves its arm; refresh again later"
 SEVERAL_HUBS = "paired to a hub, and your account has more than one, so Jarvis could not tell which"
+# Shown for a switch-mode Fingerbot behind a hub only: a click-mode press the hub took is never sent again through
+# the cloud ("unconfirmed_press" is not in FALLBACK_ERRORS), so the fallback cannot help a hub that drops presses.
 HUB_TIP = (
-    "Tip: some Tuya hubs do not pass commands on over the home network. If a Fingerbot does not respond to Jarvis, "
-    "turn on Use Tuya's cloud when a device does not answer on the network, so Jarvis can send its commands through "
-    "Tuya's cloud when the hub does not."
+    "Tip: some Tuya hubs do not pass commands on over the home network. If a Fingerbot in switch mode does not "
+    "respond to Jarvis, turn on Use Tuya's cloud when a device does not answer on the network, so Jarvis can send its "
+    "on and off through Tuya's cloud when the hub does not."
 )
 # A button pusher's mode, as the setup report gives it.
 MODE_LINES = {
@@ -943,7 +945,7 @@ class TuyaDriver(Driver):
     def status(self, device: DeviceRecord) -> Outcome:
         if device.kind == "scene":
             return Outcome.fail("unsupported", f"{device.name} is a Tuya scene; it has no state to read.")
-        return self._with_link(device, lambda link: Outcome.done(tdp.describe_state(device, link.read())))
+        return self._with_link(device, lambda link: Outcome.done(tdp.describe_state(device, link.read())), reading=True)
 
     def describe(self) -> str | None:
         try:
@@ -1027,10 +1029,12 @@ class TuyaDriver(Driver):
             tuple(sorted({entry["dp"] for entry in tdp.dp_map(device).values()})),
         )
 
-    def _with_link(self, device: DeviceRecord, work: Callable[[_AnyLink], Outcome], units: int = 1) -> Outcome:
+    def _with_link(
+        self, device: DeviceRecord, work: Callable[[_AnyLink], Outcome], units: int = 1, *, reading: bool = False
+    ) -> Outcome:
         """Runs ``work`` (``units`` requests at most); when the device does not answer at its saved address,
         looks for it once and retries. With the cloud fallback on, it goes to the cloud instead (see
-        _with_cloud)."""
+        _with_cloud). ``reading``: ``work`` is a status, which only reads."""
         conn = self._conn(device)
         cloud = self._cloud_route(device)
         if cloud is not None:
@@ -1038,7 +1042,7 @@ class TuyaDriver(Driver):
                 # No key, a hub Jarvis could not match, or saved as reachable only through the cloud.
                 return self._through_cloud(device, work, cloud, _Budget(self._budget_s()))
             if not _CLOUD.paused() and self._budget_s() - CLOUD_SLICE_S >= CLOUD_MIN_S:
-                return self._with_cloud(device, conn, work, cloud, units)
+                return self._with_cloud(device, conn, work, cloud, units, reading)
         # Without the cloud (off, paused, or too little time for it), exactly as before it existed.
         if isinstance(conn, Outcome):
             return conn
@@ -1075,7 +1079,13 @@ class TuyaDriver(Driver):
         return link if link is not None and link.get(FALLBACK) is True else None
 
     def _with_cloud(
-        self, device: DeviceRecord, conn: _Conn, work: Callable[[_AnyLink], Outcome], cloud: dict[str, Any], units: int
+        self,
+        device: DeviceRecord,
+        conn: _Conn,
+        work: Callable[[_AnyLink], Outcome],
+        cloud: dict[str, Any],
+        units: int,
+        reading: bool = False,
     ) -> Outcome:
         """Local first, on a budget that leaves CLOUD_SLICE_S for the cloud; then, after a failure the cloud may get
         round (FALLBACK_ERRORS), the same command through the cloud. A device with no known address goes to the
@@ -1086,7 +1096,7 @@ class TuyaDriver(Driver):
             self._rediscover_later(conn, units)
             log.info("Tuya device %s has no address: cloud", conn.tuya_id)
             missing = self._failure(device, _Failure("noaddress"))
-            return self._through_cloud(device, work, cloud, budget, local=missing)
+            return self._through_cloud(device, work, cloud, budget, local=missing, reading=reading)
         link = _Link(conn, _Budget(self._budget_s() - CLOUD_SLICE_S), _open_device)
         try:
             return work(link)
@@ -1097,7 +1107,7 @@ class TuyaDriver(Driver):
                 self._rediscover_later(conn, units)
             log.info("Tuya device %s failed locally (%s): cloud", conn.tuya_id, failure.err)
             local = self._failure(device, failure)
-            return self._through_cloud(device, work, cloud, budget, local=local, seed=link.seed())
+            return self._through_cloud(device, work, cloud, budget, local=local, seed=link.seed(), reading=reading)
 
     def _through_cloud(
         self,
@@ -1107,15 +1117,19 @@ class TuyaDriver(Driver):
         budget: _Budget,
         local: Outcome | None = None,
         seed: dict[str, Any] | None = None,
+        reading: bool = False,
     ) -> Outcome:
         """``work`` through Tuya's cloud. ``local`` is what the local attempt came to, when there was one: its
-        sentence leads if the cloud fails too, and a success then says it went through the cloud."""
+        sentence leads if the cloud fails too, and a success then says it went through the cloud, when it sent
+        something or ``reading`` (a status read through the cloud)."""
         link = _CloudLink(self.ctx.store, cloud, str(device.settings["tuya_id"]), tdp.dp_map(device), budget, seed)
         try:
             outcome = work(link)
         except _Failure as failure:
             return self._cloud_outcome(device, failure, local, link.sent)
-        if not outcome.ok or local is None:
+        if not outcome.ok or local is None or not (link.sent or reading):
+            # A command that sent nothing (a Fingerbot already where it was asked to be) says nothing of the cloud:
+            # "already on, through Tuya's cloud" would sound as if the cloud kept it on.
             return outcome
         # After the first sentence, which holds the user's own words (the device's name, then what a button
         # presses): past them, as a name may have a full stop in it ("St. Mary lamp"). Only those, as another
@@ -2063,21 +2077,27 @@ def _import(ui: Prompter, ctx: DriverContext, sharing: Any, link: dict[str, Any]
     removed = _gone(config, records, {c.tuya_id for c in candidates})
     offline = [c.tuya_id for c in usable if c.cloud_only and not c.online]
     left_out = [c for c in candidates if c.kind is None]
-    # A button pusher saved before (as a plain switch, before Jarvis knew them) and left out now must not stay
-    # saved as if it worked while setup says it was not added: it is offered for removal.
-    buttons = {c.tuya_id for c in left_out if tdp.kind_for(c.category, c.dps) == "button"}
-    stale = [
+    # A button pusher saved before and left out now: one that cannot work as saved must not stay saved as if it
+    # worked while setup says it was not added, so it is offered for removal; one that still works (Tuya's details
+    # fell short this time, say) is kept as it was, without asking, and setup says so.
+    reasons = {c.tuya_id: c.reason for c in left_out if tdp.kind_for(c.category, c.dps) == "button"}
+    saved = [
         d
         for d in config.devices
-        if d.driver == TuyaDriver.name and d.kind != "scene" and d.settings.get("tuya_id") in buttons
+        if d.driver == TuyaDriver.name and d.kind != "scene" and d.settings.get("tuya_id") in reasons
     ]
+    stale = [d for d in saved if not _works_as_saved(d, reasons[d.settings["tuya_id"]])]
+    kept = [d for d in saved if _works_as_saved(d, reasons[d.settings["tuya_id"]])]
     notes = [_only_hub_note(c) for c in usable if c.matched_by == "only_hub"]
-    _report(ui, records, left_out, has_ir, offline, notes, link.get(FALLBACK) is True, stale)
+    _report(ui, records, left_out, has_ir, offline, notes, link.get(FALLBACK) is True, stale, kept)
     stale_names = ", ".join(d.name for d in stale)
     if not records:
         if stale and ui.confirm(f"Remove {stale_names} from Jarvis?", default=True):
             _save_all(ctx, [], stale, None)
-            ui.say(f"Removed {stale_names}. Your Tuya account has no other devices or scenes Jarvis can use.")
+            others = "" if kept else " Your Tuya account has no other devices or scenes Jarvis can use."
+            ui.say(f"Removed {stale_names}.{others}")
+        elif kept:
+            ui.say("Nothing was changed.")
         else:
             ui.say("Your Tuya account has no devices or scenes Jarvis can use. Nothing was changed.")
         return
@@ -2109,6 +2129,14 @@ def _import(ui: Prompter, ctx: DriverContext, sharing: Any, link: dict[str, Any]
     reachable = [r for r, _ in records if r.kind != "scene" and r.settings.get("address")]
     if reachable and ui.confirm("Check now that Jarvis can reach each device? It takes a few seconds.", default=True):
         _check(ui, ctx, reachable)
+
+
+def _works_as_saved(device: DeviceRecord, reason: str | None) -> bool:
+    """Whether a saved button pusher that setup now leaves out for ``reason`` still works as it was saved: saved as
+    a button (not as a plain switch, before Jarvis knew them), with a way to reach it, and not now off its hub
+    (BLUETOOTH_ONLY: Tuya no longer lists it behind one, which does not fix itself)."""
+    reachable = any(device.settings.get(key) for key in ("parent", "address", "cloud_only"))
+    return device.kind == "button" and reachable and reason != BLUETOOTH_ONLY
 
 
 def _gone(
@@ -2194,6 +2222,10 @@ def _plan(
                     settings["hub_name"] = candidate.hub_name
             if candidate.kind == "button" and candidate.button_mode:
                 settings["button_mode"] = candidate.button_mode
+            if candidate.kind == "button" and old is not None and tdp.switch_inverted(old):
+                # Which way round it is belongs to how it sits on the switch, not to the mode it is in now: kept
+                # through a refresh in another mode (or one where Tuya did not say), for when it is back in switch mode.
+                settings["switch_inverted"] = True
             if power:
                 settings["power"] = power
             if candidate.kind == "cover":
@@ -2220,11 +2252,12 @@ def _plan(
                 if presses:
                     record.aliases.append(presses)
             if candidate.kind == "button" and candidate.button_mode == "switch":
-                # Asked on every refresh, with the saved answer as the default, as the arm's positions are the
-                # user's to change in the app.
-                was = old is not None and tdp.switch_inverted(old)
-                if _ask_inverted(ui, record, was):
+                # Asked on every refresh in switch mode, with the saved answer as the default, as the arm's positions
+                # are the user's to change in the app; only an answer of "on" clears it.
+                if _ask_inverted(ui, record, tdp.switch_inverted(record)):
                     record.settings["switch_inverted"] = True
+                else:
+                    record.settings.pop("switch_inverted", None)
             records.append((record, None if candidate.cloud_only else {"local_key": candidate.key}))
     for scene in scenes:
         old = existing.get((scene.scene_id,))
@@ -2254,10 +2287,12 @@ def _report(
     notes: Iterable[str] = (),
     fallback: bool = False,
     stale: Iterable[DeviceRecord] = (),
+    kept: Iterable[DeviceRecord] = (),
 ) -> None:
     """What the import found. ``offline``: the Tuya ids of cloud-only devices the cloud says are offline; ``notes``:
     lines to add after the devices; ``fallback``: whether the cloud fallback is on; ``stale``: saved records of
-    devices now left out, which setup offers to remove."""
+    devices now left out, which setup offers to remove; ``kept``: saved records of devices now left out that still
+    work as saved, which are kept."""
     devices = [r for r, _ in records if r.kind != "scene"]
     scenes = [r for r, _ in records if r.kind == "scene"]
     offline = set(offline)
@@ -2289,15 +2324,19 @@ def _report(
         ui.say(f"{_count(len(scenes), 'scene')}: {', '.join(r.name for r in scenes)}")
     for note in notes:
         ui.say(note)
-    saved = {d.settings.get("tuya_id") for d in stale}
+    stale, kept = list(stale), list(kept)
+    why = {c.tuya_id: c.reason for c in left_out}
+    saved = {d.settings.get("tuya_id") for d in (*stale, *kept)}
     not_added = [c for c in left_out if c.tuya_id not in saved]
     if not_added:
         ui.say("Not added: " + "; ".join(f"{c.name} ({c.reason})" for c in not_added))
-    if len(not_added) < len(left_out):
+    if stale:
         ui.say(
-            "Saved before, but Jarvis cannot use them now: "
-            + "; ".join(f"{c.name} ({c.reason})" for c in left_out if c.tuya_id in saved)
+            f"Saved before, but Jarvis cannot use {'it' if len(stale) == 1 else 'them'} now: "
+            + "; ".join(f"{d.name} ({why.get(d.settings.get('tuya_id'))})" for d in stale)
         )
+    if kept:
+        ui.say("Kept as saved before: " + "; ".join(f"{d.name} ({why.get(d.settings.get('tuya_id'))})" for d in kept))
     # A device behind a hub says so on its own line; the others may be asleep or off.
     missing = [
         r.name
@@ -2309,7 +2348,9 @@ def _report(
             f"Not found on your home network: {', '.join(missing)}. They are saved anyway: battery devices sleep "
             "and others may be switched off. Jarvis looks for them again when they are used."
         )
-    if not fallback and any(r.kind == "button" and r.settings.get("parent") for r in devices):
+    if not fallback and any(
+        r.kind == "button" and r.settings.get("parent") and tdp.saved_mode(r) == "switch" for r in devices
+    ):
         ui.say(HUB_TIP)
     if has_ir:
         ui.say(IR_ADVICE)
