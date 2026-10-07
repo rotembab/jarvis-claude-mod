@@ -30,6 +30,7 @@ ErrorCode = Literal[
     "fish_key_missing",
     "fish_auth_failed",
     "fish_unreachable",
+    "local_voice_failed",
     "mic_blocked",
     "mic_in_use",
     "no_input_device",

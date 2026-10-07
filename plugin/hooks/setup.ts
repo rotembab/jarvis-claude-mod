@@ -185,3 +185,132 @@ export async function runSetup(
   }
   return { ok: true, summary: lastProgress === '' ? 'installed' : lastProgress }
 }
+
+/** The local voice's distribution name in local-voice/pyproject.toml. */
+export const LOCAL_VOICE_PACKAGE = 'jarvis-local-voice'
+
+/** The `uv pip install` argv for the local voice (exported for tests). */
+export function localVoiceInstallArgv(
+  uv: string,
+  platform: Platform,
+  project: string,
+  { useCuda }: { useCuda: boolean },
+): string[] {
+  // PyPI's Windows and Linux torch has no CUDA; --torch-backend takes torch from
+  // PyTorch's own index instead. cu126 has the torch 2.6.0 Chatterbox pins.
+  const backend = useCuda ? ['--torch-backend', 'cu126'] : platform.os === 'macos' ? [] : ['--torch-backend', 'cpu']
+  return [
+    uv,
+    'pip',
+    'install',
+    '--python',
+    platform.localVenvPython,
+    ...backend,
+    '--reinstall-package',
+    LOCAL_VOICE_PACKAGE,
+    project,
+  ]
+}
+
+export type LocalSetupRequest = {
+  useCuda: boolean
+  /** The reference clip, so the setup's test sentence uses it. */
+  voiceClip?: string
+  onProgress: (text: string) => void
+  debug: (line: string) => void
+}
+
+/**
+ * /jarvis setup local: a separate Python 3.12 venv in <dataDir>/local-voice/venv
+ * with torch and Chatterbox-Turbo (`uv pip install`, so no lock file is ever
+ * written into the plugin folder), then the model download and one test
+ * sentence. About 3 GB of packages and 3 GB of model.
+ */
+export async function runLocalVoiceSetup(
+  engine: Engine,
+  platform: Platform,
+  uv: string,
+  request: LocalSetupRequest,
+): Promise<SetupResult> {
+  const { onProgress, debug } = request
+  const env = {
+    UV_CACHE_DIR: joinPath(platform.sep, platform.dataDir, 'uv-cache'),
+    UV_NO_PROGRESS: '1',
+    HF_HUB_DISABLE_TELEMETRY: '1',
+  }
+  const tail: string[] = []
+  const keep = (line: string): void => {
+    tail.push(line.slice(0, 300))
+    if (tail.length > 8) tail.shift()
+  }
+  const uvStep = async (argv: string[], label: string): Promise<SetupResult | undefined> => {
+    onProgress(label)
+    let code: number | null
+    try {
+      code = await runStreaming(engine, { argv, cwd: platform.dataDir, env }, (_stream, line) => {
+        keep(line)
+        debug(`uv: ${line}`)
+        onProgress(`${label} · ${line.trim().slice(0, 80)}`)
+      })
+    } catch (error) {
+      return { ok: false, reason: 'uv_failed', message: `uv could not run: ${describeError(error)}` }
+    }
+    if (code === 0) return undefined
+    return { ok: false, reason: 'uv_failed', message: `${argv.slice(0, 3).join(' ')} failed (exit ${code ?? 'signal'}):\n${tail.join('\n')}` }
+  }
+
+  const project = joinPath(platform.sep, engine.pluginRoot, 'local-voice')
+  const venvFailed = await uvStep(
+    [uv, 'venv', platform.localVenvDir, '--python', '3.12', '--allow-existing'],
+    'creating the local voice environment',
+  )
+  if (venvFailed !== undefined) return venvFailed
+  const installFailed = await uvStep(
+    localVoiceInstallArgv(uv, platform, project, { useCuda: request.useCuda }),
+    request.useCuda ? 'installing the local voice (PyTorch with CUDA, about 3 GB)' : 'installing the local voice',
+  )
+  if (installFailed !== undefined) return installFailed
+
+  onProgress('downloading the local voice model (about 3 GB)')
+  tail.length = 0
+  let lastProgress = ''
+  let failure: string | undefined
+  let code: number | null
+  try {
+    code = await runStreaming(
+      engine,
+      {
+        argv: [
+          platform.localVenvPython,
+          '-m',
+          'jarvis_local_voice',
+          'download',
+          '--models-dir',
+          joinPath(platform.sep, platform.dataDir, 'models'),
+          '--verify',
+          ...(request.voiceClip === undefined ? [] : ['--voice', request.voiceClip]),
+        ],
+        cwd: platform.dataDir,
+        env: { ...env, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1' },
+      },
+      (stream, line) => {
+        const progress = stream === 'stdout' ? parseProgress(line) : undefined
+        if (progress !== undefined) {
+          lastProgress = progress.text
+          if (progress.step === 'error') failure = progress.text
+          onProgress(progress.text)
+        } else {
+          keep(line)
+          debug(`local voice setup: ${line}`)
+        }
+      },
+    )
+  } catch (error) {
+    return { ok: false, reason: 'model_failed', message: `the local voice could not run: ${describeError(error)}` }
+  }
+  if (code !== 0) {
+    const details = [failure, ...tail].filter(line => line !== undefined).join('\n')
+    return { ok: false, reason: 'model_failed', message: `the local voice setup failed (exit ${code ?? 'signal'}):\n${details}` }
+  }
+  return { ok: true, summary: lastProgress === '' ? 'local voice installed' : lastProgress }
+}

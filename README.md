@@ -14,6 +14,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - [Requirements](#requirements)
 - [Install](#install)
 - [Fish Audio key and voice](#fish-audio-key-and-voice)
+- [Local voice (optional)](#local-voice-optional)
 - [Using Jarvis](#using-jarvis)
 - [Commands](#commands)
 - [Settings](#settings)
@@ -96,6 +97,16 @@ Jarvis needs a Fish Audio API key to speak. Create one on the API keys page of y
 
 **Fish Audio model.** Jarvis uses `s2.1-pro-free` by default: Fish Audio's free API model, the same voice model as `s2.1-pro` at no cost under Fish's fair use policy through 30 November 2026 ([announcement](https://fish.audio/blog/s2-1-pro-free-api/)). It needs only an API key, no API credit. Fish says requests to it may be used to improve its models. To use the paid `s2.1-pro` instead, set the **Fish Audio model** option and add API credit at [fish.audio/app/developers](https://fish.audio/app/developers); the app plan's monthly credits don't pay for the API.
 
+## Local voice (optional)
+
+Jarvis can also speak with a voice that runs on your own PC: [Chatterbox-Turbo](https://huggingface.co/ResembleAI/chatterbox-turbo) by Resemble AI (MIT licensed). It needs no API key and no internet once installed, and copies a voice from a short clip you give it. Fish Audio stays the default; you switch between the two with one command.
+
+1. Run `/jarvis setup local`. It installs PyTorch and Chatterbox into their own environment in `%USERPROFILE%\.jarvis\local-voice` and downloads the model: about 6 GB in all. An NVIDIA GPU is strongly recommended; `/jarvis setup local cpu` installs the CPU build, which works but speaks noticeably later.
+2. Optional: set the **Local voice clip** option to a recording of the voice you want, 10 to 20 seconds of one person speaking clearly (WAV or MP3, at least 5 seconds). Without a clip, Chatterbox's built-in voice is used.
+3. Run `/jarvis engine local`. `/jarvis engine fish` switches back.
+
+The local voice loads onto the GPU when the helper starts (a few seconds) and stays loaded while Claude Code is open. Its audio carries Resemble AI's inaudible watermark. Only copy a voice you have the right to use, and keep a clip of someone else's voice to personal use.
+
 ## Using Jarvis
 
 1. Hold the push-to-talk key (Right Ctrl by default). A chime plays, the status line shows `JARVIS · listening`, and a band above the prompt shows the microphone level.
@@ -114,6 +125,8 @@ The push-to-talk key works while another window has focus. Messages you type are
 | `/jarvis talk` | Start listening without the push-to-talk key; run it again when you have finished speaking. |
 | `/jarvis stop` | Stop speaking and cancel the spoken reply. |
 | `/jarvis test` | Speak a test line (checks your Fish Audio key, voice and speakers). |
+| `/jarvis setup local [cpu]` | Install the local voice (Chatterbox-Turbo, about 6 GB). |
+| `/jarvis engine <fish\|local>` | Speak with Fish Audio or with the local voice. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis restart` | Restart the voice helper. |
@@ -127,6 +140,8 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `fishApiKey` | empty | Fish Audio API key. Sensitive; kept in secure storage. Empty means `FISH_AUDIO_API_KEY` from your environment. |
 | `voiceId` | empty | Fish Audio voice model id. Empty means Fish Audio's default voice. |
 | `fishModel` | `s2.1-pro-free` | Fish Audio model: `s2.1-pro-free` (free through 30 Nov 2026) or `s2.1-pro` (needs API credit). Run `/jarvis restart` after changing it. |
+| `voiceEngine` | `fish` | Who speaks: `fish` (Fish Audio) or `local` (Chatterbox-Turbo on your PC, after `/jarvis setup local`). `/jarvis engine` changes it too. |
+| `localVoiceClip` | empty | A 10 to 20 second recording for the local voice to copy. Empty means its built-in voice. Run `/jarvis restart` after changing it. |
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
 | `sttModel` | `auto` | Speech-to-text model: `auto`, `base.en`, `small.en`, `small`, `medium` or `large-v3-turbo`. `auto` means `large-v3-turbo` on an NVIDIA GPU and `small.en` on the CPU. Run `/jarvis setup` after changing it. |
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |

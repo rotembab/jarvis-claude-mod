@@ -117,6 +117,24 @@ def _fish_section(env: Mapping[str, str], network: bool) -> dict[str, Any]:
     return section
 
 
+def _local_voice_section(data_dir: Path, env: Mapping[str, str]) -> dict[str, Any]:
+    from .stt.models import models_dir
+    from .tts.local import default_python, model_downloaded
+
+    python = Path(env.get("JARVIS_LOCAL_PYTHON", "").strip() or default_python(data_dir))
+    clip = env.get("JARVIS_LOCAL_VOICE", "").strip()
+    section: dict[str, Any] = {
+        "engine": env.get("JARVIS_TTS_ENGINE", "").strip() or "fish",
+        "installed": python.is_file(),
+        "python": str(python),
+        "modelDownloaded": model_downloaded(models_dir(data_dir)),
+        "voiceClip": clip or None,
+    }
+    if clip:
+        section["voiceClipFound"] = Path(clip).expanduser().is_file()
+    return section
+
+
 def _ptt_section() -> dict[str, Any]:
     try:
         from pynput import keyboard  # noqa: F401
@@ -145,6 +163,7 @@ def run_doctor(
         ("cuda", lambda: _cuda_section(data_dir)),
         ("models", lambda: _models_section(data_dir)),
         ("fish", lambda: _fish_section(env, network)),
+        ("localVoice", lambda: _local_voice_section(data_dir, env)),
         ("ptt", _ptt_section),
     ):
         try:

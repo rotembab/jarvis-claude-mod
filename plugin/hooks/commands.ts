@@ -4,8 +4,8 @@
 
 import type { CommandRunResult } from 'claude-code'
 
-import type { Jarvis, SttModel } from './app'
-import { STT_MODELS } from './app'
+import type { Jarvis, SttModel, VoiceEngine } from './app'
+import { STT_MODELS, VOICE_ENGINES } from './app'
 import { findUv, shellCommandLine } from './platform'
 import type { StatusResponse } from './protocol'
 import { uvMissingMessage } from './setup'
@@ -13,6 +13,8 @@ import { statusLine } from './ui'
 
 const HELP = [
   '/jarvis setup [model] [cpu]   install or repair the voice helper and its speech model',
+  '/jarvis setup local [cpu]     install the local voice (Chatterbox, about 6 GB)',
+  '/jarvis engine <fish|local>   speak with Fish Audio or the local voice',
   '/jarvis stop                  stop speaking and cancel the spoken reply',
   '/jarvis talk                  start or stop listening without the push-to-talk key',
   '/jarvis test                  speak a test line',
@@ -46,6 +48,8 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: restart(app) }
       case 'voice':
         return { text: await voice(app, rest[0]) }
+      case 'engine':
+        return { text: await voiceEngine(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
       default:
@@ -69,7 +73,7 @@ async function status(app: Jarvis): Promise<string> {
   if (hello !== undefined) {
     const ready = app.ready
     const model = ready ? `speech model ${ready.sttModel} on ${ready.sttDevice}` : 'loading models'
-    const voiceId = (await app.voiceId()) ?? 'Fish Audio default'
+    const voiceId = (await app.voiceEngine()) === 'local' ? 'local' : ((await app.voiceId()) ?? 'Fish Audio default')
     lines.push(`Helper ${hello.version} (pid ${hello.pid}) · ${model} · voice ${voiceId}`)
   } else if (isRetry) {
     lines.push('Starting the voice helper…')
@@ -82,6 +86,7 @@ async function setup(app: Jarvis, args: string[]): Promise<string> {
   const { engine, platform } = app
   if (!app.isLocal || engine === undefined || platform === undefined) return NOT_LOCAL
   if (app.isSetupRunning) return 'Setup is already running; its progress is in the status line.'
+  if (args[0]?.toLowerCase() === 'local') return await setupLocal(app, args.slice(1))
   let sttModel: SttModel | undefined
   let useCuda: boolean | undefined
   for (const arg of args) {
@@ -104,6 +109,51 @@ async function setup(app: Jarvis, args: string[]): Promise<string> {
     `  2. the speech model (${model === 'auto' ? 'chosen for your hardware' : model})`,
     'Progress shows in the status line; the helper starts when it is done.',
   ].join('\n')
+}
+
+async function setupLocal(app: Jarvis, args: string[]): Promise<string> {
+  const { engine, platform } = app
+  if (engine === undefined || platform === undefined) return NOT_LOCAL
+  let useCuda: boolean | undefined
+  for (const arg of args) {
+    const word = arg.toLowerCase()
+    if (word === 'cpu') useCuda = false
+    else if (word === 'cuda' || word === 'gpu') useCuda = true
+    else return `Unknown option "${arg}" for /jarvis setup local; add "cpu" to install PyTorch without CUDA.`
+  }
+  const uv = await findUv(engine, platform)
+  if (uv === undefined) return uvMissingMessage(platform)
+  void app.runLocalSetup(uv, { useCuda })
+  const clip = app.settings.localVoiceClip
+  return [
+    `Setting up the local voice with ${uv}:`,
+    `  1. a separate Python 3.12 environment in ${platform.localVenvDir} with PyTorch and Chatterbox-Turbo (about 3 GB)`,
+    `  2. the Chatterbox-Turbo model (about 3 GB) in ${platform.dataDir}${platform.sep}models, and one test sentence`,
+    clip === undefined
+      ? 'No reference clip is set, so it uses Chatterbox\'s built-in voice. Set "Local voice clip" in the plugin settings to copy a voice from a clip of 10 to 20 s.'
+      : `Voice: copied from ${clip}.`,
+    'Progress shows in the status line. Then switch with /jarvis engine local.',
+  ].join('\n')
+}
+
+async function voiceEngine(app: Jarvis, choice: string | undefined): Promise<string> {
+  const current = await app.voiceEngine()
+  if (choice === undefined) {
+    return `Voice engine: ${current === 'local' ? 'the local voice (Chatterbox)' : 'Fish Audio'}. Switch with /jarvis engine fish or /jarvis engine local.`
+  }
+  const engine = VOICE_ENGINES.find(one => one === choice.toLowerCase()) as VoiceEngine | undefined
+  if (engine === undefined) return `Unknown engine "${choice}". Use /jarvis engine fish or /jarvis engine local.`
+  const platform = app.platform
+  if (engine === 'local' && platform !== undefined && app.engine !== undefined) {
+    const isInstalled = await app.engine.exists(platform.localVenvPython).catch(() => false)
+    if (!isInstalled) return 'The local voice is not installed yet. Run /jarvis setup local first (it downloads about 6 GB).'
+  }
+  await app.setVoiceEngine(engine)
+  if (engine === current) return `Already using ${engine === 'local' ? 'the local voice' : 'Fish Audio'}.`
+  if (app.isLocal && !app.isSetupRunning) void app.restartHelper()
+  return engine === 'local'
+    ? 'Switched to the local voice. The helper restarts and loads the model onto your GPU, which takes a few seconds.'
+    : 'Switched to Fish Audio. The helper restarts.'
 }
 
 async function stop(app: Jarvis): Promise<string> {

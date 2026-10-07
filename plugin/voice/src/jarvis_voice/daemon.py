@@ -197,7 +197,11 @@ class Daemon:
     def _shutdown_components(self) -> None:
         self._stopping.set()
         self.watchdog.stop()
-        for step in (self._ptt.stop, self.pipeline.close, self._capture.close, self._playback.close):
+        steps = [self._ptt.stop, self.pipeline.close, self._capture.close, self._playback.close]
+        close_synth = getattr(self._synth, "close", None)  # the local voice owns a child process
+        if callable(close_synth):
+            steps.insert(2, close_synth)
+        for step in steps:
             try:
                 step()
             except Exception:
@@ -542,6 +546,7 @@ class Daemon:
                 "voiceId": self._voice_id,
                 "pttKey": self._hotkey.text,
                 "fishKeySet": self._synth.configured,
+                "ttsEngine": getattr(self._synth, "engine", "fish"),
                 "pttArmed": self._ptt_armed,
                 "sttRequested": self._stt_requested,
                 "language": self._language,

@@ -391,3 +391,115 @@ describe('/jarvis setup', () => {
     expect(w.children).toHaveLength(0)
   })
 })
+
+const LOCAL_PYTHON = `${DATA_DIR}\\local-voice\\venv\\Scripts\\python.exe`
+
+describe('the local voice', () => {
+  test('/jarvis setup local installs into its own venv with CUDA torch and downloads the model', async ($, on) => {
+    const w = world(on, { installed: false })
+    await startSession($, w)
+    w.existing.add(WINGET_UV)
+    w.existing.add(NVCUDA)
+    w.onSpawn = child => {
+      if (child.argv[0] === WINGET_UV && child.argv[1] === 'venv') {
+        w.existing.add(LOCAL_PYTHON)
+        child.exit(0)
+      } else if (child.argv[0] === WINGET_UV) {
+        child.stderr('Installed 97 packages in 41s\n')
+        child.exit(0)
+      } else if (child.argv[0] === LOCAL_PYTHON) {
+        child.stdout('{"type":"progress","step":"download","message":"downloading the local voice model (about 3 GB)"}\n')
+        child.stderr('Fetching 9 files: 100%\n')
+        child.stdout('{"type":"progress","step":"done","message":"local voice ready on cuda: 2.9 s of speech took 1.1 s (voice built-in)"}\n')
+        child.exit(0)
+      }
+    }
+
+    const text = await jarvis($, 'setup local')
+    expect(text).toContain(`Setting up the local voice with ${WINGET_UV}:`)
+    expect(text).toContain('built-in voice')
+    await w.settle(40)
+
+    const [venv, install, download] = w.children
+    expect(venv?.argv).toEqual([WINGET_UV, 'venv', `${DATA_DIR}\\local-voice\\venv`, '--python', '3.12', '--allow-existing'])
+    const project = install?.argv.at(-1) ?? ''
+    expect(project).toMatch(/[\\/]local-voice$/)
+    expect(install?.argv).toEqual([
+      WINGET_UV, 'pip', 'install', '--python', LOCAL_PYTHON, '--torch-backend', 'cu126',
+      '--reinstall-package', 'jarvis-local-voice', project,
+    ])
+    expect(install?.request.env?.UV_CACHE_DIR).toBe(`${DATA_DIR}\\uv-cache`)
+    expect(download?.argv).toEqual([LOCAL_PYTHON, '-m', 'jarvis_local_voice', 'download', '--models-dir', `${DATA_DIR}\\models`, '--verify'])
+    expect(w.statuses).toContain('JARVIS · setting up · installing the local voice (PyTorch with CUDA, about 3 GB) · Installed 97 packages in 41s')
+    expect(w.statuses).toContain('JARVIS · setting up · local voice ready on cuda: 2.9 s of speech took 1.1 s (voice built-in)')
+    expect(w.logs).toContain(
+      'Jarvis local voice installed (local voice ready on cuda: 2.9 s of speech took 1.1 s (voice built-in)). Switch to it with /jarvis engine local.',
+    )
+    expect(w.store.has('voiceEngine')).toBe(false) // installing does not switch
+  })
+
+  test('/jarvis setup local cpu installs CPU torch and passes the reference clip', { options: { localVoiceClip: 'C:\\Voices\\jarvis.mp3' } }, async ($, on) => {
+    const w = world(on, { installed: false })
+    await startSession($, w)
+    w.existing.add(WINGET_UV)
+    w.onSpawn = child => child.exit(0)
+    const text = await jarvis($, 'setup local cpu')
+    expect(text).toContain('Voice: copied from C:\\Voices\\jarvis.mp3.')
+    await w.settle(40)
+    expect(w.children[1]?.argv).toContain('cpu')
+    expect(w.children[2]?.argv.slice(-2)).toEqual(['--voice', 'C:\\Voices\\jarvis.mp3'])
+  })
+
+  test('a failed install is reported and nothing switches', async ($, on) => {
+    const w = world(on, { installed: false })
+    await startSession($, w)
+    w.existing.add(WINGET_UV)
+    w.onSpawn = child => {
+      if (child.argv[1] === 'pip') child.stderr('error: No solution found when resolving dependencies\n')
+      child.exit(child.argv[1] === 'pip' ? 1 : 0)
+    }
+    await jarvis($, 'setup local')
+    await w.settle(40)
+    expect(w.children).toHaveLength(2)
+    expect(w.logs.at(-1)).toContain(`Jarvis local voice setup failed: ${WINGET_UV} pip install failed (exit 1):`)
+    expect(w.logs.at(-1)).toContain('No solution found')
+  })
+
+  test('/jarvis engine local needs the local voice installed', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(await jarvis($, 'engine')).toBe('Voice engine: Fish Audio. Switch with /jarvis engine fish or /jarvis engine local.')
+    expect(await jarvis($, 'engine local')).toBe(
+      'The local voice is not installed yet. Run /jarvis setup local first (it downloads about 6 GB).',
+    )
+    expect(await jarvis($, 'engine kokoro')).toBe('Unknown engine "kokoro". Use /jarvis engine fish or /jarvis engine local.')
+    expect(w.store.has('voiceEngine')).toBe(false)
+  })
+
+  test('/jarvis engine local restarts the helper on the local voice, and fish switches back', { options: { localVoiceClip: 'C:\\Voices\\jarvis.mp3' } }, async ($, on) => {
+    const w = world(on)
+    const first = await startHelper($, w)
+    expect(first.request.env?.JARVIS_TTS_ENGINE).toBeUndefined()
+    w.existing.add(LOCAL_PYTHON)
+    w.respond = command => {
+      if (command.name === 'shutdown') w.lastHelper().exit(0)
+      return { status: 200, body: { ok: true } }
+    }
+    expect(await jarvis($, 'engine local')).toBe(
+      'Switched to the local voice. The helper restarts and loads the model onto your GPU, which takes a few seconds.',
+    )
+    await w.settle(20)
+    expect(w.store.get('voiceEngine')).toBe('local')
+    expect(w.helpers()).toHaveLength(2)
+    expect(w.lastHelper().request.env?.JARVIS_TTS_ENGINE).toBe('local')
+    expect(w.lastHelper().request.env?.JARVIS_LOCAL_VOICE).toBe('C:\\Voices\\jarvis.mp3')
+    expect(await jarvis($, 'engine')).toBe('Voice engine: the local voice (Chatterbox). Switch with /jarvis engine fish or /jarvis engine local.')
+
+    w.lastHelper().hello()
+    await w.settle()
+    expect(await jarvis($, 'engine fish')).toBe('Switched to Fish Audio. The helper restarts.')
+    await w.settle(20)
+    expect(w.helpers()).toHaveLength(3)
+    expect(w.lastHelper().request.env?.JARVIS_TTS_ENGINE).toBeUndefined()
+  })
+})

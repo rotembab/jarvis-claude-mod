@@ -12,7 +12,7 @@ import type { HelperPhase } from './helper'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
-import { hasNvidiaGpu, runSetup } from './setup'
+import { hasNvidiaGpu, runLocalVoiceSetup, runSetup } from './setup'
 import { statusLine } from './ui'
 import { Voice } from './voice'
 
@@ -27,10 +27,16 @@ export type SetupOptions = { sttModel?: SttModel; useCuda?: boolean }
 /** Fish Audio models offered in the plugin settings; the free one is the default. */
 export const FISH_MODELS = ['s2.1-pro-free', 's2.1-pro'] as const
 
+/** Who speaks: Fish Audio, or the local voice (Chatterbox-Turbo on this machine). */
+export const VOICE_ENGINES = ['fish', 'local'] as const
+export type VoiceEngine = (typeof VOICE_ENGINES)[number]
+
 export type JarvisSettings = {
   fishApiKey?: string
   fishModel: string
   voiceId?: string
+  voiceEngine: VoiceEngine
+  localVoiceClip?: string
   pttKey: string
   sttModel: SttModel
   language: string
@@ -48,6 +54,8 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     fishApiKey: optionString(options, 'fishApiKey'),
     fishModel: FISH_MODELS.find(model => model === optionString(options, 'fishModel')) ?? FISH_MODELS[0],
     voiceId: optionString(options, 'voiceId'),
+    voiceEngine: VOICE_ENGINES.find(engine => engine === optionString(options, 'voiceEngine')) ?? 'fish',
+    localVoiceClip: optionString(options, 'localVoiceClip'),
     pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
     sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
     language: optionString(options, 'language') ?? 'en',
@@ -64,6 +72,7 @@ const HELPER_STATES: ReadonlySet<string> = new Set<HelperState>([
 ])
 const LOCAL_SURFACES: ReadonlySet<RenderSurface> = new Set<RenderSurface>(['terminal', 'desktop'])
 const VOICE_OVERRIDE_KEY = 'voiceId'
+const ENGINE_OVERRIDE_KEY = 'voiceEngine'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -105,6 +114,7 @@ export class Jarvis {
       fishModel: this.settings.fishModel,
       noProxy: env.NO_PROXY,
       sttModel: () => this.sttModel(),
+      tts: async () => ({ engine: await this.voiceEngine(), localVoiceClip: this.settings.localVoiceClip }),
       initialConfig: () => this.initialConfig(),
       onEvent: event => this.onHelperEvent(event),
       onPhase: (phase, detail) => this.onHelperPhase(phase, detail),
@@ -147,6 +157,16 @@ export class Jarvis {
   async voiceId(): Promise<string | undefined> {
     const stored = await this.engine?.storeGet(VOICE_OVERRIDE_KEY).catch(() => undefined)
     return typeof stored === 'string' && stored !== '' ? stored : this.settings.voiceId
+  }
+
+  /** The engine /jarvis engine chose, else the voiceEngine setting. */
+  async voiceEngine(): Promise<VoiceEngine> {
+    const stored = await this.engine?.storeGet(ENGINE_OVERRIDE_KEY).catch(() => undefined)
+    return VOICE_ENGINES.find(engine => engine === stored) ?? this.settings.voiceEngine
+  }
+
+  async setVoiceEngine(engine: VoiceEngine): Promise<void> {
+    await this.engine?.storeSet(ENGINE_OVERRIDE_KEY, engine)
   }
 
   /**
@@ -217,6 +237,46 @@ export class Jarvis {
     } catch (error) {
       engine.log(`Jarvis setup failed: ${describeError(error)}`)
       engine.toast('Jarvis setup failed; the transcript has the details.')
+    } finally {
+      this.isSetupRunning = false
+      this.publish({ ...this.view, phase: 'stopped', detail: undefined })
+      helper.start({ userInitiated: true })
+    }
+  }
+
+  /**
+   * /jarvis setup local after uv was found: stops the helper (a running local
+   * voice holds its venv's files), installs the local voice and its model,
+   * then starts the helper again. The engine does not switch by itself.
+   */
+  async runLocalSetup(uv: string, request: { useCuda?: boolean }): Promise<void> {
+    const { engine, platform, helper } = this
+    if (engine === undefined || platform === undefined || helper === undefined || this.isSetupRunning) return
+    this.isSetupRunning = true
+    this.publish({ ...this.view, phase: 'setup', detail: 'stopping the helper' })
+    try {
+      if (!(await helper.stop())) {
+        engine.log('Jarvis local voice setup did not run: the voice helper did not exit. Run /jarvis setup local again in a minute.')
+        engine.toast('Jarvis setup did not run; the transcript says why.')
+        return
+      }
+      const result = await runLocalVoiceSetup(engine, platform, uv, {
+        useCuda: request.useCuda ?? (await hasNvidiaGpu(engine, platform)),
+        voiceClip: this.settings.localVoiceClip,
+        onProgress: text => this.publish({ ...this.view, phase: 'setup', detail: text }),
+        debug: line => engine.debug(`jarvis: ${line}`),
+      })
+      if (result.ok) {
+        const isOn = (await this.voiceEngine()) === 'local'
+        engine.log(`Jarvis local voice installed (${result.summary}).${isOn ? '' : ' Switch to it with /jarvis engine local.'}`)
+        engine.toast(isOn ? 'The local voice is installed.' : 'The local voice is installed. Switch with /jarvis engine local.')
+      } else {
+        engine.log(`Jarvis local voice setup failed: ${result.message}`)
+        engine.toast('Jarvis local voice setup failed; the transcript has the details.')
+      }
+    } catch (error) {
+      engine.log(`Jarvis local voice setup failed: ${describeError(error)}`)
+      engine.toast('Jarvis local voice setup failed; the transcript has the details.')
     } finally {
       this.isSetupRunning = false
       this.publish({ ...this.view, phase: 'stopped', detail: undefined })

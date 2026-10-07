@@ -9,7 +9,7 @@
     "Platform": { "enum": ["windows", "macos", "linux"] },
     "ErrorCode": {
       "enum": [
-        "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable",
+        "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable", "local_voice_failed",
         "mic_blocked", "mic_in_use", "no_input_device", "no_output_device",
         "stt_model_missing", "stt_failed", "ptt_unavailable", "bad_request", "unauthorized", "internal"
       ]
@@ -153,7 +153,7 @@
         "sttModel": { "type": "string" }, "sttDevice": { "type": "string" },
         "inputDevice": { "type": "string" }, "outputDevice": { "type": "string" },
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
-        "fishKeySet": { "type": "boolean" }
+        "fishKeySet": { "type": "boolean" }, "ttsEngine": { "enum": ["fish", "local"] }
       }
     }
   },

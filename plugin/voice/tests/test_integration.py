@@ -244,3 +244,32 @@ def test_refuses_to_start_without_token(tmp_path: Path) -> None:
     assert proc.returncode == 2
     event = json.loads(proc.stdout.splitlines()[0])
     assert event["type"] == "error" and event["fatal"] is True and "JARVIS_TOKEN" in event["message"]
+
+
+def test_local_voice_engine_speaks_through_its_own_process(tmp_path: Path, fish: FakeFishServer) -> None:
+    local_src = Path(__file__).resolve().parents[2] / "local-voice" / "src"
+    h = Helper(
+        tmp_path,
+        fish.url,
+        extra_args=["--tts-engine", "local", "--fake-local", "--local-python", sys.executable],
+        env={"PYTHONPATH": str(local_src)},
+    )
+    try:
+        hello = h.next_event(30)
+        assert hello["type"] == "hello" and "tts.local" in hello["capabilities"]
+        h.port = hello["port"]
+        h.wait_for("ready")
+        status = h.post("status")[1]
+        assert status["ttsEngine"] == "local"
+        protocol.load_schema().validate(status, "StatusResponse")
+        h.post("speak", {"replyId": "local-1", "seq": 0, "text": "Good evening, sir.", "final": False})
+        h.post("speak", {"replyId": "local-1", "seq": 1, "text": "", "final": True})
+        done = h.wait_for("speech_done", timeout=30, replyId="local-1")[-1]
+        assert done["interrupted"] is False and done["spokenText"] == "Good evening, sir."
+        assert fish.sessions == []  # nothing went to Fish Audio
+        assert h.post("shutdown") == (200, {"ok": True})
+        assert h.proc.wait(10) == 0
+        log = (tmp_path / "logs" / "voice.log").read_text(encoding="utf-8")
+        assert "local voice ready on fake" in log
+    finally:
+        h.stop()

@@ -52,6 +52,28 @@ jobs:
       - name: Run helper tests
         run: uv run --locked --project plugin/voice pytest -q plugin/voice/tests
 
+  local-voice:
+    name: local voice protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+
+      # The server and its tests use only the standard library (a fake voice
+      # stands in for the model), so torch and Chatterbox are not installed here.
+      - name: Lint
+        run: uvx ruff check --config plugin/local-voice/pyproject.toml plugin/local-voice
+
+      - name: Run local voice tests
+        env:
+          PYTHONPATH: plugin/local-voice/src
+        run: uv run --no-project --with pytest pytest -q plugin/local-voice/tests
+
   mod:
     name: mod
     runs-on: ubuntu-latest

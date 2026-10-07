@@ -47,6 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--stt-model", default=_env("JARVIS_STT_MODEL") or "auto")
     run.add_argument("--ptt-key", default=_env("JARVIS_PTT_KEY") or "right ctrl")
     run.add_argument("--voice-id", default=_env("JARVIS_VOICE_ID"))
+    run.add_argument(
+        "--tts-engine", choices=["fish", "local"], default=_env("JARVIS_TTS_ENGINE") or "fish", help="who speaks"
+    )
+    run.add_argument("--local-voice", default=_env("JARVIS_LOCAL_VOICE"), help="reference clip for the local voice")
+    run.add_argument("--local-python", default=_env("JARVIS_LOCAL_PYTHON"), help=argparse.SUPPRESS)
+    run.add_argument("--fake-local", action="store_true", help="local voice plays a tone instead of the model (tests)")
     run.add_argument("--language", default=_env("JARVIS_LANGUAGE") or "en")
     run.add_argument("--input-device", default=_env("JARVIS_INPUT_DEVICE"))
     run.add_argument("--output-device", default=_env("JARVIS_OUTPUT_DEVICE"))
@@ -129,11 +135,10 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
         "ptt",
         "barge_in.ptt",
         "stt.faster-whisper",
-        "tts.fish-live",
+        "tts.local" if args.tts_engine == "local" else "tts.fish-live",
     ]
-    caps += [
-        f"fake.{n}" for n, on in (("audio", args.fake_audio), ("stt", args.fake_stt), ("fish", args.fake_fish)) if on
-    ]
+    fakes = (("audio", args.fake_audio), ("stt", args.fake_stt), ("fish", args.fake_fish), ("local", args.fake_local))
+    caps += [f"fake.{n}" for n, on in fakes if on]
     return caps
 
 
@@ -172,8 +177,24 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         def transcriber_factory(requested: str) -> Any:
             return FasterWhisperTranscriber(requested, models_dir(data_dir))
 
-    settings = FishSettings.from_env(fake_url=args.fake_fish)
-    secret_filter.add(settings.api_key)
+    synth: Any
+    if args.tts_engine == "local":
+        from .stt.models import models_dir as local_models_dir
+        from .tts.local import LocalVoiceSettings, LocalVoiceSynth, default_python
+
+        synth = LocalVoiceSynth(
+            LocalVoiceSettings(
+                python=Path(args.local_python).expanduser() if args.local_python else default_python(data_dir),
+                models_dir=local_models_dir(data_dir),
+                voice_clip=Path(args.local_voice).expanduser() if args.local_voice else None,
+                fake=args.fake_local,
+            )
+        )
+        synth.start()  # load the model now, while nobody is waiting for a reply
+    else:
+        settings = FishSettings.from_env(fake_url=args.fake_fish)
+        secret_filter.add(settings.api_key)
+        synth = FishLiveSynth(settings)
     config = DaemonConfig(
         stt_model=args.stt_model,
         language=args.language,
@@ -187,7 +208,7 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         events=writer,
         capture=capture,
         playback=playback,
-        synth=FishLiveSynth(settings),
+        synth=synth,
         ptt=ptt,
         transcriber_factory=transcriber_factory,
         platform_name=plat.name(),
@@ -216,7 +237,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         writer.close()
         return exit_code
 
-    fake = bool(args.fake_audio or args.fake_stt or args.fake_fish)
+    fake = bool(args.fake_audio or args.fake_stt or args.fake_fish or args.fake_local)
     token = _env("JARVIS_TOKEN")
     if not token:
         if not fake:

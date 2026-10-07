@@ -9,7 +9,7 @@ import numpy as np
 
 KEY_HINT = "Set your Fish Audio API key in the Jarvis plugin settings (fishApiKey) or as FISH_AUDIO_API_KEY."
 
-SynthErrorCode = Literal["fish_key_missing", "fish_auth_failed", "fish_unreachable", "internal"]
+SynthErrorCode = Literal["fish_key_missing", "fish_auth_failed", "fish_unreachable", "local_voice_failed", "internal"]
 
 
 class SynthError(Exception):

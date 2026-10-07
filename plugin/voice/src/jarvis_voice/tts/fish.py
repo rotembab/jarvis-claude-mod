@@ -145,6 +145,8 @@ def start_request(settings: FishSettings, voice_id: str | None) -> dict[str, Any
 class FishLiveSynth:
     """SpeechSynth backed by Fish Audio's live WebSocket API."""
 
+    engine = "fish"
+
     def __init__(self, settings: FishSettings) -> None:
         self.settings = settings
         self.sample_rate = settings.sample_rate

@@ -27,6 +27,19 @@
       "options": ["s2.1-pro-free", "s2.1-pro"],
       "default": "s2.1-pro-free"
     },
+    "voiceEngine": {
+      "type": "string",
+      "title": "Voice engine",
+      "description": "fish speaks with Fish Audio over the internet. local speaks with Chatterbox-Turbo on this computer (install it with /jarvis setup local; best with an NVIDIA GPU). /jarvis engine fish|local switches without opening the settings.",
+      "options": ["fish", "local"],
+      "default": "fish"
+    },
+    "localVoiceClip": {
+      "type": "string",
+      "title": "Local voice clip",
+      "description": "Full path of a clean 10 to 20 second recording (wav or mp3) whose voice the local engine copies. Empty uses Chatterbox's built-in voice. Run /jarvis restart after changing it.",
+      "required": false
+    },
     "pttKey": {
       "type": "string",
       "title": "Push-to-talk key",

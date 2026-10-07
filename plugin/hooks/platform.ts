@@ -18,6 +18,10 @@ export type Platform = {
   venvDir: string
   /** Absolute path of the venv's python; never a bare `python`. */
   venvPython: string
+  /** The local voice's own venv (torch and Chatterbox), kept apart from the helper's. */
+  localVenvDir: string
+  /** Absolute path of the local voice venv's python. */
+  localVenvPython: string
   /** Fixed places uv is looked for, in order, before the PATH. */
   uvCandidates: string[]
   /** argv that prints uv's path(s) when it is on the PATH. */
@@ -58,6 +62,7 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
     const sep = '\\'
     const dataDir = joinPath(sep, home, '.jarvis')
     const venvDir = joinPath(sep, dataDir, 'venv')
+    const localVenvDir = joinPath(sep, dataDir, 'local-voice', 'venv')
     const appData = localAppData ?? joinPath(sep, home, 'AppData', 'Local')
     return {
       os,
@@ -66,6 +71,8 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
       dataDir,
       venvDir,
       venvPython: joinPath(sep, venvDir, 'Scripts', 'python.exe'),
+      localVenvDir,
+      localVenvPython: joinPath(sep, localVenvDir, 'Scripts', 'python.exe'),
       uvCandidates: [
         joinPath(sep, home, '.local', 'bin', 'uv.exe'),
         joinPath(sep, appData, 'Microsoft', 'WinGet', 'Links', 'uv.exe'),
@@ -79,6 +86,7 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
   const sep = '/'
   const dataDir = joinPath(sep, home, '.jarvis')
   const venvDir = joinPath(sep, dataDir, 'venv')
+  const localVenvDir = joinPath(sep, dataDir, 'local-voice', 'venv')
   return {
     os,
     sep,
@@ -86,6 +94,8 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
     dataDir,
     venvDir,
     venvPython: joinPath(sep, venvDir, 'bin', 'python'),
+    localVenvDir,
+    localVenvPython: joinPath(sep, localVenvDir, 'bin', 'python'),
     uvCandidates: [
       joinPath(sep, home, '.local', 'bin', 'uv'),
       joinPath(sep, home, '.cargo', 'bin', 'uv'),

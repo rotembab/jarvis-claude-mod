@@ -62,11 +62,15 @@ export type HelperOptions = {
    * loads its own pick first; undefined lets it choose ("auto").
    */
   sttModel: () => Promise<string | undefined>
+  /** Who speaks, read at each start: Fish Audio (the default) or the local voice and its reference clip. */
+  tts?: () => Promise<TtsChoice>
   /** Settings sent with `config` as soon as the helper says hello. */
   initialConfig: () => Promise<ConfigCommand>
   onEvent: (event: HelperEvent) => void
   onPhase: (phase: HelperPhase, detail?: string) => void
 }
+
+export type TtsChoice = { engine: 'fish' | 'local'; localVoiceClip?: string }
 
 /** Splits a stream of text pieces into lines; a line may span pieces. */
 export class LineReader {
@@ -262,6 +266,7 @@ export class Helper {
     const reader = new LineReader()
     const exit: Exit = { result: undefined, failure: undefined, sawAlreadyRunning: false, uptime: 0 }
     const sttModel = await this.options.sttModel().catch(() => undefined)
+    const tts = (await this.options.tts?.().catch(() => undefined)) ?? { engine: 'fish' }
     // stop() may have come while this run got ready: start nothing.
     if (!isCurrent()) return
     if (this.isStopping) {
@@ -283,7 +288,7 @@ export class Helper {
         ...(sttModel === undefined ? [] : ['--stt-model', sttModel]),
       ],
       cwd: platform.dataDir,
-      env: this.childEnv(),
+      env: this.childEnv(tts),
     })
     this.stream = stream
     // A helper that never says hello (hung opening a device, say) is let go
@@ -413,7 +418,7 @@ export class Helper {
     if (outcome.ok) await delay(this.engine, 1000)
   }
 
-  private childEnv(): Record<string, string> {
+  private childEnv(tts: TtsChoice): Record<string, string> {
     const env: Record<string, string> = {
       PYTHONUNBUFFERED: '1',
       PYTHONUTF8: '1',
@@ -423,6 +428,10 @@ export class Helper {
     }
     if (this.options.fishApiKey) env.FISH_AUDIO_API_KEY = this.options.fishApiKey
     if (this.options.fishModel) env.JARVIS_TTS_MODEL = this.options.fishModel
+    if (tts.engine === 'local') {
+      env.JARVIS_TTS_ENGINE = 'local'
+      if (tts.localVoiceClip) env.JARVIS_LOCAL_VOICE = tts.localVoiceClip
+    }
     return env
   }
 

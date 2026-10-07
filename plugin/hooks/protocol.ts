@@ -12,6 +12,7 @@ export type ErrorCode =
   | 'fish_key_missing'
   | 'fish_auth_failed'
   | 'fish_unreachable'
+  | 'local_voice_failed'
   | 'mic_blocked'
   | 'mic_in_use'
   | 'no_input_device'
@@ -124,6 +125,7 @@ export type StatusResponse = {
   voiceId?: string
   pttKey?: string
   fishKeySet?: boolean
+  ttsEngine?: 'fish' | 'local'
 }
 
 /** schema.json's maxLength on SpeakCommand.text. */
