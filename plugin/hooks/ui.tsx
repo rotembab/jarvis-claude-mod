@@ -41,12 +41,14 @@ export function handsLabel(hands: JarvisHandsView): string | undefined {
     starting: 'hands starting',
     idle: `hands ready · ${hands.engage === 'always' ? 'raise a hand' : 'open palm'} to start`,
     active: 'hands active',
-    paused: 'hands paused',
+    // The detail: why the camera could not open again, when it could not.
+    paused: `hands paused${detail}`,
     calibrating: `hands calibrating${detail}`,
     error: `hands stopped${detail}`,
     restarting: `hands restarting${detail}`,
     elsewhere: 'hands active in another window',
-    failed: `hands stopped${detail} · /jarvis hands restart`,
+    // A restart cannot cure a final error; its message says what can.
+    failed: hands.isFinal === true ? `hands stopped${detail}` : `hands stopped${detail} · /jarvis hands restart`,
   }
   return labels[hands.phase]
 }

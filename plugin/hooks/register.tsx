@@ -6,8 +6,8 @@ import type { Register } from 'claude-code'
 
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
-import type { Engine } from './engine'
 import { describeError } from './engine'
+import type { HandsEngine } from './hands'
 import { HANDS_TOOL, runHandsTool } from './hands'
 import { bandTree, isBandShown } from './ui'
 
@@ -23,7 +23,7 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     // `$` is spelled out at each call (the engine reads calls off the source),
     // so the port is a set of closures over this hook's `$`.
-    const engine: Engine = {
+    const engine: HandsEngine = {
       pluginRoot: $.plugin.root,
       env: async () => ({
         OS: await $.env.get('OS'),
@@ -40,6 +40,7 @@ export const register: Register = (on, options) => {
       spawn: request => $.process.spawn(request),
       run: (argv, init) => $.process.run(argv, init),
       exists: path => $.fs.exists(path),
+      readFile: path => $.fs.read(path),
       writeFile: (path, text) => $.fs.write(path, text),
       storeGet: key => $.store.get(key),
       storeSet: (key, value) => $.store.set(key, value),

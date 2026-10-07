@@ -54,6 +54,8 @@ export type JarvisHandsView = {
   detail?: string
   /** palm: an open palm starts control; always: any hand does. */
   engage?: 'palm' | 'always'
+  /** failed only: the helper stopped on an error no restart cures (the platform, a missing model). */
+  isFinal?: boolean
 }
 
 export type JarvisView = {

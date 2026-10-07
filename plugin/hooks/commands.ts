@@ -14,7 +14,7 @@ import { uvMissingMessage } from './setup'
 import { statusLine } from './ui'
 
 const HELP = [
-  '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model',
+  '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model (and update hand control)',
   '/jarvis setup local [cpu]        install the local voice (Chatterbox, about 6 GB)',
   '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
   '/jarvis wake <on|off>            listen for "Hey Jarvis" (push-to-talk always works)',
@@ -122,11 +122,15 @@ async function setup(app: Jarvis, args: string[]): Promise<string> {
   if (uv === undefined) return uvMissingMessage(platform)
   // Without a model named here, setup repairs the one in use.
   const model = await app.setupModel({ sttModel, useCuda })
+  // An installed hand helper is updated too (runSetup), so it matches this version.
+  const hands = app.hands
+  const hasHands = hands !== undefined && !hands.isSetupRunning && (await hands.isInstalled())
   void app.runSetup(uv, { sttModel, useCuda })
   return [
     `Setting up Jarvis with ${uv}:`,
     `  1. a Python 3.12 environment in ${platform.venvDir} with the voice helper`,
     `  2. the speech model (${model === 'auto' ? 'chosen for your hardware' : model})`,
+    ...(hasHands ? [`  3. then the hand helper in ${platform.handsVenvDir} again, from this version of Jarvis`] : []),
     'Progress shows in the status line; the helper starts when it is done.',
   ].join('\n')
 }

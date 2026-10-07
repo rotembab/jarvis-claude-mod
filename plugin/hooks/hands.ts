@@ -123,6 +123,8 @@ export type HandsCommandName = keyof HandsCommandBodies
 
 export type HandsCommandResponse = {
   ok: boolean
+  /** pause and resume: the camera is still being closed or opened as the helper answers. */
+  pending?: true
   error?: { code: HandsErrorCode; message: string }
   [extra: string]: unknown
 }
@@ -157,6 +159,20 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
 
 const integer = (value: unknown): number => (Number.isInteger(value) ? (value as number) : 0)
+
+const words = (text: string): string[] => text.toLowerCase().match(/[a-z0-9]+/g) ?? []
+
+/**
+ * An error's message with its hint in brackets, unless the hint only says the
+ * message again (in the same words or nearly: most of its words are in it).
+ */
+export function describeHandsError(message: string, hint: string | undefined): string {
+  const hinted = words(hint ?? '')
+  if (hinted.length === 0) return message
+  const said = new Set(words(message))
+  const isRepeat = hinted.filter(word => said.has(word)).length >= hinted.length * 0.8
+  return isRepeat ? message : `${message} (${hint})`
+}
 
 function toDisplay(value: unknown): HandsDisplay | undefined {
   if (!isRecord(value) || !Number.isInteger(value.id) || typeof value.name !== 'string') return undefined
@@ -223,9 +239,11 @@ const COMMAND_TIMEOUT_MS: Record<HandsCommandName, number> = {
   heartbeat: 1500,
   status: 5000,
   config: 5000,
-  pause: 5000,
-  // Reopening the camera; Windows may take a few seconds over it.
-  resume: 10_000,
+  // The helper answers these within its own waits for the camera (about 4 s
+  // to close it, 9 s to open it), with `pending` when it is still at it: a
+  // webcam can take 20 s to open on Windows.
+  pause: 10_000,
+  resume: 15_000,
   engage: 2000,
   disengage: 2000,
   calibrate: 3000,
@@ -249,8 +267,11 @@ export type HandsHelperOptions = {
   camera: () => Promise<string | undefined>
   /** Settings sent with `config` as soon as the helper says hello. */
   initialConfig: () => Promise<HandsConfigCommand>
+  /** Whether the user paused hand control: `pause` then goes out before `config`, before the camera opens. */
+  isPaused: () => Promise<boolean>
   onEvent: (event: HandsEvent) => void
-  onPhase: (phase: HandsHelperPhase, detail?: string) => void
+  /** `isFinal`: a failure no restart cures (FINAL_ERRORS), so the user is not told to restart. */
+  onPhase: (phase: HandsHelperPhase, detail?: string, isFinal?: boolean) => void
 }
 
 type Exit = {
@@ -274,6 +295,8 @@ export class HandsHelper {
 
   private token = ''
   private generation = 0
+  /** Counts stop() calls: a restart starts again only if no other stop came while it stopped. */
+  private stops = 0
   private attempt = 0
   private stream: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | undefined
   private running: Promise<void> | undefined
@@ -316,6 +339,7 @@ export class HandsHelper {
    * heartbeat watchdog ends it (and lets go of the camera) soon after.
    */
   async stop(): Promise<boolean> {
+    this.stops += 1
     this.retryTimer?.cancel()
     this.retryTimer = undefined
     const running = this.running
@@ -338,8 +362,16 @@ export class HandsHelper {
     return false
   }
 
-  async restart(): Promise<void> {
-    await this.stop()
+  /**
+   * Stops the helper, then starts it again, unless another stop came while
+   * it stopped (hand control turned off, a setup began: theirs wins) or
+   * `shouldStart` says no once it has stopped.
+   */
+  async restart(shouldStart: () => Promise<boolean> = async () => true): Promise<void> {
+    const stopping = this.stop()
+    const stops = this.stops
+    await stopping
+    if (this.stops !== stops || !(await shouldStart()) || this.stops !== stops) return
     this.start({ userInitiated: true })
   }
 
@@ -528,7 +560,7 @@ export class HandsHelper {
     const why = this.lastFatal ?? exit.failure ?? (tail === undefined ? ended : `${ended}: ${tail}`)
     const wait = BACKOFF_MS[this.attempt]
     if (wait === undefined || exit.isFinal) {
-      this.setPhase('failed', why)
+      this.setPhase('failed', why, exit.isFinal)
       return
     }
     this.attempt += 1
@@ -549,7 +581,7 @@ export class HandsHelper {
       this.hello = event
       this.onHello(event)
     } else if (event.type === 'error' && event.fatal) {
-      this.lastFatal = event.hint ? `${event.message} (${event.hint})` : event.message
+      this.lastFatal = describeHandsError(event.message, event.hint)
     }
     try {
       this.options.onEvent(event)
@@ -567,13 +599,23 @@ export class HandsHelper {
     })
     const ref: JarvisHelperRef = { port: hello.port, token: this.token, pid: hello.pid }
     void this.engine.writeHandsRef(ref).catch(() => undefined)
-    void this.options
-      .initialConfig()
-      .then(config => this.send('config', config))
-      .then(outcome => {
-        if (!outcome.ok) this.engine.debug(`jarvis: hands config not applied: ${outcome.message}`)
+    void this.sendFirst().catch((error: unknown) => this.engine.debug(`jarvis: hands config not sent: ${describeError(error)}`))
+  }
+
+  /**
+   * What a helper that just said hello hears first: `pause` while the user
+   * has hand control paused (it arrives before the camera opens, which keeps
+   * it closed), then the settings. The config does not wait for the pause's
+   * answer, which may wait on the camera.
+   */
+  private async sendFirst(): Promise<void> {
+    if (await this.options.isPaused()) {
+      void this.send('pause', {}).then(outcome => {
+        if (!outcome.ok) this.engine.debug(`jarvis: hands pause not applied: ${outcome.message}`)
       })
-      .catch((error: unknown) => this.engine.debug(`jarvis: hands config not sent: ${describeError(error)}`))
+    }
+    const outcome = await this.send('config', await this.options.initialConfig())
+    if (!outcome.ok) this.engine.debug(`jarvis: hands config not applied: ${outcome.message}`)
   }
 
   /**
@@ -611,9 +653,9 @@ export class HandsHelper {
     if (this.stderrTail.length > 20) this.stderrTail.splice(0, this.stderrTail.length - 20)
   }
 
-  private setPhase(phase: HandsHelperPhase, detail?: string): void {
+  private setPhase(phase: HandsHelperPhase, detail?: string, isFinal = false): void {
     this.phase = phase
-    this.options.onPhase(phase, detail)
+    this.options.onPhase(phase, detail, isFinal)
   }
 }
 
@@ -621,6 +663,15 @@ export class HandsHelper {
 
 /** The hand helper's distribution name in hands/pyproject.toml. */
 export const HANDS_PACKAGE = 'jarvis-hands'
+
+/**
+ * <dataDir>/hands/installed.json: what the last /jarvis setup hands
+ * installed, `{ pluginVersion }`. The venv holds a copy of the plugin's hands
+ * package (a non-editable install), so a plugin update leaves the helper as it
+ * was until the setup runs again; this record is how the mod tells.
+ */
+export const HANDS_INSTALLED_FILE = 'installed.json'
+type InstalledRecord = { pluginVersion?: string }
 
 /** The `uv sync` argv for the hand helper project (exported for tests). */
 export function handsUvSyncArgv(uv: string, project: string, { isFrozen }: { isFrozen: boolean }): string[] {
@@ -641,6 +692,8 @@ export function handsUvSyncArgv(uv: string, project: string, { isFrozen }: { isF
 }
 
 export type HandsSetupRequest = {
+  /** This plugin's version, recorded once the install succeeded (undefined: unknown). */
+  pluginVersion: string | undefined
   onProgress: (text: string) => void
   debug: (line: string) => void
 }
@@ -661,7 +714,7 @@ export async function runHandsSetup(
   // Creates the folders (fs.write makes parents): the model setup runs in the data folder.
   await engine.writeFile(
     joinPath(platform.sep, handsDir, 'README.txt'),
-    'Jarvis hand control keeps its helper here: venv/ (its own Python environment) and calibration.json. The hand model is in ../models/hands.\nDelete this folder and ../models/hands to uninstall hand control; /jarvis setup hands recreates them.\n',
+    'Jarvis hand control keeps its helper here: venv/ (its own Python environment), calibration.json, and installed.json (the version of Jarvis that installed it). The hand model is in ../models/hands.\nDelete this folder and ../models/hands to uninstall hand control; /jarvis setup hands recreates them.\n',
   )
 
   const project = joinPath(platform.sep, engine.pluginRoot, 'hands')
@@ -727,6 +780,8 @@ export async function runHandsSetup(
     const details = [failure, ...tail].filter(line => line !== undefined).join('\n')
     return { ok: false, reason: 'model_failed', message: `the hand helper's setup failed (exit ${code ?? 'signal'}):\n${details}` }
   }
+  const record: InstalledRecord = { pluginVersion: request.pluginVersion }
+  await engine.writeFile(joinPath(platform.sep, handsDir, HANDS_INSTALLED_FILE), `${JSON.stringify(record)}\n`)
   return { ok: true, summary: lastProgress === '' ? 'installed' : lastProgress }
 }
 
@@ -754,12 +809,32 @@ export function readHandsSettings(options: PluginOptions): HandsSettings {
   }
 }
 
+/**
+ * /jarvis hands on|off's choice, kept with the handControl setting it
+ * overrode: it lapses (and is dropped) once the setting changes, so the
+ * setting always has the last word. A choice equal to the setting is none.
+ */
 const ENABLED_KEY = 'handsEnabled'
+type EnabledOverride = { isOn: boolean; setting: boolean }
+/**
+ * /jarvis hands pause, until resume, on or off: kept in $.store, so a helper
+ * that restarts (a crash, a camera change, a reload, the next session) is
+ * paused again before its camera opens. "The camera is off until resume".
+ */
+const PAUSED_KEY = 'handsPaused'
 const CAMERA_KEY = 'handsCamera'
 const ENGAGE_KEY = 'handsEngage'
 const DISPLAYS_KEY = 'handsDisplays'
 /** A non-fatal error is toasted once per code in this long. */
 const ERROR_TOAST_INTERVAL_MS = 60_000
+/** Errors that say why the camera is off (a reopen that failed): shown after "hands paused" while it is. */
+const CAMERA_ERRORS: ReadonlySet<string> = new Set<HandsErrorCode>([
+  'no_camera',
+  'camera_blocked',
+  'camera_in_use',
+  'camera_lost',
+  'internal',
+])
 const CALIBRATION_TOAST_MS = 10_000
 
 /** The view phases the running helper's own state events set. */
@@ -805,6 +880,14 @@ const PHASE_TEXT: Record<HandsPhase, string> = {
   failed: 'stopped: the hand helper kept failing; /jarvis hands restart tries again',
 }
 
+/** What the hands part of the view says in words (`/jarvis hands`). */
+function phaseText(view: JarvisHandsView): string {
+  // A failure no restart cures: the reason (the detail) says what to do.
+  return view.phase === 'failed' && view.isFinal === true ? 'stopped' : PHASE_TEXT[view.phase]
+}
+
+const RESUMED = 'Hand control resumed: the camera is on again.'
+
 const NOT_LOCAL =
   'Hand control runs on your own computer; this session runs in the cloud, so the hand helper is not started here.'
 
@@ -829,24 +912,36 @@ const GESTURES = [
   'Drop your hand out of view, or touch the mouse: control lets go at once',
 ].join('\n')
 
+const TOOL_ACTIONS = ['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage'] as const
+type ToolAction = (typeof TOOL_ACTIONS)[number]
+
 /** The tool the model calls for "Jarvis, turn on hand control" (`mcp__jarvis__hands`). */
 export const HANDS_TOOL = {
   name: 'hands',
   description:
-    "Jarvis hand control: the user's webcam watches their hands and turns gestures into mouse and window actions on their own computer (an open palm starts it, a pinch clicks, a fist grabs a window). It is separate from Jarvis's voice and off until turned on, since it uses the camera. Use this tool when the user asks to turn hand or gesture control on or off, to calibrate it, to pause or resume it, or to check whether it is working. on starts the camera and hand tracking; off stops them; calibrate starts the four-corner calibration (the user holds an open palm at each corner of the screen); pause turns the camera off while hand control stays on, and resume turns it back on; status reports the state, the camera and the displays. Relay the result to the user in a sentence or two.",
+    "Jarvis hand control: the user's webcam watches their hands and turns gestures into mouse and window actions on their own computer (an open palm starts it, a pinch clicks, a fist grabs a window). It is separate from Jarvis's voice and off until turned on, since it uses the camera. Use this tool when the user asks to turn hand or gesture control on or off, to calibrate it, to pause or resume it, to choose the displays it reaches (such as a projector), to take or let go of the cursor, or to check whether it is working. Actions: on starts the camera and hand tracking; off stops them; calibrate starts the four-corner calibration (the user holds an open palm at each corner of the screen); pause turns the camera off while hand control stays on, and resume turns it back on; engage gives the cursor to the user's hand now, with no open palm needed, and disengage takes it away; status reports the state, the camera and the displays with their numbers and names. display chooses the displays the hand reaches: all, a display number, or a list such as 1,2 (status lists them); it can come alone or with an action, and applies first. Relay the result to the user in a sentence or two.",
   inputSchema: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['on', 'off', 'status', 'calibrate', 'pause', 'resume'],
+        enum: [...TOOL_ACTIONS],
         description: 'What to do with hand control.',
       },
+      display: {
+        type: 'string',
+        description: 'The displays the hand reaches: all, a display number such as 2, or a list such as 1,2.',
+      },
     },
-    required: ['action'],
     additionalProperties: false,
   },
 }
+
+/**
+ * The engine port and a file read, which hand control needs for its install
+ * record and the plugin's version (engine.ts's port has no read of its own).
+ */
+export type HandsEngine = Engine & { readFile: (path: string) => Promise<string> }
 
 export type HandsOptions = {
   platform: Platform
@@ -879,9 +974,15 @@ export class Hands {
   private lastError: string | undefined
   private corner: string | undefined
   private readonly mutedErrors = new Set<string>()
+  /** A resume answered `pending`: the camera is still opening, and the user waits to hear how it went. */
+  private isResumePending = false
+  private hasCheckedInstall = false
+  /** Says to run /jarvis setup hands, while the venv is an earlier version's. */
+  private updateNotice: string | undefined
+  private versionRead: Promise<string | undefined> | undefined
 
   constructor(
-    readonly engine: Engine,
+    readonly engine: HandsEngine,
     private readonly options: HandsOptions,
   ) {
     this.platform = options.platform
@@ -892,15 +993,59 @@ export class Hands {
       noProxy: options.noProxy,
       camera: () => this.camera(),
       initialConfig: () => this.initialConfig(),
+      isPaused: () => this.isPaused(),
       onEvent: event => this.onEvent(event),
-      onPhase: (phase, detail) => this.onHelperPhase(phase, detail),
+      onPhase: (phase, detail, isFinal) => this.onHelperPhase(phase, detail, isFinal),
     })
   }
 
-  /** Whether hand control is on: /jarvis hands on|off's choice, else the handControl setting. */
+  /**
+   * Whether hand control is on: /jarvis hands on|off's choice while the
+   * handControl setting is still the one it overrode, else the setting.
+   */
   async isEnabled(): Promise<boolean> {
     const stored = await this.engine.storeGet(ENABLED_KEY).catch(() => undefined)
-    return typeof stored === 'boolean' ? stored : this.options.settings.isOn
+    const setting = this.options.settings.isOn
+    if (stored === undefined) return setting
+    const override: Record<string, unknown> = isRecord(stored) ? stored : {}
+    if (typeof override.isOn === 'boolean' && override.setting === setting) return override.isOn
+    // Lapsed: the setting changed since. Dropped, so changing it back does not revive it.
+    await this.engine.storeDelete(ENABLED_KEY).catch(() => undefined)
+    return setting
+  }
+
+  /** Stores /jarvis hands on|off's choice against the setting it overrides; one equal to the setting is none. */
+  private async setEnabled(isOn: boolean): Promise<void> {
+    const setting = this.options.settings.isOn
+    if (isOn === setting) {
+      await this.engine.storeDelete(ENABLED_KEY)
+      return
+    }
+    const override: EnabledOverride = { isOn, setting }
+    await this.engine.storeSet(ENABLED_KEY, override)
+  }
+
+  /** Whether the user paused hand control (the camera stays off until resume, on or off). */
+  async isPaused(): Promise<boolean> {
+    return (await this.engine.storeGet(PAUSED_KEY).catch(() => undefined)) === true
+  }
+
+  private async setPaused(isPaused: boolean): Promise<void> {
+    if (isPaused) await this.engine.storeSet(PAUSED_KEY, true)
+    else await this.engine.storeDelete(PAUSED_KEY)
+  }
+
+  /** This plugin's version, from its plugin.json; undefined when it cannot be read. */
+  pluginVersion(): Promise<string | undefined> {
+    this.versionRead ??= this.engine
+      .readFile(joinPath(this.platform.sep, this.engine.pluginRoot, '.claude-plugin', 'plugin.json'))
+      .then(text => {
+        const value: unknown = JSON.parse(text)
+        const version = isRecord(value) ? value.version : undefined
+        return typeof version === 'string' && version !== '' ? version : undefined
+      })
+      .catch(() => undefined)
+    return this.versionRead
   }
 
   /** The camera /jarvis hands camera chose, else the handCamera setting; undefined: the first. */
@@ -937,13 +1082,18 @@ export class Hands {
 
   async turnOn(): Promise<string> {
     if (!this.isLocal) return NOT_LOCAL
-    await this.engine.storeSet(ENABLED_KEY, true)
+    await this.setEnabled(true)
+    // "On" means the camera on: it ends a pause too.
+    const wasPaused = await this.isPaused()
+    await this.setPaused(false)
     if (this.isSetupRunning) return 'Hand control is on; the camera starts when setup is done.'
     if (!(await this.isInstalled())) {
       this.publish({ phase: 'not_installed' })
       return 'Hand control is on, but it is not set up yet. Run /jarvis setup hands (it downloads about 500 MB); the camera starts when it is done.'
     }
-    if (this.helper.isRunning) return 'Hand control is already on.'
+    if (this.helper.isRunning) {
+      return wasPaused || this.view.phase === 'paused' ? await this.resumeRunning() : 'Hand control is already on.'
+    }
     this.engage = await this.engageMode()
     const wasElsewhere = this.helper.phase === 'elsewhere'
     this.helper.start({ userInitiated: true })
@@ -956,9 +1106,15 @@ export class Hands {
 
   async turnOff(): Promise<string> {
     if (!this.isLocal) return NOT_LOCAL
-    await this.engine.storeSet(ENABLED_KEY, false)
+    await this.setEnabled(false)
+    await this.setPaused(false)
+    // The other window's helper is not told (nor does it watch the store).
+    const wasElsewhere = this.helper.phase === 'elsewhere'
     // The supervisor's "stopped" turns the hands part of the view off.
     const isStopped = await this.helper.stop()
+    if (wasElsewhere) {
+      return 'Hand control is off here, but it still runs, with the camera, in another Claude Code window. Turn it off there with /jarvis hands off.'
+    }
     return isStopped
       ? 'Hand control is off and the camera is closed.'
       : 'Hand control is off. The hand helper did not exit when asked; it closes the camera and exits by itself within a minute.'
@@ -967,8 +1123,13 @@ export class Hands {
   async restart(): Promise<string> {
     if (this.isSetupRunning) return 'Hand control setup is running; the hand helper starts when it is done.'
     if (!(await this.isEnabled())) return 'Hand control is off. Turn it on with /jarvis hands on.'
-    void this.helper.restart()
+    void this.restartHelper()
     return 'Restarting the hand helper.'
+  }
+
+  /** Restarts the helper, unless hand control was turned off or a setup began while the old one stopped. */
+  private restartHelper(): Promise<void> {
+    return this.helper.restart(async () => !this.isSetupRunning && (await this.isEnabled()))
   }
 
   async calibrate(choice: string | undefined): Promise<string> {
@@ -990,16 +1151,48 @@ export class Hands {
     const notRunning = await this.notRunning()
     if (notRunning !== undefined) return notRunning
     const outcome = await this.helper.send('pause', {})
-    return outcome.ok
-      ? 'Hand control paused: the camera is off. /jarvis hands resume turns it back on.'
-      : `Could not pause hand control: ${outcome.message}`
+    if (!outcome.ok) return `Could not pause hand control: ${outcome.message}`
+    this.isResumePending = false
+    await this.setPaused(true)
+    return outcome.response.pending === true
+      ? 'Pausing hand control: the camera is still starting, and it turns off as soon as it has started. /jarvis hands resume turns it back on.'
+      : 'Hand control paused: the camera is off. /jarvis hands resume turns it back on.'
   }
 
   async resume(): Promise<string> {
+    // The user wants the camera on: whatever helper runs next opens it.
+    if (this.isLocal) await this.setPaused(false)
     const notRunning = await this.notRunning()
     if (notRunning !== undefined) return notRunning
+    return this.resumeRunning()
+  }
+
+  private async resumeRunning(): Promise<string> {
     const outcome = await this.helper.send('resume', {})
-    return outcome.ok ? 'Hand control resumed: the camera is on again.' : `Could not resume hand control: ${outcome.message}`
+    if (!outcome.ok) return `Could not resume hand control: ${outcome.message}`
+    // Still opening: this resume found the camera opening, or an earlier one
+    // did and the helper's state has not said it is back since. A helper that
+    // started paused never opened its camera, so it says "starting" meanwhile.
+    const isOpening =
+      (outcome.response.pending === true || this.isResumePending) &&
+      (this.view.phase === 'paused' || this.view.phase === 'starting')
+    if (!isOpening) return RESUMED
+    // The helper says the rest: a state other than paused or starting once the
+    // camera is on, or an error event if it cannot open it (onEvent tells the user).
+    this.isResumePending = true
+    return 'Resuming hand control: the camera is still opening, which can take up to about 20 seconds. A message says when it is on, or why it could not open.'
+  }
+
+  /** The tool's engage and disengage: gives the cursor to the hand now, or takes it away. */
+  async setEngaged(isEngaged: boolean): Promise<string> {
+    const notRunning = await this.notRunning()
+    if (notRunning !== undefined) return notRunning
+    if (this.view.phase === 'paused') return 'Hand control is paused, so the camera is off. Resume it first: /jarvis hands resume.'
+    const outcome = await this.helper.send(isEngaged ? 'engage' : 'disengage', {})
+    if (!outcome.ok) return `Could not ${isEngaged ? 'take' : 'let go of'} the cursor: ${outcome.message}`
+    if (isEngaged) return 'Hand control has the cursor: it follows your hand as soon as one is in view.'
+    const start = this.engage === 'always' ? 'Raise a hand' : 'Hold an open palm toward the camera'
+    return `Hand control let go of the cursor. ${start} to take it again.`
   }
 
   async chooseDisplays(args: readonly string[]): Promise<string> {
@@ -1060,7 +1253,11 @@ export class Hands {
     if (!isRunning && (this.isSetupRunning || !(await this.isEnabled()) || !(await this.isInstalled()))) {
       return `Camera set to ${label}; it applies when hand control starts.`
     }
-    void this.helper.restart()
+    void this.restartHelper()
+    // A pause outlives the restart: the new helper keeps the camera closed.
+    if (await this.isPaused()) {
+      return `Camera set to ${label}. The hand helper restarts with it, still paused: /jarvis hands resume opens the camera.`
+    }
     return `Camera set to ${label}. The hand helper ${isRunning ? 'restarts' : 'starts again'} to open it.`
   }
 
@@ -1073,8 +1270,9 @@ export class Hands {
       return `${lines.join('\n')}\n\n${HANDS_HELP}`
     }
     const { phase, detail } = this.view
-    const state = phase === 'off' ? 'on, but the hand helper is not running (/jarvis hands restart starts it)' : PHASE_TEXT[phase]
+    const state = phase === 'off' ? 'on, but the hand helper is not running (/jarvis hands restart starts it)' : phaseText(this.view)
     lines.push(`Hand control: ${state}${detail ? ` (${detail})` : ''}`)
+    if (this.updateNotice !== undefined) lines.push(this.updateNotice)
     const engage = await this.engageMode()
     const hello = this.helper.hello
     const report = await this.liveStatus()
@@ -1082,10 +1280,9 @@ export class Hands {
     if (hello !== undefined) {
       const camera = report?.camera ?? ready?.camera
       const size = ready === undefined ? '' : ` at ${ready.width}x${ready.height}`
-      const parts = [
-        `Helper ${hello.version} (pid ${hello.pid})`,
-        camera === undefined ? 'opening the camera' : `camera ${camera}${size}`,
-      ]
+      // No camera yet: opening it, unless the helper started paused, which keeps it closed.
+      const noCamera = this.view.phase === 'paused' ? 'camera off while paused' : 'opening the camera'
+      const parts = [`Helper ${hello.version} (pid ${hello.pid})`, camera === undefined ? noCamera : `camera ${camera}${size}`]
       if (report !== undefined) parts.push(`${report.fps.toFixed(1)} fps, ${Math.round(report.inferMs)} ms per frame`)
       if (report?.calibrated !== undefined) parts.push(report.calibrated ? 'calibrated' : 'not calibrated (/jarvis hands calibrate)')
       lines.push(parts.join(' · '))
@@ -1107,11 +1304,19 @@ export class Hands {
   /**
    * /jarvis setup hands after uv was found: stops the hand helper (Windows
    * locks a running venv), installs, downloads the model, then starts the
-   * helper again when hand control is on.
+   * helper again when hand control is on. `isRefresh`: the same after
+   * /jarvis setup, which updates an installed hand helper along with the
+   * voice helper; it leaves one another window runs alone.
    */
-  async runSetup(uv: string): Promise<void> {
+  async runSetup(uv: string, { isRefresh = false }: { isRefresh?: boolean } = {}): Promise<void> {
     const engine = this.engine
     if (this.isSetupRunning) return
+    if (isRefresh && this.helper.phase === 'elsewhere') {
+      engine.log(
+        'The hand helper was not reinstalled: another Claude Code window runs it, which keeps its files in use. Turn it off there (/jarvis hands off), then run /jarvis setup hands here.',
+      )
+      return
+    }
     this.isSetupRunning = true
     this.publish({ phase: 'setup', detail: 'stopping the hand helper' })
     try {
@@ -1123,11 +1328,18 @@ export class Hands {
         return
       }
       const result = await runHandsSetup(engine, this.platform, uv, {
+        pluginVersion: await this.pluginVersion(),
         onProgress: text => this.publish({ phase: 'setup', detail: text }),
         debug: line => engine.debug(`jarvis: ${line}`),
       })
       if (result.ok) {
+        this.updateNotice = undefined
         const isOn = await this.isEnabled()
+        if (isRefresh) {
+          engine.log(`Hand control reinstalled for this version of Jarvis (${result.summary}).${isOn ? ' Starting the hand helper.' : ''}`)
+          engine.toast(isOn ? 'Hand control is reinstalled. Starting the camera.' : 'Hand control is reinstalled.')
+          return
+        }
         const next = isOn ? 'Starting the hand helper.' : 'Turn it on with /jarvis hands on.'
         engine.log(`Hand control installed (${result.summary}). ${next}`)
         engine.toast(isOn ? 'Hand control is installed. Starting the camera.' : `Hand control is installed. ${next}`)
@@ -1172,7 +1384,34 @@ export class Hands {
     if (!(await this.isEnabled())) return 'Hand control is off. Turn it on with /jarvis hands on.'
     if (this.view.phase === 'off') return 'The hand helper is not running; /jarvis hands restart starts it.'
     if (this.view.phase === 'elsewhere') return ELSEWHERE_TEXT
-    return `The hand helper is not running (${PHASE_TEXT[this.view.phase]}).`
+    return `The hand helper is not running (${phaseText(this.view)}).`
+  }
+
+  /**
+   * The venv holds the hands package as the last /jarvis setup hands copied
+   * it, so after a plugin update it runs the old code. Says once (the old
+   * helper still runs) when that setup's record is missing or names another
+   * version of the plugin.
+   */
+  private async checkInstall(): Promise<void> {
+    // Not installed: nothing to be old yet; a start after the setup checks again.
+    if (!(await this.isInstalled())) {
+      this.hasCheckedInstall = false
+      return
+    }
+    const version = await this.pluginVersion()
+    if (version === undefined) return
+    const path = joinPath(this.platform.sep, this.platform.dataDir, 'hands', HANDS_INSTALLED_FILE)
+    const record: unknown = await this.engine
+      .readFile(path)
+      .then(text => JSON.parse(text) as unknown)
+      .catch(() => undefined)
+    const installed = isRecord(record) && typeof record.pluginVersion === 'string' ? record.pluginVersion : undefined
+    if (installed === version) return
+    const by = installed === undefined ? 'an earlier version of Jarvis' : `Jarvis ${installed}, and this is Jarvis ${version}`
+    this.updateNotice = `The hand helper was installed by ${by}. Run /jarvis setup hands to update it; until then the old one runs.`
+    this.engine.log(this.updateNotice)
+    this.engine.toast('Hand control needs an update: run /jarvis setup hands.', { timeoutMs: 8000 })
   }
 
   /** Sends a live setting; undefined when no helper runs (it applies at the next start), '' when applied. */
@@ -1186,10 +1425,17 @@ export class Hands {
     switch (event.type) {
       case 'hello':
         this.lastError = undefined
+        this.isResumePending = false
         this.patch({ phase: 'starting', detail: undefined })
         return
       case 'state': {
         const detail = event.state === 'error' ? this.lastError : event.state === 'calibrating' ? this.corner : undefined
+        // "starting" is the resume itself, in a helper whose camera never opened.
+        if (this.isResumePending && event.state !== 'paused' && event.state !== 'starting') {
+          // The camera opened after the helper answered the resume (or the helper failed: its error says so).
+          this.isResumePending = false
+          if (event.state !== 'error') this.engine.toast(RESUMED)
+        }
         this.patch({ phase: event.state, detail })
         return
       }
@@ -1228,13 +1474,19 @@ export class Hands {
   private onError(event: HandsErrorEvent): void {
     // The supervisor says "active in another window" for this one.
     if (event.code === 'already_running') return
-    const detail = event.hint ? `${event.message} (${event.hint})` : event.message
+    const detail = describeHandsError(event.message, event.hint)
     if (event.fatal) {
       this.lastError = detail
       this.patch({ phase: 'error', detail })
       return
     }
-    if (this.mutedErrors.has(event.code)) return
+    const isCamera = CAMERA_ERRORS.has(event.code)
+    // A camera that could not open after a resume answered `pending`: the user waits for this one.
+    const isAwaited = isCamera && this.isResumePending
+    if (isAwaited) this.isResumePending = false
+    // The camera stays off: the status line says why, until the next state.
+    if (isCamera && this.view.phase === 'paused') this.patch({ detail })
+    if (this.mutedErrors.has(event.code) && !isAwaited) return
     this.mutedErrors.add(event.code)
     this.engine.after(ERROR_TOAST_INTERVAL_MS, () => this.mutedErrors.delete(event.code))
     this.engine.toast(`Hand control: ${detail}`, { timeoutMs: 8000 })
@@ -1252,8 +1504,16 @@ export class Hands {
     })
   }
 
-  private onHelperPhase(phase: HandsHelperPhase, detail: string | undefined): void {
-    if (phase !== 'running') this.ready = undefined
+  private onHelperPhase(phase: HandsHelperPhase, detail: string | undefined, isFinal = false): void {
+    if (phase !== 'running') {
+      this.ready = undefined
+      this.isResumePending = false
+    }
+    if (phase === 'starting' && !this.hasCheckedInstall) {
+      // Before hello: an old helper may not get that far with this mod.
+      this.hasCheckedInstall = true
+      void this.checkInstall().catch((error: unknown) => this.engine.debug(`jarvis: hands install not checked: ${describeError(error)}`))
+    }
     if (this.isSetupRunning) return // setup owns the hands part until it ends
     const phases: Record<HandsHelperPhase, HandsPhase | undefined> = {
       stopped: 'off',
@@ -1271,7 +1531,7 @@ export class Hands {
     }
     // The status line has no room for what to do about it.
     if (next === 'elsewhere') this.engine.toast(ELSEWHERE_TEXT, { timeoutMs: 8000 })
-    this.publish({ phase: next, detail })
+    this.publish({ phase: next, detail, ...(isFinal ? { isFinal } : {}) })
   }
 
   private patch(change: Partial<JarvisHandsView>): void {
@@ -1396,17 +1656,37 @@ export async function runHandsCommand(hands: Hands | undefined, args: readonly s
   }
 }
 
-const TOOL_ACTIONS = ['on', 'off', 'status', 'calibrate', 'pause', 'resume'] as const
+/** The tool's display as /jarvis hands display's words: a number, or a list of them, is taken too. */
+function toolDisplay(value: unknown): string {
+  if (Array.isArray(value)) return value.map(String).join(',')
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : JSON.stringify(value)
+}
 
-/** Serves the `hands` tool: the text the matching /jarvis hands command prints; never throws. */
+/** One tool action: the text the matching /jarvis hands command prints. */
+async function runToolAction(hands: Hands | undefined, action: ToolAction): Promise<string> {
+  // /jarvis hands engage chooses the engage mode; the tool's engage takes the cursor now.
+  if (action !== 'engage' && action !== 'disengage') return runHandsCommand(hands, [action])
+  if (hands === undefined || !hands.isLocal) return NOT_LOCAL
+  return hands.setEngaged(action === 'engage')
+}
+
+/**
+ * Serves the `hands` tool: a display choice (as /jarvis hands display), then
+ * an action (as the matching /jarvis hands command), their texts together;
+ * never throws.
+ */
 export async function runHandsTool(hands: Hands | undefined, input: Record<string, unknown>): Promise<string> {
   const action = TOOL_ACTIONS.find(one => one === input.action)
-  if (action === undefined) {
-    return `Unknown action ${JSON.stringify(input.action ?? null)}; use one of ${TOOL_ACTIONS.join(', ')}.`
+  if (input.action !== undefined && action === undefined) {
+    return `Unknown action ${JSON.stringify(input.action)}; use one of ${TOOL_ACTIONS.join(', ')}.`
   }
+  if (action === undefined && input.display === undefined) return 'Give an action, a display, or both.'
+  const texts: string[] = []
   try {
-    return await runHandsCommand(hands, [action])
+    if (input.display !== undefined) texts.push(await runHandsCommand(hands, ['display', toolDisplay(input.display)]))
+    if (action !== undefined) texts.push(await runToolAction(hands, action))
   } catch (error) {
-    return `Hand control ${action} failed: ${describeError(error)}`
+    texts.push(`Hand control ${action ?? 'display'} failed: ${describeError(error)}`)
   }
+  return texts.join('\n\n')
 }

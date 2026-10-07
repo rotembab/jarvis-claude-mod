@@ -8,7 +8,7 @@ import type { PluginOptions, RenderSurface } from 'claude-code'
 import type { JarvisPhase, JarvisView } from '../types'
 import type { Engine } from './engine'
 import { describeError } from './engine'
-import type { HandsSettings } from './hands'
+import type { HandsEngine, HandsSettings } from './hands'
 import { Hands, readHandsSettings } from './hands'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
@@ -134,7 +134,7 @@ export class Jarvis {
   constructor(readonly settings: JarvisSettings) {}
 
   /** session.start: binds the port; starts the helper when a local surface draws. */
-  async onSessionStart(engine: Engine, surface: RenderSurface | null): Promise<void> {
+  async onSessionStart(engine: HandsEngine, surface: RenderSurface | null): Promise<void> {
     this.engine = engine
     const env = await engine.env()
     const platform = await detectPlatform(engine, env)
@@ -271,7 +271,8 @@ export class Jarvis {
    * /jarvis setup after uv was found: stops the helper (Windows locks a
    * running venv), installs, downloads the model, starts the helper again.
    * A model named here (or pinned by `cpu`) is remembered, so the helper
-   * loads the one installed.
+   * loads the one installed. Then it updates the hand helper, when that is
+   * installed: so one /jarvis setup after a plugin update covers both.
    */
   async runSetup(uv: string, request: SetupOptions): Promise<void> {
     const { engine, platform, helper } = this
@@ -311,7 +312,19 @@ export class Jarvis {
       this.isSetupRunning = false
       this.publish({ ...this.view, phase: 'stopped', detail: undefined })
       helper.start({ userInitiated: true })
+      await this.refreshHands(uv)
     }
+  }
+
+  /**
+   * The hand helper's venv holds a copy of the plugin's hands package (a
+   * non-editable install), so an update reaches it only through a setup of
+   * its own: /jarvis setup runs that too while hand control is installed.
+   */
+  private async refreshHands(uv: string): Promise<void> {
+    const hands = this.hands
+    if (hands === undefined || !hands.isLocal || !(await hands.isInstalled())) return
+    await hands.runSetup(uv, { isRefresh: true })
   }
 
   /**

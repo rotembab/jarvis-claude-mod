@@ -90,7 +90,7 @@
     "handControl": {
       "type": "string",
       "title": "Hand control",
-      "description": "on: Jarvis watches your hands through the webcam and turns gestures into mouse and window actions (install it with /jarvis setup hands). The camera picture never leaves this computer. off: the camera stays off. /jarvis hands on|off switches without opening the settings.",
+      "description": "on: Jarvis watches your hands through the webcam and turns gestures into mouse and window actions (install it with /jarvis setup hands). The camera picture never leaves this computer. off: the camera stays off. /jarvis hands on|off switches without opening the settings, until this setting is changed again.",
       "options": ["on", "off"],
       "default": "off"
     },

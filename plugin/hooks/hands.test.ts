@@ -2,16 +2,19 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { BACKOFF_MS, HEARTBEAT_MS, ORPHAN_RETRY_MS, STOP_WAIT_MS } from './helper'
-import { parseDisplaySelection, parseHandsEvent } from './hands'
-import type { FakeChild, World, WorldOptions } from './test-harness'
+import { describeHandsError, HANDS_TOOL, parseDisplaySelection, parseHandsEvent } from './hands'
+import type { Answer, FakeChild, World, WorldOptions } from './test-harness'
 import {
   DATA_DIR,
+  HANDS_INSTALLED,
   HANDS_PORT,
   HANDS_PYTHON,
   jarvis,
+  PLUGIN_VERSION,
   PORT,
   startHelper,
   startSession,
+  VENV_PYTHON,
   WINGET_UV,
   world,
 } from './test-harness'
@@ -25,18 +28,49 @@ const ELSEWHERE =
   'Hand control is running in another Claude Code window. Turn it off there (/jarvis hands off), then run /jarvis hands restart here.'
 /** A previous load's hand helper: the first start gives it a second to exit before it checks the venv. */
 const PREVIOUS_HANDS = { port: 40001, token: 'old-hands-token', pid: 98 }
+/** What /jarvis hands on stores under the default Hand control setting (off). */
+const ON = { isOn: true, setting: false }
+const PAUSED = 'Hand control paused: the camera is off. /jarvis hands resume turns it back on.'
+const RESUMED = 'Hand control resumed: the camera is on again.'
+const IN_USE = { type: 'error', code: 'camera_in_use', message: 'The camera is in use by another app', hint: 'close Teams or Zoom', fatal: false }
+const IN_USE_TOAST = 'Hand control: The camera is in use by another app (close Teams or Zoom)'
+const STALE_TOAST = 'Hand control needs an update: run /jarvis setup hands.'
+/** What the helper says on macOS and Linux (runtime.py), message and hint. */
+const UNSUPPORTED = 'Hand control can drive the mouse and windows on Windows only, for now.'
+const UNSUPPORTED_HINT = 'Hand control drives the mouse and windows on Windows only, for now.'
 
 const DISPLAYS = [
   { id: 1, name: 'DELL U2720Q', x: 0, y: 0, width: 2560, height: 1440, primary: true, virtual: false, used: true },
   { id: 2, name: 'EPSON Projector', x: 2560, y: 0, width: 1920, height: 1080, primary: false, virtual: false, used: true },
 ]
 
-/** Hand control turned on (as /jarvis hands on stores it) and installed. */
+/** Hand control turned on (as /jarvis hands on stores it) and installed by this version. */
 function handsWorld(on: On, options: WorldOptions = {}): World {
   const w = world(on, options)
-  w.store.set('handsEnabled', true)
+  w.store.set('handsEnabled', ON)
   w.existing.add(HANDS_PYTHON)
+  w.files.set(HANDS_INSTALLED, JSON.stringify({ pluginVersion: PLUGIN_VERSION }))
   return w
+}
+
+/** The commands sent to the hand helper, by name, in order. */
+function handsSent(w: World): string[] {
+  return w.commands.filter(command => command.url.includes(`:${HANDS_PORT}/`)).map(command => command.name)
+}
+
+/** Holds the hand helper's answers to `names` until the test calls the returned function. */
+function slowAnswers(w: World, names: string[], body: Record<string, unknown> = { ok: true }): () => void {
+  const waiting: (() => void)[] = []
+  w.respond = command => {
+    if (!names.includes(command.name)) return { status: 200, body: { ok: true } }
+    return new Promise<Answer>(resolve => waiting.push(() => resolve({ status: 200, body })))
+  }
+  return () => waiting.splice(0).forEach(answer => answer())
+}
+
+/** Answers `name` with `body`, and everything else with ok. */
+function answer(w: World, name: string, body: Record<string, unknown>): void {
+  w.respond = command => ({ status: 200, body: command.name === name ? body : { ok: true } })
 }
 
 /** Brings the running hand helper up to hello, ready and idle. */
@@ -131,14 +165,56 @@ describe('hand helper process', () => {
   test('/jarvis hands off wins over the handControl setting', { options: { handControl: 'on' } }, async ($, on) => {
     const w = world(on)
     w.existing.add(HANDS_PYTHON)
-    w.store.set('handsEnabled', false)
+    w.store.set('handsEnabled', { isOn: false, setting: true })
     await startSession($, w)
     expect(w.handsHelpers()).toHaveLength(0)
   })
 
+  test('/jarvis hands on wins over the default setting of off, and is kept with it', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    await startHelper($, w)
+    exitOnShutdown(w)
+    await jarvis($, 'hands on')
+    await w.settle()
+    expect(w.store.get('handsEnabled')).toEqual({ isOn: true, setting: false })
+    expect(w.handsHelpers()).toHaveLength(1)
+    await handsReady(w)
+    // Off is what the setting says: no override is left to outlive a change of the setting.
+    await jarvis($, 'hands off')
+    expect(w.store.has('handsEnabled')).toBe(false)
+  })
+
+  test('the setting changed since /jarvis hands on: the setting wins, and the old choice is dropped', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    // "On" while the setting was on, then the setting set to off (the default here).
+    w.store.set('handsEnabled', { isOn: true, setting: true })
+    await startSession($, w)
+    expect(w.handsHelpers()).toHaveLength(0)
+    expect(w.store.has('handsEnabled')).toBe(false)
+  })
+
+  test('a choice with no record of the setting it overrode is no override', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    w.store.set('handsEnabled', true)
+    await startSession($, w)
+    expect(w.handsHelpers()).toHaveLength(0)
+  })
+
+  test('"turn on hand control" while the setting is on stores nothing, so setting it to off later turns the camera off', { options: { handControl: 'on' } }, async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    await startSession($, w)
+    await handsReady(w)
+    expect((await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })).result).toBe('Hand control is already on.')
+    expect(w.store.has('handsEnabled')).toBe(false)
+  })
+
   test('on but not installed: says so in the status line and spawns nothing', async ($, on) => {
     const w = world(on)
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     await startHelper($, w)
     expect(w.handsHelpers()).toHaveLength(0)
     expect(w.checked).toContain(HANDS_PYTHON)
@@ -305,10 +381,29 @@ describe('hand helper process', () => {
     hands.event({ type: 'error', code: 'model_missing', message: 'The hand model is missing', hint: 'run /jarvis setup hands', fatal: true })
     hands.exit(1)
     await w.settle()
-    expect(w.status()).toBe(`${VOICE_READY} · hands stopped · The hand model is missing (run /jarvis setup hands) · /jarvis hands restart`)
+    expect(w.status()).toBe(`${VOICE_READY} · hands stopped · The hand model is missing (run /jarvis setup hands)`)
     await w.clock.advance(30_000)
     await w.settle()
     expect(w.handsHelpers()).toHaveLength(1)
+  })
+
+  test('an unsupported platform stops it for good: no restart offered, and the reason said once', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const hands = w.lastHands()
+    hands.hello(HANDS_PORT)
+    hands.event({ type: 'state', state: 'starting' })
+    hands.event({ type: 'error', code: 'unsupported_platform', message: UNSUPPORTED, hint: UNSUPPORTED_HINT, fatal: true })
+    hands.event({ type: 'state', state: 'error' })
+    hands.exit(1)
+    await w.settle(20)
+    expect(w.status()).toBe(`${VOICE_READY} · hands stopped · ${UNSUPPORTED}`)
+    await w.clock.advance(30_000)
+    await w.settle()
+    expect(w.handsHelpers()).toHaveLength(1)
+    const text = await jarvis($, 'hands')
+    expect(text).toContain(`Hand control: stopped (${UNSUPPORTED})\n`)
+    expect(text).not.toContain('kept failing')
   })
 
   test('already_running: active in another window, what to do about it, and no retry until the user asks', async ($, on) => {
@@ -364,7 +459,7 @@ describe('hand helper process', () => {
 
   test('setup during the first start\'s wait on a previous helper starts the helper when it is done', async ($, on) => {
     const w = world(on)
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     w.state.set('jarvis.handsHelper', PREVIOUS_HANDS)
     await startHelper($, w)
     installable(w)
@@ -378,7 +473,7 @@ describe('hand helper process', () => {
 
   test('off during the first start\'s wait on a previous helper ends it, and the next on starts the helper', async ($, on) => {
     const w = world(on)
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     w.state.set('jarvis.handsHelper', PREVIOUS_HANDS)
     await startHelper($, w)
     const off = jarvis($, 'hands off')
@@ -397,7 +492,7 @@ describe('hand helper process', () => {
 
   test('never starts in a cloud session, and offers no tool there', async ($, on) => {
     const w = world(on, { env: { HOME: '/root', CLAUDE_CODE_REMOTE: 'true' } })
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     await startSession($, w)
     expect(w.children).toHaveLength(0)
     expect(w.tools).toEqual([])
@@ -417,14 +512,14 @@ describe('/jarvis hands', () => {
       'Hand control is on. The camera starts in a moment; then hold an open palm toward the camera for half a second to take the cursor. Nothing leaves this computer.',
     )
     await w.settle()
-    expect(w.store.get('handsEnabled')).toBe(true)
+    expect(w.store.get('handsEnabled')).toEqual(ON)
     expect(w.handsHelpers()).toHaveLength(1)
     await handsReady(w)
     expect(await jarvis($, 'hands on')).toBe('Hand control is already on.')
 
     expect(await jarvis($, 'hands off')).toBe('Hand control is off and the camera is closed.')
     expect(w.handsNamed('shutdown')).toHaveLength(1)
-    expect(w.store.get('handsEnabled')).toBe(false)
+    expect(w.store.has('handsEnabled')).toBe(false)
     await w.settle()
     expect(w.status()).toBe(VOICE_READY)
     expect(w.lastHelper().hasExited).toBe(false)
@@ -437,7 +532,7 @@ describe('/jarvis hands', () => {
     expect(await jarvis($, 'hands on')).toBe(
       'Hand control is on, but it is not set up yet. Run /jarvis setup hands (it downloads about 500 MB); the camera starts when it is done.',
     )
-    expect(w.store.get('handsEnabled')).toBe(true)
+    expect(w.store.get('handsEnabled')).toEqual(ON)
     expect(w.handsHelpers()).toHaveLength(0)
     expect(w.status()).toBe(`${VOICE_READY} · hands not set up · /jarvis setup hands`)
     expect(await jarvis($, 'hands off')).toBe('Hand control is off and the camera is closed.')
@@ -560,12 +655,270 @@ describe('/jarvis hands', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
-    expect(await jarvis($, 'hands pause')).toBe('Hand control paused: the camera is off. /jarvis hands resume turns it back on.')
-    expect(await jarvis($, 'hands resume')).toBe('Hand control resumed: the camera is on again.')
+    expect(await jarvis($, 'hands pause')).toBe(PAUSED)
+    expect(await jarvis($, 'hands resume')).toBe(RESUMED)
     expect(w.handsNamed('pause')).toHaveLength(1)
     expect(w.handsNamed('resume')).toHaveLength(1)
     w.respond = () => ({ status: 503, body: { ok: false, error: { code: 'camera_in_use', message: 'The camera is in use by another app.' } } })
     expect(await jarvis($, 'hands resume')).toBe('Could not resume hand control: The camera is in use by another app.')
+  })
+
+  test('pause and resume wait longer than the helper does for the camera before giving up', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    // The helper answers within its own waits (about 4 s to close the camera, 9 s to open it).
+    const release = slowAnswers(w, ['pause', 'resume'])
+    const paused = jarvis($, 'hands pause')
+    await w.settle()
+    await w.clock.advance(6000)
+    await w.settle()
+    release()
+    expect(await paused).toBe(PAUSED)
+
+    const resumed = jarvis($, 'hands resume')
+    await w.settle()
+    await w.clock.advance(12_000)
+    await w.settle()
+    release()
+    expect(await resumed).toBe(RESUMED)
+  })
+
+  test('a resume the camera is still opening for says so, then says when it is on', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const hands = await handsReady(w)
+    expect(await jarvis($, 'hands pause')).toBe(PAUSED)
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+
+    answer(w, 'resume', { ok: true, pending: true })
+    expect(await jarvis($, 'hands resume')).toBe(
+      'Resuming hand control: the camera is still opening, which can take up to about 20 seconds. A message says when it is on, or why it could not open.',
+    )
+    expect(w.status()).toBe(`${VOICE_READY} · hands paused`)
+    expect(w.toasts).not.toContain(RESUMED)
+    // Asked again meanwhile: the helper is no longer paused, so it answers plain ok, but the camera is still opening.
+    answer(w, 'resume', { ok: true })
+    expect(await jarvis($, 'hands resume')).toContain('the camera is still opening')
+    hands.event({ type: 'state', state: 'idle' })
+    await w.settle()
+    expect(w.toasts.filter(toast => toast === RESUMED)).toHaveLength(1)
+    expect(w.status()).toBe(`${VOICE_READY} · hands ready · open palm to start`)
+    // The next state change is not a resume.
+    hands.event({ type: 'state', state: 'active' })
+    hands.event({ type: 'state', state: 'idle' })
+    await w.settle()
+    expect(w.toasts.filter(toast => toast === RESUMED)).toHaveLength(1)
+  })
+
+  test('a camera that fails after a pending resume is toasted and shown in the status line', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const hands = await handsReady(w)
+    // Teams had the camera a moment ago: that error was toasted already.
+    hands.event(IN_USE)
+    await w.settle()
+    expect(await jarvis($, 'hands pause')).toBe(PAUSED)
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+
+    answer(w, 'resume', { ok: true, pending: true })
+    expect(await jarvis($, 'hands resume')).toContain('the camera is still opening')
+    // The open fails after the helper answered: it stays paused and says why, though that was toasted a moment ago.
+    hands.event(IN_USE)
+    await w.settle()
+    expect(w.toasts.filter(toast => toast === IN_USE_TOAST)).toHaveLength(2)
+    expect(w.status()).toBe(`${VOICE_READY} · hands paused · The camera is in use by another app (close Teams or Zoom)`)
+    expect(await jarvis($, 'hands')).toContain(
+      'Hand control: paused: the camera is off until /jarvis hands resume (The camera is in use by another app (close Teams or Zoom))',
+    )
+    // Opened at last: the reason goes.
+    answer(w, 'resume', { ok: true })
+    expect(await jarvis($, 'hands resume')).toBe(RESUMED)
+    hands.event({ type: 'state', state: 'idle' })
+    await w.settle()
+    expect(w.status()).toBe(`${VOICE_READY} · hands ready · open palm to start`)
+  })
+
+  test('a resume of a helper that started paused, its camera never opened, says the camera is still opening', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set('handsPaused', true) // paused yesterday
+    await startHelper($, w)
+    const hands = w.lastHands()
+    hands.hello(HANDS_PORT)
+    hands.event({ type: 'state', state: 'starting' })
+    // Teams had the camera a moment ago: that error was toasted already.
+    hands.event(IN_USE)
+    // The pause came before the camera opened, which kept it closed.
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+    // Never opened, so the helper's resume says "starting" before it waits 9 s for the open, then answers pending.
+    let release: (() => void) | undefined
+    w.respond = command => {
+      if (command.name !== 'resume') return { status: 200, body: { ok: true } }
+      hands.event({ type: 'state', state: 'starting' })
+      return new Promise<Answer>(resolve => {
+        release = () => resolve({ status: 200, body: { ok: true, pending: true } })
+      })
+    }
+    const resumed = jarvis($, 'hands resume')
+    await w.settle()
+    await w.clock.advance(9000)
+    await w.settle()
+    release?.()
+    expect(await resumed).toContain('the camera is still opening')
+    expect(w.toasts).not.toContain(RESUMED)
+    // Asked again meanwhile, it is not "on again" either.
+    answer(w, 'resume', { ok: true })
+    expect(await jarvis($, 'hands resume')).toContain('the camera is still opening')
+    // It cannot open: paused again, and the user waits for why, so it is toasted although it was a moment ago.
+    hands.event({ type: 'state', state: 'paused' })
+    hands.event(IN_USE)
+    await w.settle()
+    expect(w.toasts.filter(toast => toast === IN_USE_TOAST)).toHaveLength(2)
+    expect(w.toasts).not.toContain(RESUMED)
+    expect(w.status()).toBe(`${VOICE_READY} · hands paused · The camera is in use by another app (close Teams or Zoom)`)
+  })
+
+  test('a pending resume\'s own "starting" is not "on again"; the camera opening is, once', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set('handsPaused', true)
+    await startHelper($, w)
+    const hands = w.lastHands()
+    hands.hello(HANDS_PORT)
+    hands.event({ type: 'state', state: 'starting' })
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+    answer(w, 'resume', { ok: true, pending: true })
+    expect(await jarvis($, 'hands resume')).toContain('the camera is still opening')
+    // The resume's "starting" reaches the mod after its answer.
+    hands.event({ type: 'state', state: 'starting' })
+    await w.settle()
+    expect(w.toasts).not.toContain(RESUMED)
+    hands.event({ type: 'ready', camera: 'UGREEN Camera', width: 1280, height: 720, fps: 30, displays: DISPLAYS })
+    hands.event({ type: 'state', state: 'idle' })
+    await w.settle()
+    expect(w.toasts.filter(toast => toast === RESUMED)).toHaveLength(1)
+    expect(w.status()).toBe(`${VOICE_READY} · hands ready · open palm to start`)
+  })
+
+  test('status of a helper that started paused says the camera is off, not opening', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set('handsPaused', true)
+    await startHelper($, w)
+    const hands = w.lastHands()
+    hands.hello(HANDS_PORT)
+    hands.event({ type: 'state', state: 'starting' })
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+    // It never opened a camera, so its status names none.
+    answer(w, 'status', { ok: true, state: 'paused', fps: 0, inferMs: 0, calibrated: true, displays: DISPLAYS })
+    const text = await jarvis($, 'hands')
+    expect(text).toContain('Hand control: paused: the camera is off until /jarvis hands resume')
+    expect(text).not.toContain('opening the camera')
+    expect(text).toContain('camera off while paused')
+  })
+
+  test('a pause while the camera is still starting says it turns off once started', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    answer(w, 'pause', { ok: true, pending: true })
+    expect(await jarvis($, 'hands pause')).toBe(
+      'Pausing hand control: the camera is still starting, and it turns off as soon as it has started. /jarvis hands resume turns it back on.',
+    )
+    expect(w.store.get('handsPaused')).toBe(true)
+  })
+
+  test('a pause is remembered: a restarted helper is paused at its hello, before its config, until resume', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const first = await handsReady(w)
+    expect(await jarvis($, 'hands pause')).toBe(PAUSED)
+    expect(w.store.get('handsPaused')).toBe(true)
+    first.event({ type: 'state', state: 'paused' })
+    first.exit(1)
+    await w.settle()
+    await w.clock.advance(BACKOFF_MS[0] ?? 1000)
+    await w.settle()
+    expect(w.handsHelpers()).toHaveLength(2)
+    const before = handsSent(w).length
+    w.lastHands().hello(HANDS_PORT)
+    await w.settle()
+    // The helper keeps the camera off when pause comes before its start.
+    expect(handsSent(w).slice(before)).toEqual(['pause', 'config'])
+
+    expect(await jarvis($, 'hands resume')).toBe(RESUMED)
+    expect(w.store.has('handsPaused')).toBe(false)
+    w.lastHands().exit(1)
+    await w.settle()
+    await w.clock.advance(BACKOFF_MS[1] ?? 2000)
+    await w.settle()
+    expect(w.handsHelpers()).toHaveLength(3)
+    const after = handsSent(w).length
+    w.lastHands().hello(HANDS_PORT)
+    await w.settle()
+    expect(handsSent(w).slice(after)).toEqual(['config'])
+  })
+
+  test('a pause outlives the session; off, on and resume forget it', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set('handsPaused', true)
+    await startHelper($, w)
+    w.lastHands().hello(HANDS_PORT)
+    await w.settle()
+    expect(handsSent(w)).toEqual(['pause', 'config'])
+
+    exitOnShutdown(w)
+    await jarvis($, 'hands off')
+    expect(w.store.has('handsPaused')).toBe(false)
+
+    w.store.set('handsPaused', true)
+    await jarvis($, 'hands on')
+    expect(w.store.has('handsPaused')).toBe(false)
+    await w.settle()
+    w.lastHands().hello(HANDS_PORT)
+    await w.settle()
+    expect(handsSent(w).filter(name => name === 'pause')).toHaveLength(1)
+
+    // Resume while the helper is down: it opens the camera when it is back.
+    w.store.set('handsPaused', true)
+    w.lastHands().exit(1)
+    await w.settle()
+    expect(await jarvis($, 'hands resume')).toContain('The hand helper is not running')
+    expect(w.store.has('handsPaused')).toBe(false)
+  })
+
+  test('a camera change while paused restarts the helper still paused', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const first = await handsReady(w)
+    exitOnShutdown(w)
+    expect(await jarvis($, 'hands pause')).toBe(PAUSED)
+    first.event({ type: 'state', state: 'paused' })
+    await w.settle()
+    expect(await jarvis($, 'hands camera UGREEN')).toBe(
+      'Camera set to "UGREEN". The hand helper restarts with it, still paused: /jarvis hands resume opens the camera.',
+    )
+    await w.settle(20)
+    expect(w.handsHelpers()).toHaveLength(2)
+    const before = handsSent(w).length
+    w.lastHands().hello(HANDS_PORT)
+    await w.settle()
+    expect(handsSent(w).slice(before)).toEqual(['pause', 'config'])
+  })
+
+  test('on while paused turns the camera back on', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const hands = await handsReady(w)
+    await jarvis($, 'hands pause')
+    hands.event({ type: 'state', state: 'paused' })
+    await w.settle()
+    expect(await jarvis($, 'hands on')).toBe(RESUMED)
+    expect(w.handsNamed('resume')).toHaveLength(1)
+    expect(w.store.has('handsPaused')).toBe(false)
   })
 
   test('commands that need the helper explain why it is not there', async ($, on) => {
@@ -574,7 +927,7 @@ describe('/jarvis hands', () => {
     expect(await jarvis($, 'hands pause')).toBe('Hand control is off. Turn it on with /jarvis hands on.')
     expect(await jarvis($, 'hands calibrate')).toBe('Hand control is off. Turn it on with /jarvis hands on.')
     expect(await jarvis($, 'hands restart')).toBe('Hand control is off. Turn it on with /jarvis hands on.')
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     expect(await jarvis($, 'hands pause')).toBe('The hand helper is not running; /jarvis hands restart starts it.')
   })
 
@@ -600,6 +953,76 @@ describe('/jarvis hands', () => {
     }
     expect(w.handsHelpers()).toHaveLength(3)
     expect(w.lastHands().argv).not.toContain('--camera')
+  })
+
+  test('off while a camera change or a restart is stopping the helper keeps it stopped', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    let first = await handsReady(w)
+    expect(await jarvis($, 'hands camera UGREEN')).toBe('Camera set to "UGREEN". The hand helper restarts to open it.')
+    await w.settle()
+    expect(w.handsNamed('shutdown')).toHaveLength(1)
+    // The helper takes a moment to close the camera and exit; the user turns hand control off meanwhile.
+    const off = jarvis($, 'hands off')
+    await w.settle()
+    first.exit(0)
+    await w.settle(20)
+    expect(await off).toBe('Hand control is off and the camera is closed.')
+    expect(w.handsHelpers()).toHaveLength(1)
+    expect(w.status()).toBe(VOICE_READY)
+
+    // The same with a restart and the tool's off.
+    await jarvis($, 'hands on')
+    await w.settle()
+    first = await handsReady(w)
+    expect(await jarvis($, 'hands restart')).toBe('Restarting the hand helper.')
+    await w.settle()
+    const toolOff = $.tool.call({ tool: 'mcp__jarvis__hands', action: 'off' })
+    await w.settle()
+    first.exit(0)
+    await w.settle(20)
+    expect((await toolOff).result).toBe('Hand control is off and the camera is closed.')
+    expect(w.handsHelpers()).toHaveLength(2)
+    expect(w.lastHands().hasExited).toBe(true)
+    expect(w.status()).toBe(VOICE_READY)
+  })
+
+  test('setup during a pending restart installs before any helper starts', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const first = await handsReady(w)
+    w.existing.add(WINGET_UV)
+    let uv: FakeChild | undefined
+    w.onSpawn = child => {
+      if (child.argv[0] === WINGET_UV) uv = child // uv runs for a while
+      else if (child.argv.includes('setup')) child.exit(0)
+    }
+    expect(await jarvis($, 'hands restart')).toBe('Restarting the hand helper.')
+    await w.settle()
+    expect(await jarvis($, 'setup hands')).toContain('Setting up hand control')
+    await w.settle()
+    first.exit(0) // the old helper exits after the shutdown both asked for
+    await w.settle(20)
+    expect(uv?.hasExited).toBe(false)
+    expect(w.handsHelpers()).toHaveLength(1)
+    uv?.exit(0)
+    await w.settle(40)
+    expect(w.handsHelpers()).toHaveLength(2)
+    expect(w.status()).toBe(`${VOICE_READY} · hands starting`)
+  })
+
+  test('off in a window where another window runs the helper says it still runs there', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    w.lastHands().event({ type: 'error', code: 'already_running', message: 'Hand control is running in another window', fatal: true })
+    w.lastHands().exit(3)
+    await w.settle()
+    expect(w.status()).toBe(`${VOICE_READY} · hands active in another window`)
+    expect(await jarvis($, 'hands off')).toBe(
+      'Hand control is off here, but it still runs, with the camera, in another Claude Code window. Turn it off there with /jarvis hands off.',
+    )
+    expect(w.store.has('handsEnabled')).toBe(false)
+    expect(w.status()).toBe(VOICE_READY)
   })
 
   test('camera takes a quoted name without its quotes; while off it waits for hand control', async ($, on) => {
@@ -641,7 +1064,7 @@ describe('/jarvis hands', () => {
 describe('/jarvis setup hands', () => {
   test('installs with uv into its own venv, downloads the hand model, then starts the helper', async ($, on) => {
     const w = world(on)
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     await startHelper($, w)
     w.existing.add(WINGET_UV)
     w.exists = path => w.existing.has(path) || HANDS_LOCK.test(path)
@@ -682,6 +1105,8 @@ describe('/jarvis setup hands', () => {
     expect(model?.argv).toEqual([HANDS_PYTHON, '-m', 'jarvis_hands', 'setup', '--data-dir', DATA_DIR])
     expect(model?.request.cwd).toBe(DATA_DIR)
     expect(w.existing.has(`${DATA_DIR}\\hands\\README.txt`)).toBe(true)
+    // What it installed, so a later version of Jarvis can tell the venv is older than itself.
+    expect(JSON.parse(w.files.get(HANDS_INSTALLED) ?? 'null')).toEqual({ pluginVersion: PLUGIN_VERSION })
 
     expect(w.statuses).toContain(`${VOICE_READY} · hands setting up · installing the hand helper (Python 3.12, MediaPipe and OpenCV)`)
     expect(w.statuses).toContain(`${VOICE_READY} · hands setting up · installing · Installed 27 packages in 14.1s`)
@@ -690,6 +1115,8 @@ describe('/jarvis setup hands', () => {
     expect(w.statuses.some(line => line?.includes('urllib3') === true)).toBe(false)
     expect(w.logs).toContain('Hand control installed (Ready: hand model (7.8 MB)). Starting the hand helper.')
     expect(w.toasts).toContain('Hand control is installed. Starting the camera.')
+    // Not installed at the session's start, this version's install after: nothing to update.
+    expect(w.toasts).not.toContain(STALE_TOAST)
 
     expect(w.handsHelpers()).toHaveLength(1)
     expect(w.status()).toBe(`${VOICE_READY} · hands starting`)
@@ -730,9 +1157,117 @@ describe('/jarvis setup hands', () => {
     expect(w.named('shutdown')).toHaveLength(1) // only the hand helper's
   })
 
+  test('a hand helper an earlier version installed says once to run /jarvis setup hands, and still starts', async ($, on) => {
+    const w = handsWorld(on)
+    w.files.delete(HANDS_INSTALLED) // set up before the record was kept
+    await startHelper($, w)
+    const notice =
+      'The hand helper was installed by an earlier version of Jarvis. Run /jarvis setup hands to update it; until then the old one runs.'
+    // Said as it starts: an old helper may never get as far as hello with this mod.
+    expect(w.logs).toContain(notice)
+    expect(w.toasts).toContain(STALE_TOAST)
+    await handsReady(w)
+    expect(w.status()).toBe(`${VOICE_READY} · hands ready · open palm to start`)
+    expect(await jarvis($, 'hands')).toContain(notice)
+
+    // A restart does not say it again.
+    w.lastHands().exit(1)
+    await w.settle()
+    await w.clock.advance(BACKOFF_MS[0] ?? 1000)
+    await w.settle()
+    await handsReady(w)
+    expect(w.logs.filter(line => line === notice)).toHaveLength(1)
+    expect(w.toasts.filter(toast => toast === STALE_TOAST)).toHaveLength(1)
+  })
+
+  test('a hand helper another version installed names both versions; this version\'s says nothing', async ($, on) => {
+    const w = handsWorld(on)
+    w.files.set(HANDS_INSTALLED, JSON.stringify({ pluginVersion: '0.4.0' }))
+    await startHelper($, w)
+    await handsReady(w)
+    expect(w.logs).toContain(
+      `The hand helper was installed by Jarvis 0.4.0, and this is Jarvis ${PLUGIN_VERSION}. Run /jarvis setup hands to update it; until then the old one runs.`,
+    )
+    // After /jarvis setup hands the record is this version's.
+    installable(w)
+    exitOnShutdown(w)
+    await jarvis($, 'setup hands')
+    await w.settle(40)
+    expect(JSON.parse(w.files.get(HANDS_INSTALLED) ?? 'null')).toEqual({ pluginVersion: PLUGIN_VERSION })
+    expect(await jarvis($, 'hands')).not.toContain('Run /jarvis setup hands to update it')
+  })
+
+  test('the installed version starting says nothing about updates', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(w.logs.some(line => line.includes('/jarvis setup hands'))).toBe(false)
+    expect(w.toasts).not.toContain(STALE_TOAST)
+  })
+
+  test('/jarvis setup reinstalls an installed hand helper after the voice helper, then starts it again', async ($, on) => {
+    const w = handsWorld(on)
+    w.files.delete(HANDS_INSTALLED)
+    await startHelper($, w)
+    await handsReady(w)
+    exitOnShutdown(w)
+    w.existing.add(WINGET_UV)
+    w.onSpawn = child => {
+      if (!child.isHelperRun && !child.isHandsRun) child.exit(0)
+    }
+    const text = await jarvis($, 'setup')
+    expect(text).toContain(`  3. then the hand helper in ${DATA_DIR}\\hands\\venv again, from this version of Jarvis`)
+    await w.settle(80)
+
+    const syncs = w.children.filter(child => child.argv[0] === WINGET_UV).map(child => child.argv.at(child.argv.indexOf('--reinstall-package') + 1))
+    expect(syncs).toEqual(['jarvis-voice', 'jarvis-hands'])
+    const models = w.children.filter(child => child.argv.includes('setup')).map(child => child.argv[0])
+    expect(models).toEqual([VENV_PYTHON, HANDS_PYTHON])
+    expect(w.handsNamed('shutdown')).toHaveLength(1)
+    expect(w.helpers()).toHaveLength(2)
+    expect(w.handsHelpers()).toHaveLength(2)
+    expect(w.logs).toContain('Hand control reinstalled for this version of Jarvis (installed). Starting the hand helper.')
+    expect(JSON.parse(w.files.get(HANDS_INSTALLED) ?? 'null')).toEqual({ pluginVersion: PLUGIN_VERSION })
+    expect(w.status()).toBe('JARVIS · starting · hands starting')
+  })
+
+  test('/jarvis setup leaves hand control alone while it is not installed', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    exitOnShutdown(w)
+    w.existing.add(WINGET_UV)
+    w.onSpawn = child => {
+      if (!child.isHelperRun && !child.isHandsRun) child.exit(0)
+    }
+    expect(await jarvis($, 'setup')).not.toContain('hand helper')
+    await w.settle(40)
+    expect(w.children.some(child => child.argv.includes('jarvis-hands'))).toBe(false)
+    expect(w.logs.some(line => line.includes('Hand control'))).toBe(false)
+  })
+
+  test('/jarvis setup does not reinstall a hand helper another window runs', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    w.lastHands().event({ type: 'error', code: 'already_running', message: 'Hand control is running in another window', fatal: true })
+    w.lastHands().exit(3)
+    await w.settle()
+    exitOnShutdown(w)
+    w.existing.add(WINGET_UV)
+    w.onSpawn = child => {
+      if (!child.isHelperRun && !child.isHandsRun) child.exit(0)
+    }
+    await jarvis($, 'setup')
+    await w.settle(60)
+    expect(w.children.some(child => child.argv.includes('jarvis-hands'))).toBe(false)
+    expect(w.logs).toContain(
+      'The hand helper was not reinstalled: another Claude Code window runs it, which keeps its files in use. Turn it off there (/jarvis hands off), then run /jarvis setup hands here.',
+    )
+    expect(w.status()).toBe('JARVIS · starting · hands active in another window')
+  })
+
   test('without uv it prints the install command; a failed uv sync is reported', async ($, on) => {
     const w = world(on)
-    w.store.set('handsEnabled', true)
+    w.store.set('handsEnabled', ON)
     await startHelper($, w)
     const missing = await jarvis($, 'setup hands')
     expect(missing).toContain('uv is not installed')
@@ -763,7 +1298,7 @@ describe('the hands tool', () => {
 
     const turnedOn = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })
     expect(turnedOn.result).toContain('Hand control is on. The camera starts in a moment')
-    expect(w.store.get('handsEnabled')).toBe(true)
+    expect(w.store.get('handsEnabled')).toEqual(ON)
     await w.settle()
     await handsReady(w)
 
@@ -775,10 +1310,61 @@ describe('the hands tool', () => {
 
     const off = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'off' })
     expect(off.result).toBe('Hand control is off and the camera is closed.')
-    expect(w.store.get('handsEnabled')).toBe(false)
+    expect(w.store.has('handsEnabled')).toBe(false)
 
     const unknown = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'explode' })
-    expect(unknown.result).toBe('Unknown action "explode"; use one of on, off, status, calibrate, pause, resume.')
+    expect(unknown.result).toBe(
+      'Unknown action "explode"; use one of on, off, status, calibrate, pause, resume, engage, disengage.',
+    )
+  })
+
+  test('display chooses the displays as /jarvis hands display does, alone or with an action', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const call = async (input: Record<string, unknown>): Promise<string> =>
+      String((await $.tool.call({ tool: 'mcp__jarvis__hands', ...input })).result)
+
+    // "Jarvis, put hand control on the projector"
+    expect(await call({ display: '2' })).toBe('Hand control now reaches display 2 (EPSON Projector).')
+    expect(w.store.get('handsDisplays')).toEqual([2])
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ displays: [2] })
+    expect(await call({ display: [1, 2] })).toBe('Hand control now reaches displays 1 (DELL U2720Q) and 2 (EPSON Projector).')
+    expect(await call({ display: 1 })).toBe('Hand control now reaches display 1 (DELL U2720Q).')
+    expect(await call({ display: 'left' })).toBe(await jarvis($, 'hands display left'))
+
+    const both = await call({ action: 'status', display: 'all' })
+    expect(both.startsWith('Hand control now reaches all displays.\n\nHand control: ready\n')).toBe(true)
+    expect(w.store.has('handsDisplays')).toBe(false)
+    expect(await call({})).toBe('Give an action, a display, or both.')
+  })
+
+  test('engage and disengage take and let go of the cursor through the helper', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const call = async (action: string): Promise<string> =>
+      String((await $.tool.call({ tool: 'mcp__jarvis__hands', action })).result)
+
+    // "Jarvis, take the cursor"
+    expect(await call('engage')).toBe('Hand control has the cursor: it follows your hand as soon as one is in view.')
+    expect(await call('disengage')).toBe(
+      'Hand control let go of the cursor. Hold an open palm toward the camera to take it again.',
+    )
+    expect(handsSent(w).filter(name => name === 'engage' || name === 'disengage')).toEqual(['engage', 'disengage'])
+    expect(w.handsNamed('engage')[0]?.body).toEqual({})
+    // The engage mode is not changed by either.
+    expect(w.store.has('handsEngage')).toBe(false)
+
+    answer(w, 'engage', { ok: false, error: { code: 'internal', message: 'boom' } })
+    expect(await call('engage')).toBe('Could not take the cursor: boom')
+  })
+
+  test('the schema offers the display and the engage actions', () => {
+    const { properties } = HANDS_TOOL.inputSchema
+    expect(properties.action.enum).toEqual(['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage'])
+    expect(Object.keys(properties)).toEqual(['action', 'display'])
+    expect(HANDS_TOOL.inputSchema).not.toHaveProperty('required')
   })
 })
 
@@ -797,6 +1383,17 @@ describe('hands protocol parsing', () => {
     expect(parseHandsEvent('{"v":1,"type":"error","code":"internal","message":"boom"}')).toMatchObject({ fatal: false })
     expect(parseHandsEvent('[1,2]')).toBeUndefined()
     expect(parseHandsEvent('not json')).toBeUndefined()
+  })
+
+  test('an error\'s hint is shown unless it says the message again', () => {
+    expect(describeHandsError('The hand model is missing', 'run /jarvis setup hands')).toBe('The hand model is missing (run /jarvis setup hands)')
+    expect(describeHandsError('The camera is in use by another app', 'close the other app using the camera')).toBe(
+      'The camera is in use by another app (close the other app using the camera)',
+    )
+    expect(describeHandsError(UNSUPPORTED, UNSUPPORTED_HINT)).toBe(UNSUPPORTED)
+    expect(describeHandsError('No camera found', 'No camera found.')).toBe('No camera found')
+    expect(describeHandsError('No camera found', undefined)).toBe('No camera found')
+    expect(describeHandsError('No camera found', ' ')).toBe('No camera found')
   })
 
   test('display selections', () => {
