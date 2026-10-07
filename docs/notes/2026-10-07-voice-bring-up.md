@@ -94,7 +94,18 @@ against the code.
 Status on main (2026-10-07): item 3 is done (f7b9870: the Fish stream opens while the clip is
 transcribed, and the first sentence reuses it). Item 2 is done (`Voice.step` ends the line when a
 tool call starts, with a test). Item 1 is half done: the persona now asks for one short sentence
-before tool work; the earcon is still open, as is item 4.
+before tool work; the earcon is still open.
+
+Item 4 (branch fix/output-cutoff): it did cut replies off on the Windows PC (10:54 and 11:35).
+The reaper closed a healthy output during a tool pause of more than 30 s, and the reopen, on the
+Fish reader thread, failed with "Unanticipated host error" and WDM-KS text. Measured on that PC
+(PortAudio 19.7, WASAPI): a stream starts on the main thread, but on a worker thread only after
+`CoInitializeEx`. PortAudio's WASAPI start needs COM on the calling thread, Python's worker threads
+never set it up, and the WDM-KS text is stale host-error info. Now every thread initialises COM
+before it opens, starts or restarts a stream, and an open reply holds the output open from its
+first sentence to `speech_done` (at most 5 minutes of silence). Reopening for new audio backs off
+(1 s, doubling up to 16 s). A reply whose output cannot be reopened ends at once with a plain
+message, and PortAudio's text goes to the log.
 
 Smaller items:
 - There are no timing logs between the speak POST and the first audio frame. Add them first.

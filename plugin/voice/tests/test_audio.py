@@ -226,6 +226,37 @@ def test_windows_mic_consent_reads_without_error() -> None:
     assert isinstance(windows.mic_access_denied(), bool)
 
 
+def test_windows_ensure_com_initialises_com_on_the_calling_thread() -> None:
+    import ctypes
+    import threading
+
+    from jarvis_voice.platform import windows
+
+    if plat_name() != "windows":
+        pytest.skip("calls ole32")
+    probe: list[int] = []
+
+    def run() -> None:
+        windows.ensure_com()
+        windows.ensure_com()  # once per thread: does nothing
+        ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        probe.append(ole32.CoInitializeEx(None, windows.COINIT_MULTITHREADED) & 0xFFFFFFFF)
+        ole32.CoUninitialize()  # balances the probe only
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(5.0)
+    assert probe == [windows.S_FALSE]  # COM was already up on that thread, multithreaded
+
+
+def test_a_zero_host_error_code_is_left_out() -> None:
+    # What a start on a thread without COM raised on Windows: the WDM-KS text is stale, its code 0.
+    exc = FakePortAudioError("Error starting stream: Unanticipated host error", -9999, (11, 0, "WdmSyncIoctl: ..."))
+    err = classify_audio_error(exc, "output")
+    assert err.code == "no_output_device" and "host error 0x" not in err.message
+
+
 def test_output_errors_and_passthrough() -> None:
     assert classify_audio_error(FakePortAudioError("Invalid device", -9996), "output").code == "no_output_device"
     original = AudioError("mic_in_use", "busy")
@@ -260,6 +291,12 @@ def test_select_falls_back_to_hostapi_default() -> None:
     assert dev is not None and dev.index == 8
     dev = select_device(DEVICES, "output", wanted=None, hostapi="Windows WASAPI", default_index=5)
     assert dev is not None and dev.index == 5
+
+
+def test_select_never_leaves_the_preferred_hostapi_while_it_has_a_device() -> None:
+    # A default index that points outside WASAPI (stale) and a name only another host API has.
+    dev = select_device(DEVICES, "input", wanted="Sound Mapper", hostapi="Windows WASAPI", default_index=1)
+    assert dev is not None and (dev.index, dev.hostapi) == (7, "Windows WASAPI")
 
 
 def test_select_without_preferred_hostapi_or_devices() -> None:

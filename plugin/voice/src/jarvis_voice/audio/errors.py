@@ -73,7 +73,7 @@ def _pa_details(exc: BaseException) -> tuple[str, int | None, int | None]:
     pa_code = args[1] if len(args) > 1 and isinstance(args[1], int) else None
     host_code = None
     if len(args) > 2 and isinstance(args[2], tuple) and len(args[2]) >= 2 and isinstance(args[2][1], int):
-        host_code = args[2][1]
+        host_code = args[2][1] or None  # 0: PortAudio kept no host error (stale WDM-KS text, for one)
     text = " ".join(str(a) for a in args).lower() or str(exc).lower()
     return text, pa_code, host_code
 

@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import numpy as np
 import pytest
 
+from jarvis_voice.audio.errors import AudioError
 from jarvis_voice.audio.fake import FakePlayback
 from jarvis_voice.speech import SpeechPipeline, estimate_spoken_text
 from jarvis_voice.tts.base import SynthError
@@ -297,6 +298,72 @@ def test_output_that_stops_playing_ends_the_reply_with_no_output_device(sink: Re
         # The next reply reopens the output and plays normally.
         pipe.speak("r2", 0, "Back again.", True)
         assert sink.wait_type("speech_done", replyId="r2")["interrupted"] is False
+    finally:
+        pipe.close()
+
+
+REOPEN_FAILED = "The audio output could not be reopened (headset disconnected or asleep?)."
+
+
+def test_output_that_cannot_reopen_ends_the_reply_at_once(sink: RecordingSink, playback: FakePlayback) -> None:
+    pipe, _, speaking = make(sink, playback, FakeSynth(ms_per_char=400))  # long audio, default stall timeout
+    try:
+        pipe.speak("r1", 0, "A sentence that will not finish playing.", True)
+        sink.wait_type("speech_started")
+        playback.open_error = AudioError("no_output_device", REOPEN_FAILED, "check it")
+        err = sink.wait_type("error", timeout=1.0)  # at once, not after the stall timeout
+        assert err["code"] == "no_output_device" and err["message"] == REOPEN_FAILED
+        assert err["hint"] == "check it" and err["fatal"] is False
+        assert sink.wait_type("speech_done")["interrupted"] is True
+        assert len(sink.of_type("error")) == 1 and playback.stops == 1 and playback.speech_idle()
+        wait_until(lambda: speaking == [True, False])
+    finally:
+        pipe.close()
+
+
+@pytest.mark.parametrize("output_back", [True, False])
+def test_output_that_cannot_reopen_waits_while_the_user_talks(
+    sink: RecordingSink, playback: FakePlayback, output_back: bool
+) -> None:
+    """Hands-free: the user talks over a reply (speech paused) while its output is down."""
+    pipe, _, _ = make(sink, playback, FakeSynth(ms_per_char=50))
+    try:
+        playback.set_paused(True)
+        pipe.speak("r1", 0, "Held while you talk.", True)
+        wait_until(lambda: not playback.speech_idle())
+        playback.open_error = AudioError("no_output_device", REOPEN_FAILED, "check it")
+        time.sleep(0.3)
+        assert sink.of_type("error") == []  # not while the user is talking
+        if not output_back:
+            playback.fail_with = AudioError("no_output_device", REOPEN_FAILED, "check it")
+        playback.set_paused(False)  # the user stopped: one more try at the output
+        done = sink.wait_type("speech_done")
+        if output_back:
+            assert done["interrupted"] is False and sink.of_type("error") == []
+        else:
+            assert done["interrupted"] is True
+            assert [e["message"] for e in sink.of_type("error")] == [REOPEN_FAILED]
+    finally:
+        pipe.close()
+
+
+def test_replies_hold_the_output_open_until_the_last_speech_done(sink: RecordingSink, playback: FakePlayback) -> None:
+    pipe, _, _ = make(sink, playback, FakeSynth(ms_per_char=50))
+    try:
+        assert playback.held is False
+        pipe.speak("r1", 0, "Let me check.", False)
+        assert playback.held is True  # from the first sentence on
+        sink.wait_type("speech_started")
+        pipe.speak("r2", 0, "Queued reply.", True)
+        pipe.speak("r1", 1, "", True)
+        sink.wait_type("speech_done", replyId="r1")
+        assert playback.held is True  # r2 is still to come
+        sink.wait_type("speech_done", replyId="r2")
+        assert playback.held is False
+        pipe.speak("r3", 0, "Interrupted.", False)
+        assert playback.held is True
+        pipe.stop("user")
+        assert playback.held is False
     finally:
         pipe.close()
 

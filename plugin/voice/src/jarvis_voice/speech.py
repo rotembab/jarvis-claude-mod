@@ -9,8 +9,10 @@ A reply whose ``final`` never arrives (lost POST, or a sentence that landed
 after a stop) must not block the replies behind it: once a newer reply is
 waiting and the open one has had no sentence for ``stale_after`` seconds, it
 is closed as interrupted. A lone open reply is left alone, because a voice
-turn may run tools for minutes between sentences. If queued audio stops
-playing (dead output device), the reply ends with ``no_output_device``.
+turn may run tools for minutes between sentences; while any reply is open the
+output is held open (``Playback.hold_open``) so such a pause does not close
+it. If queued audio stops playing (dead output device), or the output cannot
+be reopened for it, the reply ends with ``no_output_device``.
 
 ``prewarm()`` (called when the user has just spoken) opens the output and a
 TTS stream ahead of the reply, so the first sentence skips the handshake; an
@@ -185,6 +187,8 @@ class SpeechPipeline:
                 reply = _Reply(reply_id)
                 self._replies[reply_id] = reply
                 self._order.append(reply_id)
+                if len(self._order) == 1:
+                    self._playback.hold_open(True)  # through tool pauses, until the last speech_done
             if reply.final_queued or seq < reply.next_seq or seq in reply.pending:
                 return {"ok": True, "dropped": True}  # duplicate, or after the final sentence
             if len(reply.pending) >= MAX_PENDING_PER_REPLY:
@@ -357,6 +361,7 @@ class SpeechPipeline:
         flushed = False
         failure: SynthError | AudioError | None = None
         stalled = False
+        retry_open = False
         last_played, stall_since = -1, 0.0
         while True:
             item: tuple[str, bool] | None = None
@@ -392,6 +397,23 @@ class SpeechPipeline:
             if stream is not None and stream.error is not None:
                 failure = stream.error
                 break
+            # Audio is waiting but the output closed and would not reopen: fail now, with the reason.
+            # Not while the user talks over the reply (speech paused): try once more when they stop.
+            open_error = pb.open_error
+            if open_error is not None and not pb.speech_idle():
+                if pb.paused:
+                    retry_open = True
+                else:
+                    if retry_open:
+                        retry_open = False
+                        try:
+                            pb.open()
+                        except AudioError:
+                            pass
+                        open_error = pb.open_error
+                    if open_error is not None:
+                        failure, stalled = open_error, True
+                        break
             # Audio is queued and not held, yet nothing plays: the output device died.
             played = pb.speech_frames_played
             if played != last_played or pb.speech_idle() or pb.paused:
@@ -499,6 +521,8 @@ class SpeechPipeline:
             self._order.remove(reply.id)
         except ValueError:
             pass
+        if not self._order:
+            self._playback.hold_open(False)  # nothing left to say: the output may close when idle
         self._closed_ids[reply.id] = None
         while len(self._closed_ids) > 256:
             self._closed_ids.popitem(last=False)

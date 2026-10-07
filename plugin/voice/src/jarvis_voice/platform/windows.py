@@ -1,10 +1,11 @@
-"""Windows: named-mutex single instance, WASAPI, microphone privacy hints."""
+"""Windows: named-mutex single instance, WASAPI, COM per audio thread, microphone privacy hints."""
 
 from __future__ import annotations
 
 import ctypes
 import logging
 import os
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -14,6 +15,11 @@ ERROR_ALREADY_EXISTS = 183
 ERROR_ACCESS_DENIED = 5
 MIC_SETTINGS_URI = "ms-settings:privacy-microphone"
 _MIC_CONSENT_KEY = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
+
+COINIT_MULTITHREADED = 0x0
+S_OK, S_FALSE = 0x0, 0x1  # initialised now / already initialised on this thread
+RPC_E_CHANGED_MODE = 0x80010106  # already initialised on this thread as single-threaded: COM works too
+_com = threading.local()
 
 
 class NamedMutexLock:
@@ -63,6 +69,28 @@ class NamedMutexLock:
 def make_instance_lock(instance_name: str, lock_dir: Path) -> NamedMutexLock:
     del lock_dir  # the mutex lives in the kernel object namespace
     return NamedMutexLock(f"Local\\{instance_name}")
+
+
+def ensure_com() -> None:
+    """Initialise COM on the calling thread, once per thread; it is never uninitialised.
+
+    PortAudio's WASAPI backend marshals COM interfaces when it starts a stream.
+    On a thread where COM was never initialised (any thread Python starts) that
+    fails as "Unanticipated host error", with stale WDM-KS text as the detail.
+    """
+    if getattr(_com, "ready", False):
+        return
+    _com.ready = True  # once, even if it fails: the stream start then reports PortAudio's own error
+    try:
+        ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        ole32.CoInitializeEx.restype = ctypes.c_long  # HRESULT
+        hr = ole32.CoInitializeEx(None, COINIT_MULTITHREADED) & 0xFFFFFFFF
+    except (AttributeError, OSError) as exc:
+        log.warning("could not initialise COM on thread %s: %s", threading.current_thread().name, exc)
+        return
+    if hr not in (S_OK, S_FALSE, RPC_E_CHANGED_MODE):
+        log.warning("CoInitializeEx failed on thread %s: 0x%08X", threading.current_thread().name, hr)
 
 
 def mic_blocked_hint() -> str:
