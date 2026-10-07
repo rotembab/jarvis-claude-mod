@@ -6,7 +6,7 @@
 import { type BrowserWindow, Menu, type MenuItemConstructorOptions, nativeImage, type NativeImage, Tray } from 'electron'
 
 import type { HudMode } from '../../../plugin/hooks/hud-ring'
-import { MODE_COLORS } from '../shared/view'
+import { hoverText, MODE_COLORS } from '../shared/view'
 import { ringPng } from './tray-icon'
 import { type TrayAction, type TrayItem, trayMenu, type TrayMenuState } from './tray-menu'
 
@@ -59,7 +59,7 @@ export function createTray(onAction: (action: TrayAction) => void): AppTray {
       menuKey = key
       menu = Menu.buildFromTemplate(template(trayMenu(state), onAction))
       tray.setContextMenu(menu)
-      tray.setToolTip(`Jarvis: ${state.status}`)
+      tray.setToolTip(hoverText(state))
     },
     popup(window) {
       menu?.popup(window === undefined ? {} : { window })

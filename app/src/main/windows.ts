@@ -89,8 +89,7 @@ export class OverlayFader {
       this.hideTimer = undefined
       if (!this.win.isVisible()) {
         this.win.showInactive()
-        // Showing again can drop the level on Windows; set it each time.
-        this.win.setAlwaysOnTop(true, 'screen-saver')
+        this.raise()
       }
     } else if (this.win.isVisible() && this.hideTimer === undefined) {
       this.hideTimer = setTimeout(() => {
@@ -98,6 +97,18 @@ export class OverlayFader {
         if (!this.win.isDestroyed()) this.win.hide()
       }, FADE_MS + 50)
     }
+  }
+
+  /**
+   * Puts the shown overlay back above everything. It never takes the focus,
+   * so it never comes forward by itself: a topmost window activated since
+   * (Task Manager, a game) stays over it until this runs. Showing again can
+   * also drop its level on Windows, so the level is set each time.
+   */
+  raise(): void {
+    if (this.win.isDestroyed() || !this.win.isVisible()) return
+    this.win.setAlwaysOnTop(true, 'screen-saver')
+    this.win.moveTop()
   }
 }
 

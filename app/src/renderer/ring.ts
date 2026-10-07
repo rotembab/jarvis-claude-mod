@@ -48,7 +48,8 @@ export class RingView {
     clearTimeout(this.trailing)
     this.trailing = undefined
     const { mode, mic, out } = latest
-    const doc = new DOMParser().parseFromString(ringSvg(mode, mic, out, now / 1000), 'image/svg+xml')
+    // Without the plugin pane's square tile: the page puts the ring straight over other windows.
+    const doc = new DOMParser().parseFromString(ringSvg(mode, mic, out, now / 1000, { frame: false }), 'image/svg+xml')
     this.host.replaceChildren(document.importNode(doc.documentElement, true))
     this.drawn = { mode, micTenth: tenth(mic), outTenth: tenth(out), at: now }
   }

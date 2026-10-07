@@ -205,6 +205,19 @@ describe('Jarvis app link', () => {
     expect(await jarvis($, 'app')).toContain('0.8.0 is connected')
   })
 
+  test('/jarvis app: an address left behind reads as not running; an app that answers wrongly did not answer', async ($, on) => {
+    const w = world(on)
+    appRunning(w)
+    w.respond = command => {
+      if (isApp(command)) throw new Error('connect ECONNREFUSED 127.0.0.1:50999')
+      return OK
+    }
+    await startHelper($, w)
+    expect(await jarvis($, 'app')).toContain('not running')
+    w.respond = command => (isApp(command) ? { status: 500, body: { ok: false } } : OK)
+    expect(await jarvis($, 'app')).toContain('did not answer (HTTP 500)')
+  })
+
   test('/jarvis app off stops sending, in later sessions too; on sends again', async ($, on) => {
     const w = world(on)
     appRunning(w)

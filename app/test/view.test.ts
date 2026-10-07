@@ -6,7 +6,7 @@ import { test } from 'node:test'
 // The plugin's colours, imported at runtime here only: the app's own code keeps a copy.
 import { HUD_COLORS } from '../../plugin/hooks/hud-ring'
 import type { AppSnapshot } from '../src/shared/snapshot'
-import { ACTION_MARKS, buildView, MODE_COLORS, noteFor, statusLine } from '../src/shared/view'
+import { ACTION_MARKS, buildView, hoverText, MODE_COLORS, noteFor, statusLine } from '../src/shared/view'
 
 const snap = (overrides: Partial<AppSnapshot> = {}): AppSnapshot => ({
   v: 1,
@@ -103,4 +103,10 @@ test('the tray status for each mode', () => {
   ]
   for (const [mode, status] of cases) assert.equal(statusLine(snap({ mode })), status)
   assert.equal(statusLine(undefined), 'waiting for Claude Code')
+})
+
+test('hovering says what to do when Jarvis needs you, else what he is doing', () => {
+  assert.equal(hoverText(buildView(snap(), false)), 'Jarvis: standing by')
+  assert.equal(hoverText(buildView(snap({ mode: 'offline', phase: 'not_installed' }), false)), 'The voice helper is not set up. Run /jarvis setup in Claude Code.')
+  assert.equal(hoverText(buildView(undefined, false)), 'Waiting for Claude Code. Start a session with the Jarvis plugin.')
 })

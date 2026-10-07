@@ -89,6 +89,15 @@ export function statusLine(snapshot: AppSnapshot | undefined): string {
   return snapshot === undefined ? 'waiting for Claude Code' : STATUS[snapshot.mode]
 }
 
+/**
+ * The words for hovering over the orb or the tray icon: the note when Jarvis
+ * needs something from you (a gray ring alone cannot say what), else what he
+ * is doing.
+ */
+export function hoverText(view: Pick<AppView, 'status' | 'note'>): string {
+  return view.note === '' ? `Jarvis: ${view.status}` : view.note
+}
+
 export function buildView(snapshot: AppSnapshot | undefined, isOverlayShown: boolean): AppView {
   const mode = snapshot?.mode ?? 'offline'
   return {

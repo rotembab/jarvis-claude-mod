@@ -8,13 +8,14 @@ import { homedir } from 'node:os'
 
 import { type AppView, buildView } from '../shared/view'
 import { newToken, removeEndpointSync, writeEndpoint } from './discovery'
+import { loginItem } from './login'
 import { jarvisHome, userDataOverride } from './paths'
 import { type LinkServer, startLinkServer } from './server'
 import { SessionBoard } from './sessions'
-import { loadSettings, placeOrb, saveSettings, type Settings } from './settings'
+import { loadSettings, placeOrb, type Point, saveSettings, type Settings } from './settings'
 import { type AppTray, createTray } from './tray'
 import type { TrayAction } from './tray-menu'
-import { OverlayVisibility } from './visibility'
+import { OverlayVisibility, WAKE_PHASES } from './visibility'
 import { createOrbWindow, createOverlayWindow, OverlayFader, sendView } from './windows'
 
 /** How often the app re-judges which session is live and whether the overlay shows. */
@@ -25,6 +26,10 @@ const HOTKEY = 'Control+Alt+J'
 
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
+// The app's own clock for when pushes arrive and how long the overlay lingers:
+// it never steps back when the PC's time is set, as Date.now() can.
+const clock = (): number => performance.now()
+
 async function main(): Promise<void> {
   // Tests give each copy its own folder, and with it its own single-instance lock.
   const userDataDir = userDataOverride(process.env, process.platform)
@@ -32,6 +37,8 @@ async function main(): Promise<void> {
 
   // One app per user: a second launch only asks the first to show its overlay.
   if (!app.requestSingleInstanceLock()) {
+    // Most often `npm start` after a pull, so say why the new build did not start.
+    console.log('Jarvis is already running, and shows its overlay now. To run a new build, quit Jarvis from the tray or the orb first.')
     app.quit()
     return
   }
@@ -40,7 +47,7 @@ async function main(): Promise<void> {
 
   const version = app.getVersion()
   const home = jarvisHome(process.env, process.platform, homedir())
-  const loginArgs = [`"${app.getAppPath()}"`]
+  const login = loginItem(process.execPath, app.getAppPath())
   const board = new SessionBoard()
 
   let settings: Settings | undefined
@@ -55,17 +62,25 @@ async function main(): Promise<void> {
   let startWithWindows: boolean | undefined
   let view: AppView = buildView(undefined, false)
   let viewKey = ''
+  let wasAwake = false
+  /** Where the app itself last put the orb; only a move to anywhere else is saved. */
+  let orbPlacedAt: Point | undefined
 
   const readLoginItem = (): boolean | undefined =>
-    process.platform === 'win32' ? app.getLoginItemSettings({ path: process.execPath, args: loginArgs }).openAtLogin : undefined
+    process.platform === 'win32' ? app.getLoginItemSettings(login).openAtLogin : undefined
 
   function refresh(): void {
     if (visibility === undefined || overlay === undefined || fader === undefined || settings === undefined) return
-    const now = Date.now()
+    const now = clock()
     const shown = board.current(now)
     visibility.update(shown && { mode: shown.mode, phase: shown.phase }, now)
     const next = buildView(shown, visibility.isVisible)
     fader.apply(next.isOverlayShown)
+    // Woken while the overlay was already up (Always, or shown by hand): a
+    // topmost window activated since, such as Task Manager, may cover it.
+    const isAwake = shown !== undefined && WAKE_PHASES.has(shown.phase)
+    if (isAwake && !wasAwake) fader.raise()
+    wasAwake = isAwake
     const key = JSON.stringify(next)
     if (key !== viewKey) {
       viewKey = key
@@ -77,6 +92,7 @@ async function main(): Promise<void> {
       {
         version,
         status: view.status,
+        note: view.note,
         isOverlayShown: view.isOverlayShown,
         overlay: visibility.setting,
         showOrb: settings.showOrb,
@@ -89,6 +105,7 @@ async function main(): Promise<void> {
   function toggleOverlay(): void {
     visibility?.toggle()
     refresh()
+    fader?.raise()
   }
 
   function save(): void {
@@ -100,19 +117,28 @@ async function main(): Promise<void> {
 
   function openOrb(): void {
     if (orb !== undefined || settings === undefined) return
-    const win = createOrbWindow(placeOrb(settings.orb, workAreas(), screen.getPrimaryDisplay().workArea), () => tray?.popup(win))
+    orbPlacedAt = placeOrb(settings.orb, workAreas(), screen.getPrimaryDisplay().workArea)
+    const win = createOrbWindow(orbPlacedAt, () => tray?.popup(win))
     orb = win
     win.webContents.on('did-finish-load', () => sendView(win, view))
+    // Only the person's drags are saved. When a screen goes away, Windows and
+    // placeWindows move the orb too, and saving that would lose the place it
+    // goes back to when the screen returns. 'moved' (Windows) comes once, at
+    // the end of a drag. Linux has only 'move', so there a move to where the
+    // app itself put the orb is skipped.
     let saveTimer: NodeJS.Timeout | undefined
-    win.on('move', () => {
+    const saveSoon = (): void => {
       clearTimeout(saveTimer)
       saveTimer = setTimeout(() => {
         if (win.isDestroyed() || settings === undefined) return
         const { x, y } = win.getBounds()
+        if (orbPlacedAt !== undefined && x === orbPlacedAt.x && y === orbPlacedAt.y) return
         settings.orb = { x, y }
         save()
       }, ORB_SAVE_MS)
-    })
+    }
+    if (process.platform === 'linux') win.on('move', saveSoon)
+    else win.on('moved', saveSoon)
     win.on('closed', () => {
       clearTimeout(saveTimer)
       if (orb === win) orb = undefined
@@ -145,7 +171,7 @@ async function main(): Promise<void> {
         refresh()
         return
       case 'start-with-windows':
-        app.setLoginItemSettings({ openAtLogin: action.value, path: process.execPath, args: loginArgs })
+        app.setLoginItemSettings({ ...login, openAtLogin: action.value })
         startWithWindows = readLoginItem()
         refresh()
         return
@@ -159,6 +185,7 @@ async function main(): Promise<void> {
   app.on('second-instance', () => {
     visibility?.show()
     refresh()
+    fader?.raise()
   })
   // Closing a window never quits the app; only the tray's Quit does.
   app.on('window-all-closed', () => undefined)
@@ -180,6 +207,9 @@ async function main(): Promise<void> {
     isQuitting = true
     cleanUp()
   })
+  // Ctrl+C in the window `npm start` runs in, or that window closing: quit
+  // properly, so the address file goes too.
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const) process.on(signal, () => app.quit())
 
   await app.whenReady()
   if (isQuitting) return
@@ -200,7 +230,7 @@ async function main(): Promise<void> {
       token: launchToken,
       version,
       onSnapshot: snapshot => {
-        if (board.accept(snapshot, Date.now())) refresh()
+        if (board.accept(snapshot, clock())) refresh()
       },
     })
     await writeEndpoint(home, { v: 1, port: server.port, token: launchToken, pid: process.pid, version })
@@ -221,6 +251,9 @@ async function main(): Promise<void> {
   const overlayWin = createOverlayWindow()
   overlay = overlayWin
   fader = new OverlayFader(overlayWin)
+  // Windows signing out, restarting or shutting down ends the app without
+  // 'before-quit'; this is the last moment to remove the address file.
+  overlayWin.on('session-end', cleanUp)
   overlayWin.webContents.on('did-finish-load', () => sendView(overlayWin, view))
   if (settings.showOrb) openOrb()
   tray = createTray(onAction)
@@ -240,8 +273,8 @@ async function main(): Promise<void> {
   const placeWindows = (): void => {
     overlay?.setBounds(screen.getPrimaryDisplay().workArea)
     if (orb !== undefined && settings !== undefined) {
-      const { x, y } = placeOrb(settings.orb, workAreas(), screen.getPrimaryDisplay().workArea)
-      orb.setPosition(x, y)
+      orbPlacedAt = placeOrb(settings.orb, workAreas(), screen.getPrimaryDisplay().workArea)
+      orb.setPosition(orbPlacedAt.x, orbPlacedAt.y)
     }
   }
   screen.on('display-added', placeWindows)

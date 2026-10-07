@@ -23,10 +23,14 @@ body {
 
 [hidden] { display: none !important; }
 
-/* The ring's square drawing, cut round with a soft edge. */
+/* The ring is drawn without the plugin pane's square tile (ring.ts). A soft
+   dark disc behind it keeps it readable over a light window, and its very edge
+   fades out so nothing ends in a hard line. */
 .ring {
-  -webkit-mask-image: radial-gradient(circle closest-side, #000 88%, transparent 100%);
-  mask-image: radial-gradient(circle closest-side, #000 88%, transparent 100%);
+  border-radius: 50%;
+  background: radial-gradient(circle closest-side, rgba(3, 7, 13, .8) 0%, rgba(3, 7, 13, .7) 58%, rgba(3, 7, 13, .32) 78%, transparent 96%);
+  -webkit-mask-image: radial-gradient(circle closest-side, #000 92%, transparent 100%);
+  mask-image: radial-gradient(circle closest-side, #000 92%, transparent 100%);
 }
 
 .ring svg {
@@ -37,53 +41,102 @@ body {
 
 /* ---------------------------------------------------------------- overlay */
 
+/* Everything scales with the screen: the ring takes most of its height, the
+   text grows with it, from 15px on a small screen. */
 body.overlay {
+  --text: clamp(15px, 1.6vmin, 26px);
+  --gap: 4vmin;
+  --side: min(36vw, 42em);
+  --ring: min(64vmin, 1200px, calc(96vw - var(--side) - var(--gap)));
   display: grid;
   place-items: center;
+  font-size: var(--text);
 }
 
+/* On a wide screen the words go beside the ring, as in the plugin's focus
+   mode, in a column of fixed width so the ring never moves while they change. */
 #hud {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: var(--ring) var(--side);
+  grid-template-rows: 1fr auto auto 1fr;
+  grid-template-areas: "ring ." "ring label" "ring panel" "ring .";
+  column-gap: var(--gap);
+  row-gap: 1em;
   align-items: center;
-  gap: 14px;
+  max-height: 100vh;
   opacity: 0;
   transition: opacity 300ms ease;
+}
+
+/* On a tall screen they go under it. */
+@media (max-aspect-ratio: 1/1) {
+  body.overlay {
+    --side: min(92vw, 42em);
+    --ring: min(64vmin, 1200px, 50vh);
+  }
+
+  #hud {
+    grid-template-columns: var(--side);
+    grid-template-rows: auto auto auto;
+    grid-template-areas: "ring" "label" "panel";
+    justify-items: center;
+  }
 }
 
 body[data-visible="true"] #hud { opacity: 1; }
 
 body.overlay .ring {
-  width: min(46vmin, 440px);
-  height: min(46vmin, 440px);
+  grid-area: ring;
+  width: var(--ring);
+  height: var(--ring);
 }
 
+/* The mode's name on a dark pill, so it reads over a white page too. */
 #label {
+  grid-area: label;
+  justify-self: start;
+  padding: .3em .9em .3em 1.2em;
+  border-radius: 999px;
+  background: rgba(3, 10, 18, .84);
   font-weight: 600;
-  font-size: 15px;
+  font-size: clamp(15px, 2.1vmin, 34px);
   letter-spacing: .32em;
   color: var(--mode);
-  text-shadow: 0 0 12px var(--mode);
+  text-shadow: 0 0 2px #000, 0 0 14px var(--mode);
+}
+
+@media (max-aspect-ratio: 1/1) {
+  #label { justify-self: center; }
 }
 
 #panel {
+  grid-area: panel;
   box-sizing: border-box;
-  max-width: min(680px, 80vw);
-  padding: 14px 18px;
-  background: rgba(3, 10, 18, .78);
+  width: 100%;
+  padding: .9em 1.2em;
+  background: rgba(3, 10, 18, .88);
   color: #d6efff;
   border: 1px solid rgba(92, 200, 255, .28);
   border-radius: 14px;
-  font-size: 15px;
   line-height: 1.45;
 }
 
 #panel p,
 #panel ul { margin: 0; }
 
-#panel > * + * { margin-top: 10px; }
+#panel > * + * { margin-top: .65em; }
+
+/* A long text stops after a few lines (with "…"), so the panel never runs off the screen. */
+#utterance,
+#reply,
+#note {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 
 #utterance {
+  -webkit-line-clamp: 4;
   color: #ffffff;
   font-weight: 600;
 }
@@ -91,17 +144,20 @@ body.overlay .ring {
 #utterance::before { content: "\201C"; }
 #utterance::after { content: "\201D"; }
 
-#reply { color: #b4d3e8; }
+#reply {
+  -webkit-line-clamp: 6;
+  color: #b4d3e8;
+}
 
 #actions {
   list-style: none;
   padding: 0;
-  font-size: 14px;
+  font-size: .93em;
 }
 
 #actions li {
   display: flex;
-  gap: 8px;
+  gap: .55em;
 }
 
 #actions .mark {
@@ -121,8 +177,9 @@ body.overlay .ring {
 #actions li[data-status="failed"] .mark { color: #ff7a7a; }
 
 #note {
+  -webkit-line-clamp: 3;
   color: #9fb4c4;
-  font-size: 14px;
+  font-size: .93em;
 }
 
 /* ---------------------------------------------------------------- orb */

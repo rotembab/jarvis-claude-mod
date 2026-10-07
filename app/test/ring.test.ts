@@ -17,7 +17,7 @@ test('the ring is redrawn for a mode change at once, for a level change at most 
 test('the ring SVG holds nothing the pages policy would block', () => {
   // The pages allow no inline style or script and load nothing; SMIL animation is fine.
   for (const mode of HUD_MODES) {
-    const svg = ringSvg(mode, 0.5, 0.5, 1)
+    const svg = ringSvg(mode, 0.5, 0.5, 1, { frame: false })
     assert.doesNotMatch(svg, /<script|<style|<foreignObject|style=|href|\son[a-z]+=/i, mode)
     assert.match(svg, /^<svg /)
   }

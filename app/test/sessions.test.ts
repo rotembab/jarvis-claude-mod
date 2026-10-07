@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { MAX_SESSIONS, SessionBoard, STALE_MS } from '../src/main/sessions'
+import { MAX_SESSIONS, REORDER_MS, SessionBoard, STALE_MS } from '../src/main/sessions'
 import type { AppSnapshot } from '../src/shared/snapshot'
 
 const snap = (sessionId: string, overrides: Partial<AppSnapshot> = {}): AppSnapshot => ({
@@ -73,6 +73,17 @@ test('a snapshot older than the one held for its session is ignored', () => {
   board.accept(snap('a', { at: 2000, mode: 'thinking' }), 1000)
   assert.equal(board.accept(snap('a', { at: 1500, mode: 'listening' }), 1100), false)
   assert.equal(board.current(1100)?.mode, 'thinking')
+})
+
+test("after the PC's clock is set back, the session's next snapshot is taken", () => {
+  const board = new SessionBoard()
+  const hour = 3_600_000
+  board.accept(snap('a', { at: 2 * hour, mode: 'thinking' }), 1000)
+  assert.equal(board.accept(snap('a', { at: 2 * hour - REORDER_MS - 1, mode: 'speaking' }), 3000), true)
+  assert.equal(board.accept(snap('a', { at: hour, mode: 'listening' }), 5000), true)
+  assert.equal(board.current(5000)?.mode, 'listening')
+  assert.equal(board.accept(snap('a', { at: hour + 2000, mode: 'sleeping' }), 7000), true)
+  assert.equal(board.current(7000 + STALE_MS - 1)?.mode, 'sleeping')
 })
 
 test('a stale owner loses to a live session', () => {

@@ -3,9 +3,9 @@
 // wins, else the one whose display changed last. A heartbeat that repeats what
 // a session showed does not count as a change, or two windows would take turns
 // on the screen every 2 seconds. A session that missed three heartbeats is
-// gone. Staleness is judged by when the app received a push, never by its
-// `at`, which comes from another process's clock and only orders one
-// session's snapshots.
+// gone. Staleness is judged by when the app received a push (on the app's
+// own steady clock), never by its `at`, which comes from the plugin's wall
+// clock and only orders one session's snapshots.
 
 import type { AppSnapshot } from '../shared/snapshot'
 
@@ -13,6 +13,14 @@ import type { AppSnapshot } from '../shared/snapshot'
 export const STALE_MS = 6000
 /** Sessions remembered at most; the board is a display, not a log. */
 export const MAX_SESSIONS = 16
+/**
+ * A snapshot up to this much older than the one held for its session arrived
+ * late and is dropped. One further back means the PC's clock was set back, and
+ * is taken: dropping it would leave the session looking gone until the clock
+ * caught up. It stays below STALE_MS less a heartbeat, so a smaller step
+ * never makes a live session look gone either.
+ */
+export const REORDER_MS = 3000
 
 /** `changedAt`: when the app last received something new from the session (its first push, or a different display). */
 type Entry = { snapshot: AppSnapshot; receivedAt: number; changedAt: number }
@@ -27,10 +35,10 @@ const isNewer = (a: Entry, b: Entry | undefined): boolean =>
 export class SessionBoard {
   private readonly entries = new Map<string, Entry>()
 
-  /** Stores a pushed snapshot; false when it is older than one already held for its session. */
+  /** Stores a pushed snapshot; false when it arrived after a newer one from its session. */
   accept(snapshot: AppSnapshot, receivedAt: number): boolean {
     const held = this.entries.get(snapshot.sessionId)
-    if (held !== undefined && held.snapshot.at > snapshot.at) return false
+    if (held !== undefined && held.snapshot.at > snapshot.at && held.snapshot.at - snapshot.at <= REORDER_MS) return false
     const isSame = held !== undefined && shownKey(held.snapshot) === shownKey(snapshot)
     this.entries.set(snapshot.sessionId, { snapshot, receivedAt, changedAt: isSame ? held.changedAt : receivedAt })
     for (const [id, entry] of this.entries) {

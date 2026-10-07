@@ -174,7 +174,9 @@ Under the ring are the last thing you said and the last six things Claude ran (`
 
 ### The Jarvis app (optional)
 
-The Jarvis app shows the HUD on your desktop as well: a ring over your screen while you talk to Jarvis, a small orb you can put anywhere, and a tray icon. Claude Code and the plugin still do all the work; the app only shows what the plugin sends it, over `127.0.0.1` on your own computer. There is no installer yet, so it runs from a clone of this repository:
+The Jarvis app shows the HUD on your desktop as well: a ring over your screen while you talk to Jarvis, a small orb you can put anywhere, and a tray icon. Claude Code and the plugin still do all the work; the app only shows what the plugin sends it, over `127.0.0.1` on your own computer.
+
+It needs the plugin 0.8.0 or later, so [update Jarvis](#update) first (`claude plugin update jarvis@jarvis-claude-mod`, restart Claude Code, `/jarvis setup`). There is no installer yet, so the app runs from a clone of this repository:
 
 ```text
 git clone https://github.com/rotembab/jarvis-claude-mod
@@ -183,8 +185,9 @@ npm ci
 npm start
 ```
 
-- It needs [Node.js](https://nodejs.org) 22 or later (`winget install OpenJS.NodeJS.LTS`). The first start downloads Electron, about 100 MB.
-- Claude Code finds the app within a few seconds of it starting. `/jarvis app` says whether it is connected; `/jarvis app off` stops sending it the HUD.
+- It needs [Node.js](https://nodejs.org) 22 or later (`winget install OpenJS.NodeJS.LTS`). The first start downloads Electron, about 100 MB. If PowerShell refuses to run `npm`, type `npm.cmd` instead.
+- Claude Code finds the app within a few seconds of it starting. `/jarvis app` says whether it is connected (if it says `Unknown subcommand "app"`, the plugin is not updated yet); `/jarvis app off` stops sending it the HUD.
+- To update the app, quit it from its tray menu first, then `git pull`, `npm ci` and `npm start`.
 - [docs/APP.md](docs/APP.md) covers the overlay, the orb, the tray menu, Ctrl+Alt+J and starting with Windows.
 
 ## Hand control (preview)

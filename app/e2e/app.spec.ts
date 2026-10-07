@@ -272,6 +272,51 @@ test('it shows each mode with what was said, the reply and the actions', async (
       await expect(orb.locator('#ring svg')).toHaveCount(1)
       await shoot(step.name)
     }
+
+    // The longest texts the app takes still fit, beside the ring on a wide
+    // screen and under it on a tall one, and the ring takes most of the height.
+    const label = (verb: string) => `${verb} ${'app/src/main/a-long-folder-name/'.repeat(3)}`.slice(0, 80)
+    const longest = () => snapshot({
+      mode: 'speaking',
+      phase: 'speaking',
+      out: 0.5,
+      utterance: 'Run the unit tests, then '.repeat(20).slice(0, 500),
+      reply: 'Two tests failed in the link server, both about its checks. '.repeat(10).slice(0, 600),
+      actions: ['Bash', 'Read', 'Edit', 'Grep', 'Write', 'Glob'].map(verb => ({ label: label(verb), status: 'done' })),
+    })
+    expect((await push(ep, longest())).status).toBe(200)
+    await expect(overlay.locator('#actions li')).toHaveCount(6)
+    const fit = () =>
+      overlay.evaluate(() => {
+        const box = (id: string) => document.getElementById(id)?.getBoundingClientRect() ?? new DOMRect()
+        const parts = ['ring', 'label', 'panel'].map(box)
+        return {
+          width: innerWidth,
+          height: innerHeight,
+          ring: box('ring').height,
+          isInside: parts.every(part => part.top >= 0 && part.left >= 0 && part.bottom <= innerHeight && part.right <= innerWidth),
+        }
+      })
+    const full = await fit()
+    expect(full.isInside, JSON.stringify(full)).toBe(true)
+    expect(full.ring / full.height, JSON.stringify(full)).toBeGreaterThanOrEqual(0.55)
+    await shoot('longest')
+    // Other screens, by resizing the overlay: 1080p at 150%, 4:3, 5:4, 1440p and portrait.
+    for (const [width, height] of [[1280, 688], [1024, 768], [1280, 1024], [2560, 1400], [800, 1240]] as const) {
+      await app.evaluate(({ BrowserWindow }, size) => {
+        const win = BrowserWindow.getAllWindows().find(each => each.webContents.getURL().endsWith('/overlay.html'))
+        win?.setResizable(true)
+        win?.setBounds({ x: 0, y: 0, ...size })
+      }, { width, height })
+      await expect.poll(async () => (await fit()).width).toBe(width)
+      // Again, so the session stays live (a session unheard from for 6 s is gone).
+      expect((await push(ep, longest())).status).toBe(200)
+      await expect(overlay.locator('#actions li')).toHaveCount(6)
+      const sized = await fit()
+      expect(sized.isInside, JSON.stringify(sized)).toBe(true)
+      if (width > height) expect(sized.ring / sized.height, JSON.stringify(sized)).toBeGreaterThanOrEqual(0.55)
+      await shoot(`longest-${width}x${height}`)
+    }
   } finally {
     await app.close()
   }

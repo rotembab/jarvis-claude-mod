@@ -6,6 +6,7 @@ import { trayMenu, type TrayMenuState } from '../src/main/tray-menu'
 const STATE: TrayMenuState = {
   version: '0.8.0',
   status: 'standing by',
+  note: '',
   isOverlayShown: false,
   overlay: 'auto',
   showOrb: true,
@@ -30,6 +31,16 @@ test('the items, in order', () => {
   assert.equal(items[2]?.accelerator, 'Control+Alt+J')
   assert.deepEqual(items[2]?.action, { kind: 'toggle-overlay' })
   assert.equal(trayMenu({ ...STATE, isOverlayShown: true })[2]?.label, 'Hide the overlay')
+})
+
+test('a note on what Jarvis needs goes under the status', () => {
+  const items = trayMenu({ ...STATE, status: 'offline', note: 'The voice helper is not set up. Run /jarvis setup in Claude Code.' })
+  assert.deepEqual(items.slice(0, 3).map(item => [item.type, item.label, item.enabled]), [
+    ['normal', 'Jarvis 0.8.0: offline', false],
+    ['normal', 'The voice helper is not set up. Run /jarvis setup in Claude Code.', false],
+    ['separator', undefined, undefined],
+  ])
+  assert.equal(items.at(-1)?.label, 'Quit Jarvis')
 })
 
 test('the overlay choices follow the setting and carry their action', () => {

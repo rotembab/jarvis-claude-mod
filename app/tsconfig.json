@@ -11,5 +11,7 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["src", "test", "e2e", "scripts", "playwright.config.ts"]
+  "include": ["src", "test", "e2e", "scripts", "playwright.config.ts"],
+  // It imports plugin modules, whose types need Claude Code's declarations (not in git).
+  "exclude": ["test/link.test.ts"]
 }

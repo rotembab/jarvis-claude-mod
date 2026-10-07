@@ -109,7 +109,8 @@ function randomId(): string {
 }
 
 type Shown = Omit<AppSnapshot, 'at'>
-type Outcome = { ok: true } | { ok: false; reason: string; isRefused: boolean }
+/** `isRefused`: the app answered 400 (it would not take the snapshot). `isGone`: nothing answered at its address. */
+type Outcome = { ok: true } | { ok: false; reason: string; isRefused: boolean; isGone: boolean }
 
 export class Companion {
   /** Tells this window's pushes apart from another's; new with each session start. */
@@ -201,6 +202,9 @@ export class Companion {
     }
     this.endpoint = endpoint
     const outcome = await this.post(endpoint)
+    // Nothing listens there: the app ended without removing its address
+    // (Task Manager, a closed terminal), so it is simply not running.
+    if (!outcome.ok && outcome.isGone) return { state: 'not_running' }
     if (!outcome.ok) return { state: 'no_answer', reason: outcome.reason }
     return { state: 'connected', version: endpoint.version }
   }
@@ -283,11 +287,11 @@ export class Companion {
         body: JSON.stringify(snapshot),
       })
       const response = await withTimeout(this.engine, request, APP_PUSH_TIMEOUT_MS)
-      if (response === TIMEOUT) outcome = { ok: false, reason: `no answer within ${APP_PUSH_TIMEOUT_MS} ms`, isRefused: false }
+      if (response === TIMEOUT) outcome = { ok: false, reason: `no answer within ${APP_PUSH_TIMEOUT_MS} ms`, isRefused: false, isGone: false }
       else if (response.ok) outcome = { ok: true }
-      else outcome = { ok: false, reason: `HTTP ${response.status}`, isRefused: response.status === 400 }
+      else outcome = { ok: false, reason: `HTTP ${response.status}`, isRefused: response.status === 400, isGone: false }
     } catch (error) {
-      outcome = { ok: false, reason: describeError(error), isRefused: false }
+      outcome = { ok: false, reason: describeError(error), isRefused: false, isGone: true }
     }
     if (this.endpoint !== endpoint) return outcome
     if (outcome.ok) {

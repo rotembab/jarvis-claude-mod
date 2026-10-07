@@ -23,6 +23,8 @@ export type TrayItem = {
 export type TrayMenuState = {
   version: string
   status: string
+  /** What Jarvis needs from you, if anything (view.ts noteFor); shown under the status. */
+  note: string
   isOverlayShown: boolean
   overlay: OverlaySetting
   showOrb: boolean
@@ -39,6 +41,7 @@ const OVERLAY_LABELS: Record<OverlaySetting, string> = {
 export function trayMenu(state: TrayMenuState): TrayItem[] {
   const items: TrayItem[] = [
     { type: 'normal', label: `Jarvis ${state.version}: ${state.status}`, enabled: false },
+    ...(state.note === '' ? [] : [{ type: 'normal', label: state.note, enabled: false } as const]),
     { type: 'separator' },
     {
       type: 'normal',
