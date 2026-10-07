@@ -1,7 +1,8 @@
 """What the tracker hands the gesture engine: hands per camera frame.
 
-The camera frame is mirrored before tracking, so image x grows to the user's
-right and ``handedness`` names the user's own hand.
+The tracker mirrors the landmarks (not the frame: MediaPipe's handedness is
+anatomical on the raw frame), so image x grows to the user's right and
+``handedness`` names the user's own hand.
 """
 
 from __future__ import annotations

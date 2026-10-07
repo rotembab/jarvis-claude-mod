@@ -421,7 +421,7 @@ class GestureEngine:
                 track.palm_since += missed
             hand, _, anchor_fw = observed[i]
             track.seen, track.last_seen, track.handedness = True, now, hand.handedness
-            pose = track.poses.classify(hand, self.settings.anchor)
+            pose = track.poses.classify(hand, self.settings.anchor, aspect)
             track.observe(pose, now, anchor_fw, confirm)
 
         keep = [t for t in self._tracks if t.seen or t is self._pointer or now - t.last_seen <= self.settings.lost_s]

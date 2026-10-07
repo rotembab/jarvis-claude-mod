@@ -15,7 +15,7 @@ from jarvis_hands.poses import (
     pinch_ratio,
 )
 
-from scripted import POSES, hand
+from scripted import HEIGHT, POSES, SCALE, WIDTH, hand
 
 EXPECTED = {
     "palm": "palm",
@@ -113,8 +113,14 @@ def real_world(name: str) -> np.ndarray:
 
 
 def observation(world: np.ndarray, base: HandObservation | None = None) -> HandObservation:
+    """A hand whose image landmarks are ``world`` projected like ``scripted.hand`` does (1280 x 720)."""
     base = base or hand("palm")
-    return HandObservation(base.handedness, base.score, base.image, world)
+    k = SCALE / WIDTH
+    image = np.empty((21, 3))
+    image[:, 0] = 0.5 + world[:, 0] * k
+    image[:, 1] = 0.45 + world[:, 1] * SCALE / HEIGHT
+    image[:, 2] = (world[:, 2] - world[0, 2]) * k
+    return HandObservation(base.handedness, base.score, image, world)
 
 
 def with_reach(world: np.ndarray, finger: str, ratio: float) -> np.ndarray:
@@ -158,7 +164,7 @@ def test_measured_features_of_the_test_photos() -> None:
     index, middle, ring, pinky = finger_reach(real_world("victory"))
     assert index > 1.6 and middle > 1.6 and ring < 0.95 and pinky < 0.95
     # A fist brings the thumb onto the index: a pinch distance only the "index not curled" rule tells apart.
-    assert pinch_ratio(real_world("fist_mirrored"), INDEX_TIP) < 0.25
+    assert pinch_ratio(real_world("fist_mirrored"), INDEX_TIP) < 0.28
 
 
 def test_poses_do_not_depend_on_hand_size() -> None:
@@ -280,7 +286,7 @@ def test_reset_forgets_the_hysteresis() -> None:
 def test_thresholds_are_the_spec_values() -> None:
     th = PoseThresholds()
     assert (th.extended_enter, th.extended_leave, th.curled_enter, th.curled_leave) == (1.40, 1.25, 1.10, 1.20)
-    assert (th.pinch_close, th.pinch_open) == (0.25, 0.40)
+    assert (th.pinch_close, th.pinch_open) == (0.28, 0.40)
     with pytest.raises(AttributeError):
         th.pinch_close = 0.3  # type: ignore[misc]
 

@@ -6,12 +6,15 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    # 1.x is the ctypes-based Tasks-only package (no mediapipe.solutions); the
-    # hand landmarker API used here is mediapipe.tasks.python.vision.HandLandmarker.
-    "mediapipe==1.1.0",
+    # 0.10.33 is the newest MediaPipe without usage telemetry: 0.10.35 and later
+    # (1.x included) report usage to play.googleapis.com with no way to turn it
+    # off. Same ctypes Tasks API (mediapipe.tasks.python.vision.HandLandmarker),
+    # same hand model and the same results on MediaPipe's test photos.
+    "mediapipe==0.10.33",
     "numpy>=2",
-    # Camera capture, drawing and (later) ArUco calibration. mediapipe depends on it too.
-    "opencv-contrib-python>=4.10",
+    # Camera capture, drawing and (later) ArUco calibration; mediapipe depends on
+    # it too. OpenCV 5 changed APIs this code uses (cv2.utils.logging, ArucoDetector).
+    "opencv-contrib-python>=5.0,<6",
 ]
 
 [project.scripts]

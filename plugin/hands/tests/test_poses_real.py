@@ -77,8 +77,8 @@ def landmarker(models_dir: Path) -> Any:
     detector.close()
 
 
-def detect(landmarker: Any, models_dir: Path, name: str, *, mirror: bool) -> list[tuple[str, HandObservation]]:
-    """MediaPipe's own handedness label and the HandObservation for each hand in a test photo."""
+def detect(landmarker: Any, models_dir: Path, name: str, *, mirror: bool) -> list[tuple[str, HandObservation, float]]:
+    """MediaPipe's own handedness label, the HandObservation and the photo's aspect for each hand in a test photo."""
     import cv2
     import mediapipe as mp
 
@@ -104,6 +104,7 @@ def detect(landmarker: Any, models_dir: Path, name: str, *, mirror: bool) -> lis
                     image=np.array([[p.x, p.y, p.z] for p in result.hand_landmarks[i]], dtype=float),
                     world=np.array([[p.x, p.y, p.z] for p in world], dtype=float),
                 ),
+                bgr.shape[0] / bgr.shape[1],
             )
         )
     return hands
@@ -113,7 +114,7 @@ def detect(landmarker: Any, models_dir: Path, name: str, *, mirror: bool) -> lis
 @pytest.mark.parametrize("name", list(EXPECTED))
 def test_poses_on_mediapipe_test_photos(landmarker: Any, models_dir: Path, name: str, mirror: bool) -> None:
     hands = detect(landmarker, models_dir, name, mirror=mirror)
-    poses = sorted(PoseTracker().classify(obs).pose for _, obs in hands)
+    poses = sorted(PoseTracker().classify(obs, aspect=aspect).pose for _, obs, aspect in hands)
     assert poses == EXPECTED[name]
 
 
@@ -123,5 +124,5 @@ def test_handedness_labels_name_the_hand_as_photographed(landmarker: Any, models
     MediaPipe Tasks labels them "right"; mirrored, as the tracker feeds frames, it labels them "left". So
     the tracker must swap the label after mirroring for ``handedness`` to name the user's own hand.
     """
-    assert [label for label, _ in detect(landmarker, models_dir, "right_hands", mirror=False)] == ["right", "right"]
-    assert [label for label, _ in detect(landmarker, models_dir, "right_hands", mirror=True)] == ["left", "left"]
+    assert [label for label, _, _ in detect(landmarker, models_dir, "right_hands", mirror=False)] == ["right", "right"]
+    assert [label for label, _, _ in detect(landmarker, models_dir, "right_hands", mirror=True)] == ["left", "left"]

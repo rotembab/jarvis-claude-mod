@@ -1,15 +1,20 @@
-"""Per-hand pose classification from MediaPipe's world landmarks, with hysteresis.
+"""Per-hand pose classification from MediaPipe's image landmarks, with hysteresis.
 
-Every feature is a ratio of distances in the metric, hand-centred world
-landmarks, so it holds whatever the hand's distance to the camera:
+The features are computed on the image landmarks scaled to frame widths on
+every axis, ``(x, y * height / width, z)`` (MediaPipe's ``z`` uses roughly the
+scale of ``x``). Every feature is a ratio of distances, so it holds whatever
+the hand's distance to the camera. World landmarks would be metric, but their
+depth is poor: on MediaPipe's OK-sign photo the world thumb-to-index distance
+is 4 to 7 cm with the tips touching, which hides the pinch.
 
-- finger reach ``|tip - wrist| / |mcp - wrist|``: about 1.6 to 2.0 for a
-  straight finger and 0.7 to 1.05 for a curled one on MediaPipe's own test
-  photos. Extended and curled each have an enter and a leave threshold, and
-  the band between them belongs to neither, so a half-bent finger never
-  flickers between the two.
+- finger reach ``|tip - wrist| / |mcp - wrist|``: 1.5 to 2.2 for a straight
+  finger, 1.3 to 1.4 for a relaxed one and 0.7 to 0.95 for a curled one on
+  MediaPipe's own test photos. Extended and curled each have an enter and a
+  leave threshold, and the band between them belongs to neither, so a
+  half-bent finger never flickers between the two.
 - pinch ``|thumb tip - finger tip| / palm size`` (palm size: wrist to the
-  middle knuckle), closing below 0.25 and opening above 0.40. A fist also
+  middle knuckle), closing below 0.28 and opening above 0.40: 0.13 and 0.22
+  on the OK-sign photo, 0.39 and up for open or relaxed hands. A fist also
   brings the thumb onto the index, so the index pinch only counts while the
   index is not curled; in a pointing pose the thumb rests on the curled middle
   finger, so the middle pinch only counts while the middle is not curled and
@@ -42,7 +47,7 @@ class PoseThresholds:
     extended_leave: float = 1.25
     curled_enter: float = 1.10
     curled_leave: float = 1.20
-    pinch_close: float = 0.25
+    pinch_close: float = 0.28
     pinch_open: float = 0.40
     #: Pinch ratio shown as fully open (0) by the overlay's closing arc; ``pinch_close`` shows as 1.
     pinch_display_open: float = 0.80
@@ -60,27 +65,36 @@ class HandPose:
     curled: tuple[bool, bool, bool, bool]
 
 
-def finger_reach(world: np.ndarray) -> tuple[float, float, float, float]:
-    """Reach ratio per finger (index, middle, ring, pinky)."""
-    wrist = world[WRIST]
+#: Height over width of the camera frame when the caller does not say (1280 x 720).
+DEFAULT_ASPECT = 720 / 1280
+
+
+def pose_points(image: np.ndarray, aspect: float = DEFAULT_ASPECT) -> np.ndarray:
+    """Image landmarks in frame widths on every axis: ``(x, y * aspect, z)``, aspect = height / width."""
+    return np.asarray(image, dtype=float) * np.array([1.0, aspect, 1.0])
+
+
+def finger_reach(points: np.ndarray) -> tuple[float, float, float, float]:
+    """Reach ratio per finger (index, middle, ring, pinky) of a (21, 3) landmark array."""
+    wrist = points[WRIST]
     reach = []
     for name in FINGER_ORDER:
         mcp, tip = FINGERS[name]
-        base = float(np.linalg.norm(world[mcp] - wrist))
-        reach.append(float(np.linalg.norm(world[tip] - wrist)) / base if base > 1e-9 else 0.0)
+        base = float(np.linalg.norm(points[mcp] - wrist))
+        reach.append(float(np.linalg.norm(points[tip] - wrist)) / base if base > 1e-9 else 0.0)
     return reach[0], reach[1], reach[2], reach[3]
 
 
-def palm_size(world: np.ndarray) -> float:
-    return float(np.linalg.norm(world[WRIST] - world[MIDDLE_MCP]))
+def palm_size(points: np.ndarray) -> float:
+    return float(np.linalg.norm(points[WRIST] - points[MIDDLE_MCP]))
 
 
-def pinch_ratio(world: np.ndarray, tip: int) -> float:
+def pinch_ratio(points: np.ndarray, tip: int) -> float:
     """Thumb tip to ``tip`` over the palm size."""
-    size = palm_size(world)
+    size = palm_size(points)
     if size < 1e-9:
         return float("inf")
-    return float(np.linalg.norm(world[THUMB_TIP] - world[tip])) / size
+    return float(np.linalg.norm(points[THUMB_TIP] - points[tip])) / size
 
 
 def anchor_point(image: np.ndarray, mode: AnchorMode = "knuckles") -> Point:
@@ -105,14 +119,18 @@ class PoseTracker:
         self._pinch_index = False
         self._pinch_middle = False
 
-    def classify(self, hand: HandObservation, anchor: AnchorMode = "knuckles") -> HandPose:
+    def classify(
+        self, hand: HandObservation, anchor: AnchorMode = "knuckles", aspect: float = DEFAULT_ASPECT
+    ) -> HandPose:
+        """``aspect``: the camera frame's height over its width."""
         th = self.thresholds
-        reach = finger_reach(hand.world)
+        points = pose_points(hand.image, aspect)
+        reach = finger_reach(points)
         for i, r in enumerate(reach):
             self._extended[i] = r > th.extended_leave if self._extended[i] else r > th.extended_enter
             self._curled[i] = r < th.curled_leave if self._curled[i] else r < th.curled_enter
 
-        index_ratio = pinch_ratio(hand.world, INDEX_TIP)
+        index_ratio = pinch_ratio(points, INDEX_TIP)
         if self._curled[0]:
             self._pinch_index = False
         else:
@@ -121,7 +139,7 @@ class PoseTracker:
         if self._curled[1] or self._pinch_index:
             self._pinch_middle = False
         else:
-            self._pinch_middle = self._closed(self._pinch_middle, pinch_ratio(hand.world, MIDDLE_TIP))
+            self._pinch_middle = self._closed(self._pinch_middle, pinch_ratio(points, MIDDLE_TIP))
 
         extended = (self._extended[0], self._extended[1], self._extended[2], self._extended[3])
         curled = (self._curled[0], self._curled[1], self._curled[2], self._curled[3])

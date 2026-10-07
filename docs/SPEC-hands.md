@@ -20,7 +20,7 @@ Out of scope for this version: the projector wall mode (camera aimed at the proj
 
 ```text
 plugin/hands/                     the hand helper: uv project "jarvis-hands", package jarvis_hands (src layout)
-  pyproject.toml, uv.lock         mediapipe==1.1.0, numpy, opencv-contrib-python; dev: pytest, jsonschema
+  pyproject.toml, uv.lock         mediapipe==0.10.33 (the newest without usage telemetry), numpy, opencv-contrib-python 5; dev: pytest, jsonschema
   src/jarvis_hands/
     __init__.py                   __version__ (the helper versions on its own; the plugin version is bumped as usual)
     __main__.py                   python -m jarvis_hands
@@ -41,12 +41,14 @@ plugin/hands/                     the hand helper: uv project "jarvis-hands", pa
     calibration.py                four-corner calibration flow
     executor.py                   applies actions to the desktop: smoothing, buttons, windows, safety
     runtime.py                    wires camera -> tracker -> engine -> executor + overlay; command handler
+    synthetic.py                  synthetic hands (a small kinematic model) for tests and `run --fake`
     models.py                     hand model download (sha256 checked)
     doctor.py                     JSON health report
-    desktop/  base.py windows.py fake.py unsupported.py
-    camera/   base.py opencv_camera.py fake.py
-    tracker/  base.py mediapipe_tracker.py fake.py
-    overlay/  base.py render.py windows.py
+    preview.py                    camera window with the tracked hands drawn on it
+    desktop/  base.py windows.py fake.py           create_desktop() in __init__
+    camera/   base.py opencv_camera.py fake.py     create_camera(), list_cameras()
+    tracker/  base.py mediapipe_tracker.py fake.py create_tracker()
+    overlay/  base.py render.py windows.py         create_overlay() (NullOverlay off Windows)
   tests/
 plugin/protocol/hands.schema.json helper <-> mod messages for hands (authoritative)
 plugin/hooks/hands.ts             the mod side: supervisor, controller, /jarvis hands, the `hands` tool
@@ -69,8 +71,8 @@ Same contract as the voice helper ([SPEC-phase1.md](SPEC-phase1.md#process-model
 
 ## Coordinates and units
 
-- **Camera space**: the frame is mirrored (flipped left-right) before tracking, so it reads like a mirror: moving your right hand to your right moves it right in the image. Normalized `x, y` in `[0, 1]`, origin top-left. MediaPipe's handedness then names the user's real hand.
-- **World landmarks**: metres, from MediaPipe's `hand_world_landmarks`. All pose features use these, so they hold whatever the distance to the camera.
+- **Camera space**: mirrored, so it reads like a mirror: moving your right hand to your right moves it right. The model runs on the raw camera frame, where MediaPipe's Tasks handedness is anatomical (a right hand is "Right"; flipping the frame would swap the label), and the tracker then mirrors the landmarks: image `x' = 1 - x`, world `x' = -x`. Normalized `x, y` in `[0, 1]`, origin top-left; `x` can stray slightly outside when a hand is cut by the frame edge.
+- **Pose space**: image landmarks as `(x, y * height / width, z)`, all in frame widths (MediaPipe's `z` uses roughly the scale of `x`). Pose features are ratios of distances here. World landmarks (metres) are kept for reference, but their depth is poor: on MediaPipe's OK-sign photo the world thumb-index distance is 4 to 7 cm with the tips touching.
 - **Desktop space**: physical pixels in Windows' virtual-screen coordinates. The helper makes itself per-monitor DPI aware (v2) before any other Windows call, so every rect and cursor position is in physical pixels, and monitors left of or above the primary have negative coordinates.
 - **Time**: seconds from `time.monotonic()`; the engine and executor take `now` as an argument so tests drive the clock.
 
@@ -96,14 +98,14 @@ Landmark indices are MediaPipe's: 0 wrist; thumb 1-4; index 5-8; middle 9-12; ri
 
 ## Poses (poses.py)
 
-Per hand, per frame, from world landmarks, with per-hand hysteresis state (a `PoseTracker` keyed by track id):
+Per hand, per frame, from the pose-space points `P` (see Coordinates), with per-hand hysteresis state (a `PoseTracker` keyed by track id):
 
-- palm size `s = |w0 - w9|` (wrist to middle MCP; about 9 cm).
-- finger reach `r_f = |tip - w0| / |mcp - w0|` for index (8/5), middle (12/9), ring (16/13), pinky (20/17). Measured on MediaPipe's test images: straight fingers 1.6 to 2.0, curled 0.7 to 1.05.
+- palm size `s = |P0 - P9|` (wrist to middle MCP).
+- finger reach `r_f = |tip - P0| / |mcp - P0|` for index (8/5), middle (12/9), ring (16/13), pinky (20/17). Measured on MediaPipe's test photos: straight fingers 1.5 to 2.2, relaxed 1.3 to 1.4, curled 0.7 to 0.95; the OK sign's index (pinching) 1.3.
   - extended: enters above 1.40, leaves below 1.25.
   - curled: enters below 1.10, leaves above 1.20.
-- index pinch `p_i = |w4 - w8| / s`: closes below 0.25, opens above 0.40, and only while the index is not curled (a fist brings the thumb near the index too: 0.36 on the test fist).
-- middle pinch `p_m = |w4 - w12| / s`: same thresholds, only while the middle finger is not curled and the index pinch is open (in a pointing pose the thumb rests on the curled middle finger).
+- index pinch `p_i = |P4 - P8| / s`: closes below 0.28, opens above 0.40, and only while the index is not curled (a fist brings the thumb near the index too: 0.20 on the test fist). The OK-sign photo gives 0.13 and 0.22; open and relaxed hands 0.39 and up.
+- middle pinch `p_m = |P4 - P12| / s`: same thresholds, only while the middle finger is not curled and the index pinch is open (in a pointing pose the thumb rests on the curled middle finger).
 
 The pose, in priority order: `pinch` (index pinch closed), `pinch_middle`, `fist` (all four fingers curled), `two` (index and middle extended, ring and pinky curled), `palm` (all four extended, index pinch open), else `hover`.
 
@@ -195,12 +197,12 @@ class Desktop(Protocol):
     def close(self) -> None
 ```
 
-`windows.py` implements it with ctypes only (no pywin32). `fake.py` keeps displays, windows and a log of calls for tests. `unsupported.py` (macOS, Linux) raises `UnsupportedPlatform` at construction; the helper then reports `unsupported_platform`.
+`windows.py` implements it with ctypes only (no pywin32). `fake.py` keeps displays, windows and a log of calls for tests. `create_desktop()` raises `UnsupportedPlatform` off Windows; the helper then reports `unsupported_platform`.
 
 ## Camera and tracker
 
-- `camera/opencv_camera.py`: `cv2.VideoCapture` on Media Foundation (DirectShow as fallback), MJPG, 1280 x 720 at 30 fps requested; a reader thread keeps only the newest frame. `--camera` takes an index or part of a camera's name. Errors become `camera_blocked` (Windows privacy switch), `camera_in_use`, `no_camera` or `camera_lost` with a hint.
-- `tracker/mediapipe_tracker.py`: `HandLandmarker` in VIDEO mode, two hands, detection confidence 0.6, presence and tracking 0.5. It mirrors the frame, converts BGR to RGB and returns `HandObservation`s. Closed explicitly on exit.
+- `camera/opencv_camera.py`: `cv2.VideoCapture` on Media Foundation (DirectShow as fallback), 1280 x 720 at 30 fps requested; a reader thread keeps only the newest frame. `--camera` takes an index or part of a camera's name. Errors become `camera_blocked` (Windows privacy switch), `camera_in_use`, `no_camera` or `camera_lost` with a hint.
+- `tracker/mediapipe_tracker.py`: `HandLandmarker` in VIDEO mode on the raw frame (BGR to RGB with `cv2.cvtColor`, never a strided view), then mirrors the landmarks (see Coordinates). One hand by default; the runtime asks for two only while a window is grabbed (two-hand resize), because with two requested the palm detector runs on every frame while one hand is in view (about twice the CPU). Closed explicitly on exit.
 - Fakes replay scripted frames so the whole runtime runs in tests without a camera or a model.
 
 ## Overlay (overlay/)
