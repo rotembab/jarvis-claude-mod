@@ -221,12 +221,19 @@ class _LastFrame:
 class _CameraRequest:
     """A pause or resume waiting for the loop thread to close or reopen the camera."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, resume: bool) -> None:
         self.done = threading.Event()
+        #: A resume: its answer says why the camera could not open (a pause's answer never does).
+        self.resume = resume
         #: (error code, message) when reopening the camera failed.
         self.error: tuple[protocol.ErrorCode, str] | None = None
         #: The command stopped waiting (it answered ``pending``), so a failure has to go out as an event.
         self.abandoned = False
+
+    @property
+    def awaits_error(self) -> bool:
+        """A resume still waiting: a camera that fails to open is in its answer, not an event."""
+        return self.resume and not self.abandoned
 
     def finish(self, error: tuple[protocol.ErrorCode, str] | None) -> None:
         self.error = error
@@ -496,9 +503,19 @@ class HandsRuntime:
             log.info("paused while the camera was opening: it is off again")
             self._countermand_resumes()
         except CameraError as exc:
-            self._finish_requests((exc.code, exc.message))
-            self._fatal(exc.code, exc.message, exc.hint)
-            return
+            with self._lock:
+                # A pause came while the camera opened, then the open failed: the camera is off, as the pause
+                # wanted. Start paused, not failed, as the loop does after a reopen that fails.
+                paused = self._paused
+                requests, self._requests = self._requests, []
+                if paused and not any(request.awaits_error for request in requests):
+                    self._report(exc.code, exc.message, exc.hint, always=True)
+            for request in requests:
+                request.finish((exc.code, exc.message))
+            if not paused:
+                self._fatal(exc.code, exc.message, exc.hint)
+                return
+            log.warning("paused while the camera was opening, which then failed: %s: %s", exc.code, exc.message)
         finally:
             with self._lock:
                 self._start_opening = False
@@ -680,14 +697,22 @@ class HandsRuntime:
             if failed and error is not None:
                 with self._lock:
                     self._paused = True
+                    # A pause and a resume that came while it opened waited on this open too: the next pass
+                    # would find the camera off and answer that resume "ok".
+                    requests += self._requests
+                    self._requests = []
+                    # As a pause does: no calibration or engage asked for meanwhile waits for the next resume.
+                    self._disengage_all("command")
                     self._sync_state()
-                    # Nobody left waiting for the answer (no request, or every one gave up): say it as an
+                    # No resume left waiting for the answer (none, or every one gave up): say it as an
                     # event, so a camera a resume could not reopen still reaches the status line.
-                    if not any(not request.abandoned for request in requests):
+                    if not any(request.awaits_error for request in requests):
                         # Never throttled: a resume that answered "pending" waits for this one.
                         self._report(error[0], error[1], always=True)
         for request in requests:
             request.finish(error)
+        if failed:
+            self._release_everything()  # after the answers: a resume deciding on its answer is not kept waiting
 
     def _finish_requests(self, error: tuple[protocol.ErrorCode, str] | None) -> None:
         """Answer every command waiting on the camera (``start()`` only: after it, the loop does)."""
@@ -1132,16 +1157,19 @@ class HandsRuntime:
 
     def _cmd_pause(self, body: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            if self._paused:
-                return protocol.ok_response()
-            self._paused = True
-            self._disengage_all("command")
-            self._sync_state()
-            self._last_visible = None
-            self._show(OverlayState())
-            request = self._camera_request()
-        log.info("pause requested")
-        self._release_everything()
+            again = self._paused
+            if not again:
+                self._paused = True
+                self._disengage_all("command")
+                self._sync_state()
+                self._last_visible = None
+                self._show(OverlayState())
+            # A pause again waits as well: the first may have answered "pending" with the camera still opening.
+            # With the camera off, the loop's next pass answers it at once.
+            request = self._camera_request(resume=False)
+        if not again:
+            log.info("pause requested")
+            self._release_everything()
         # The loop may be in the middle of a camera open: say the camera is still on its way out, so the mod
         # does not tell the user it is off while its light is still on.
         pending = request is not None and not self._wait(request, PAUSE_WAIT_S)
@@ -1154,7 +1182,7 @@ class HandsRuntime:
             self._paused = False
             if not self._ready:  # the camera never opened yet: start() or the loop opens it now
                 self._sync_state()
-            request = self._camera_request()
+            request = self._camera_request(resume=True)
             # Nothing to wait on before start() gets to the camera, which it then opens: not on yet.
             opening_later = not self._ready and not self._failed and not self._stop_event.is_set()
         log.info("resume requested")
@@ -1168,7 +1196,7 @@ class HandsRuntime:
             return protocol.error_response(*request.error)
         return protocol.ok_response()
 
-    def _camera_request(self) -> _CameraRequest | None:
+    def _camera_request(self, *, resume: bool) -> _CameraRequest | None:
         """A request for the loop (or ``start()``'s open) to reconcile the camera (runtime lock held).
 
         None when neither runs: the camera is not on and not on its way, so
@@ -1176,7 +1204,7 @@ class HandsRuntime:
         """
         if not self._loop_alive and not self._start_opening:
             return None
-        request = _CameraRequest()
+        request = _CameraRequest(resume=resume)
         self._requests.append(request)
         self._wake.set()
         return request
@@ -1221,6 +1249,10 @@ class HandsRuntime:
             if action == "start":
                 if self._paused:
                     return protocol.error_response("bad_request", "Hand control is paused; resume it to calibrate.")
+                if self._ready and self._camera is None:  # a resume is reopening it: the state still says paused
+                    return protocol.error_response(
+                        "bad_request", "The camera is still turning back on; calibrate once it is on."
+                    )
                 if engine is None or self._last_frame is None:  # starts with the first frame, on its clock
                     self._wish_calibrate = True
                 else:

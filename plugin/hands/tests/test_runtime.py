@@ -1038,9 +1038,15 @@ class SlowOpenCamera(FakeCamera):
 
     #: Seconds ``open`` takes; a class attribute, so the rig's own factory needs no arguments.
     open_s = 0.0
+    #: When set, ``open`` lasts until the test sets it instead: commands land in the open however slow the machine.
+    gate: threading.Event | None = None
 
     def open(self) -> CameraInfo:
-        time.sleep(type(self).open_s)
+        gate = type(self).gate
+        if gate is not None:
+            gate.wait(TIMEOUT)
+        else:
+            time.sleep(type(self).open_s)
         return super().open()  # raises when the rig asked this camera to fail
 
 
@@ -1048,6 +1054,9 @@ class SlowOpenCamera(FakeCamera):
 def slow_camera() -> Iterator[type[SlowOpenCamera]]:
     yield SlowOpenCamera
     SlowOpenCamera.open_s = 0.0
+    if SlowOpenCamera.gate is not None:
+        SlowOpenCamera.gate.set()  # an open still waiting on it ends before the rig stops
+    SlowOpenCamera.gate = None
 
 
 def test_a_resume_the_camera_outlasts_answers_pending_not_ok(
@@ -1177,6 +1186,129 @@ def test_a_resume_countermanded_by_a_pause_is_answered_as_an_error(
     assert rig.command("status")["state"] == "paused"
 
 
+def reopening_on_a_gated_camera(rig: Rig, slow_camera: type[SlowOpenCamera]) -> threading.Event:
+    """Paused, then resumed (``pending``): the loop is opening a camera until the test sets the gate it returns."""
+    assert rig.command("pause") == {"ok": True}
+    gate = slow_camera.gate = threading.Event()
+    assert rig.command("resume") == {"ok": True, "pending": True}
+    eventually(lambda: len(rig.cameras) == 2, what="the loop to open the camera")
+    return gate
+
+
+def test_a_resume_after_a_pause_during_a_reopen_that_fails_answers_with_the_error(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume, pause, resume again while a held webcam opens and then fails: the last resume must not say "on"."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera).started()
+    rig.next_camera_fails = "camera_in_use"
+    mark = len(rig.writer.snapshot())
+    gate = reopening_on_a_gated_camera(rig, slow_camera)
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.2)
+    assert rig.command("pause") == {"ok": True, "pending": True}
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", TIMEOUT)  # this one still waits when the open fails
+    resumed: list[dict[str, Any]] = []
+    resume = threading.Thread(target=lambda: resumed.append(rig.command("resume")))
+    resume.start()
+    try:
+        eventually(lambda: not rig.runtime._paused, what="the second resume")
+    finally:
+        gate.set()
+        resume.join(TIMEOUT)
+    assert resumed and resumed[0]["ok"] is False and resumed[0]["error"]["code"] == "camera_in_use"
+    assert rig.command("status")["state"] == "paused"
+    assert [e for e in rig.writer.snapshot()[mark:] if e["type"] == "error"] == []  # the answer says it
+    assert rig.command("resume") == {"ok": True}  # the user can try again
+    assert rig.command("status")["state"] == "idle"
+
+
+def test_a_reopen_that_fails_while_only_a_pause_waits_on_it_is_still_reported(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pause's answer never says why the camera could not open: that still goes out as an event."""
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", TIMEOUT)
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera).started()
+    rig.next_camera_fails = "camera_in_use"
+    mark = len(rig.writer.snapshot())
+    gate = reopening_on_a_gated_camera(rig, slow_camera)
+    paused: list[dict[str, Any]] = []
+    pause = threading.Thread(target=lambda: paused.append(rig.command("pause")))
+    pause.start()
+    try:
+        eventually(lambda: rig.runtime._paused, what="the pause")
+    finally:
+        gate.set()
+        pause.join(TIMEOUT)
+    assert paused == [{"ok": True}]
+    error = rig.writer.wait_for("error", after=mark)
+    assert (error["code"], error["fatal"]) == ("camera_in_use", False)
+
+
+def test_a_second_pause_while_the_camera_is_still_reopening_answers_pending_too(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Told "the camera is still starting", the user pauses again: not "the camera is off" while its light is on."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera).started()
+    gate = reopening_on_a_gated_camera(rig, slow_camera)
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.2)
+    assert rig.command("pause") == {"ok": True, "pending": True}
+    assert rig.command("pause") == {"ok": True, "pending": True}
+    gate.set()
+    eventually(lambda: not any(camera.is_open for camera in rig.cameras), what="the camera off again")
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", TIMEOUT)
+    assert rig.command("pause") == {"ok": True}  # off now: the loop answers it on its next pass
+
+
+def test_calibrate_while_a_resume_is_reopening_the_camera_is_refused(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The state says "paused" until the camera is back: no target and no 30 s timeout before it can see a hand."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera).started()
+    mark = len(rig.writer.snapshot())
+    gate = reopening_on_a_gated_camera(rig, slow_camera)
+    response = rig.command("calibrate", {"action": "start"})
+    assert response["ok"] is False and response["error"]["code"] == "bad_request"
+    assert "camera" in response["error"]["message"]
+    gate.set()
+    rig.writer.wait_for("state", state="idle", after=mark)
+    assert rig.writer.of("calibration") == []
+    assert rig.command("calibrate", {"action": "start"}) == {"ok": True}  # the camera is on: now it can
+    rig.writer.wait_for("calibration", step="top_left", after=mark)
+
+
+@pytest.mark.parametrize(("name", "body"), [("calibrate", {"action": "start"}), ("engage", {})])
+def test_a_reopen_that_fails_leaves_nothing_asked_meanwhile_for_the_next_resume(
+    make_rig: Callable[..., Rig],
+    slow_camera: type[SlowOpenCamera],
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    body: dict[str, Any],
+) -> None:
+    """Paused since hello, resumed (state "starting"), calibrate or engage, and Teams has the camera: as a pause
+    does, the failure drops what was asked, so a resume minutes later neither calibrates nor engages by itself."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera)
+    assert rig.command("pause") == {"ok": True}
+    rig.start()
+    rig.writer.wait_for("state", state="paused")
+    slow_camera.gate = threading.Event()
+    rig.next_camera_fails = "camera_in_use"
+    assert rig.command("resume") == {"ok": True, "pending": True}
+    assert rig.command(name, body) == {"ok": True}  # "starting": it waits for the first frame
+    slow_camera.gate.set()
+    rig.writer.wait_for("error", code="camera_in_use")
+    eventually(lambda: rig.command("status")["state"] == "paused", what="paused again")
+    rig.puppet.set({"pose": "hover"})  # a hand in view, no palm hold
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", TIMEOUT)
+    assert rig.command("resume") == {"ok": True}
+    eventually(lambda: rig.command("status")["fps"] > 0, what="frames through the engine")
+    assert rig.writer.of("calibration") == [] and rig.writer.gestures() == []
+    assert rig.command("status")["state"] == "idle"
+
+
 def starting_on_a_slow_camera(rig: Rig) -> threading.Thread:
     """Runs ``start()`` on its own thread (the command thread stays free) until the camera is opening."""
     starter = threading.Thread(target=rig.start)
@@ -1222,6 +1354,63 @@ def test_a_pause_while_start_is_opening_the_camera_answers_pending_when_the_open
     eventually(lambda: not any(camera.is_open for camera in rig.cameras), what="the camera to be off again")
     assert rig.command("status")["state"] == "paused"
     assert rig.writer.of("error") == []
+
+
+def test_a_second_pause_while_start_is_opening_the_camera_answers_pending_too(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.2)
+    gate = slow_camera.gate = threading.Event()
+    rig = make_rig(camera_type=slow_camera)
+    starter = starting_on_a_slow_camera(rig)
+    try:
+        assert rig.command("pause") == {"ok": True, "pending": True}
+        assert rig.command("pause") == {"ok": True, "pending": True}  # the camera light is still on
+    finally:
+        gate.set()
+        starter.join(TIMEOUT)
+    eventually(lambda: not any(camera.is_open for camera in rig.cameras), what="the camera to be off again")
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", TIMEOUT)
+    assert rig.command("pause") == {"ok": True}
+    assert rig.writer.of("error") == []
+
+
+@pytest.mark.parametrize("answered_first", [True, False])
+def test_a_pause_while_start_opens_a_camera_that_then_fails_leaves_hand_control_paused_not_failed(
+    make_rig: Callable[..., Rig],
+    slow_camera: type[SlowOpenCamera],
+    monkeypatch: pytest.MonkeyPatch,
+    answered_first: bool,
+) -> None:
+    """Teams holds the webcam and the user pauses while hand control starts: paused, with the reason, no restart.
+
+    ``answered_first``: the pause answered ``pending`` before the open failed; else it still waits then.
+    """
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.2 if answered_first else TIMEOUT)
+    gate = slow_camera.gate = threading.Event()
+    rig = make_rig(camera_type=slow_camera)
+    rig.next_camera_fails = "camera_in_use"
+    starter = starting_on_a_slow_camera(rig)
+    paused: list[dict[str, Any]] = []
+    pause = threading.Thread(target=lambda: paused.append(rig.command("pause")))
+    try:
+        pause.start()
+        if answered_first:
+            pause.join(TIMEOUT)
+        else:
+            eventually(lambda: rig.runtime._paused, what="the pause")
+    finally:
+        gate.set()
+        pause.join(TIMEOUT)
+        starter.join(TIMEOUT)
+    assert paused == [{"ok": True, "pending": True} if answered_first else {"ok": True}]
+    error = rig.writer.wait_for("error")
+    assert (error["code"], error["fatal"]) == ("camera_in_use", False)  # a pause answer never says it
+    assert rig.runtime.exit_code is None and rig.writer.states() == ["starting", "paused"]
+    assert rig.command("status")["state"] == "paused"
+    assert rig.command("resume") == {"ok": True}  # the loop runs, paused: a resume opens the camera
+    rig.writer.wait_for("ready")
+    eventually(lambda: rig.command("status")["state"] == "idle", what="the camera to be on")
 
 
 def test_a_resume_while_start_is_opening_the_camera_after_a_pause_waits_for_that_open(

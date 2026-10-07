@@ -11,6 +11,7 @@ import pytest
 from jarvis_hands import clock
 from jarvis_hands import executor as executor_module
 from jarvis_hands.actions import (
+    Action,
     Button,
     DragWindow,
     GrabWindow,
@@ -634,6 +635,75 @@ def test_release_all_drops_what_was_queued() -> None:
     assert not h.ex.grabbing
 
 
+def test_flush_ends_a_grab_whose_throw_was_queued_without_throwing() -> None:
+    w = FakeWindow(1, rect=Rect(300, 200, 700, 500))
+    h = Harness([PRIMARY, PROJECTOR], [w])
+    h.do(GrabWindow(500, 300), at=0.0)
+    h.ex.submit([ThrowWindow("right")], now=0.01)
+    h.ex.flush()  # a pause: nothing queued may act any more, yet the throw was the grab's end
+    h.ex.tick(0.02)
+    assert w.rect == Rect(300, 200, 700, 500)
+    assert not h.ex.grabbing
+
+
+class SlowRestoreDesktop(FakeDesktop):
+    """Restoring a maximized window holds the tick: the Windows backend waits up to RESTORE_WAIT_S for a busy app."""
+
+    def __init__(self, sim: SimulatedTime, window: FakeWindow, restore_s: float = 0.25) -> None:
+        super().__init__([PRIMARY, PROJECTOR], [window], cursor=(0, 0))
+        self.sim = sim
+        self.restore_s = restore_s
+
+    def restore(self, window: Window) -> None:
+        maximized = self.window(window.handle).state == "maximized"
+        super().restore(window)
+        if maximized:
+            self.sim.t += self.restore_s
+
+
+def play(ex: Executor, sim: SimulatedTime, frames: list[tuple[float, list[Action]]], until: float) -> None:
+    """Queues each frame's actions at its time, also while a tick is held, and ticks at 120 Hz on ``sim``."""
+    pending = list(frames)
+    while sim.t < until:
+        while pending and pending[0][0] <= sim.t:
+            t, actions = pending.pop(0)
+            ex.submit(actions, now=t)
+        ex.tick(sim.t)
+        sim.t += PERIOD
+
+
+def test_a_throw_queued_while_a_restore_holds_the_tick_still_lands() -> None:
+    sim = SimulatedTime()
+    w = FakeWindow(1, "Report", PRIMARY.work, state="maximized", normal_rect=Rect(300, 200, 1000, 700))
+    desktop = SlowRestoreDesktop(sim, w)
+    ex = Executor(desktop, displays=desktop.displays, clock=sim.clock)
+    # A quick fling: the first drag restores the window, and the throw is queued while that takes 0.25 s.
+    frames: list[tuple[float, list[Action]]] = [(0.0, [GrabWindow(900, 20)])]
+    frames += [(0.1 + i / 30, [DragWindow(1020 + 120 * i, 20)]) for i in range(3)]
+    frames.append((0.1 + 4 / 30, [ThrowWindow("right")]))
+    play(ex, sim, frames, until=1.0)
+    assert w.state == "maximized" and w.rect == PROJECTOR.work
+    assert not ex.grabbing
+
+
+@pytest.mark.parametrize("opening_frames", [pytest.param(2, id="let-go-in-that-batch"), pytest.param(5, id="later")])
+def test_a_drag_that_ends_while_a_restore_holds_the_tick_leaves_the_window_where_the_hand_let_go(
+    opening_frames: int,
+) -> None:
+    sim = SimulatedTime()
+    w = FakeWindow(1, "Mail", PRIMARY.work, state="maximized", normal_rect=Rect(400, 200, 1000, 700))
+    desktop = SlowRestoreDesktop(sim, w)
+    ex = Executor(desktop, displays=desktop.displays, clock=sim.clock)
+    # Pulled down off its title bar in five quick frames; then the fist opens (no drags meanwhile) and lets go.
+    frames: list[tuple[float, list[Action]]] = [(0.0, [GrabWindow(960, 15)])]
+    frames += [(0.2 + i / 30, [DragWindow(960, 75 + 60 * i)]) for i in range(5)]
+    frames.append((0.2 + (4 + opening_frames) / 30, [ReleaseWindow()]))
+    play(ex, sim, frames, until=1.0)
+    assert w.rect.y == 315 - 15  # the hand's last point, as far below the top edge as when it grabbed
+    assert len(desktop.calls_named("set_window_rect")) == 2  # the restore's placement, then only the newest step
+    assert not ex.grabbing
+
+
 # -- the desktop blocked (the lock screen, a UAC prompt) -------------------------------
 
 
@@ -761,6 +831,51 @@ def test_a_drag_keeps_the_size_the_app_chose_for_the_new_monitor() -> None:
     assert h.desktop.scaled
     assert (w.rect.width, w.rect.height) == (400, 300)  # not back to the grab-time 800 x 600
     assert w.rect.x == 1000 + 2300 - 1400
+
+
+LAPTOP = display(1, 0, 0, 2880, 1800, primary=True)
+EXTERNAL = display(2, 2880, 0, 1920, 1080)
+SCALES = {LAPTOP.id: 1.5, EXTERNAL.id: 1.0}
+
+
+def overlap(a: Rect, b: Rect) -> float:
+    return max(0.0, min(a.right, b.right) - max(a.left, b.left)) * max(0.0, min(a.bottom, b.bottom) - max(a.top, b.top))
+
+
+class MixedDpiDesktop(FakeDesktop):
+    """A laptop panel at 150 % with a monitor at 100 % on its right, and a per-monitor aware app.
+
+    Like Windows: after every move the window takes the scale of the monitor holding most of it, and on a change
+    the app takes the rect Windows suggests for it, the size for the new scale about the same centre.
+    """
+
+    def __init__(self, window: FakeWindow) -> None:
+        super().__init__([LAPTOP, EXTERNAL], [window], cursor=(0, 0))
+        self.scale = 1.5
+        self.dpi_changes = 0
+
+    def set_window_rect(self, window: Window, rect: Rect) -> None:
+        super().set_window_rect(window, rect)
+        w = self.window(window.handle)
+        scale = SCALES[max(self._displays, key=lambda d: overlap(w.rect, d.rect)).id]
+        if scale != self.scale:
+            k, self.scale = scale / self.scale, scale
+            self.dpi_changes += 1
+            width, height = w.rect.width * k, w.rect.height * k
+            w.rect = Rect(*Rect(w.rect.center.x - width / 2, w.rect.center.y - height / 2, width, height).rounded())
+
+
+def test_a_drag_onto_a_monitor_at_another_scale_changes_the_windows_dpi_once() -> None:
+    w = FakeWindow(1, "Notes", Rect(1500, 100, 1200, 900))  # 800 x 600 at 100 %
+    h = Harness()
+    h.desktop = MixedDpiDesktop(w)
+    h.ex = Executor(h.desktop, displays=h.desktop.displays)
+    h.do(GrabWindow(1600, 400), at=0.0)  # near its left edge, where keeping the cursor's relative place is no cure
+    for i in range(1, 101):  # right at 600 px/s, across the boundary
+        h.do(DragWindow(1600 + 20 * i, 400), at=i / 30)
+    assert h.desktop.dpi_changes == 1  # not a flip at every frame while the window straddles the boundary
+    # Where the app put it (shrunk about its centre: 200 px right, 150 px down), then moved with the hand.
+    assert w.rect == Rect(1500 + 200 + 2000, 100 + 150, 800, 600)
 
 
 def test_a_two_hand_resize_still_sets_the_size() -> None:

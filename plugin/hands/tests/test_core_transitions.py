@@ -27,7 +27,7 @@ from jarvis_hands.landmarks import Frame
 from jarvis_hands.poses import PoseTracker
 from jarvis_hands.settings import HandsSettings
 
-from scripted import HEIGHT, WIDTH, Blend, H, Rig, Script, camera_point, display
+from scripted import HEIGHT, WIDTH, Blend, H, Rig, Script, SyntheticPose, camera_point, display
 
 A = (0.5, 0.45)
 
@@ -242,6 +242,64 @@ def test_a_pinch_from_a_relaxed_hand_presses_once_it_lasted_two_frame_intervals(
     assert rig.executor.held == frozenset()
     rig.feed(script.hold(H("pinch", A), frames=1))
     assert rig.executor.held == {"left"}
+
+
+# -- one finger moving on its own past the thumb tucked against the curled ones ------------------------------
+
+#: Pointing into a fist, the scroll pose folding back into pointing, and pointing opening into the scroll pose:
+#: what the hand does next (``two`` is a scroll, ``point`` none). The other fingers hold still all along.
+ONE_FINGER: dict[tuple[SyntheticPose, SyntheticPose], list[str]] = {
+    ("point", "fist"): ["grab"],
+    ("two", "point"): [],
+    ("point", "two"): ["scroll_start"],
+}
+
+
+def min_jerk(k: float) -> float:
+    """How far a real finger is along a move ``k`` of the way through its time: slow, fast, slow."""
+    return 10 * k**3 - 15 * k**4 + 6 * k**5
+
+
+def one_finger(
+    start: SyntheticPose,
+    end: SyntheticPose,
+    seconds: float,
+    fps: float,
+    profile: Callable[[float], float] = lambda k: k,
+    options: dict[str, object] | None = None,
+) -> tuple[list[Button], list[str]]:
+    """``start`` held, then one finger moving it into ``end`` (``profile`` maps time to progress): the buttons
+    and the gestures that move made. ``options`` are more ``hand`` keywords for every frame, as for ``H``."""
+    noise = dict(options or {})
+    rig, script = engaged(fps, windows=[FakeWindow(1, "Explorer", Rect(500, 300, 900, 600))])
+    rig.feed(script.transition("palm", start, A, seconds=0.3, options=noise))
+    rig.feed(script.hold(H(start, A, options=noise), seconds=0.5))
+    before = len(rig.gestures)
+    n = script.count(seconds)
+    rig.feed([script.frame(Blend(start, end, profile(i / n), A, options=noise)) for i in range(1, n + 1)])
+    rig.feed(script.hold(H(end, A, options=noise), seconds=0.5))
+    return buttons(rig), rig.gestures[before:]
+
+
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+@pytest.mark.parametrize("seconds", [0.45, 0.6, 0.8, 1.0])
+@pytest.mark.parametrize(("start", "end"), list(ONE_FINGER))
+def test_one_finger_curling_or_uncurling_past_the_tucked_thumb_clicks_nothing(
+    start: SyntheticPose, end: SyntheticPose, seconds: float, fps: float
+) -> None:
+    """The finger passes through a pinch while the other fingers are already still: only its own motion tells
+    that pinch from a held one (a left click before the grab, a right-click before or after the scroll)."""
+    assert one_finger(start, end, seconds, fps) == ([], ONE_FINGER[start, end])
+
+
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+@pytest.mark.parametrize("seconds", [0.6, 0.8, 1.0, 1.5])
+@pytest.mark.parametrize(("start", "end"), list(ONE_FINGER))
+def test_one_finger_moving_at_a_real_fingers_pace_past_the_tucked_thumb_clicks_nothing(
+    start: SyntheticPose, end: SyntheticPose, seconds: float, fps: float
+) -> None:
+    """A real finger speeds up and slows down (``min_jerk``) instead of moving at one speed throughout."""
+    assert one_finger(start, end, seconds, fps, min_jerk) == ([], ONE_FINGER[start, end])
 
 
 # -- quick taps: a pinch let go before the hand settled into it is still a click ----------------------------
@@ -473,6 +531,21 @@ def test_a_noisy_relaxed_hand_closing_slowly_into_a_fist_clicks_nothing(fps: flo
     assert clicked == []
 
 
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+@pytest.mark.parametrize("seconds", [0.45, 0.8])
+@pytest.mark.parametrize(("start", "end"), list(ONE_FINGER))
+def test_a_noisy_finger_moving_on_its_own_past_the_tucked_thumb_clicks_nothing(
+    start: SyntheticPose, end: SyntheticPose, seconds: float, fps: float
+) -> None:
+    """The finger's own motion is measured over the pinch's few frames only: noise must not make it look still."""
+    clicked = []
+    for seed in range(8):
+        pressed, made = one_finger(start, end, seconds, fps, options=jittered(0.001, seed))
+        if pressed or made != ONE_FINGER[start, end]:
+            clicked.append((seed, made))
+    assert clicked == []
+
+
 @pytest.mark.parametrize("level", [0.001, 0.0015])
 @pytest.mark.parametrize("fps", [30.0, 60.0])
 @pytest.mark.parametrize("hold", [0.05, 0.1])
@@ -494,18 +567,27 @@ def test_noisy_quick_taps_still_click(level: float, fps: float, hold: float) -> 
 
 
 @pytest.mark.parametrize("fps", [30.0, 60.0])
-def test_a_noisy_held_pinch_presses_within_a_settle_window_of_the_hand_holding_still(fps: float) -> None:
-    """What the settle rule costs a drag: the press waits about ``SETTLE_WINDOW_S`` after the fingers stop."""
+@pytest.mark.parametrize("start", ["palm", "hover", "point"])
+def test_a_noisy_held_pinch_presses_within_a_settle_window_of_the_hand_holding_still(
+    start: SyntheticPose, fps: float
+) -> None:
+    """What the settle rule costs a drag: the press waits about ``SETTLE_WINDOW_S`` after the fingers stop.
+
+    From a relaxed or a pointing hand the other fingers are still already: there the index's own settling
+    (``SETTLE_FINGER_RATE``) is what the press waits for, and the press may even beat the hand's stop."""
     late = []
     for seed in range(10):
         noise = jittered(0.0015, seed)
         rig = Rig()
         script = Script(fps=fps)
         rig.feed(script.hold(H("palm", A, options=noise), seconds=1.0))
-        rig.feed(script.transition("palm", "pinch", A, seconds=0.2, options=noise))
+        if start != "palm":
+            rig.feed(script.transition("palm", start, A, seconds=0.3, options=noise))
+            rig.feed(script.hold(H(start, A, options=noise), seconds=0.4))
+        closing = script.transition(start, "pinch", A, seconds=0.2, options=noise)
         still = script.t
         down = None
-        for frame in script.hold(H("pinch", A, options=noise), seconds=0.3):
+        for frame in closing + script.hold(H("pinch", A, options=noise), seconds=0.3):
             if down is None and any(isinstance(a, Button) and a.down for a in rig.feed([frame])):
                 down = frame.t - still
         if down is None or down > 0.1 + 1.5 / fps:

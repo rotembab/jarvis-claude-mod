@@ -820,6 +820,22 @@ def test_a_moving_palm_after_a_break_in_tracking_does_not_engage(engine: Gesture
     assert not engine.engaged
 
 
+@pytest.mark.parametrize("reason", ["command", "desktop_locked"])
+def test_engage_always_follows_the_hand_at_once_after_a_break_in_tracking(
+    settings: HandsSettings, engine: GestureEngine, script: Script, reason: str
+) -> None:
+    """A pause disengages as the command does and its resume breaks tracking, like the lock screen: the hand
+    that was up then cannot be told from a new one, so neither waits for the hands to leave."""
+    settings.engage = "always"
+    run(engine, script.hold(H("hover", A), frames=3))
+    assert engine.engaged
+    engine.disengage(reason)
+    engine.reset_tracks()
+    script.t += 15.0  # the camera reopening (or the desktop locked): no frames
+    run(engine, script.hold(H("hover", A), frames=1))
+    assert engine.engaged
+
+
 def test_a_break_in_tracking_does_not_keep_an_engaged_hand_from_working(engine: GestureEngine, script: Script) -> None:
     """reset_tracks only ever comes with a disengage, but a stray one must not strand the pointer."""
     engage(engine, script)

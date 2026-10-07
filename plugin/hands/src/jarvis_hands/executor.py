@@ -20,9 +20,11 @@ Safety rules, in order of importance:
   (a press, the wheel, a window operation) is then dropped instead of fired
   in one burst, which Windows would read as a double-click. Only the newest
   ``MoveCursor`` of a batch is applied, consecutive drags and resizes
-  collapse to the last one, and letting go (``ReleaseAll``,
-  ``ReleaseWindow``, the up of a held button) is never dropped. ``flush()``
-  empties the queue down to those releases, for a pause, the lock screen and
+  collapse to the last one, the newest of them is applied however late (one
+  rect computed from the grab, it puts the window where the hand was last
+  seen), and letting go (``ReleaseAll``, ``ReleaseWindow``, a throw, the up
+  of a held button) is never dropped. ``flush()`` empties the queue down to
+  those releases, a throw only letting go, for a pause, the lock screen and
   the way out.
 - **The real mouse wins.** Each tick, while the executor owns the cursor, it
   reads the cursor and compares it with where it last put it (read back
@@ -49,11 +51,12 @@ does it: the cursor keeps its relative x across the window and sits at most
 ``TITLE_GRAB_PX`` below its top edge. Drags move the grab-time rect by the
 cursor's displacement, keeping whatever size the window has at the time (an
 app resizes itself when it crosses to a monitor with another DPI, and that
-must not be undone); a two-hand resize keeps the hands' first positions and
-scales the rect by the change in their separation. Throws move the
-window to the next display that way (same relative place, size scaled to
-the work area, maximized again if it was), snap it to that half of its
-display when there is none, maximize (up) or minimize (down).
+must not be undone; the drag goes on from where the app then put it); a
+two-hand resize keeps the hands' first positions and scales the rect by the
+change in their separation. Throws move the window to the next display that
+way (same relative place, size scaled to the work area, maximized again if it
+was), snap it to that half of its display when there is none, maximize (up)
+or minimize (down).
 
 Callbacks run on the executor's thread; they may call ``submit`` but must
 not call ``tick``.
@@ -219,7 +222,12 @@ class Executor:
     def flush(self) -> None:
         """Drop what is queued, down to the actions that let go of something. Any thread; never raises."""
         with self._queue_lock:
-            self._queue = [entry for entry in self._queue if _releases(entry[1])]
+            # A throw would still move the window: it only ends the grab.
+            self._queue = [
+                (t, ReleaseWindow() if isinstance(action, ThrowWindow) else action)
+                for t, action in self._queue
+                if _releases(action)
+            ]
 
     def set_desktop_blocked(self, blocked: bool) -> None:
         """The lock screen or a UAC prompt has the input (the runtime's check), or it is ours again.
@@ -348,13 +356,16 @@ class Executor:
         """What of ``batch`` is still worth doing (see the shelf-life rule in the module docstring)."""
         shelf = SHELF_FRAMES * self.frame_interval
         due: list[tuple[float, Action]] = []
-        for submitted, action in batch:
+        # The newest drag or resize goes out however late: one rect computed from the grab, it moves the window
+        # once, to where the hand was last seen, and it may be the gesture's end (the let-go can come later).
+        newest_step = max((i for i, (_, a) in enumerate(batch) if _window_step(a)), default=-1)
+        for i, (submitted, action) in enumerate(batch):
             fresh = shelf <= 0.0 or now - submitted <= shelf
             if _releases(action):
                 # Letting go always goes out; a button nobody holds any more only needs its move while fresh.
                 if fresh or not isinstance(action, Button) or action.button in self._held:
                     due.append((submitted, action))
-            elif not fresh:
+            elif not fresh and i != newest_step:
                 continue
             elif _window_step(action) and len(due) >= 2 and _same_step(due[-1][1], due[-2][1], action):
                 # A stalled tick holds a whole gesture: its steps in between changed nothing, because every
@@ -521,11 +532,17 @@ class Executor:
             if p.distance(grab.grab_point) >= RESTORE_DRAG_PX:
                 self._restore_at(grab, p)
             return
-        moved = grab.rect0.moved_to(grab.rect0.x + p.x - grab.ref.x, grab.rect0.y + p.y - grab.ref.y)
         # The size is read back, not carried from the grab: dragged onto a monitor with another DPI, the app
         # resizes itself for that monitor, and sending the grab-time size back would undo it. A two-hand
         # resize still sets the size, from the rect it last set.
         size = self._desktop.window_rect(grab.window)
+        last = grab.last_rect or grab.rect0
+        if (size.width, size.height) != (last.width, last.height):
+            # It also went where Windows suggests for the new DPI: go on from there (the anchor moves as far as
+            # the app moved it). Put back by its old top-left, most of it would be on the old monitor again, and
+            # its DPI and size would flip back and forth at every frame while it straddles the two.
+            grab.rect0 = Rect(grab.rect0.x + size.x - last.x, grab.rect0.y + size.y - last.y, size.width, size.height)
+        moved = grab.rect0.moved_to(grab.rect0.x + p.x - grab.ref.x, grab.rect0.y + p.y - grab.ref.y)
         self._set_rect(grab, Rect(moved.x, moved.y, size.width, size.height))
 
     def _resize(self, grab: _Grab, a: Point, b: Point) -> None:
@@ -625,8 +642,10 @@ def _same_step(*actions: Action) -> bool:
 
 
 def _releases(action: Action) -> bool:
-    """Whether the action lets go of something (never dropped, whatever else is)."""
-    return isinstance(action, ReleaseAll | ReleaseWindow) or (isinstance(action, Button) and not action.down)
+    """Whether the action lets go of something (never dropped, whatever else is); a throw ends its grab."""
+    if isinstance(action, Button):
+        return not action.down
+    return isinstance(action, ReleaseAll | ReleaseWindow | ThrowWindow)
 
 
 def _display_of(rect: Rect, displays: list[Display]) -> Display:

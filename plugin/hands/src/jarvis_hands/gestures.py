@@ -34,8 +34,10 @@ How a frame flows:
    neither moves nor drags, so the opening hand's own drift never lands in a
    drop, a drag or a window.
 4. **Pinches.** A hand closing into a fist, or opening out of one, passes
-   through a pinch, which must not click. So a pinch's button goes down only
-   once the other fingers have settled (``SETTLE_RATE``); a pinch let go
+   through a pinch, which must not click, and so does one finger curling or
+   uncurling on its own past the thumb. So a pinch's button goes down only
+   once the other fingers have settled (``SETTLE_RATE``) and its own finger
+   too (``SETTLE_FINGER_RATE``); a pinch let go
    before that is a quick tap and clicks whole as it ends, unless its finger
    curled on the way in or out (``_tap_verdict``). After a grab the pinches
    stay latched until the hand is open (``_let_go``).
@@ -107,6 +109,18 @@ SPEED_WINDOW_S = 0.1
 #: A pinch let go before that is a quick tap, which clicks as it ends (see ``_tap_verdict``).
 SETTLE_WINDOW_S = 0.1
 SETTLE_RATE = 0.3
+#: The pinching finger must hold still too: its own reach moves less than ``SETTLE_FINGER_RATE`` over the
+#: pinch's frames within that window (frames from before the pinch left out: the finger moved to get there).
+#: One finger curling into a fist, or uncurling out of one, past the thumb tucked against the curled fingers
+#: (pointing into a fist, the scroll pose into pointing and back) passes through a pinch while the others hold
+#: still all along.
+#: The numbers: a still finger through the real tracker (the same photos and noise) has a p99 of 0.1 to 0.4,
+#: the synthetic hands' with 0.001 frame widths of jitter 0.55 to 0.8; a finger moving at a real finger's pace
+#: (slow, fast, slow) past a thumb resting on the curled middle finger is at 1.4 to 2.9 where it is slowest
+#: in the pinch (medians over moves of 0.8 to 1.25 s, built from MediaPipe's pointing, V-sign and fist photos).
+#: So a held pinch still presses within about ``SETTLE_WINDOW_S`` of its fingers stopping (now and then a
+#: frame later under heavy noise), and such a move presses now and then only once it takes a second or more.
+SETTLE_FINGER_RATE = 1.0
 #: The slope is only taken over at least this long and three frames (two frame intervals), and the pinch
 #: itself must have lasted as long: over one interval, landmark noise alone can make a closing hand look still.
 SETTLE_MIN_S = 0.05
@@ -164,6 +178,11 @@ _S = TypeVar("_S")
 def _finger(pose: PoseName) -> int:
     """The finger (index 0, middle 1) the thumb pinches in ``pose``."""
     return 1 if pose == "pinch_middle" else 0
+
+
+def _others(pose: PoseName) -> tuple[int, ...]:
+    """The fingers that take no part in ``pose``: all but ``_finger(pose)``."""
+    return (0, 2, 3) if pose == "pinch_middle" else (1, 2, 3)
 
 
 class _Track:
@@ -238,7 +257,7 @@ class _Track:
         return p1.distance(p0) / (t1 - t0) if t1 - t0 > 1e-6 else 0.0
 
     def settled(self, pose: PoseName, began: float, since: float = -math.inf) -> bool:
-        """Whether the fingers that take no part in ``pose`` (a pinch that ``began`` then) are holding still.
+        """Whether the fingers that take no part in ``pose`` (a pinch that ``began`` then), and its own, hold still.
 
         The slope over the last ``SETTLE_WINDOW_S``, frames from before the
         pinch included: a hand that closed into the pinch has to stop before
@@ -249,25 +268,29 @@ class _Track:
         confirmed. Never back past
         ``since`` (the last frame the pinching finger was curled): the way down
         into a fist and back out of it could average out to no slope at all.
+        The pinching finger's own slope (``SETTLE_FINGER_RATE``) is taken over
+        the pinch's frames only.
         """
         pinch = [t for t, _ in self.reach if t >= began]
         if len(pinch) < 3 or pinch[-1] - pinch[0] < SETTLE_MIN_S - 1e-6:
             return False
-        slope = self._reach_slope(pose, since)
-        return slope is not None and abs(slope) <= SETTLE_RATE
+        slope = self._reach_slope(_others(pose), since)
+        if slope is None or abs(slope) > SETTLE_RATE:
+            return False
+        own = self._reach_slope((_finger(pose),), max(since, began))
+        return own is not None and abs(own) <= SETTLE_FINGER_RATE
 
     def closing(self, pose: PoseName) -> bool:
         """Whether the fingers that take no part in ``pose`` are curling faster than ``SETTLE_RATE``."""
-        slope = self._reach_slope(pose, -math.inf)
+        slope = self._reach_slope(_others(pose), -math.inf)
         return slope is not None and slope < -SETTLE_RATE
 
-    def _reach_slope(self, pose: PoseName, since: float) -> float | None:
+    def _reach_slope(self, fingers: tuple[int, ...], since: float) -> float | None:
         """Least-squares slope (reach units per second) of those fingers' mean reach; None without enough frames."""
         if not self.reach:
             return None
         end = self.reach[-1][0]
-        others = (0, 2, 3) if pose == "pinch_middle" else (1, 2, 3)
-        window = [(t, _mean(r, others)) for t, r in self.reach if t >= since and end - t <= SETTLE_WINDOW_S + 1e-6]
+        window = [(t, _mean(r, fingers)) for t, r in self.reach if t >= since and end - t <= SETTLE_WINDOW_S + 1e-6]
         if len(window) < 3 or end - window[0][0] < SETTLE_MIN_S - 1e-6:
             return None
         t_mean = sum(t for t, _ in window) / len(window)
@@ -349,7 +372,8 @@ class GestureEngine:
         self._pointer: _Track | None = None
         self._candidate: _Track | None = None
         self._engage_requested = False
-        #: After a command or real-mouse disengage, ``engage: always`` waits for the hands to leave first.
+        #: After a command or real-mouse disengage, ``engage: always`` waits for the hands to leave first (or for
+        #: a break in tracking, after which they cannot be told from new ones).
         self._always_blocked = False
         #: Set by ``reset_tracks``; the next frame starts the tracks over on its own clock.
         self._tracks_broken = False
@@ -603,7 +627,10 @@ class GestureEngine:
             track.restart(now)
             track.last_seen = now
         self._candidate = None
+        # The hands up when the gap began cannot be told from new ones, so none is held back: engage: always
+        # takes the next hand at once again, after a pause as after the lock screen (whose disengage blocks none).
         self._palm_blocked = set()
+        self._always_blocked = False
         self._engage_floor = self._last_hand_t = now
         self._cursor = None
         self._cursor_hist.clear()
