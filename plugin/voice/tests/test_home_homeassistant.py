@@ -491,7 +491,13 @@ class FakeHomeAssistant:
             self._http.socket = tls.wrap_socket(self._http.socket, server_side=True)
         quiet = logging.getLogger("fake_home_assistant.websocket")
         quiet.setLevel(logging.CRITICAL)  # the server would log the auth frame, token and all
-        self._ws = serve(self.ws_session, "127.0.0.1", 0, ssl=tls, logger=quiet)
+        if tls is not None:
+            tls.sslsocket_class = SturdyServerSocket  # serve() wraps its listening socket right away
+        try:
+            self._ws = serve(self.ws_session, "127.0.0.1", 0, ssl=tls, logger=quiet)
+        finally:
+            if tls is not None:
+                tls.sslsocket_class = ssl.SSLSocket
         scheme = "https" if tls is not None else "http"
         self.url = f"{scheme}://127.0.0.1:{self._http.server_address[1]}"
         ws_port = self._ws.socket.getsockname()[1]
@@ -1433,6 +1439,25 @@ def test_wizard_changes_the_settings_then_disconnects(tmp_path: Path, ha: FakeHo
     with pytest.raises(EOFError):
         ha_mod.wizard(ui, ctx)
     assert ui.asked == ["Home Assistant's address, as you open it in your browser"]
+
+
+class SturdyServerSocket(ssl.SSLSocket):
+    """The fake WebSocket server's listening TLS socket: it keeps accepting after one connection fails.
+
+    SSLSocket.accept() asks each new socket for its peer, which on macOS fails (EINVAL) for a
+    connection its client already dropped; the websockets server stops accepting on any error
+    from accept(), and every later client of the fake would wait until its own timeout.
+    """
+
+    def accept(self) -> tuple[socket.socket, Any]:
+        while True:
+            try:
+                return super().accept()
+            except OSError:
+                if self.fileno() == -1:  # closed: the server is shutting down
+                    raise
+                # Wait for the next connection, a little at a time, so a shutdown is noticed.
+                self.settimeout(0.2)
 
 
 def self_signed(tmp_path: Path) -> ssl.SSLContext:
