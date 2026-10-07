@@ -25,8 +25,8 @@ export const INTERRUPT_MS = 450
 export const ACTION_LIMIT = 6
 /** At rest the ring repaints on every this-many frames. */
 const SLEEPING_EVERY = 4
-/** The desktop redraws for a level change at most this often. */
-const LEVEL_REDRAW_MS = 250
+/** The desktop redraws for a level change at most this often (it swells and shrinks with the voice). */
+const LEVEL_REDRAW_MS = 150
 
 export const MODE_LABELS: Record<HudMode, string> = {
   offline: 'OFFLINE',
@@ -248,7 +248,7 @@ export class Hud {
   }
 
   private desktopLevelKey(): string {
-    return `${this.mode()}:${Math.round(this.mic * 5)}:${Math.round(this.out * 5)}`
+    return `${this.mode()}:${Math.round(this.mic * 10)}:${Math.round(this.out * 10)}`
   }
 
   private redrawDesktop(now: number): void {

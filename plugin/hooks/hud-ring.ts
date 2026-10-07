@@ -6,8 +6,9 @@
 // It follows the two reference images. At rest and listening: the monitor
 // photo, a glowing blue ring around "JARVIS" on a dark grid, a white arc to
 // its left and a sparse ring of dots. Thinking and speaking: the orange
-// sphere, a broken ring of glowing fragments around a bright core wrapped in
-// elliptical orbits. Every pixel is one of a few dozen colors (a ramp per
+// sphere, a turning 3D shell of glowing fragments (bright in front, dim
+// behind) around a bright core wrapped in orbits. The drawing swells and
+// shrinks with the voice (hudZoom); the backdrop stays put. Every pixel is one of a few dozen colors (a ramp per
 // mode, a white ramp, the backdrop), well under a Raster's 1,024 color pairs.
 
 export type HudMode = 'offline' | 'sleeping' | 'listening' | 'thinking' | 'speaking' | 'interrupted'
@@ -161,43 +162,43 @@ function blueRing(input: RingInput, r: number, a: number): Shade {
   return { main, white }
 }
 
-/** The orange sphere: broken fragments in a ring, orbits around a bright core. */
+/** The sphere's radius, inside the debris around it. */
+const SPHERE = 0.74
+
+/** The orange sphere, flat parts: shading, debris, orbits and the core (the shell is drawn by `drawShell`). */
 function amberSphere(input: RingInput, x: number, y: number, r: number, a: number): Shade {
   const { mode, t, out } = input
   const isSpeaking = mode === 'speaking'
   const level = isSpeaking ? Math.min(1, out) : 0.35
   let main = 0
 
-  // Fragments: three layers of glinting pieces at random radii, some gaps.
-  const layers = [
-    { count: 70, seed: 1, spin: 0.22, inner: 0.7, outer: 0.95, length: 0.1 },
-    { count: 120, seed: 7, spin: -0.12, inner: 0.6, outer: 0.98, length: 0.05 },
-    { count: 26, seed: 13, spin: 0.08, inner: 0.78, outer: 0.9, length: 0.02 },
-  ]
-  for (const layer of layers) {
-    const { k, at } = sector(a, layer.count, t * layer.spin)
-    const h1 = hash(k + layer.seed)
-    if (h1 < 0.3) continue
-    const h2 = hash(k + layer.seed + 0.37)
-    const h3 = hash(k + layer.seed + 0.71)
-    const from = layer.inner + h2 * (layer.outer - layer.inner - layer.length)
-    const to = from + layer.length * (0.4 + h3)
-    const span = layer.count === 26 ? 0.85 : 0.3 + h3 * 0.5 // the last layer is arcs
-    if (r < from || r > to || at > span) continue
-    const glint = 0.55 + 0.45 * Math.sin(t * (2 + h1 * 3) + k)
-    main = Math.max(main, (0.5 + 0.45 * h2) * (0.7 + 0.3 * glint) * (0.75 + level * 0.3))
+  // Volume: the sphere lit from the top left, and a rim of light.
+  if (r < SPHERE) {
+    const nz = Math.sqrt(1 - (r / SPHERE) ** 2)
+    const light = Math.max(0, (-0.45 * x - 0.55 * y) / SPHERE + 0.7 * nz)
+    main = 0.06 + light * 0.1
   }
-  // A broken inner shell.
-  const shell = sector(a, 9, -t * 0.15)
-  if (hash(shell.k + 3) > 0.35 && shell.at < 0.75) main = Math.max(main, band(r, 0.5, 0.018) * 0.55)
+  main = Math.max(main, band(r, SPHERE, 0.025) * 0.3)
 
-  // Orbits: tilted ellipses turning around the core.
+  // Debris outside the sphere: glinting pieces at random radii, some gaps, turning slowly.
+  const { k, at } = sector(a, 90, t * 0.12)
+  if (hash(k + 1) > 0.35) {
+    const h2 = hash(k + 1.37)
+    const h3 = hash(k + 1.71)
+    const from = 0.82 + h2 * 0.1
+    if (r > from && r < from + 0.03 + h3 * 0.06 && at < 0.3 + h3 * 0.5) {
+      const glint = 0.55 + 0.45 * Math.sin(t * (2 + h2 * 3) + k)
+      main = Math.max(main, (0.4 + 0.4 * h3) * (0.7 + 0.3 * glint))
+    }
+  }
+
+  // Orbits: tilted rings turning round the core.
   for (let i = 0; i < 3; i += 1) {
     const angle = (i * Math.PI) / 3 + t * (isSpeaking ? 0.6 : 1.1) * (i % 2 === 0 ? 1 : -1)
     const u = x * Math.cos(angle) + y * Math.sin(angle)
     const v = -x * Math.sin(angle) + y * Math.cos(angle)
-    const e = Math.hypot(u / 0.52, v / 0.15)
-    main = Math.max(main, band(e, 1, 0.05) * 0.5)
+    const e = Math.hypot(u / 0.44, v / 0.13)
+    main = Math.max(main, band(e, 1, 0.06) * 0.45)
   }
 
   // The core, and while speaking streaks out from it with the voice.
@@ -206,11 +207,85 @@ function amberSphere(input: RingInput, x: number, y: number, r: number, a: numbe
   main = Math.max(main, band(r, 0, core * 1.1) * 0.95)
   if (isSpeaking) {
     const ray = sector(a, 18, t * 0.3)
-    const reach = 0.2 + level * 0.55 * (0.5 + 0.5 * hash(ray.k + Math.floor(t * 8)))
-    if (ray.at < 0.18 && r > core && r < reach) main = Math.max(main, (1 - r / reach) * 0.9)
+    const reach = 0.2 + level * 0.5 * (0.5 + 0.5 * hash(ray.k + Math.floor(t * 8)))
+    if (ray.at < 0.18 && r > core && r < reach) main = Math.max(main, (1 - r / reach) * 0.85)
   }
   if (white < 0.25) white = 0
   return { main, white }
+}
+
+type ShellPoint = { x: number; y: number; z: number; glint: number }
+
+/** Points on the sphere's shell in patches, like the fragments of the reference (unit sphere, y up). */
+const SHELL: readonly ShellPoint[] = (() => {
+  const points: ShellPoint[] = []
+  const count = 400
+  const golden = Math.PI * (3 - Math.sqrt(5))
+  for (let i = 0; i < count; i += 1) {
+    const y = 1 - (2 * (i + 0.5)) / count
+    const ring = Math.sqrt(1 - y * y)
+    const lon = i * golden
+    // Patches: whole cells of latitude and longitude left out, as in the reference's broken shell.
+    const cell = Math.floor(((lon % TAU) / TAU) * 7) * 13 + Math.floor((y + 1) * 3)
+    if (hash(cell + 0.5) < 0.3 || hash(i + 0.25) < 0.2) continue
+    const lift = 0.94 + hash(i + 0.75) * 0.1
+    points.push({ x: Math.cos(lon) * ring * lift, y: y * lift, z: Math.sin(lon) * ring * lift, glint: hash(i + 0.9) })
+  }
+  return points
+})()
+
+/** The camera looks down on the sphere this far (radians), so it reads as a ball. */
+const TILT = 0.38
+
+/**
+ * The shell of the orange sphere, turning about its upright axis: each piece
+ * a short streak along its path, bright in front and dim behind.
+ */
+function drawShell(main: Float32Array, width: number, height: number, radius: number, zoom: number, t: number, isSpeaking: boolean): void {
+  const cx = (width - 1) / 2
+  const cy = (height - 1) / 2
+  const size = SPHERE * radius * zoom
+  const turn = t * (isSpeaking ? 0.35 : 0.55)
+  const cosTilt = Math.cos(TILT)
+  const sinTilt = Math.sin(TILT)
+  const project = (p: ShellPoint, angle: number): [number, number, number] => {
+    const x = p.x * Math.cos(angle) + p.z * Math.sin(angle)
+    const z = -p.x * Math.sin(angle) + p.z * Math.cos(angle)
+    const y = p.y * cosTilt - z * sinTilt
+    const depth = p.y * sinTilt + z * cosTilt
+    return [cx + x * size, cy - y * size, depth]
+  }
+  const plot = (px: number, py: number, value: number) => {
+    const ix = Math.round(px)
+    const iy = Math.round(py)
+    if (ix < 0 || iy < 0 || ix >= width || iy >= height) return
+    const at = iy * width + ix
+    if ((main[at] as number) < value) main[at] = value
+  }
+  for (const p of SHELL) {
+    const [x, y, depth] = project(p, turn)
+    const [tailX, tailY] = project(p, turn - 0.09)
+    const near = (depth + 1) / 2
+    const glint = 0.75 + 0.25 * Math.sin(t * 3 + p.glint * TAU)
+    const value = (0.18 + 0.72 * near * near) * glint * (0.6 + 0.4 * p.glint)
+    plot(x, y, value)
+    plot((x + tailX) / 2, (y + tailY) / 2, value * 0.8)
+    plot(tailX, tailY, value * 0.55)
+  }
+}
+
+/** How big the drawing is now: it swells and shrinks with the voice, and breathes while thinking. */
+export function hudZoom(input: RingInput): number {
+  switch (input.mode) {
+    case 'speaking':
+      return 0.84 + 0.16 * Math.min(1, input.out)
+    case 'listening':
+      return 0.95 + 0.06 * Math.min(1, input.mic)
+    case 'thinking':
+      return 0.92 + 0.03 * Math.sin(input.t * 2.6)
+    default:
+      return 1
+  }
 }
 
 function shade(input: RingInput, x: number, y: number): Shade {
@@ -299,14 +374,16 @@ export function ringPixels(input: RingInput, width: number, height: number): Int
   const cy = (height - 1) / 2
   const main = new Float32Array(width * height)
   const white = new Float32Array(width * height)
+  const zoom = hudZoom(input)
   for (let py = 0; py < height; py += 1) {
     for (let px = 0; px < width; px += 1) {
-      const { main: m, white: w } = shade(input, (px - cx) / radius, (py - cy) / radius)
+      const { main: m, white: w } = shade(input, (px - cx) / radius / zoom, (py - cy) / radius / zoom)
       main[py * width + px] = m
       white[py * width + px] = w
     }
   }
-  if (FAMILY[input.mode] !== 'amber') drawWord(white, width, height, radius, input.mode === 'offline' ? 0.75 : 1)
+  if (FAMILY[input.mode] === 'amber') drawShell(main, width, height, radius, zoom, input.t, input.mode === 'speaking')
+  else drawWord(white, width, height, radius, input.mode === 'offline' ? 0.75 : 1)
   const glow = look.glow > 0 ? blur(main, width, height, Math.max(1, Math.round(radius / 12))) : undefined
   const spacing = Math.max(4, Math.round(radius / 3))
   const pixels = new Int32Array(width * height)
