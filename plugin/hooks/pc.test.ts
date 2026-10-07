@@ -227,11 +227,11 @@ describe('the guard hook', () => {
     await startHelper($, w)
     w.realPaths.set('C:\\proj\\', 'C:\\proj')
     expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\deploy.ps1', content: 'x' })).toMatchObject({ result: 'ok' })
-    w.fileText.set('C:\\proj\\deploy.ps1', 'Set-MpPreference -DisableRealtimeMonitoring $true')
+    w.files.set('C:\\proj\\deploy.ps1', 'Set-MpPreference -DisableRealtimeMonitoring $true')
     expect(await bash($, 'wt -d . pwsh deploy.ps1')).toEqual({ deny: expect.stringMatching(/^Jarvis blocks this: it turns off Windows Defender/) })
     // A command that only reads it runs nothing of it; once it is deleted, there is nothing to judge.
     expect(await bash($, 'cat deploy.ps1')).toMatchObject({ result: 'ok' })
-    w.fileText.delete('C:\\proj\\deploy.ps1')
+    w.files.delete('C:\\proj\\deploy.ps1')
     expect(await bash($, 'wt -d . pwsh deploy.ps1')).toMatchObject({ result: 'ok' })
     expect(w.asked).toEqual([])
     // Its text never reaches the logs.
@@ -248,15 +248,15 @@ describe('the guard hook', () => {
     await startHelper($, w)
     w.askAnswer = 'Run it'
     // A harmless script reads clean and runs with no question.
-    w.fileText.set('/home/rotem/build.sh', 'npm run build\necho done')
+    w.files.set('/home/rotem/build.sh', 'npm run build\necho done')
     expect(await bash($, 'bash /home/rotem/build.sh')).toMatchObject({ result: { stdout: '' } })
     expect(w.asked).toEqual([])
     // A script that deletes files is held for a click.
-    w.fileText.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
+    w.files.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
     expect(await bash($, 'bash /home/rotem/clean.sh')).toMatchObject({ result: { stdout: '' } })
     expect(w.asked).toHaveLength(1)
     // A script that runs a never-list command is blocked with no question.
-    w.fileText.set('/home/rotem/evil.sh', 'mkfs.ext4 /dev/sdb1')
+    w.files.set('/home/rotem/evil.sh', 'mkfs.ext4 /dev/sdb1')
     expect(await bash($, 'bash /home/rotem/evil.sh')).toMatchObject({ deny: expect.stringMatching(/Jarvis blocks this/) })
     // A script Jarvis cannot read is held for a click (it does not run unasked).
     w.askAnswer = "Don't run it"
@@ -365,7 +365,7 @@ describe('the guard hook', () => {
     expect(w.asked.at(-1)).toMatch(/that deletes files, in this part: "rm -rf ~\/Documents" \([\d,]+ more characters not shown\)\. Run it\?$/)
 
     // The piece that runs a script, when what the script does sets the tier.
-    w.fileText.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
+    w.files.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
     await bash($, `${filler}; bash /home/rotem/clean.sh`)
     expect(w.asked.at(-1)).toMatch(/that deletes files, in this part: "bash \/home\/rotem\/clean\.sh" \([\d,]+ more characters not shown\)\. Run it\?$/)
   })
@@ -677,7 +677,7 @@ describe('voice consent', () => {
     })
     const w = world(on)
     const helper = await startHelper($, w)
-    w.fileText.set('/home/rotem/ship.sh', 'git push')
+    w.files.set('/home/rotem/ship.sh', 'git push')
     await heard(w, helper, 'Ship it', 'u1')
     await turn($, w, 'Ship it', 't1')
     expect(await bash($, 'bash /home/rotem/ship.sh')).toEqual({ deny: expect.stringMatching(HELD) })
@@ -685,7 +685,7 @@ describe('voice consent', () => {
     await answered(w, helper, 't1', 'Yes.', 'u2')
     await turn($, w, 'Yes.', 't2')
     // The same command, but the script now does something else: the yes was not for that.
-    w.fileText.set('/home/rotem/ship.sh', 'npm publish')
+    w.files.set('/home/rotem/ship.sh', 'npm publish')
     expect(await bash($, 'bash /home/rotem/ship.sh')).toEqual({ deny: expect.stringMatching(/^Jarvis held this: it publishes a package/) })
     await completeTurn($, 't2')
     // Asked again and answered: exactly that script runs.

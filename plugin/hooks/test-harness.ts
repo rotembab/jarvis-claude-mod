@@ -1,7 +1,7 @@
 // Test support for the *.test.ts files: a fake world beneath the plugin.
 // The testing kit's `on` hooks stand for the engine, so these answer every
 // call the mod makes: a fake helper process, its HTTP control server, the
-// clock, the filesystem checks, prompt submission and turn aborts.
+// clock, the filesystem checks and reads, prompt submission and turn aborts.
 
 import { mock } from 'claude-code/testing'
 import type { Engine as TestEngine, MockClock } from 'claude-code/testing'
@@ -37,6 +37,14 @@ export const DATA_DIR = 'C:\\Users\\Rotem\\.jarvis'
 export const VENV_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\venv\\Scripts\\python.exe'
 export const WINGET_UV = 'C:\\Users\\Rotem\\AppData\\Local\\Microsoft\\WinGet\\Links\\uv.exe'
 export const PORT = 50123
+/** The hand helper's python (hands.ts), a child of its own beside the voice helper. */
+export const HANDS_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\hands\\venv\\Scripts\\python.exe'
+export const HANDS_PORT = 50124
+/** The record /jarvis setup hands writes of what it installed. */
+export const HANDS_INSTALLED = 'C:\\Users\\Rotem\\.jarvis\\hands\\installed.json'
+/** The version the fake plugin.json says (the real one's is not read by the tests). */
+export const PLUGIN_VERSION = '0.5.0'
+const PLUGIN_JSON = /[\\/]\.claude-plugin[\\/]plugin\.json$/
 
 /** One spawned child the test drives: what it writes and when it exits. */
 export class FakeChild {
@@ -52,6 +60,10 @@ export class FakeChild {
 
   get isHelperRun(): boolean {
     return this.request.argv[0] === VENV_PYTHON && this.request.argv.includes('run')
+  }
+
+  get isHandsRun(): boolean {
+    return this.request.argv[0] === HANDS_PYTHON && this.request.argv.includes('run')
   }
 
   get hasExited(): boolean {
@@ -137,10 +149,14 @@ export type World = {
   state: Map<string, unknown>
   /** Paths that exist (`$.fs.write` adds to them). */
   existing: Set<string>
+  /**
+   * File contents `$.fs.read` serves (`$.fs.write` sets them; a test sets a
+   * script the guard reads before it runs); a missing path rejects. The
+   * plugin's own plugin.json is served apart.
+   */
+  files: Map<string, string>
   /** Every path `$.fs.exists` was asked about. */
   checked: string[]
-  /** What `$.fs.read` returns per path (the guard reads a script it is about to run); a missing path rejects. */
-  fileText: Map<string, string>
   /** What `$.fs.stat(path, { resolve: true })` resolves a path to (a link's or 8.3 short name's real target); a missing path rejects. */
   realPaths: Map<string, string>
   /** Paths that are symbolic links leading nowhere: `$.fs.list` of their folder shows them, and they do not stat. */
@@ -155,11 +171,15 @@ export type World = {
   uvOnPath: string | undefined
   /** Scripted behaviour per spawn (default: nothing, the test drives the child). */
   onSpawn: (child: FakeChild) => void
-  /** The helper's answer per command (default `{ ok: true }`). */
-  respond: (command: SentCommand) => { status: number; body: unknown }
+  /** The helper's answer per command (default `{ ok: true }`); a promise answers when it resolves. */
+  respond: (command: SentCommand) => Answer | Promise<Answer>
   helpers: () => FakeChild[]
   lastHelper: () => FakeChild
   named: (name: string) => SentCommand[]
+  /** The hand helper's runs, and the commands sent to the one on HANDS_PORT. */
+  handsHelpers: () => FakeChild[]
+  lastHands: () => FakeChild
+  handsNamed: (name: string) => SentCommand[]
   status: () => string | undefined
   /** Model responses served beneath `turn.step`, by `${turnId}:${index}`. */
   steps: Map<string, TurnStepChunk[]>
@@ -246,6 +266,8 @@ export const ADMIN_PROBE_ANSWERS: Record<'whoami' | 'reg' | 'id', string> = {
   id: '1000\n',
 }
 
+export type Answer = { status: number; body: unknown }
+
 export type WorldOptions = {
   env?: Record<string, string>
   /** Whether the helper's venv exists (default true). */
@@ -268,8 +290,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     store: new Map(),
     state: new Map(),
     existing: new Set(installed ? [VENV_PYTHON] : []),
+    files: new Map(),
     checked: [],
-    fileText: new Map(),
     realPaths: new Map(),
     links: new Set(),
     writeError: undefined,
@@ -298,6 +320,13 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       return helper
     },
     named: name => w.commands.filter(command => command.name === name),
+    handsHelpers: () => w.children.filter(child => child.isHandsRun),
+    lastHands: () => {
+      const hands = w.handsHelpers().at(-1)
+      if (hands === undefined) throw new Error('no hand helper was spawned')
+      return hands
+    },
+    handsNamed: name => w.commands.filter(command => command.url === `http://127.0.0.1:${HANDS_PORT}/v1/${name}`),
     status: () => w.statuses.at(-1),
     settle: async (rounds = 8) => {
       for (let i = 0; i < rounds; i += 1) await clock.settle()
@@ -395,11 +424,14 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('fs.write', ($, e) => {
     if (w.writeError !== undefined) throw new Error(w.writeError)
     w.existing.add(windowsPath(e.path))
+    w.files.set(windowsPath(e.path), e.text)
     return { value: undefined }
   })
   on('fs.read', ($, e) => {
-    const text = w.fileText.get(windowsPath(e.path))
-    if (text === undefined) throw new Error('ENOENT')
+    const path = windowsPath(e.path)
+    if (PLUGIN_JSON.test(path)) return { value: JSON.stringify({ name: 'jarvis', version: PLUGIN_VERSION }) }
+    const text = w.files.get(path)
+    if (text === undefined) throw new Error(`ENOENT: no such file or directory, open '${path}'`)
     return { value: text }
   })
   on('fs.stat', ($, e) => {
@@ -445,7 +477,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     const code = yield* child.chunks()
     return { value: { code, signal: null } }
   })
-  on('http.fetch', ($, e) => {
+  on('http.fetch', async ($, e) => {
     const url = new URL(e.url)
     const command: SentCommand = {
       name: url.pathname.replace(/^\/v1\//, ''),
@@ -454,7 +486,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       headers: e.init?.headers ?? {},
     }
     w.commands.push(command)
-    const { status, body } = w.respond(command)
+    const { status, body } = await w.respond(command)
     return { value: { status, ok: status < 300, headers: {}, text: JSON.stringify(body) } }
   })
   on('prompt.submit', ($, e) => {

@@ -1,0 +1,223 @@
+"""Token-protected HTTP control server on 127.0.0.1 (mod -> helper commands).
+
+``POST /v1/<command>`` with ``Authorization: Bearer <token>`` and a JSON body.
+A command whose answer must be on the wire before it takes effect (``shutdown``
+tears this server down) is handled through ``on_sent``, which runs once the
+response has been written: the handler threads are daemon threads that nothing
+joins, so a stop requested before the write can cut the answer off.
+This helper moves the real mouse, so the guard is the voice helper's, unchanged:
+browsers are shut out twice over (any ``Origin`` header is rejected against
+CSRF, and ``Host`` must be ``127.0.0.1:<port>`` or ``localhost:<port>`` against
+DNS rebinding), the token is compared in constant time, and bodies are capped
+before they are read.
+"""
+
+from __future__ import annotations
+
+import hmac
+import json
+import logging
+import socket
+import socketserver
+import sys
+import threading
+from collections.abc import Callable
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+
+from . import __version__, protocol
+
+log = logging.getLogger(__name__)
+
+MAX_BODY_BYTES = 64 * 1024
+
+CommandHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+
+def _encode(payload: dict[str, Any]) -> bytes:
+    # allow_nan=False: a NaN fps or inference time must fail here, not in the mod's JSON.parse.
+    return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _reject_constant(name: str) -> Any:
+    # json.loads accepts NaN and Infinity by default; they are not JSON.
+    raise ValueError(f"{name} is not valid JSON")
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # SO_REUSEADDR on Windows would let another socket bind our port.
+    allow_reuse_address = False
+
+    def __init__(self, control: ControlServer, address: tuple[str, int]) -> None:
+        self.control = control
+        super().__init__(address, _Handler)
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        # Skip HTTPServer.server_bind: its socket.getfqdn() can stall for
+        # seconds on Windows machines with slow reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name, self.server_port = str(host), int(port)
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: _Server
+    protocol_version = "HTTP/1.1"
+    server_version = f"jarvis-hands/{__version__}"
+    sys_version = ""
+    timeout = 10  # idle keep-alive connections and slow clients
+
+    # -- plumbing
+
+    def log_message(self, format: str, *args: Any) -> None:
+        log.debug("http %s - %s", self.address_string(), format % args)
+
+    def _send(self, status: int, payload: dict[str, Any], *, close: bool = False) -> None:
+        self._send_encoded(status, _encode(payload), close=close)
+
+    def _send_encoded(self, status: int, body: bytes, *, close: bool = False) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if close:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _fail(self, status: int, code: protocol.ErrorCode, message: str, *, close: bool = False) -> None:
+        self._send(status, protocol.error_response(code, message), close=close)
+
+    def _guard(self) -> bool:
+        """Origin / Host / token checks shared by every method. True = allowed."""
+        control = self.server.control
+        if self.headers.get("Origin") is not None:
+            self._fail(403, "unauthorized", "requests with an Origin header are not accepted", close=True)
+            return False
+        host = (self.headers.get("Host") or "").strip().lower()
+        port = control.port
+        if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._fail(403, "unauthorized", "unexpected Host header", close=True)
+            return False
+        auth = self.headers.get("Authorization") or ""
+        scheme, _, given = auth.partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(
+            given.strip().encode("utf-8"), control.token.encode("utf-8")
+        ):
+            self._fail(401, "unauthorized", "missing or invalid bearer token", close=True)
+            return False
+        return True
+
+    # -- methods
+
+    def do_POST(self) -> None:
+        if not self._guard():
+            return
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/v1/") or "/" in path[4:]:
+            self._fail(404, "bad_request", f"unknown path {path}", close=True)
+            return
+        name = path[4:]
+        if self.headers.get("Transfer-Encoding"):
+            self._fail(411, "bad_request", "chunked bodies are not supported; send Content-Length", close=True)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._fail(400, "bad_request", "invalid Content-Length", close=True)
+            return
+        if length < 0:
+            self._fail(400, "bad_request", "invalid Content-Length", close=True)
+            return
+        if length > MAX_BODY_BYTES:
+            # Do not read it: answer and drop the connection.
+            self._fail(413, "bad_request", f"body larger than {MAX_BODY_BYTES} bytes", close=True)
+            return
+        # Read the body even for an unknown command, so a keep-alive connection stays in step.
+        raw = self.rfile.read(length) if length else b""
+        if name not in protocol.COMMAND_NAMES:
+            self._fail(404, "bad_request", f"unknown command {name!r}")
+            return
+        # A body that fails to parse or check, in any way, is the client's to fix: it
+        # gets a 400, never a dropped connection. A few kilobytes of "[" nest deeper
+        # than the decoder recurses (RecursionError, not a ValueError).
+        try:
+            body = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant) if raw.strip() else {}
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError
+            self._fail(400, "bad_request", f"body is not valid JSON: {type(exc).__name__}: {exc}")
+            return
+        try:
+            protocol.validate_command(name, body)
+        except protocol.ValidationError as exc:
+            self._fail(400, "bad_request", str(exc))
+            return
+        except Exception as exc:  # a validator bug; still refuse the body rather than drop the connection
+            log.exception("validating %s failed", name)
+            self._fail(400, "bad_request", f"body could not be checked: {type(exc).__name__}")
+            return
+        try:
+            encoded = _encode(self.server.control.handler(name, body))
+        except Exception as exc:  # the handler must never take the server down
+            log.exception("command %s failed", name)
+            self._fail(500, "internal", f"{type(exc).__name__}: {exc}")
+            return
+        try:
+            # Domain-level failures are still HTTP 200 with ok:false.
+            self._send_encoded(200, encoded)
+        finally:
+            # Also when the write failed: a shutdown must happen either way, or the helper would stay up.
+            self._sent(name)
+
+    def _sent(self, name: str) -> None:
+        """What the command does once its answer is written (see the module docstring)."""
+        on_sent = self.server.control.on_sent
+        if on_sent is None:
+            return
+        try:
+            on_sent(name)
+        except Exception:
+            log.exception("acting on %s after its answer failed", name)
+
+    def _method_not_allowed(self) -> None:
+        if self._guard():
+            self._fail(405, "bad_request", "use POST", close=True)
+
+    do_GET = do_PUT = do_DELETE = do_PATCH = _method_not_allowed  # noqa: N815
+
+
+class ControlServer:
+    """Owns the listening socket and the serving thread."""
+
+    def __init__(
+        self,
+        token: str,
+        handler: CommandHandler,
+        *,
+        host: str = "127.0.0.1",
+        on_sent: Callable[[str], None] | None = None,
+    ) -> None:
+        if not token:
+            raise ValueError("a non-empty token is required")
+        self.token = token
+        self.handler = handler
+        #: Called with the command's name once its answer has been written (``shutdown`` stops the helper).
+        self.on_sent = on_sent
+        self._httpd = _Server(self, (host, 0))
+        self.port: int = self._httpd.server_port
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.1}, name="control-server", daemon=True
+        )
+
+    def start(self) -> ControlServer:
+        self._thread.start()
+        log.info("control server listening on 127.0.0.1:%d", self.port)
+        return self
+
+    def stop(self) -> None:
+        if self._thread.is_alive():
+            self._httpd.shutdown()
+        self._httpd.server_close()

@@ -1,10 +1,10 @@
-// The UI: a status line entry ("JARVIS · <state>"), a band above the prompt
-// while the user is talking, and the HUD pane (the ring, what you said and
-// what Claude is doing).
+// The UI: a status line entry ("JARVIS · <state>", with hand control's part
+// while it is on), a band above the prompt while the user is talking, and the
+// HUD pane (the ring, what you said and what Claude is doing).
 
 import type { Elements, RenderElement } from 'claude-code'
 
-import type { HudAction, JarvisHud, JarvisPhase, JarvisView } from '../types'
+import type { HandsPhase, HudAction, JarvisHandsView, JarvisHud, JarvisPhase, JarvisView } from '../types'
 import type { HudMode } from './hud'
 import type { HudLayout } from './hud'
 import { ACTION_LIMIT, MODE_LABELS, REPLY_ROWS, RING_KEY } from './hud'
@@ -31,7 +31,31 @@ export function statusLine(view: JarvisView): string | undefined {
     failed: `stopped${detail} · /jarvis restart`,
   }
   const label = labels[view.phase]
-  return label === undefined ? undefined : `JARVIS · ${label}`
+  if (label === undefined) return undefined
+  const hands = view.hands === undefined ? undefined : handsLabel(view.hands)
+  return hands === undefined ? `JARVIS · ${label}` : `JARVIS · ${label} · ${hands}`
+}
+
+/** Hand control's part of the status line; undefined while it is off. */
+export function handsLabel(hands: JarvisHandsView): string | undefined {
+  const detail = hands.detail ? ` · ${hands.detail}` : ''
+  const labels: Record<HandsPhase, string | undefined> = {
+    off: undefined,
+    not_installed: 'hands not set up · /jarvis setup hands',
+    setup: `hands setting up${detail}`,
+    starting: 'hands starting',
+    idle: `hands ready · ${hands.engage === 'always' ? 'raise a hand' : 'open palm'} to start`,
+    active: 'hands active',
+    // The detail: why the camera could not open again, when it could not.
+    paused: `hands paused${detail}`,
+    calibrating: `hands calibrating${detail}`,
+    error: `hands stopped${detail}`,
+    restarting: `hands restarting${detail}`,
+    elsewhere: 'hands active in another window',
+    // A restart cannot cure a final error; its message says what can.
+    failed: hands.isFinal === true ? `hands stopped${detail}` : `hands stopped${detail} · /jarvis hands restart`,
+  }
+  return labels[hands.phase]
 }
 
 /** A ten-cell level meter for the microphone. */

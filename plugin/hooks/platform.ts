@@ -25,6 +25,10 @@ export type Platform = {
   localVenvDir: string
   /** Absolute path of the local voice venv's python. */
   localVenvPython: string
+  /** The hand helper's own venv (MediaPipe and OpenCV), kept apart from the voice helper's. */
+  handsVenvDir: string
+  /** Absolute path of the hand helper venv's python. */
+  handsVenvPython: string
   /** Fixed places uv is looked for, in order, before the PATH. */
   uvCandidates: string[]
   /** argv that prints uv's path(s) when it is on the PATH. */
@@ -66,6 +70,7 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
     const dataDir = joinPath(sep, home, '.jarvis')
     const venvDir = joinPath(sep, dataDir, 'venv')
     const localVenvDir = joinPath(sep, dataDir, 'local-voice', 'venv')
+    const handsVenvDir = joinPath(sep, dataDir, 'hands', 'venv')
     const appData = localAppData ?? joinPath(sep, home, 'AppData', 'Local')
     return {
       os,
@@ -76,6 +81,8 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
       venvPython: joinPath(sep, venvDir, 'Scripts', 'python.exe'),
       localVenvDir,
       localVenvPython: joinPath(sep, localVenvDir, 'Scripts', 'python.exe'),
+      handsVenvDir,
+      handsVenvPython: joinPath(sep, handsVenvDir, 'Scripts', 'python.exe'),
       uvCandidates: [
         joinPath(sep, home, '.local', 'bin', 'uv.exe'),
         joinPath(sep, appData, 'Microsoft', 'WinGet', 'Links', 'uv.exe'),
@@ -90,6 +97,7 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
   const dataDir = joinPath(sep, home, '.jarvis')
   const venvDir = joinPath(sep, dataDir, 'venv')
   const localVenvDir = joinPath(sep, dataDir, 'local-voice', 'venv')
+  const handsVenvDir = joinPath(sep, dataDir, 'hands', 'venv')
   return {
     os,
     sep,
@@ -99,6 +107,8 @@ export function describePlatform({ os, home, localAppData }: PlatformInputs): Pl
     venvPython: joinPath(sep, venvDir, 'bin', 'python'),
     localVenvDir,
     localVenvPython: joinPath(sep, localVenvDir, 'bin', 'python'),
+    handsVenvDir,
+    handsVenvPython: joinPath(sep, handsVenvDir, 'bin', 'python'),
     uvCandidates: [
       joinPath(sep, home, '.local', 'bin', 'uv'),
       joinPath(sep, home, '.cargo', 'bin', 'uv'),

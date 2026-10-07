@@ -56,6 +56,50 @@ jobs:
           JARVIS_WAKE_MODELS_DIR: ${{ runner.temp }}/wake-models
         run: uv run --locked --project plugin/voice pytest -q plugin/voice/tests
 
+  hands:
+    name: hands (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # MediaPipe's Linux wheel links EGL and GLES even when it runs on the CPU.
+      - name: Install EGL
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgles2
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: plugin/hands/uv.lock
+
+      - name: Lint
+        run: |
+          uvx ruff check --config plugin/hands/pyproject.toml plugin/hands
+          uvx ruff format --check --config plugin/hands/pyproject.toml plugin/hands
+
+      # --locked: /jarvis setup hands installs from the lock file, so it must stay current.
+      - name: Install the hand helper and its dev dependencies
+        run: uv sync --locked --project plugin/hands --group dev
+
+      # JARVIS_HANDS_MODELS_DIR lets the real-model tests download the hand model
+      # (about 8 MB, checked by SHA-256) and MediaPipe's test photos.
+      - name: Run hand helper tests
+        env:
+          JARVIS_HANDS_MODELS_DIR: ${{ runner.temp }}/hands-models
+        run: uv run --locked --project plugin/hands pytest -q plugin/hands/tests
+
   local-voice:
     name: local voice protocol
     runs-on: ubuntu-latest
