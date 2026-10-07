@@ -2,16 +2,17 @@
 // from `$` and wires the session's events to the coordinator (app.ts).
 
 import { atom, read, update } from 'claude-code'
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import { DESKTOP_TOOL_SPEC, GUARD_FAILED, wantsDesktopTool } from './pc'
-import type { GuardCall } from './pc'
+import { DESKTOP_TOOL, DESKTOP_TOOL_SPEC, GUARD_FAILED, wantsDesktopTool } from './pc'
+import type { AskPorts, GuardCall } from './pc'
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
 import { describeError } from './engine'
 import type { HandsEngine } from './hands'
-import { HANDS_TOOL, runHandsTool } from './hands'
+import { HANDS_TOOL } from './hands'
+import { callHandsTool, HANDS_TOOL_ID } from './hands-gate'
 import { actionLabel, HUD_PANE, hudLayout, hudMode, PANE_START } from './hud'
 import { bandTree, foldedRow, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
 
@@ -26,6 +27,26 @@ const foldedAtom = atom({ plugin: 'jarvis', key: 'folded' } as const, false)
 const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', ...PANE_START }
 /** How many folders up the guard looks for one that is there when it places a new file. */
 const REAL_PATH_DEPTH = 64
+
+/**
+ * A tool this plugin answers itself (the desktop and hands tools), through its
+ * hook's own `$`: the question dialog, the engine's verdict on the user's
+ * rules for `tool`, and each settings source as loaded (only the hooks'
+ * matchers are read there, and nothing of it is logged).
+ */
+function ownToolPorts($: EngineInterface, tool: string): AskPorts {
+  return {
+    ask: (question, options) => $.ui.ask(question, options),
+    check: input => $.tool.check({ tool, input }),
+    settings: async () => [
+      await $.settings.read({ source: 'user' }),
+      await $.settings.read({ source: 'project' }),
+      await $.settings.read({ source: 'local' }),
+      await $.settings.read({ source: 'flag' }),
+      await $.settings.read({ source: 'policy' }),
+    ],
+  }
+}
 
 export const register: Register = (on, options) => {
   const app = new Jarvis(readSettings(options))
@@ -160,7 +181,9 @@ export const register: Register = (on, options) => {
   // The command opens the HUD through its own `$`: the person asked, so it is placed at any width.
   on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: size => $.ui.open({ ...HUD_OPEN, ...size }) }))
 
-  on('tool.call', { tool: 'mcp__jarvis__hands' }, async ($, e) => ({ result: await runHandsTool(app.hands, e) })).catch(() => ({
+  // The hands tool: answered here like the desktop tool, so hands-gate.ts applies the user's own
+  // rules for it ($.tool.check), asks when a settings hook could match it, and keeps plan mode read-only.
+  on('tool.call', { tool: 'mcp__jarvis__hands' }, ($, e, next) => callHandsTool(app, e, ownToolPorts($, HANDS_TOOL_ID), next.signal)).catch(() => ({
     result: 'Hand control did not answer in time; /jarvis hands shows its state.',
   }))
 
@@ -189,21 +212,7 @@ export const register: Register = (on, options) => {
   // could match it (each source read on its own: only the hooks' matchers are looked at, and nothing
   // of it is logged), plan mode and the tiers. Outer to the HUD's hook too, so it logs its own actions there.
   on('tool.call', { tool: 'mcp__jarvis__desktop' }, ($, e, next) =>
-    app.pc.desktop(
-      e as unknown as Record<string, unknown>,
-      {
-        ask: (question, options) => $.ui.ask(question, options),
-        check: input => $.tool.check({ tool: 'mcp__jarvis__desktop', input }),
-        settings: async () => [
-          await $.settings.read({ source: 'user' }),
-          await $.settings.read({ source: 'project' }),
-          await $.settings.read({ source: 'local' }),
-          await $.settings.read({ source: 'flag' }),
-          await $.settings.read({ source: 'policy' }),
-        ],
-      },
-      next.signal,
-    ),
+    app.pc.desktop(e as unknown as Record<string, unknown>, ownToolPorts($, DESKTOP_TOOL), next.signal),
   ).catch(($, e, next) => (next.called ? next(e) : { deny: 'The desktop action failed, so it is not known whether it was done.' }))
   on('tool.describe', { tool: 'mcp__jarvis__desktop' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
 

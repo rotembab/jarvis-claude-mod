@@ -11,7 +11,8 @@
 // not when a PreToolUse or PermissionRequest hook in their settings could
 // match the tool, nor when the turn's mode is not known), keeps plan mode
 // read-only, and asks before the clipboard is read or the screen is captured
-// (a spoken yes in a voice turn, else a click; pc.ts).
+// (a spoken yes in a voice turn, else a click; pc.ts). The hands tool
+// (hands-gate.ts) applies the user's rules through the same checkRules.
 
 import type { Timer, ToolSpec } from 'claude-code'
 
@@ -359,6 +360,72 @@ const ASK_FIRST: Partial<Record<DesktopAction, Omit<Consent, 'agentId'>>> = {
   },
 }
 
+/** A call of a tool this plugin answers itself (the desktop tool, the hands tool), as checkRules judges it. */
+export type OwnToolCall = {
+  /** The name the model calls it by (`mcp__jarvis__desktop`). */
+  tool: string
+  /** Its name in words, as in "the desktop tool". */
+  name: string
+  /** What the call would do, in a few words ("lock the PC"). */
+  what: string
+  /** The call as `tool.call` carries it; its own keys (`tool`, `tool_use_id`, `agentId`) are not asked about. */
+  input: Record<string, unknown>
+}
+
+/**
+ * The user's own rules for a tool this plugin answers (`$.tool.check`), which
+ * the engine never applies to such a tool: a deny (a deny rule, dontAsk
+ * without an allow rule, an organization's ceiling) refuses; every ask (an
+ * ask rule, an `ask` ceiling, or the engine's own ask for a tool nothing
+ * allows yet) needs a yes first. Only an allow by the user's own rule (one
+ * the verdict names, not a mode's) runs unasked, and only while no hook in
+ * their settings could decide about the call (the engine runs none for this
+ * tool) and the turn's mode is known (`isModeStale` false). Rules or
+ * settings that cannot be read refuse.
+ */
+export async function checkRules(
+  app: Jarvis,
+  pc: PcControl,
+  call: OwnToolCall,
+  ports: AskPorts,
+  isModeStale: boolean,
+): Promise<'allow' | 'ask' | { deny: string }> {
+  const args: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(call.input)) if (!RESERVED.has(key)) args[key] = value
+  let verdict: RuleVerdict
+  try {
+    verdict = await ports.check(args)
+  } catch (error) {
+    // The rules could not be read: a click must not override a deny no one could see.
+    app.engine?.debug(`jarvis: ${call.name} permission check failed: ${describeError(error)}`)
+    return { deny: RULES_UNREADABLE }
+  }
+  const why = verdict.reason === undefined || verdict.reason === '' ? '' : ` (${clip(verdict.reason, 200)})`
+  const refused = { deny: `The user's permission settings do not let the ${call.name} tool ${call.what} here${why}.` }
+  if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
+  const isUsersAllow = verdict.decision === 'allow' && typeof verdict.rule === 'string' && verdict.rule !== '' && verdict.ceiling !== 'ask'
+  const gate = isUsersAllow && !isModeStale ? await settingsGate(app, call.tool, ports) : 'ask'
+  if (typeof gate === 'object') return gate
+  // dontAsk: what is not allowed beforehand is refused, never asked.
+  if (gate === 'ask' && pc.permissionMode === 'dontAsk') return refused
+  return gate
+}
+
+/**
+ * 'ask' when a PreToolUse or PermissionRequest hook in the user's settings
+ * could match the tool (the engine runs none for it), 'allow' when none
+ * could; a refusal when the settings could not be read. The settings are
+ * never logged: they hold secrets.
+ */
+async function settingsGate(app: Jarvis, tool: string, ports: AskPorts): Promise<'allow' | 'ask' | { deny: string }> {
+  try {
+    return settingsHooksMatch(await ports.settings(), tool) ? 'ask' : 'allow'
+  } catch {
+    app.engine?.debug('jarvis: the settings could not be read for their hooks')
+    return { deny: SETTINGS_UNREADABLE }
+  }
+}
+
 /** The tool's calls and the timers it set (module memory: a reload loses them). */
 export class DesktopTool {
   /** By label in lower case ('' for the unnamed one). */
@@ -397,7 +464,7 @@ export class DesktopTool {
     const what = describeRequest(request)
     // A change on the PC needs the mode known for this very turn: a Shift+Tab into plan mode may have come since.
     const isModeStale = !isReadOnly(request) && !this.pc.isModeKnownForTurn(agentId)
-    const gate = await this.checkRules(input, ports, what, isModeStale)
+    const gate = await checkRules(this.app, this.pc, { tool: DESKTOP_TOOL, name: DESKTOP_TOOL_NAME, what, input }, ports, isModeStale)
     if (typeof gate === 'object') return gate
     let isAsked = false
     if (gate === 'ask') {
@@ -425,59 +492,6 @@ export class DesktopTool {
     }
     if (signal?.aborted === true) return { result: 'The call was interrupted, so nothing was done.' }
     return { result: await this.send(request.body) }
-  }
-
-  /**
-   * The user's own rules for the tool (`$.tool.check`), which the engine never
-   * applies to a tool its plugin answers: a deny (a deny rule, dontAsk without
-   * an allow rule, an organization's ceiling) refuses; every ask (an ask rule,
-   * an `ask` ceiling, or the engine's own ask for a tool nothing allows yet)
-   * needs a yes on screen first. Only an allow by the user's own rule (one
-   * the verdict names, not a mode's) runs unasked, and only while no hook in
-   * their settings could decide about the call (the engine runs none for this
-   * tool) and the turn's mode is known (`isModeStale` false). Rules or
-   * settings that cannot be read refuse.
-   */
-  private async checkRules(
-    input: Record<string, unknown>,
-    ports: AskPorts,
-    what: string,
-    isModeStale: boolean,
-  ): Promise<'allow' | 'ask' | { deny: string }> {
-    const args: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(input)) if (!RESERVED.has(key)) args[key] = value
-    let verdict: RuleVerdict
-    try {
-      verdict = await ports.check(args)
-    } catch (error) {
-      // The rules could not be read: a click must not override a deny no one could see.
-      this.app.engine?.debug(`jarvis: desktop permission check failed: ${describeError(error)}`)
-      return { deny: RULES_UNREADABLE }
-    }
-    const why = verdict.reason === undefined || verdict.reason === '' ? '' : ` (${clip(verdict.reason, 200)})`
-    const refused = { deny: `The user's permission settings do not let the desktop tool ${what} here${why}.` }
-    if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
-    const isUsersAllow = verdict.decision === 'allow' && typeof verdict.rule === 'string' && verdict.rule !== '' && verdict.ceiling !== 'ask'
-    const gate = isUsersAllow && !isModeStale ? await this.settingsGate(ports) : 'ask'
-    if (typeof gate === 'object') return gate
-    // dontAsk: what is not allowed beforehand is refused, never asked.
-    if (gate === 'ask' && this.pc.permissionMode === 'dontAsk') return refused
-    return gate
-  }
-
-  /**
-   * 'ask' when a PreToolUse or PermissionRequest hook in the user's settings
-   * could match the tool (the engine runs none for it), 'allow' when none
-   * could; a refusal when the settings could not be read. The settings are
-   * never logged: they hold secrets.
-   */
-  private async settingsGate(ports: AskPorts): Promise<'allow' | 'ask' | { deny: string }> {
-    try {
-      return settingsHooksMatch(await ports.settings(), DESKTOP_TOOL) ? 'ask' : 'allow'
-    } catch {
-      this.app.engine?.debug('jarvis: the settings could not be read for their hooks')
-      return { deny: SETTINGS_UNREADABLE }
-    }
   }
 
   /** Why the helper cannot do it now; undefined when it can. */

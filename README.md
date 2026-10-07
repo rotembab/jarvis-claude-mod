@@ -177,7 +177,7 @@ Under the ring are the last thing you said and the last six things Claude ran (`
 Your webcam can drive the mouse and windows: point with your hand, pinch to click and drag files, make a fist to grab a window and fling it to another screen. It runs on Windows, needs a webcam, and is off until you turn it on.
 
 1. Install it once: `/jarvis setup hands` (about 500 MB: MediaPipe and OpenCV in `%USERPROFILE%\.jarvis\hands`, and an 8 MB hand model in `%USERPROFILE%\.jarvis\models\hands`).
-2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control". The camera light comes on.
+2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control" and answer yes when Jarvis asks. The camera light comes on.
 3. Hold an open palm toward the camera, still, for half a second. A cyan ring appears at the cursor, which now follows your hand.
 
 | Gesture | What it does |
@@ -196,7 +196,7 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 - `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
 - `/jarvis hands pause` turns the camera off without turning hand control off. It stays paused when the helper restarts and in new sessions, until `/jarvis hands resume`, `on` or `off`.
 - Some webcams take up to about 20 seconds to open. If the camera is still opening when `/jarvis hands resume` answers, it says so, and a message follows when the camera is on or why it could not open.
-- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand".
+- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand". Jarvis asks you first (a spoken yes when you talk, else a click) unless your own permission rules allow `mcp__jarvis__hands`, and a deny rule refuses it. In plan mode Claude can only check its status. [docs/PC-CONTROL.md](docs/PC-CONTROL.md#hand-controls-tool) has the details.
 - Hand control runs in one Claude Code window at a time, since one camera can serve only one. In another window `/jarvis hands` says where it runs; turning it off there and running `/jarvis hands restart` brings it to this window.
 - Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays (virtual display drivers and streaming dummies) are left out; USB display adapters count as real displays. `/jarvis hands display 1` keeps your hand on one display, and a display you leave out takes none of your reach.
 - Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.

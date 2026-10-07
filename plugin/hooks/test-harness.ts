@@ -611,6 +611,27 @@ export async function jarvis($: TestEngine, args: string): Promise<string> {
   return result.text ?? ''
 }
 
+let promptedTurns = 0
+
+/** A prompt in the main loop and the turn it starts (how the mod learns the turn's permission mode); the turn's id. */
+export async function promptTurn($: TestEngine, mode = 'default', text = 'Jarvis, hand control'): Promise<string> {
+  await $.classic.UserPromptSubmit({ prompt: text, permission_mode: mode })
+  promptedTurns += 1
+  const turnId = `prompted-${promptedTurns}`
+  await $.turn.start({ text, turnId })
+  return turnId
+}
+
+/**
+ * The user's own allow rule for `tool` (one the plugin answers itself, such as
+ * mcp__jarvis__hands) and a prompt's turn: its actions then run with no
+ * question of the rules' own. The turn's id.
+ */
+export async function allowedTurn($: TestEngine, w: World, tool: string, mode = 'default'): Promise<string> {
+  w.toolCheck = () => ({ decision: 'allow', rule: tool })
+  return await promptTurn($, mode)
+}
+
 /** Text chunks as a model streams them, cut into small deltas. */
 export function textChunks(text: string, index = 0, size = 7): TurnStepChunk[] {
   const chunks: TurnStepChunk[] = []
