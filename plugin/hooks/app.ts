@@ -9,6 +9,7 @@ import type { Engine } from './engine'
 import { describeError } from './engine'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
+import { HomeControl } from './home'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
@@ -110,6 +111,8 @@ export class Jarvis {
   platform: Platform | undefined
   helper: Helper | undefined
   voice: Voice | undefined
+  /** The home_control tool and /jarvis home (home.ts). */
+  readonly home: HomeControl = new HomeControl(this)
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined

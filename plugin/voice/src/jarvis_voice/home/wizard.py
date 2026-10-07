@@ -262,6 +262,14 @@ def setup_argv(data_dir: Path) -> list[str]:
     return [sys.executable, "-m", "jarvis_voice", "home", "setup", "--data-dir", str(data_dir)]
 
 
+# The window must not hold the caller's pipes open, or the mod waits until the window closes.
+_DETACHED_STREAMS: dict[str, Any] = {
+    "stdin": subprocess.DEVNULL,
+    "stdout": subprocess.DEVNULL,
+    "stderr": subprocess.DEVNULL,
+}
+
+
 def launch_in_new_console(data_dir: Path) -> tuple[bool, str]:
     """Opens the wizard in a console window of its own. Returns (opened, what to tell the user)."""
     argv = setup_argv(data_dir)
@@ -277,14 +285,16 @@ def launch_in_new_console(data_dir: Path) -> tuple[bool, str]:
             return True, "The Jarvis home setup window is open on your desktop."
         if sys.platform == "darwin":
             script = f'tell application "Terminal" to do script {_applescript_string(manual)}'
-            subprocess.Popen(["osascript", "-e", script, "-e", 'tell application "Terminal" to activate'])
+            subprocess.Popen(
+                ["osascript", "-e", script, "-e", 'tell application "Terminal" to activate'], **_DETACHED_STREAMS
+            )
             return True, "The Jarvis home setup window is open in Terminal."
         if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
             for terminal in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
                 if shutil.which(terminal) is None:
                     continue
                 extra = ["--"] if terminal == "gnome-terminal" else ["-e"]
-                subprocess.Popen([terminal, *extra, *argv], start_new_session=True)
+                subprocess.Popen([terminal, *extra, *argv], start_new_session=True, **_DETACHED_STREAMS)
                 return True, "The Jarvis home setup window is open."
     except OSError as exc:
         log.warning("could not open the setup window: %s", exc)

@@ -6,6 +6,7 @@ import type { CommandRunResult } from 'claude-code'
 
 import type { Jarvis, SttModel, VoiceEngine } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
+import { HOME_HELP } from './home'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
 import { ROUTING_MODES } from './router'
@@ -25,6 +26,7 @@ const HELP = [
   '/jarvis restart                  restart the voice helper',
   '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
   '/jarvis devices                  show the audio devices and models in use',
+  HOME_HELP,
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -64,6 +66,8 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: await routing(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
+      case 'home':
+        return { text: await app.home.command(rest) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }

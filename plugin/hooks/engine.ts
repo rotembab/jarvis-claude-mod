@@ -4,6 +4,7 @@
 // closures, and every other module depends on the port instead of on `$`.
 
 import type {
+  AskOptions,
   HookStream,
   HttpInit,
   HttpResponse,
@@ -59,6 +60,12 @@ export type Engine = {
   log: (text: string) => void
   /** A line in the debug log only. */
   debug: (text: string) => void
+  /**
+   * Asks the user in the engine's on-screen question dialog; resolves to the
+   * label chosen or the text typed under "Other". Rejects when the dialog is
+   * dismissed, and in a `-p` run (nobody to ask).
+   */
+  ask: (question: string, options: readonly string[] | AskOptions) => Promise<string>
 
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>

@@ -12,6 +12,7 @@ import type {
   ProcessSpawnChunk,
   ProcessSpawnRequest,
   PromptSubmitInput,
+  ToolSpec,
   TurnCompleteInput,
   TurnStepChunk,
   TurnStepInput,
@@ -101,6 +102,12 @@ export type SentCommand = {
   headers: Record<string, string>
 }
 
+/** One `$.process.run` the mod made (cwd as the mod gave it). */
+export type RunCall = { argv: readonly string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number }
+
+/** What a scripted `$.process.run` answers; `deny` rejects the call (it did not start, or timed out). */
+export type RunAnswer = { exitCode: number; stdout: string; stderr?: string } | { deny: string }
+
 export type World = {
   clock: MockClock
   children: FakeChild[]
@@ -149,6 +156,18 @@ export type World = {
   complete: (input: ModelCompleteInput) => ModelCompleteResult | Promise<ModelCompleteResult>
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
+  /** Every tool `$.tool.register` declared, in order. */
+  tools: ToolSpec[]
+  /** When set, `$.tool.register` is refused with it (a managed policy, a host that cannot add tools). */
+  toolRefusal: string | undefined
+  /** The questions `$.ui.ask` put to the user (AskUserQuestion). */
+  asked: string[]
+  /** The user's answer to `$.ui.ask`: a label, or text typed under "Other"; undefined dismisses the dialog. */
+  askAnswer: string | undefined
+  /** Every `$.process.run` the mod made. */
+  runs: RunCall[]
+  /** Answers a `$.process.run` the world does not know; undefined: exit 127 (no such program). */
+  onRun: (call: RunCall) => RunAnswer | undefined
 }
 
 export type WorldOptions = {
@@ -198,12 +217,30 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     settle: async (rounds = 8) => {
       for (let i = 0; i < rounds; i += 1) await clock.settle()
     },
+    tools: [],
+    toolRefusal: undefined,
+    asked: [],
+    askAnswer: undefined,
+    runs: [],
+    onRun: () => undefined,
   }
   const state = w.state
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => {
+    if (w.toolRefusal !== undefined) return { deny: w.toolRefusal }
+    w.tools.push(e)
+    return { value: { tool: `mcp__jarvis__${e.name}` } }
+  })
+  // `$.ui.ask` is a call of the AskUserQuestion tool: the person's answer, or a dismissal.
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const question = e.questions[0]?.question ?? ''
+    w.asked.push(question)
+    if (w.askAnswer === undefined) return { deny: 'dismissed' }
+    return { result: { questions: e.questions, answers: { [question]: w.askAnswer } } }
+  })
   on('ui.status', ($, e) => {
     w.statuses.push(e.text)
     return { value: undefined }
@@ -249,7 +286,18 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       return { value: run(w.uvOnPath === undefined ? 1 : 0, w.uvOnPath ?? '') }
     }
     if (command === 'uname') return { value: run(0, 'Linux\n') }
-    return { value: run(127, '') }
+    const init = e.init ?? {}
+    const call: RunCall = {
+      argv: e.argv,
+      ...(init.cwd === undefined ? {} : { cwd: windowsPath(init.cwd) }),
+      ...(init.env === undefined ? {} : { env: init.env }),
+      ...(init.timeoutMs === undefined ? {} : { timeoutMs: init.timeoutMs }),
+    }
+    w.runs.push(call)
+    const answer = w.onRun(call)
+    if (answer === undefined) return { value: run(127, '') }
+    if ('deny' in answer) return { deny: answer.deny }
+    return { value: { ...run(answer.exitCode, answer.stdout), stderr: answer.stderr ?? '' } }
   })
   on('process.spawn', async function* ($, e) {
     const child = new FakeChild(e.cwd === undefined ? e : { ...e, cwd: windowsPath(e.cwd) })
@@ -313,6 +361,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
+  on('classic.PostToolUse', () => ({}))
   return w
 }
 
