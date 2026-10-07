@@ -1,6 +1,6 @@
 # Developing Jarvis
 
-How to work on Jarvis on Windows: run your working copy inside Claude Code, run the tests, drive the voice helper by hand, and find out what went wrong. The engineering contract is [SPEC-phase1.md](SPEC-phase1.md); the helper <-> mod message format is [plugin/protocol/schema.json](../plugin/protocol/schema.json).
+How to work on Jarvis on Windows: run your working copy inside Claude Code, run the tests, drive the voice and hand helpers by hand, and find out what went wrong. The engineering contract is [SPEC-phase1.md](SPEC-phase1.md) for voice and [SPEC-hands.md](SPEC-hands.md) for hand control; the helper <-> mod message formats are [plugin/protocol/schema.json](../plugin/protocol/schema.json) and [plugin/protocol/hands.schema.json](../plugin/protocol/hands.schema.json).
 
 Commands below are for PowerShell (Windows Terminal). Git Bash is not needed.
 
@@ -13,9 +13,11 @@ plugin/                           the plugin, the only folder that ships
   hooks/                          the mod: TypeScript hooks module (register.tsx) and its *.test.ts
   types/index.d.ts                the mod's $.state contract
   tsconfig.json                   type-checks the mod (tsc -p plugin)
-  protocol/schema.json            helper <-> mod messages (authoritative)
+  protocol/schema.json            voice helper <-> mod messages (authoritative)
+  protocol/hands.schema.json      hand helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
-docs/                             the phase 1 spec and this file
+  hands/                          the hand helper: Python package jarvis_hands (its own uv project and venv)
+docs/                             the specs, the plan and this file
 ```
 
 ## Prerequisites
@@ -91,6 +93,19 @@ This creates `plugin\voice\.venv` (ignored by git). The tests need no microphone
 
 `--locked` fails if `uv.lock` no longer matches `pyproject.toml`. After changing dependencies, run `uv lock --project plugin\voice` and commit the new `uv.lock`; `/jarvis setup` installs from it.
 
+### Hand helper (Python)
+
+```powershell
+uv sync --locked --project plugin\hands --group dev
+uv run --locked --project plugin\hands pytest -q plugin\hands\tests
+uvx ruff check --config plugin\hands\pyproject.toml plugin\hands
+uvx ruff format --check --config plugin\hands\pyproject.toml plugin\hands
+```
+
+This creates `plugin\hands\.venv`. The tests need no camera and no display: the camera, the tracker and the desktop have fakes (`camera\fake.py`, `tracker\fake.py`, `desktop\fake.py`), gestures are written as scripts of synthetic hands (`tests\scripted.py`, built on `jarvis_hands.synthetic`), and the Windows desktop and reticle code also runs against stand-in Win32 layers that check every call against its declared prototype. On Windows, the tests in `test_desktop_windows.py` and `test_overlay_windows.py` also drive the real cursor and create real windows for a moment, so leave the mouse alone while they run. The real MediaPipe model tests (the tracker, and poses on MediaPipe's own test photos) are skipped unless `JARVIS_HANDS_MODELS_DIR` names a folder for the model and photos (downloaded there when missing, about 8 MB); CI sets it.
+
+MediaPipe is pinned to 0.10.33 on purpose: 0.10.35 and later send usage telemetry to Google with no way to turn it off. Do not upgrade it without checking that is still so.
+
 ### Mod (TypeScript)
 
 ```powershell
@@ -106,11 +121,11 @@ tsc -p plugin                   # type-checks the mod (see below)
 
 ### CI
 
-[.github/workflows/ci.yml](../.github/workflows/ci.yml) runs the helper tests on Windows, macOS and Ubuntu, and the validate and test commands above on Ubuntu with the latest Claude Code from npm. It does not run `tsc -p plugin`: the declarations exist only once a Claude Code session has loaded the mod, and no command writes them without one (the runner has no login). Type-check locally before you push.
+[.github/workflows/ci.yml](../.github/workflows/ci.yml) runs the voice and hand helper tests (and the hand helper's ruff checks) on Windows, macOS and Ubuntu, and the validate and test commands above on Ubuntu with the latest Claude Code from npm. It does not run `tsc -p plugin`: the declarations exist only once a Claude Code session has loaded the mod, and no command writes them without one (the runner has no login). Type-check locally before you push.
 
 ## Releasing
 
-Users update with `claude plugin update jarvis@jarvis-claude-mod`, which installs a new copy only when `version` in `plugin\.claude-plugin\plugin.json` changes. Bump it with every push to main that changes anything under `plugin\`, together with `version` in `plugin\voice\pyproject.toml` and `__version__` in `plugin\voice\src\jarvis_voice\__init__.py`, then run `uv lock --project plugin\voice`. `tests\test_version.py` fails if the three differ. Use a patch bump (0.2.1) for fixes and a minor bump (0.3.0) for new features.
+Users update with `claude plugin update jarvis@jarvis-claude-mod`, which installs a new copy only when `version` in `plugin\.claude-plugin\plugin.json` changes. The hand helper keeps its own version in `plugin\hands\pyproject.toml`; `/jarvis setup hands` reinstalls it from the plugin's copy whatever that version says, so it does not need a bump. Bump it with every push to main that changes anything under `plugin\`, together with `version` in `plugin\voice\pyproject.toml` and `__version__` in `plugin\voice\src\jarvis_voice\__init__.py`, then run `uv lock --project plugin\voice`. `tests\test_version.py` fails if the three differ. Use a patch bump (0.2.1) for fixes and a minor bump (0.3.0) for new features.
 
 ## Run the helper by hand
 
@@ -168,12 +183,65 @@ Prints a JSON report: audio devices, microphone access (a one-second test record
 
 The doctor reads `FISH_AUDIO_API_KEY` from its own environment, and a plain PowerShell window does not have the `env` block of Claude Code's settings. Set it for that window with `$env:FISH_AUDIO_API_KEY = Read-Host 'Fish Audio key'`, which keeps the key out of your command history. The key is masked in the report.
 
+### Hand helper
+
+Fake mode runs the whole hand helper with no camera, no model and no real mouse: a fake camera, a scripted tracker and a fake desktop (the cursor moves only in memory).
+
+```powershell
+@'
+{"t": 0, "hands": [{"pose": "palm", "at": [0.5, 0.45]}]}
+{"t": 1.0, "hands": [{"pose": "point", "at": [0.4, 0.4]}]}
+{"t": 1.5, "hands": [{"pose": "pinch", "at": [0.4, 0.4]}]}
+{"t": 1.8, "hands": [{"pose": "point", "at": [0.4, 0.4]}]}
+{"t": 2.5, "hands": []}
+'@ | Set-Content "$env:TEMP\hands-script.jsonl"
+uv run --project plugin\hands python -m jarvis_hands run --fake --fake-script "$env:TEMP\hands-script.jsonl" `
+  --data-dir "$env:TEMP\jarvis-hands-dev" --instance-name JarvisHandsDev --heartbeat-timeout 600 --heartbeat-grace 600
+```
+
+- The script is JSON lines: from second `t` on, these hands are in view (`pose` is one of the names in `jarvis_hands.synthetic.POSES`, `at` the knuckles' position in the mirrored camera frame, 0 to 1). The last line holds. The format is documented in `tracker\fake.py`. Without `--fake-script` no hand is ever seen.
+- The script above holds an open palm to engage, points, pinches once (a click) and leaves. The first terminal prints `hello`, `starting`, `ready`, `idle`, then gesture events (`engage`, `click`, ...) and `active`, then `idle` once the hand is gone long enough.
+- `--instance-name`, the heartbeat flags and the token work as for the voice helper: the default lock is `JarvisHands`, a second helper with the same name exits 3, and with no `JARVIS_TOKEN` fake mode accepts `jarvis-fake-token`.
+
+Commands go to the same kind of control server; the names and bodies are in `hands.schema.json`:
+
+```powershell
+$port = 53125   # the port from the hello line
+$hands = @{ Method = 'Post'; ContentType = 'application/json'; Headers = @{ Authorization = 'Bearer jarvis-fake-token' } }
+
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/status" -Body '{}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/config" -Body '{"engage":"palm","displays":"all"}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/engage" -Body '{}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/calibrate" -Body '{"action":"start"}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/pause" -Body '{}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/shutdown" -Body '{}'
+```
+
+To run the installed helper on the real camera and mouse outside Claude Code (turn hand control off there first with `/jarvis hands off`, or pass `--instance-name`):
+
+```powershell
+$env:JARVIS_TOKEN = 'dev-token'
+& "$env:USERPROFILE\.jarvis\hands\venv\Scripts\python.exe" -m jarvis_hands run --heartbeat-timeout 600 --heartbeat-grace 600
+```
+
+It really moves the mouse once you engage. Moving the real mouse takes over at once, and `Ctrl+C` in that terminal stops it and lets go of every button.
+
+Two more commands help while tuning:
+
+```powershell
+& "$env:USERPROFILE\.jarvis\hands\venv\Scripts\python.exe" -m jarvis_hands doctor        # JSON report; --no-camera skips the camera test
+& "$env:USERPROFILE\.jarvis\hands\venv\Scripts\python.exe" -m jarvis_hands preview       # the camera with the tracked hands and their poses; q or Esc quits
+```
+
+The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name (`palm`, `point`, `pinch`, `fist`, ...) with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
+
 ## Logs
 
 | What | Where |
 | --- | --- |
 | Voice helper | `%USERPROFILE%\.jarvis\logs\voice.log`, rotated at 1 MB with three old files kept. Follow it with `Get-Content "$env:USERPROFILE\.jarvis\logs\voice.log" -Tail 50 -Wait`. |
-| Mod | Claude Code's debug log. Start with `claude --plugin-dir "$PWD\plugin" --debug-file "$env:TEMP\claude-debug.log"`. The mod's lines start with `jarvis:`, the helper's stderr appears as `jarvis: helper: ...`, and `/jarvis setup` logs uv's output as `jarvis: uv: ...`. |
+| Hand helper | `%USERPROFILE%\.jarvis\logs\hands.log`, rotated the same way. Its calibration is `%USERPROFILE%\.jarvis\hands\calibration.json` and its model `%USERPROFILE%\.jarvis\models\hands`. |
+| Mod | Claude Code's debug log. Start with `claude --plugin-dir "$PWD\plugin" --debug-file "$env:TEMP\claude-debug.log"`. The mod's lines start with `jarvis:`, the voice helper's stderr appears as `jarvis: helper: ...` and the hand helper's as `jarvis: hand helper: ...`, and `/jarvis setup` logs uv's output as `jarvis: uv: ...`. |
 
 Secrets (the Fish Audio key, the control token) are masked in the helper's log.
 
@@ -218,3 +286,7 @@ The helper reports `mic_blocked` when Windows denies microphone access. Open Set
 ### uv is not found
 
 `/jarvis setup` looks for uv in `%USERPROFILE%\.local\bin\uv.exe`, then `%LOCALAPPDATA%\Microsoft\WinGet\Links\uv.exe`, then on `PATH`. After `winget install astral-sh.uv`, open a new terminal so Claude Code sees the updated `PATH`.
+
+### Hand control
+
+The README's [Hand control](../README.md#hand-control-preview) section covers the camera being blocked or in use and gestures that are missed. For anything else, `hands.log` says why the helper stopped, `/jarvis hands` shows its state, and the doctor and preview above show what the camera and the model see. If clicks or window moves do nothing on one window while the cursor still follows your hand, that window runs as administrator: Windows does not let a normal program click or move it, and the helper reports `input_blocked`.
