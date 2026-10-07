@@ -4,6 +4,8 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
+import { DESKTOP_TOOL_SPEC, GUARD_FAILED, wantsDesktopTool } from './pc'
+import type { GuardCall } from './pc'
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
@@ -35,6 +37,7 @@ export const register: Register = (on, options) => {
         HOME: await $.env.get('HOME'),
         NO_PROXY: await $.env.get('NO_PROXY'),
         CLAUDE_CODE_REMOTE: await $.env.get('CLAUDE_CODE_REMOTE'),
+        SystemRoot: await $.env.get('SystemRoot'),
       }),
       now: () => $.clock.now(),
       after: (ms, fn) => $.clock.after(ms, fn),
@@ -76,6 +79,11 @@ export const register: Register = (on, options) => {
       },
       contextTokens: async () => (await $.session.usage()).context.tokens,
       abortTurn: turnId => $.turn.abort({ turnId }),
+      stopTask: taskId => $.tool.call({ tool: 'TaskStop', task_id: taskId }),
+    }
+    // Jarvis's desktop tool (pc.ts, desktop.ts): local Windows sessions only; a refusal costs nothing else.
+    if (await wantsDesktopTool(engine)) {
+      await $.tool.register(DESKTOP_TOOL_SPEC).catch((error: unknown) => engine.debug(`jarvis: the desktop tool is not available: ${String(error)}`))
     }
     await $.command.register({
       name: 'jarvis',
@@ -101,6 +109,48 @@ export const register: Register = (on, options) => {
     app.hud?.onTurnStart()
     return next(e)
   })
+
+  // Jarvis's guard (guard.ts, pc.ts): shell commands, and writes to Claude's own settings,
+  // sorted into a tier before they run. Waits for a click inside this hook's own `$` call. Fails closed.
+  // Registered before the HUD's tool.call hook: hooks nest in order, first outermost, so an overrun
+  // lands on this hook's own catch, never on a catch-all that would run the call.
+  on('tool.call', { tool: /^(Bash|PowerShell|Monitor|Write|Edit|NotebookEdit)$/ }, async ($, e, next) => {
+    const call = e as unknown as GuardCall
+    const held = await app.pc.guard(call, (question, options) => $.ui.ask(question, options), next.signal)
+    if (held !== undefined) return { deny: held }
+    const result = await next(e)
+    app.pc.noteRan(call, result)
+    return result
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: GUARD_FAILED }))
+
+  // The desktop tool: answered here, so the engine's permission path never sees it; desktop.ts
+  // applies the user's own rules for it ($.tool.check), plan mode and the tiers. Outer to the HUD's
+  // hook too, so it logs its own actions there.
+  on('tool.call', { tool: 'mcp__jarvis__desktop' }, ($, e, next) =>
+    app.pc.desktop(
+      e as unknown as Record<string, unknown>,
+      {
+        ask: (question, options) => $.ui.ask(question, options),
+        check: input => $.tool.check({ tool: 'mcp__jarvis__desktop', input }),
+      },
+      next.signal,
+    ),
+  ).catch(($, e, next) => (next.called ? next(e) : { deny: 'The desktop action failed, so it is not known whether it was done.' }))
+  on('tool.describe', { tool: 'mcp__jarvis__desktop' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
+
+  // Every question dialog (Jarvis's, another plugin's, Claude's own): while one is open a spoken yes
+  // or no counts for nothing. Jarvis's own questions (`$.ui.ask` above) give only the label chosen:
+  // the dialog's record says when it closed by itself while the user was away. Read, never changed.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    app.pc.dialogOpened()
+    try {
+      const result = await next(e)
+      app.pc.noteDialog(e.questions, result)
+      return result
+    } finally {
+      app.pc.dialogClosed()
+    }
+  }).catch(($, e, next) => next(e))
 
   on('turn.step', async function* ($, e, next) {
     const voice = app.voice
@@ -128,6 +178,26 @@ export const register: Register = (on, options) => {
       hud.onToolEnd(id, isOk)
     }
   }).catch(($, e, next) => next(e)) // never in the way of a tool: next is replay-safe here
+
+  // No bypass mode (PLAN.md:149): one warning when the session starts with permission checks skipped.
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    const warning = app.pc.onPermissionMode(e.permission_mode)
+    if (warning !== undefined) $.ui.toast(warning, { timeoutMs: 10_000 })
+    return result
+  }).catch(($, e, next) => next(e))
+
+  // The permission mode, for the desktop tool's plan-mode hold: each prompt's, and a change
+  // mid-turn (Shift+Tab, EnterPlanMode, ExitPlanMode) that the next tool's PostToolUse reports.
+  // Matched (on a field every input has) so another hook of the same event may stand beside them.
+  on('classic.UserPromptSubmit', { hook_event_name: 'UserPromptSubmit' }, ($, e, next) => {
+    app.pc.notePermissionMode(e.permission_mode, e.agent_id)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+  on('classic.PostToolUse', { hook_event_name: 'PostToolUse' }, ($, e, next) => {
+    app.pc.noteToolUse(e.tool_name, e.permission_mode, e.agent_id)
+    return next(e)
+  }).catch(($, e, next) => next(e))
 
   // The persona: a constant section once voice is in use, plus a per-turn
   // flag only when a voice prompt's note could not ride along with it.

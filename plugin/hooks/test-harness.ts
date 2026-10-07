@@ -14,6 +14,7 @@ import type {
   ProcessSpawnRequest,
   PromptSubmitInput,
   SessionMessage,
+  ToolSpec,
   TurnCompleteInput,
   TurnStepChunk,
   TurnStepInput,
@@ -21,11 +22,14 @@ import type {
   UiBlitArgs,
 } from 'claude-code'
 
+import type { RuleVerdict } from './pc'
+
 export const WINDOWS_ENV = {
   OS: 'Windows_NT',
   USERPROFILE: 'C:\\Users\\Rotem',
   LOCALAPPDATA: 'C:\\Users\\Rotem\\AppData\\Local',
   NO_PROXY: 'corp.example',
+  SystemRoot: 'C:\\WINDOWS',
 }
 export const DATA_DIR = 'C:\\Users\\Rotem\\.jarvis'
 export const VENV_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\venv\\Scripts\\python.exe'
@@ -105,6 +109,18 @@ export type SentCommand = {
   headers: Record<string, string>
 }
 
+/** One `$.process.run` the mod made (cwd as the mod gave it). */
+export type RunCall = { argv: readonly string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number }
+
+/**
+ * What a scripted `$.process.run` answers; `deny` rejects the call (it did not
+ * start, or timed out), and `delayMs` holds the answer back that long on the mocked clock.
+ */
+export type RunAnswer = { exitCode: number; stdout: string; stderr?: string; delayMs?: number } | { deny: string }
+
+/** One question dialog, as `$.ui.ask` raised it. */
+export type AskedDialog = { question: string; header: string | undefined; options: string[]; multiSelect: boolean }
+
 export type World = {
   clock: MockClock
   children: FakeChild[]
@@ -163,6 +179,31 @@ export type World = {
   blitDeny: string | undefined
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
+  /** Every tool `$.tool.register` declared, in order. */
+  tools: ToolSpec[]
+  /** When set, `$.tool.register` is refused with it (a managed policy, a host that cannot add tools). */
+  toolRefusal: string | undefined
+  /** The questions `$.ui.ask` put to the user (AskUserQuestion). */
+  asked: string[]
+  /** Each of those dialogs as drawn: its header, its options in order, and whether it took several. */
+  dialogs: AskedDialog[]
+  /** The user's answer to `$.ui.ask`: a label, or text typed under "Other"; undefined dismisses the dialog. */
+  askAnswer: string | undefined
+  /** When set, the answer comes this long after the dialog opened, on the mocked clock. */
+  askDelayMs: number | undefined
+  /** When set, the dialog auto-resolved to `askAnswer` after this long idle (the user was away). */
+  askIdleMs: number | undefined
+  /** Every `$.tool.check` question, and the verdict it gets (default: the engine's plain "ask"). */
+  checks: { tool: string; input: unknown }[]
+  toolCheck: (tool: string, input: unknown) => RuleVerdict | Promise<RuleVerdict>
+  /** The task ids TaskStop was called with. */
+  stoppedTasks: string[]
+  /** Every `$.process.run` the mod made, but the administrator check's. */
+  runs: RunCall[]
+  /** The administrator check's runs (whoami, reg, id), kept apart so other tests' runs stay their own. */
+  probes: RunCall[]
+  /** Answers a `$.process.run` the world does not know; undefined: exit 127 (no such program). */
+  onRun: (call: RunCall) => RunAnswer | undefined
 }
 
 export type WorldOptions = {
@@ -218,12 +259,58 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     settle: async (rounds = 8) => {
       for (let i = 0; i < rounds; i += 1) await clock.settle()
     },
+    tools: [],
+    toolRefusal: undefined,
+    asked: [],
+    dialogs: [],
+    askAnswer: undefined,
+    askDelayMs: undefined,
+    askIdleMs: undefined,
+    checks: [],
+    toolCheck: () => ({ decision: 'ask' }),
+    stoppedTasks: [],
+    runs: [],
+    probes: [],
+    onRun: () => undefined,
   }
   const state = w.state
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => {
+    if (w.toolRefusal !== undefined) return { deny: w.toolRefusal }
+    w.tools.push(e)
+    return { value: { tool: `mcp__jarvis__${e.name}` } }
+  })
+  on('tool.describe', { tool: 'mcp__jarvis__desktop' }, ($, e) => ({ description: e.description, ...(e.isDeferred === true ? { isDeferred: true } : {}) }))
+  // `$.ui.ask` is a call of the AskUserQuestion tool: the person's answer, a dismissal, or an idle auto-resolve.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+    const [first] = e.questions
+    const question = first?.question ?? ''
+    w.asked.push(question)
+    w.dialogs.push({
+      question,
+      header: first?.header,
+      options: (first?.options ?? []).map(option => option.label),
+      multiSelect: first?.multiSelect === true,
+    })
+    if (w.askDelayMs !== undefined) await clock.sleep(w.askDelayMs)
+    if (w.askAnswer === undefined) return { deny: 'dismissed' }
+    const idle = w.askIdleMs === undefined ? {} : { afkTimeoutMs: w.askIdleMs }
+    return { result: { questions: e.questions, answers: { [question]: w.askAnswer }, ...idle } }
+  })
+  // The engine's verdict for the session's rules and mode; the default is its
+  // plain "ask" for a tool nothing allows yet (default mode, no rule).
+  on('tool.check', async ($, e) => {
+    w.checks.push({ tool: e.tool, input: e.input })
+    return await w.toolCheck(e.tool, e.input)
+  })
+  on('tool.call', { tool: 'TaskStop' }, ($, e) => {
+    const taskId = e.task_id ?? ''
+    w.stoppedTasks.push(taskId)
+    return { result: { message: `Stopped ${taskId}`, task_id: taskId, task_type: 'local_bash' } }
+  })
   on('ui.status', ($, e) => {
     w.statuses.push(e.text)
     return { value: undefined }
@@ -263,13 +350,27 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     w.existing.add(windowsPath(e.path))
     return { value: undefined }
   })
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const [command] = e.argv
     if (command === 'where' || command === 'which') {
       return { value: run(w.uvOnPath === undefined ? 1 : 0, w.uvOnPath ?? '') }
     }
     if (command === 'uname') return { value: run(0, 'Linux\n') }
-    return { value: run(127, '') }
+    const init = e.init ?? {}
+    const call: RunCall = {
+      argv: e.argv,
+      ...(init.cwd === undefined ? {} : { cwd: windowsPath(init.cwd) }),
+      ...(init.env === undefined ? {} : { env: init.env }),
+      ...(init.timeoutMs === undefined ? {} : { timeoutMs: init.timeoutMs }),
+    }
+    const program = (command ?? '').split(/[\\/]/).at(-1)?.toLowerCase().replace(/\.exe$/, '')
+    if (program === 'whoami' || program === 'reg' || program === 'id') w.probes.push(call)
+    else w.runs.push(call)
+    const answer = w.onRun(call)
+    if (answer === undefined) return { value: run(127, '') }
+    if ('deny' in answer) return { deny: answer.deny }
+    if (answer.delayMs !== undefined) await clock.sleep(answer.delayMs)
+    return { value: { ...run(answer.exitCode, answer.stdout), stderr: answer.stderr ?? '' } }
   })
   on('process.spawn', async function* ($, e) {
     const child = new FakeChild(e.cwd === undefined ? e : { ...e, cwd: windowsPath(e.cwd) })
@@ -351,6 +452,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('tool.call', () => ({ result: 'ok' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  on('classic.PostToolUse', () => ({}))
   return w
 }
 

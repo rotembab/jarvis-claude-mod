@@ -22,6 +22,7 @@ const HELP = [
   '/jarvis bargein <speech|wake|off>  what interrupts Jarvis: any speech, "Hey Jarvis", or nothing',
   '/jarvis routing <auto|off>       Sonnet answers voice requests, Opus or Fable the hard ones; off: your model',
   '/jarvis stop                     stop speaking and cancel the spoken reply',
+  '/jarvis pc [check <command>|rules|stop]  PC control: guard tiers, UAC level, rules to paste, stand down',
   '/jarvis talk                     start or stop listening without the push-to-talk key',
   '/jarvis test                     speak a test line',
   '/jarvis restart                  restart the voice helper',
@@ -51,6 +52,8 @@ export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi 
         return { text: await setup(app, rest) }
       case 'stop':
         return { text: await stop(app) }
+      case 'pc':
+        return { text: await app.pc.command(rest) }
       case 'talk':
         return { text: await talk(app) }
       case 'test':
@@ -111,6 +114,9 @@ async function setup(app: Jarvis, args: string[]): Promise<string> {
   const { engine, platform } = app
   if (!app.isLocal || engine === undefined || platform === undefined) return NOT_LOCAL
   if (app.isSetupRunning) return 'Setup is already running; its progress is in the status line.'
+  // Nothing installs as administrator, or before the check has said.
+  const held = app.pc.whyHeld()
+  if (held !== undefined) return held
   if (args[0]?.toLowerCase() === 'local') return await setupLocal(app, args.slice(1))
   let sttModel: SttModel | undefined
   let useCuda: boolean | undefined

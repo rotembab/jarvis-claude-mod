@@ -1,0 +1,631 @@
+import { describe, expect, test } from 'claude-code/testing'
+import type { Plugin, Engine as TestEngine } from 'claude-code/testing'
+
+import type { JarvisHud } from '../types'
+import { GUARD_FAILED } from './pc'
+import { parseUacPolicy, parseWhoamiGroups, system32 } from './platform'
+import type { FakeChild, RunAnswer, RunCall, World } from './test-harness'
+import { completeTurn, jarvis, startHelper, startSession, WINDOWS_ENV, world } from './test-harness'
+import { isNoPhrase, isStandDownPhrase, isStopPhrase, isYesPhrase } from './voice'
+
+const CLOUD_ENV = { ...WINDOWS_ENV, CLAUDE_CODE_REMOTE: 'true' }
+const LINUX_ENV = { HOME: '/home/rotem' }
+const HELD = /^Jarvis held this: it pushes commits to the remote and needs the user's spoken OK\. Say in one short sentence/
+const SECOND_HOLD = /^Jarvis did not hold this: it [^,]+, and this turn already held another command\. One spoken yes answers one question, so neither is held now\./
+const HEARD_WHILE_TALKING = "The user's 'yes' was heard while Jarvis was still speaking, so it does not count. Ask again in one short sentence and end your turn."
+const DECLINED = 'The user chose "Don\'t run it" on Jarvis\'s on-screen question, so nothing ran. Do not retry unless they ask.'
+const COULD_NOT_ASK = 'Jarvis could not ask the user on screen, so nothing ran.'
+const BYPASS = "Permission checks are off. Jarvis still asks before risky commands, but Claude Code's own rules are skipped."
+const ELEVATED_STATUS = 'JARVIS · error · Claude Code runs as administrator, so Jarvis stays off'
+
+/** `whoami /groups /fo csv /nh` for an administrator: elevated (High label) or not (Medium, Administrators for deny only). */
+function groups(elevated: boolean, admin = true): string {
+  return [
+    '"Everyone","Well-known group","S-1-1-0","Mandatory group, Enabled by default, Enabled group"',
+    ...(admin ? [`"BUILTIN\\Administrators","Alias","S-1-5-32-544","${elevated ? 'Enabled group, Group owner' : 'Group used for deny only'}"`] : []),
+    '"BUILTIN\\Users","Alias","S-1-5-32-545","Mandatory group, Enabled by default, Enabled group"',
+    elevated
+      ? '"Mandatory Label\\High Mandatory Level","Label","S-1-16-12288",""'
+      : '"Mandatory Label\\Medium Mandatory Level","Label","S-1-16-8192",""',
+  ].join('\r\n')
+}
+
+/** `reg query` of the UAC policy key with these REG_DWORD values. */
+function policy(values: Record<string, number>): string {
+  const lines = Object.entries(values).map(([name, value]) => `    ${name}    REG_DWORD    0x${value.toString(16)}`)
+  return ['', 'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System', ...lines, ''].join('\r\n')
+}
+
+const ALWAYS_NOTIFY = policy({ ConsentPromptBehaviorAdmin: 2, EnableLUA: 1, PromptOnSecureDesktop: 1 })
+const WINDOWS_DEFAULT = policy({ ConsentPromptBehaviorAdmin: 5, EnableLUA: 1, PromptOnSecureDesktop: 1 })
+
+const WHOAMI = 'C:\\WINDOWS\\System32\\whoami.exe'
+const REG = 'C:\\WINDOWS\\System32\\reg.exe'
+
+/** The administrator check's two commands, answered (by full path only: a `whoami` on PATH may be Git's), after `delayMs`. */
+function adminCheck(w: World, whoami: string, reg: string, delayMs?: number): void {
+  w.onRun = (call: RunCall): RunAnswer | undefined => {
+    if (call.argv[0] === WHOAMI) return { exitCode: 0, stdout: whoami, delayMs }
+    if (call.argv[0] === REG) return { exitCode: 0, stdout: reg, delayMs }
+    return undefined
+  }
+}
+
+/** The helper hears the user. */
+async function heard(w: World, helper: FakeChild, text: string, id: string, source: 'wake' | 'ptt' = 'wake'): Promise<void> {
+  helper.event({ type: 'utterance', id, text, source, durationMs: 900, language: 'en' })
+  await w.settle()
+}
+
+/** The engine starts the turn for a prompt (spoken or typed). */
+async function turn($: TestEngine, w: World, text: string, turnId: string): Promise<void> {
+  await $.classic.UserPromptSubmit({ prompt: text, permission_mode: 'default' })
+  await $.turn.start({ text, turnId })
+  await w.settle()
+}
+
+const bash = ($: TestEngine, command: string) => $.tool.call({ tool: 'Bash', command })
+
+const spokenTexts = (w: World) => w.named('speak').map(command => String(command.body.text))
+
+/** Waits in real time, which the hook budget counts (the test runner's own timer; the hooks' typings leave it out). */
+const realSleep = (ms: number): Promise<void> =>
+  new Promise(resolve => (globalThis as unknown as { setTimeout: (fn: () => void, ms: number) => void }).setTimeout(resolve, ms))
+
+/**
+ * Above Jarvis: every question dialog is answered only after 12 s of real
+ * time, past one hook's 10 s budget. The wait is three 4 s naps, each a tool
+ * call of its own, so no hook spends more than 4 s of its own time.
+ */
+const SLOW_ANSWER: Plugin = {
+  name: 'slow-answer',
+  tier: 'prepend',
+  register(on) {
+    on('tool.call', { tool: 'mcp__slow__nap' }, async () => {
+      await realSleep(4000)
+      return { result: 'rested' }
+    })
+    on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+      for (let nap = 0; nap < 3; nap += 1) await $.tool.call({ tool: 'mcp__slow__nap' })
+      return next(e)
+    })
+  },
+}
+
+/** Above Jarvis: abandons a Bash call a second (mocked) after it began, as Esc does. */
+const INTERRUPTER: Plugin = {
+  name: 'interrupter',
+  tier: 'prepend',
+  register(on) {
+    on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+      void next(e).catch(() => undefined)
+      await $.clock.sleep(1000)
+      return { deny: 'Interrupted by the user.' }
+    })
+  },
+}
+
+describe('the guard hook', () => {
+  test('a screen-tier command waits for a click; "Run it" lets it run unchanged', async ($, on) => {
+    const ran: string[] = []
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: 'removed', stderr: '', interrupted: false } }
+    })
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    expect(await bash($, 'rm -rf ~/Downloads')).toMatchObject({ result: { stdout: 'removed' } })
+    expect(ran).toEqual(['rm -rf ~/Downloads'])
+    // "Don't run it" first: Enter, a default or an auto-resolve lands on no.
+    expect(w.dialogs).toEqual([
+      {
+        question: 'Jarvis: Claude wants to run a Bash command that deletes files: "rm -rf ~/Downloads". Run it?',
+        header: 'Jarvis',
+        options: ["Don't run it", 'Run it'],
+        multiSelect: false,
+      },
+    ])
+  })
+
+  test('"Don\'t run it" refuses the call, and the HUD shows it failed', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = "Don't run it"
+    expect(await bash($, 'rm -rf ~/Downloads')).toEqual({ deny: DECLINED })
+    await w.settle()
+    const hud = w.state.get('jarvis.hud') as JarvisHud
+    expect(hud.actions.find(action => action.label === 'Bash rm -rf ~/Downloads')?.status).toBe('failed')
+  })
+
+  test('a yes typed under "Other" runs it; other words do not', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Yes, please'
+    expect(await bash($, 'rm old.log')).toMatchObject({ result: 'ok' })
+    w.askAnswer = 'only the .tmp files'
+    expect(await bash($, 'rm old.log')).toEqual({ deny: 'The user did not confirm; they wrote: "only the .tmp files". Nothing ran.' })
+  })
+
+  test('an idle auto-resolve, a dismissal or no dialog at all is a no', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    w.askIdleMs = 60_000
+    expect(await bash($, 'rm old.log')).toEqual({
+      deny: "Jarvis's on-screen question closed while the user was away, so nothing ran. Ask again when they are back.",
+    })
+    w.askIdleMs = undefined
+    w.askAnswer = undefined
+    expect(await bash($, 'rm old.log')).toEqual({ deny: COULD_NOT_ASK })
+  })
+
+  test('the never list is refused with no question; a harmless command asks nothing', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    expect(await bash($, 'sudo csrutil disable')).toEqual({
+      deny: "Jarvis blocks this: it turns off system protection, which is on Jarvis's never list. Do not retry it or work around it; the user can do it themselves.",
+    })
+    expect(await bash($, 'npm test')).toMatchObject({ result: 'ok' })
+    expect(w.asked).toEqual([])
+  })
+
+  test("writes to Claude Code's own settings are refused", async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    const refused = await $.tool.call({ tool: 'Write', file_path: '/home/rotem/.claude/settings.json', content: '{}' })
+    expect(refused).toEqual({ deny: expect.stringMatching(/^Jarvis blocks this: it changes Claude Code's own permissions or plugins/) })
+    expect(await $.tool.call({ tool: 'Write', file_path: '/home/rotem/notes.md', content: 'hi' })).toMatchObject({ result: 'ok' })
+    expect(w.asked).toEqual([])
+  })
+
+  test('a call abandoned while its question is open runs nothing, whatever is clicked later', { plugins: [INTERRUPTER] }, async ($, on) => {
+    const ran: string[] = []
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: '', stderr: '', interrupted: false } }
+    })
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    w.askDelayMs = 5000
+    const call = bash($, 'rm -rf ~/Downloads')
+    await w.settle()
+    expect(w.asked).toHaveLength(1)
+    await w.clock.advance(1000) // Esc: the call is abandoned with the question still open
+    expect(await call).toEqual({ deny: 'Interrupted by the user.' })
+    await w.clock.advance(5000) // then "Run it" is clicked
+    await w.settle()
+    expect(ran).toEqual([])
+  })
+
+  test('questions open at once each wait in a dialog of their own, under a text of their own', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    w.askDelayMs = 5000
+    const first = bash($, 'rm -rf build')
+    const second = bash($, 'rm -rf build')
+    await w.settle()
+    expect(w.asked).toEqual([
+      'Jarvis: Claude wants to run a Bash command that deletes files: "rm -rf build". Run it?',
+      'Jarvis: Claude wants to run a Bash command that deletes files: "rm -rf build". Run it? (2)',
+    ])
+    await w.clock.advance(5000)
+    expect(await first).toMatchObject({ result: 'ok' })
+    expect(await second).toMatchObject({ result: 'ok' })
+    // Both closed: the text is free again.
+    const third = bash($, 'rm -rf build')
+    await w.settle()
+    expect(w.asked.at(-1)).toBe('Jarvis: Claude wants to run a Bash command that deletes files: "rm -rf build". Run it?')
+    await w.clock.advance(5000)
+    expect(await third).toMatchObject({ result: 'ok' })
+  })
+
+  test('two calls asked at once, answered after more than 10 s of real time, are both asked, never run', { plugins: [SLOW_ANSWER], timeoutMs: 30_000 }, async ($, on) => {
+    const ran: string[] = []
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: '', stderr: '', interrupted: false } }
+    })
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = "Don't run it"
+    const [build, dist] = await Promise.all([bash($, 'rm -rf build'), bash($, 'rm -rf dist')])
+    expect(build).toEqual({ deny: DECLINED })
+    expect(dist).toEqual({ deny: DECLINED })
+    expect(w.asked).toHaveLength(2)
+    expect(ran).toEqual([])
+  })
+
+  test('a cloud session is left alone', async ($, on) => {
+    const w = world(on, { env: CLOUD_ENV })
+    await startSession($, w)
+    expect(await bash($, 'rm -rf build')).toMatchObject({ result: 'ok' })
+    expect(w.asked).toEqual([])
+  })
+
+  test('the failure answer refuses', () => {
+    expect(GUARD_FAILED).toMatch(/did not run/)
+  })
+})
+
+describe('voice consent', () => {
+  test('a voice-tier command is held, asked aloud, and run on a plain spoken yes', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Push my branch', 'u1')
+    await turn($, w, 'Push my branch', 't1')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    expect(w.asked).toEqual([])
+    await completeTurn($, 't1')
+
+    await heard(w, helper, 'Yes.', 'u2')
+    await turn($, w, 'Yes.', 't2')
+    // Exactly that command; spacing aside.
+    expect(await bash($, 'git  push')).toMatchObject({ result: 'ok' })
+    // Another command is not covered by that yes; nor is the same one twice.
+    expect(await bash($, 'git push --tags')).toEqual({ deny: expect.stringMatching(/^Jarvis held this/) })
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(SECOND_HOLD) })
+    expect(w.asked).toEqual([])
+  })
+
+  test('a yes answers only the question just asked: any turn in between unbinds it', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Close Notepad', 'u1')
+    await turn($, w, 'Close Notepad', 't1')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    await completeTurn($, 't1')
+    // Spoken: a no, and another question.
+    await heard(w, helper, 'No, leave it. What time is it?', 'u2')
+    await turn($, w, 'No, leave it. What time is it?', 't2')
+    await completeTurn($, 't2')
+    await heard(w, helper, 'Yes.', 'u3')
+    await turn($, w, 'Yes.', 't3')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    await completeTurn($, 't3')
+    // Typed, in between.
+    await turn($, w, 'what is the weather', 't4')
+    await completeTurn($, 't4')
+    await heard(w, helper, 'Yes.', 'u5')
+    await turn($, w, 'Yes.', 't5')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    expect(w.asked).toEqual([])
+  })
+
+  test('one yes runs one command: a turn that holds two holds neither', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Push and open a PR', 'u1')
+    await turn($, w, 'Push and open a PR', 't1')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    expect(await bash($, 'gh pr create --fill')).toEqual({ deny: expect.stringMatching(SECOND_HOLD) })
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(SECOND_HOLD) })
+    await completeTurn($, 't1')
+    await heard(w, helper, 'Yes.', 'u2')
+    await turn($, w, 'Yes.', 't2')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    expect(await bash($, 'gh pr create --fill')).toEqual({ deny: expect.stringMatching(SECOND_HOLD) })
+    await completeTurn($, 't2')
+    // Asked about one: that one runs on the yes, and only once.
+    await heard(w, helper, 'Push it', 'u3')
+    await turn($, w, 'Push it', 't3')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    await completeTurn($, 't3')
+    await heard(w, helper, 'Yes.', 'u4')
+    await turn($, w, 'Yes.', 't4')
+    expect(await bash($, 'gh pr create --fill')).toEqual({ deny: expect.stringMatching(/^Jarvis held this: it posts to GitHub and needs the user's spoken OK/) })
+    await completeTurn($, 't4')
+    expect(w.asked).toEqual([])
+  })
+
+  test('a yes said over Jarvis does not count; push-to-talk does', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Push my branch', 'u1')
+    await turn($, w, 'Push my branch', 't1')
+    await bash($, 'git push')
+    await completeTurn($, 't1')
+
+    helper.event({ type: 'barge_in', spokenText: 'Shall I push' })
+    await heard(w, helper, 'yes', 'u2')
+    await turn($, w, 'yes', 't2')
+    expect(await bash($, 'git push')).toEqual({ deny: HEARD_WHILE_TALKING })
+    await completeTurn($, 't2')
+
+    helper.event({ type: 'barge_in', spokenText: 'Shall I push' })
+    await heard(w, helper, 'Go ahead, Jarvis.', 'u3', 'ptt')
+    await turn($, w, 'Go ahead, Jarvis.', 't3')
+    expect(await bash($, 'git push')).toMatchObject({ result: 'ok' })
+  })
+
+  test('a yes with more words, or a typed yes, is not a spoken OK', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Push my branch', 'u1')
+    await turn($, w, 'Push my branch', 't1')
+    await bash($, 'git push')
+    await completeTurn($, 't1')
+    await heard(w, helper, 'Yes, and delete dist', 'u2')
+    await turn($, w, 'Yes, and delete dist', 't2')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+    await completeTurn($, 't2')
+
+    // Typed: asked on screen instead.
+    w.askAnswer = "Don't run it"
+    await turn($, w, 'yes', 't3')
+    expect(await bash($, 'git push')).toEqual({ deny: DECLINED })
+    expect(w.asked).toEqual(['Jarvis: Claude wants to run a Bash command that pushes commits to the remote: "git push". Run it?'])
+  })
+
+  test('a held command expires after two minutes', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Push my branch', 'u1')
+    await turn($, w, 'Push my branch', 't1')
+    await bash($, 'git push')
+    await completeTurn($, 't1')
+    await w.clock.advance(121_000)
+    await heard(w, helper, 'yes', 'u2')
+    await turn($, w, 'yes', 't2')
+    expect(await bash($, 'git push')).toEqual({ deny: expect.stringMatching(HELD) })
+  })
+
+  test('a typed turn asks on screen', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    await turn($, w, 'push it', 't1')
+    expect(await bash($, 'git push')).toMatchObject({ result: 'ok' })
+    expect(w.asked).toHaveLength(1)
+  })
+
+  test('while a question is open on screen, a spoken yes is not sent: it needs a click', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await heard(w, helper, 'Clear out the build folder', 'u1')
+    await turn($, w, 'Clear out the build folder', 't1')
+    w.askAnswer = "Don't run it"
+    w.askDelayMs = 5000
+    const call = bash($, 'rm -rf build')
+    await w.settle()
+    expect(w.asked).toHaveLength(1)
+    expect(spokenTexts(w)).toContain('That one needs your OK on screen, sir.')
+
+    await heard(w, helper, 'Yes!', 'u2')
+    expect(w.submits).toHaveLength(1)
+    expect(spokenTexts(w)).toContain('I need a click on screen for that one, sir.')
+    expect(w.logs).toContain('Jarvis: "Yes!" was not sent: the question on screen needs a click.')
+
+    await w.clock.advance(5000)
+    expect(await call).toEqual({ deny: DECLINED })
+    // Once answered, words are prompts again.
+    await heard(w, helper, 'Yes!', 'u3')
+    expect(w.submits).toHaveLength(2)
+  })
+
+  test("another dialog open (another plugin's, Claude's own) also needs a click, not a spoken yes", async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    w.askAnswer = 'Leave it'
+    w.askDelayMs = 5000
+    const dialog = $.tool.call({
+      tool: 'AskUserQuestion',
+      questions: [{ question: 'Turn the TV off?', header: 'Jarvis home', options: [{ label: 'Leave it', description: '' }, { label: 'Turn it off', description: '' }], multiSelect: false }],
+    })
+    await w.settle()
+    await heard(w, helper, 'Yes.', 'u1')
+    expect(w.submits).toEqual([])
+    expect(w.logs).toContain('Jarvis: "Yes." was not sent: the question on screen needs a click.')
+    await w.clock.advance(5000)
+    await dialog
+    await heard(w, helper, 'Yes.', 'u2')
+    expect(w.submits).toHaveLength(1)
+  })
+})
+
+describe('spoken phrases', () => {
+  test('a yes, a no and stand down are words said on their own', () => {
+    for (const yes of ['Yes.', 'Yes please, Jarvis.', 'Go ahead.', 'OK.', 'Okay, do it.', 'Proceed, thank you.']) expect(isYesPhrase(yes)).toBe(true)
+    for (const other of ['Yes, and delete dist', 'Is it done?', 'Go ahead and push everything', 'yesterday']) expect(isYesPhrase(other)).toBe(false)
+    for (const no of ['No.', "Don't do it.", 'Nope, thanks.']) expect(isNoPhrase(no)).toBe(true)
+    for (const down of ['Jarvis, stand down.', 'Abort that!', 'Abort.']) expect(isStandDownPhrase(down)).toBe(true)
+    expect(isStandDownPhrase('Abort the merge and push')).toBe(false)
+    // Still a stop phrase, for a voice without PC control.
+    expect(isStopPhrase('Stand down.')).toBe(true)
+  })
+})
+
+describe('stand down', () => {
+  test('"Stand down" stops speech, aborts the running typed turn and stops its background command', async ($, on) => {
+    on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b1' } }))
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await turn($, w, 'Start the dev server', 't1')
+    await $.tool.call({ tool: 'Bash', command: 'npm run dev', run_in_background: true })
+
+    await heard(w, helper, 'Jarvis, stand down.', 'u1')
+    await w.clock.advance(300)
+    await w.settle()
+    expect(w.aborts).toEqual(['t1'])
+    expect(w.stoppedTasks).toEqual(['b1'])
+    expect(w.named('stop').map(command => command.body)).toEqual([{ reason: 'stand_down' }])
+    expect(w.submits).toEqual([])
+    expect(w.logs).toContain('Jarvis: stood down (stopped speech, aborted the turn, stopped 1 background command).')
+    expect(w.toasts).toContain('Jarvis stood down.')
+  })
+
+  test('/jarvis pc stop does the same; a stopped task is not stopped twice', async ($, on) => {
+    on('tool.call', { tool: 'Monitor' }, () => ({ result: { taskId: 'm7', timeoutMs: 60_000, persistent: false } }))
+    const w = world(on)
+    await startHelper($, w)
+    await $.tool.call({ tool: 'Monitor', command: 'tail -f app.log', description: 'Watch the log', timeout_ms: 60_000 })
+    const stopping = jarvis($, 'pc stop')
+    await w.settle()
+    expect(await stopping).toBe('Stood down: stopped speech, no turn was running, stopped 1 background command.')
+    expect(w.stoppedTasks).toEqual(['m7'])
+    expect(await jarvis($, 'pc stop')).toBe('Stood down: stopped speech, no turn was running, stopped 0 background commands.')
+  })
+})
+
+describe('never as administrator', () => {
+  test('when Claude Code runs elevated, the helper never starts', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(true), ALWAYS_NOTIFY)
+    await startSession($, w)
+    expect(w.helpers()).toEqual([])
+    expect(w.status()).toBe(ELEVATED_STATUS)
+    expect(w.toasts).toContain('Jarvis stays off: Claude Code runs as administrator.')
+
+    await jarvis($, '')
+    await jarvis($, 'restart')
+    await w.settle()
+    expect(w.helpers()).toEqual([])
+    expect(w.logs.filter(line => line.startsWith('Jarvis stays off: Claude Code runs as administrator'))).toHaveLength(2)
+    expect(await jarvis($, 'pc')).toContain('Administrator: Claude Code runs as administrator')
+  })
+
+  test('as root on Linux too', async ($, on) => {
+    const w = world(on, { env: LINUX_ENV })
+    w.onRun = call => (call.argv.join(' ') === 'id -u' ? { exitCode: 0, stdout: '0\n' } : undefined)
+    await startSession($, w)
+    expect(w.status()).toBe(ELEVATED_STATUS)
+    expect(w.children).toEqual([])
+  })
+
+  test('with normal rights it starts; a UAC level below Always notify gets one hint', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(false), WINDOWS_DEFAULT)
+    await startSession($, w)
+    expect(w.helpers()).toHaveLength(1)
+    expect(w.probes.map(call => call.argv.join(' '))).toEqual([
+      `${WHOAMI} /groups /fo csv /nh`,
+      `${REG} query HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System`,
+    ])
+    expect(w.runs).toEqual([])
+    expect(w.toasts.filter(text => text.startsWith('Jarvis: UAC is below "Always notify"'))).toHaveLength(1)
+    expect(w.store.get('pc.uacHint')).toBe(true)
+    expect(await jarvis($, 'pc')).toContain('UAC: notify only when apps try to make changes (the Windows default). For PC control')
+  })
+
+  test('the hint is shown once, and not at all for Always notify', async ($, on) => {
+    const w = world(on)
+    w.store.set('pc.uacHint', true)
+    adminCheck(w, groups(false), WINDOWS_DEFAULT)
+    await startSession($, w)
+    expect(w.toasts).toEqual([])
+  })
+
+  test('a surface that attaches while the check runs starts nothing; setup waits for it too', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(true), ALWAYS_NOTIFY, 3000)
+    const starting = $.session.start({ cwd: 'C:\\work', surface: null, isInteractive: false })
+    await w.settle()
+    await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+    await w.settle()
+    expect(w.helpers()).toEqual([])
+    expect(await jarvis($, 'setup')).toMatch(/^Jarvis is still checking whether Claude Code runs as administrator/)
+    await w.clock.advance(3000)
+    await starting
+    await w.settle()
+    expect(w.helpers()).toEqual([])
+    expect(w.status()).toBe(ELEVATED_STATUS)
+    expect(await jarvis($, 'setup')).toMatch(/^Jarvis stays off: Claude Code runs as administrator/)
+    expect(w.children).toEqual([])
+  })
+
+  test('with normal rights, a surface that attached during the check gets the helper once it ends', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(false), ALWAYS_NOTIFY, 3000)
+    const starting = $.session.start({ cwd: 'C:\\work', surface: null, isInteractive: false })
+    await w.settle()
+    await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+    await w.settle()
+    expect(w.helpers()).toEqual([])
+    await w.clock.advance(3000)
+    await starting
+    await w.settle()
+    expect(w.helpers()).toHaveLength(1)
+  })
+
+  test("the check runs Windows's own whoami and reg by full path", () => {
+    expect(system32('C:\\WINDOWS')).toBe('C:\\WINDOWS\\System32')
+    expect(system32('D:\\Win\\')).toBe('D:\\Win\\System32')
+    for (const odd of [undefined, '', 'Windows', '\\\\server\\share', '%SystemRoot%']) expect(system32(odd), String(odd)).toBe('C:\\Windows\\System32')
+  })
+
+  test('a failed check is taken as not elevated', async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    expect(w.helpers()).toHaveLength(1)
+    expect(w.logs.some(line => line.startsWith('jarvis: the administrator check failed'))).toBe(true)
+  })
+
+  test('UAC levels from the policy values', () => {
+    expect(parseUacPolicy(policy({ EnableLUA: 0, ConsentPromptBehaviorAdmin: 5 }))).toBe('off')
+    expect(parseUacPolicy(policy({ EnableLUA: 1, ConsentPromptBehaviorAdmin: 0 }))).toBe('never-notify')
+    expect(parseUacPolicy(policy({ EnableLUA: 1, ConsentPromptBehaviorAdmin: 2 }))).toBe('always-notify')
+    expect(parseUacPolicy(policy({ EnableLUA: 1, ConsentPromptBehaviorAdmin: 5, PromptOnSecureDesktop: 1 }))).toBe('default')
+    expect(parseUacPolicy(policy({ EnableLUA: 1, ConsentPromptBehaviorAdmin: 5, PromptOnSecureDesktop: 0 }))).toBe('default-no-dim')
+    expect(parseUacPolicy(policy({ EnableLUA: 1, ConsentPromptBehaviorAdmin: 2, TypeOfAdminApprovalMode: 2 }))).toBe('admin-protection')
+    expect(parseUacPolicy(policy({ EnableLUA: 1 }))).toBeUndefined()
+    expect(parseWhoamiGroups(groups(true)).has('S-1-16-12288')).toBe(true)
+  })
+
+  test('a standard account is reported as such', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(false, false), ALWAYS_NOTIFY)
+    await startSession($, w)
+    expect(await jarvis($, 'pc')).toContain('UAC: a standard account')
+    expect(w.toasts).toEqual([])
+  })
+})
+
+describe('bypass warning', () => {
+  test('a session started with permission checks skipped gets one warning', async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    await $.classic.SessionStart({ source: 'startup', permission_mode: 'default' })
+    expect(w.toasts).not.toContain(BYPASS)
+    await $.classic.SessionStart({ source: 'startup', permission_mode: 'bypassPermissions' })
+    await $.classic.SessionStart({ source: 'resume', permission_mode: 'bypassPermissions' })
+    expect(w.toasts.filter(text => text === BYPASS)).toHaveLength(1)
+    expect(await jarvis($, 'pc')).toContain('Permission mode: bypassPermissions.')
+  })
+})
+
+describe('/jarvis pc', () => {
+  test('shows the guard, the desktop tool and what stand down would stop', async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    const text = await jarvis($, 'pc')
+    expect(text).toContain('Guard: on for PowerShell, Bash, Monitor')
+    expect(text).toContain('Desktop tool: offered; its actions wait for the voice helper')
+    expect(text).toContain('Permission mode: not known yet')
+    expect(text).toContain('/jarvis pc check <command>')
+  })
+
+  test('check names the tier and the reason per shell', async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    expect(await jarvis($, 'pc check rm -rf build')).toMatch(/^Bash: screen · asks for a click on screen: it deletes files \(rule [a-z-]+\)$/m)
+    expect(await jarvis($, 'pc check git push')).toMatch(/^PowerShell: voice · asks for a spoken yes in a voice conversation, else a click: it pushes commits/m)
+    expect(await jarvis($, 'pc check git status')).toContain("Bash: pass · runs without a question from Jarvis (Claude Code's own rules still apply)")
+    expect(await jarvis($, 'pc check')).toMatch(/^Which command\?/)
+  })
+
+  test('rules prints the snippet to paste and writes nothing', async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    const text = await jarvis($, 'pc rules')
+    expect(text).toContain('Jarvis writes no settings')
+    const snippet = JSON.parse(text.slice(text.indexOf('{'))) as { permissions: Record<string, string[]>; env: Record<string, string> }
+    expect(snippet.permissions.deny?.length).toBeGreaterThan(0)
+    expect(snippet.permissions.allow).toBeUndefined()
+    expect(snippet.permissions.ask).toBeUndefined()
+    expect(snippet.env).toEqual({ CLAUDE_CODE_USE_POWERSHELL_TOOL: '1' })
+    expect(w.existing.size).toBe(1) // only the venv the world started with
+  })
+})

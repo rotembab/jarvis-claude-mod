@@ -34,6 +34,8 @@ export type EnvSnapshot = {
   HOME?: string
   NO_PROXY?: string
   CLAUDE_CODE_REMOTE?: string
+  /** Windows only: its own folder, for running System32 programs by full path. */
+  SystemRoot?: string
 }
 
 export type Engine = {
@@ -78,6 +80,8 @@ export type Engine = {
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>
   abortTurn: (turnId: string) => Promise<void>
+  /** Stops a background task (a backgrounded command or a monitor) through the TaskStop tool. */
+  stopTask: (taskId: string) => Promise<unknown>
   /** One completion through the session's own client and credentials. */
   complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
   /** The main conversation's messages (the newest 4096). */

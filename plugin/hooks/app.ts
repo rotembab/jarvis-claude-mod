@@ -13,6 +13,7 @@ import { Hud, hudMode } from './hud'
 import type { PaneSize } from './hud'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
+import { PcControl } from './pc'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
 import type { RoutingMode } from './router'
 import { ModelRouter, ROUTING_MODES } from './router'
@@ -129,6 +130,8 @@ export class Jarvis {
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined
+  /** The guard, the desktop tool, stand down and the admin check (pc.ts). */
+  readonly pc: PcControl = new PcControl(this)
   view: JarvisView = { phase: 'stopped' }
   isSetupRunning = false
 
@@ -172,6 +175,8 @@ export class Jarvis {
       platform,
       helper,
       onSubmitted: text => this.patch({ lastUtterance: text }),
+      onStandDown: () => this.pc.standDown(),
+      isAwaitingClick: () => this.pc.isAwaitingClick,
       router: new ModelRouter(engine, { mode: () => this.routingMode(), complete: request => engine.complete(request) }),
     })
     this.isLocal = !isRemoteSession(env)
@@ -179,6 +184,7 @@ export class Jarvis {
       this.publish({ phase: 'unavailable' })
       return
     }
+    if (await this.pc.onSessionStart()) return // Claude Code runs elevated: never as administrator (PLAN.md:150)
     this.hud?.dispose()
     this.hud = new Hud(engine)
     this.hud.setPhase(this.view.phase)
@@ -200,18 +206,19 @@ export class Jarvis {
     this.hasLocalAttach = true
     // The desktop app attaches its surface after session.start: show the HUD there too.
     if (this.isLocal && this.hud !== undefined) void this.isHudOn().then(isOn => (isOn ? this.openHud() : false))
-    // Before session.start has finished, it starts the helper itself.
-    if (this.isLocal) this.autoStart()
+    // It starts the helper itself, unless the administrator check still runs: session.start then does once it ends.
+    if (this.isLocal && !this.pc.holdsHelper) this.autoStart()
   }
 
   /** Starts the helper (a user's request retries after already_running or a give-up). */
   startHelper(userInitiated: boolean): void {
-    if (!this.isLocal || this.isSetupRunning) return
+    if (!this.isLocal || this.isSetupRunning || this.pc.holdsHelper) return
     this.helper?.start({ userInitiated })
   }
 
   async restartHelper(): Promise<void> {
     if (!this.isLocal || this.isSetupRunning || this.helper === undefined) return
+    if (this.pc.refusesElevated()) return
     await this.helper.restart()
   }
 
@@ -382,6 +389,7 @@ export class Jarvis {
   async runSetup(uv: string, request: SetupOptions): Promise<void> {
     const { engine, platform, helper } = this
     if (engine === undefined || platform === undefined || helper === undefined || this.isSetupRunning) return
+    if (this.pc.refusesElevated()) return // nothing installs as administrator
     this.isSetupRunning = true
     this.publish({ ...this.view, phase: 'setup', detail: 'stopping the helper' })
     try {
@@ -428,6 +436,7 @@ export class Jarvis {
   async runLocalSetup(uv: string, request: { useCuda?: boolean }): Promise<void> {
     const { engine, platform, helper } = this
     if (engine === undefined || platform === undefined || helper === undefined || this.isSetupRunning) return
+    if (this.pc.refusesElevated()) return // nothing installs as administrator
     this.isSetupRunning = true
     this.publish({ ...this.view, phase: 'setup', detail: 'stopping the helper' })
     try {
