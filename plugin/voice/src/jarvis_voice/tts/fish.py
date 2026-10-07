@@ -37,7 +37,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "wss://api.fish.audio"
 LIVE_PATH = "/v1/tts/live"
-DEFAULT_MODEL = "s2.1-pro"
+# Fish's free API model: the same voice model as s2.1-pro at no cost under
+# fair use through 30 Nov 2026 (fish.audio/blog/s2-1-pro-free-api). Fish may
+# use requests to improve its models. Set JARVIS_TTS_MODEL=s2.1-pro for the
+# paid model, which needs prepaid API credit.
+DEFAULT_MODEL = "s2.1-pro-free"
 SAMPLE_RATE = 24_000
 
 AUTH_HINT = "Check the Fish Audio API key (and account balance) at fish.audio, then update fishApiKey."

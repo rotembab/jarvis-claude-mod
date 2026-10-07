@@ -53,6 +53,8 @@ export type HelperOptions = {
   platform: Platform
   /** The Fish Audio key from the plugin's sensitive userConfig, when set. */
   fishApiKey?: string
+  /** The Fish Audio model (`JARVIS_TTS_MODEL`); undefined keeps the helper's default. */
+  fishModel?: string
   /** NO_PROXY as the session has it; the child's gains the loopback hosts. */
   noProxy?: string
   /**
@@ -420,6 +422,7 @@ export class Helper {
       NO_PROXY: withLoopbackNoProxy(this.options.noProxy),
     }
     if (this.options.fishApiKey) env.FISH_AUDIO_API_KEY = this.options.fishApiKey
+    if (this.options.fishModel) env.JARVIS_TTS_MODEL = this.options.fishModel
     return env
   }
 

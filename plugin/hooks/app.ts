@@ -24,8 +24,12 @@ export const CPU_AUTO_MODEL: SttModel = 'small.en'
 /** What /jarvis setup was asked for: a model, and whether to install the CUDA libraries. */
 export type SetupOptions = { sttModel?: SttModel; useCuda?: boolean }
 
+/** Fish Audio models offered in the plugin settings; the free one is the default. */
+export const FISH_MODELS = ['s2.1-pro-free', 's2.1-pro'] as const
+
 export type JarvisSettings = {
   fishApiKey?: string
+  fishModel: string
   voiceId?: string
   pttKey: string
   sttModel: SttModel
@@ -42,6 +46,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
   const stt = optionString(options, 'sttModel')
   return {
     fishApiKey: optionString(options, 'fishApiKey'),
+    fishModel: FISH_MODELS.find(model => model === optionString(options, 'fishModel')) ?? FISH_MODELS[0],
     voiceId: optionString(options, 'voiceId'),
     pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
     sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
@@ -97,6 +102,7 @@ export class Jarvis {
     const helper = new Helper(engine, {
       platform,
       fishApiKey: this.settings.fishApiKey,
+      fishModel: this.settings.fishModel,
       noProxy: env.NO_PROXY,
       sttModel: () => this.sttModel(),
       initialConfig: () => this.initialConfig(),

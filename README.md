@@ -94,6 +94,8 @@ Jarvis needs a Fish Audio API key to speak. Create one on the API keys page of y
 
 **Voice.** Without a voice set, Fish Audio's default voice is used. To pick one, open the voice on fish.audio, copy its model id (the id in the voice's page address), and either set the **Fish Audio voice** option or run `/jarvis voice <id>`. `/jarvis voice default` goes back to the default voice.
 
+**Fish Audio model.** Jarvis uses `s2.1-pro-free` by default: Fish Audio's free API model, the same voice model as `s2.1-pro` at no cost under Fish's fair use policy through 30 November 2026 ([announcement](https://fish.audio/blog/s2-1-pro-free-api/)). It needs only an API key, no API credit. Fish says requests to it may be used to improve its models. To use the paid `s2.1-pro` instead, set the **Fish Audio model** option and add API credit at [fish.audio/app/developers](https://fish.audio/app/developers); the app plan's monthly credits don't pay for the API.
+
 ## Using Jarvis
 
 1. Hold the push-to-talk key (Right Ctrl by default). A chime plays, the status line shows `JARVIS · listening`, and a band above the prompt shows the microphone level.
@@ -124,6 +126,7 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | --- | --- | --- |
 | `fishApiKey` | empty | Fish Audio API key. Sensitive; kept in secure storage. Empty means `FISH_AUDIO_API_KEY` from your environment. |
 | `voiceId` | empty | Fish Audio voice model id. Empty means Fish Audio's default voice. |
+| `fishModel` | `s2.1-pro-free` | Fish Audio model: `s2.1-pro-free` (free through 30 Nov 2026) or `s2.1-pro` (needs API credit). Run `/jarvis restart` after changing it. |
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
 | `sttModel` | `auto` | Speech-to-text model: `auto`, `base.en`, `small.en`, `small`, `medium` or `large-v3-turbo`. `auto` means `large-v3-turbo` on an NVIDIA GPU and `small.en` on the CPU. Run `/jarvis setup` after changing it. |
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |

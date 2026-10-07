@@ -18,8 +18,21 @@ describe('helper process', () => {
     expect(env.JARVIS_PARENT).toBe('claude-code')
     expect(env.JARVIS_TOKEN).toMatch(/^[0-9a-f]{64}$/)
     expect(env.FISH_AUDIO_API_KEY).toBe('fk-test')
+    expect(env.JARVIS_TTS_MODEL).toBe('s2.1-pro-free')
     expect(env.NO_PROXY).toBe('corp.example,127.0.0.1,localhost')
     expect(w.status()).toBe('JARVIS · starting')
+  })
+
+  test('passes the chosen Fish Audio model to the helper', { options: { fishModel: 's2.1-pro' } }, async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    expect(w.lastHelper().request.env?.JARVIS_TTS_MODEL).toBe('s2.1-pro')
+  })
+
+  test('an unknown Fish Audio model falls back to the free one', { options: { fishModel: 's2.1-pro-fre' } }, async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    expect(w.lastHelper().request.env?.JARVIS_TTS_MODEL).toBe('s2.1-pro-free')
   })
 
   test('loads the configured speech model from the start', { options: { sttModel: 'small.en' } }, async ($, on) => {

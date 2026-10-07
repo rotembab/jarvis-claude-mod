@@ -106,7 +106,7 @@ def test_doctor_report_masks_key(tmp_path: Path) -> None:
         report = run_doctor(tmp_path, test_mic=False, env={"FISH_AUDIO_API_KEY": key, "JARVIS_FISH_BASE_URL": fish.url})
     text = json.dumps(report)
     assert key not in text and report["fish"]["key"] == "****CRET"
-    assert report["fish"]["status"] == "ok" and report["fish"]["model"] == "s2.1-pro"
+    assert report["fish"]["status"] == "ok" and report["fish"]["model"] == "s2.1-pro-free"
     assert set(report) >= {"version", "platform", "python", "audio", "cuda", "models", "fish", "ptt"}
     assert report["models"]["downloaded"]["small.en"] is False
     assert "deviceCount" in report["cuda"]
@@ -117,7 +117,7 @@ def test_doctor_without_network(tmp_path: Path) -> None:
     assert report["fish"] == {
         "keySet": False,
         "key": None,
-        "model": "s2.1-pro",
+        "model": "s2.1-pro-free",
         "baseUrl": "wss://api.fish.audio",
         "status": "skipped",
     }

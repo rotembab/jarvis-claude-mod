@@ -20,6 +20,13 @@
       "description": "The model id of a Fish Audio voice (its reference id). Empty uses Fish Audio's default voice; /jarvis voice <id> overrides it.",
       "required": false
     },
+    "fishModel": {
+      "type": "string",
+      "title": "Fish Audio model",
+      "description": "s2.1-pro-free is free under Fish's fair use through 30 Nov 2026, and Fish may use requests to improve its models. s2.1-pro needs prepaid API credit (fish.audio/app/developers). Run /jarvis restart after changing it.",
+      "options": ["s2.1-pro-free", "s2.1-pro"],
+      "default": "s2.1-pro-free"
+    },
     "pttKey": {
       "type": "string",
       "title": "Push-to-talk key",

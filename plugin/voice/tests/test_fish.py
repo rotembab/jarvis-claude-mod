@@ -44,7 +44,7 @@ def settings(url: str, key: str | None = "good-key", **kw: object) -> FishSettin
 def test_settings_from_env() -> None:
     s = FishSettings.from_env({})
     assert (s.api_key, s.base_url, s.model, s.sample_rate) == (None, DEFAULT_BASE_URL, DEFAULT_MODEL, 24_000)
-    assert DEFAULT_MODEL == "s2.1-pro"
+    assert DEFAULT_MODEL == "s2.1-pro-free"
     s = FishSettings.from_env(
         {"FISH_AUDIO_API_KEY": " k ", "JARVIS_TTS_MODEL": "s1", "JARVIS_FISH_BASE_URL": "https://x.test"}
     )
@@ -99,7 +99,7 @@ def test_streams_sentences_and_receives_pcm() -> None:
         assert start is not None and start["request"]["reference_id"] == "v1"
         assert start["request"]["format"] == "pcm" and start["request"]["sample_rate"] == 24_000
         assert session.headers["Authorization"] == "Bearer good-key"
-        assert session.headers["model"] == "s2.1-pro"
+        assert session.headers["model"] == "s2.1-pro-free"
         assert collector.total == session.audio_bytes > 0
         assert stream.error is None
 
