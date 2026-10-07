@@ -111,9 +111,9 @@ Ask Jarvis about it and it says what the Fingerbot presses, its mode and its bat
 Jarvis controls your Tuya devices over your home network. With the cloud fallback on, it can also send a command through Tuya's cloud, over the internet, when a device doesn't answer at home. It is off unless you turn it on.
 
 - **Turning it on or off.** Jarvis asks right after you link your Tuya account. To change your answer, choose **Link Tuya devices (Tuya Smart or Smart Life)** in the setup window, then **Use Tuya's cloud when a device does not answer on the network**. After turning it on, choose **Refresh devices and scenes** to add devices only the cloud can reach.
-- **What it does.** Jarvis always tries your home network first. Only if the device doesn't answer, takes too long or turns Jarvis away does the same command go through Tuya's cloud, and Jarvis's answer then ends "through Tuya's cloud". A device Jarvis hasn't found on the network goes to the cloud at once, while Jarvis looks for it in the background so the next command can stay at home. A value the device refused, or a command it doesn't have, never goes to the cloud. A toggle or a Fingerbot press is never sent twice.
+- **What it does.** Jarvis always tries your home network first. Only if the device doesn't answer, takes too long or turns Jarvis away does the same command go through Tuya's cloud, and Jarvis's answer then says it went "through Tuya's cloud". A device Jarvis hasn't found on the network goes to the cloud at once, while Jarvis looks for it in the background so the next command can stay at home. A value the device refused, or a command it doesn't have, never goes to the cloud. A toggle or a Fingerbot press is never sent twice.
 - **Devices only the cloud reaches.** With the fallback on, a refresh also adds devices Tuya gives no local key for and devices behind a hub Jarvis couldn't match. Setup lists them as "through Tuya's cloud only". If you turn the fallback off, Jarvis can't control them until you turn it on again.
-- **What it can't do.** A Bluetooth device with no Tuya gateway, such as a Fingerbot paired only to your phone, can't be reached either way. If Tuya's cloud says a device is offline, Jarvis says so. If Tuya limits requests, Jarvis makes no cloud calls for a minute, scenes included.
+- **What it can't do.** A Bluetooth device with no Tuya gateway, such as a Fingerbot paired only to your phone, can't be reached either way. If Tuya's cloud says a device is offline, Jarvis says so. If Tuya limits requests, Jarvis sends no commands or scenes through the cloud for a minute.
 - **Devices saved earlier.** Colours and some brightness ranges on devices Jarvis saved before the fallback existed need **Refresh devices and scenes** before the cloud can set them. On and off work right away.
 
 The fallback uses the same unofficial sign-in as the link. If Tuya blocks it, the fallback and scenes stop working, and control over your home network carries on.
@@ -164,7 +164,7 @@ Jarvis runs on Windows, and Apple gives Windows programs no way into Apple Home.
 - **Tuya scenes in Siri.** A Tap-to-Run scene you added to Siri from the Tuya Smart or Smart Life app is the same scene Jarvis runs once your Tuya account is linked.
 - **Devices Jarvis reaches itself.** A Sony TV or Tuya devices work with Jarvis whether or not they are also in Apple Home.
 
-A network search shows which devices it sees in Apple Home. A Mac version of Jarvis could one day run your Shortcuts, and Apple Home through them; there is none yet.
+A network search shows which devices are already in a HomeKit home, usually Apple Home. A Mac version of Jarvis could one day run your Shortcuts, and Apple Home through them; there is none yet.
 
 ## Using it
 
