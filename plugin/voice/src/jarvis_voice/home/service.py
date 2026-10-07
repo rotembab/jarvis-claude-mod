@@ -5,7 +5,8 @@ Every answer is ``{"ok": true, "result": "done"|"failed"|"confirm", "code",
 "text", ...}``: ``ok`` says the helper handled the request, ``result`` how it
 went, and ``text`` is the plain-words summary Claude reads (and may speak).
 "confirm" means the command needs the user's OK on screen first: the mod
-asks, then sends the same request with ``confirmed: true``.
+asks, then sends the same request with ``confirmed: true``. ``scan`` only
+looks at the network (scan.py), so it needs no tier and no device.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .base import DRIVERS, LABELS, Driver, DriverContext, load_object, quiet_device_loggers
 from .model import (
@@ -24,6 +25,7 @@ from .model import (
     Code,
     CommandSpec,
     DeviceRecord,
+    HomeConfig,
     Outcome,
     Tier,
     Value,
@@ -33,9 +35,14 @@ from .model import (
 )
 from .store import HomeStore, StoreError
 
+if TYPE_CHECKING:
+    from .scan import ScanReport
+
 log = logging.getLogger(__name__)
 
 HOME_CALL_TIMEOUT_S = 20.0
+# A network scan takes about 9 s (scan.SCAN_S, then up to scan.JOIN_MARGIN_S to collect the searches).
+SCAN_TIMEOUT_S = 15.0
 LIST_LIMIT = 80
 SETUP_HINT = "Run /jarvis home setup, or ask me to open home setup, to add devices."
 
@@ -47,6 +54,7 @@ KIND_WORDS: dict[str, tuple[str, ...]] = {
     "light": ("light", "lamp", "bulb"),
     "plug": ("plug", "socket", "outlet"),
     "switch": ("switch",),
+    "button": ("button", "fingerbot", "button pusher", "pusher", "clicker"),
     "fan": ("fan",),
     "cover": ("curtain", "curtains", "blind", "blinds", "shutter", "shade"),
     "climate": ("ac", "air conditioner", "aircon", "air conditioning", "thermostat", "heat pump"),
@@ -83,6 +91,12 @@ def _strictest(*tiers: Tier | None) -> Tier:
     return max((t for t in tiers if t is not None), key=TIERS.index, default="free")
 
 
+def _scan_network(config: HomeConfig) -> ScanReport:
+    from .scan import scan
+
+    return scan(config)
+
+
 def _the(device: DeviceRecord) -> str:
     """ "the Sony TV", but "Movie night" for a scene (it reads as a name)."""
     return device.name if device.kind == "scene" else f"the {device.name}"
@@ -96,12 +110,14 @@ class HomeService:
         store: HomeStore | None = None,
         drivers: Mapping[str, str | Callable[[DriverContext], Driver]] | None = None,
         call_timeout: float = HOME_CALL_TIMEOUT_S,
+        scanner: Callable[[HomeConfig], ScanReport] | None = None,
     ) -> None:
         quiet_device_loggers()
         self.store = store or HomeStore(Path(data_dir))
         self.ctx = DriverContext(self.store, Path(data_dir), call_timeout)
         # Driver classes by name, as import paths (or, in tests, factories).
         self._paths: dict[str, str | Callable[[DriverContext], Driver]] = dict(DRIVERS if drivers is None else drivers)
+        self._scanner = scanner or _scan_network
         self._drivers: dict[str, Driver] = {}
         self._broken: dict[str, str] = {}
         self._mutex = threading.Lock()
@@ -127,6 +143,8 @@ class HomeService:
                 )
             if action == "info":
                 return self._info()
+            if action == "scan":
+                return self._scan()
             if action == "reload":
                 self._reset()
                 return self._info()
@@ -297,6 +315,21 @@ class HomeService:
             credentialsFile=str(self.store.secrets_path),
             count=sum(counts.values()),
         )
+
+    def _scan(self) -> dict[str, Any]:
+        """Which smart devices answer on the network, and which of them Jarvis has. Read-only."""
+        config = self.store.load()
+        future = self._pool.submit(self._scanner, config)
+        try:
+            report = future.result(timeout=SCAN_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            return _reply("failed", "timeout", "The network search did not finish in time. Try again in a minute.")
+        except Exception as exc:  # noqa: BLE001 - logged by its type only: a message could carry an address
+            log.warning("home scan failed: %s", type(exc).__name__)
+            return _reply("failed", "failed", f"The network search failed ({type(exc).__name__}).")
+        if not report.ran:
+            return _reply("failed", "busy", report.text())
+        return _reply("done", "ok", report.text(), count=sum(entry.count for entry in report.devices()))
 
     # ------------------------------------------------------------------ helpers
 

@@ -1,7 +1,8 @@
 """Sony Bravia TVs (Android TV and Google TV) over the home network.
 
-The TV offers two interfaces, both plain HTTP with the pre-shared key in an
-``X-Auth-PSK`` header:
+The TV offers two interfaces, both over HTTP with the pre-shared key in an
+``X-Auth-PSK`` header (HTTPS on TVs made since August 2025, whose plain HTTP
+only ever answers with an error):
 
 - the Scalar REST API, JSON-RPC at ``/sony/<service>``: power, volume, apps,
   inputs and what is on;
@@ -124,6 +125,12 @@ ERR_APP_UNDECIDED = 41402
 GONE = frozenset({"unreachable", "timeout", "refused", "tls"})
 # Failures worth one more try after a short wait (WebApiCore restarting).
 RETRYABLE = frozenset({"restarting", "refused"})
+# What plain http can answer a TV that takes only https: setup tries https after any of these.
+HTTPS_HINTS = frozenset({"refused", "auth", "http", "restarting", "bad_reply", "off"})
+
+# audio.getSoundSettings outputTerminal values for a soundbar or receiver over HDMI (eARC).
+# There setAudioVolume can do nothing without an error, so the remote's buttons are used.
+EXTERNAL_OUTPUTS = frozenset({"audioSystem", "hdmi"})
 
 
 # --------------------------------------------------------------------------- the client
@@ -200,7 +207,9 @@ class BraviaClient:
     ) -> None:
         if not usable_key(psk):
             raise BraviaError("bad_key", "the saved key has characters an HTTP header cannot carry")
-        self.base = f"{'https' if scheme == 'https' else 'http'}://{_netloc(address)}"
+        self.address = address
+        self.scheme = "https" if scheme == "https" else "http"
+        self.base = f"{self.scheme}://{_netloc(address)}"
         # TVs on https use a certificate of their own, which nothing on the PC can check.
         self.verify_tls = False
         self.deadline = time.monotonic() + budget
@@ -215,6 +224,12 @@ class BraviaClient:
 
     def remaining(self) -> float:
         return self.deadline - time.monotonic()
+
+    def over_https(self) -> BraviaClient:
+        """The same TV and key over https, within what is left of this client's budget."""
+        client = BraviaClient(self.address, self._psk, scheme="https", budget=0.0, retry_wait=self.retry_wait)
+        client.deadline = self.deadline
+        return client
 
     def call(
         self,
@@ -386,6 +401,15 @@ def _no_speaker(err: BraviaError) -> bool:
     return err.kind == "rpc" and err.code in (ERR_TARGET, ERR_UNSUPPORTED)
 
 
+def _output_terminal(result: list[Any]) -> str | None:
+    """getSoundSettings 1.1 for outputTerminal: ``[[{target, currentValue}]]`` -> currentValue."""
+    for entry in _first_list(result):
+        if isinstance(entry, dict) and entry.get("target", "outputTerminal") == "outputTerminal":
+            value = entry.get("currentValue")
+            return value if isinstance(value, str) else None
+    return None
+
+
 def _has_signal(entry: dict[str, Any]) -> bool:
     # getCurrentExternalInputsStatus 1.1 sends "status" as the STRING "true" or "false".
     status = entry.get("status")
@@ -484,6 +508,8 @@ class _Session:
         self.mac = net.normalize_mac(str(device.settings.get("mac") or ""))
         self.host = host_of(str(device.settings.get("address") or ""))
         self._codes_fetched = False
+        self._output: str | None = None
+        self._output_asked = False
 
     def remember(self, **changes: Any) -> None:
         self.driver._remember(self.device, changes)
@@ -502,6 +528,21 @@ class _Session:
             if err.kind in ("rpc", "bad_reply", "off"):
                 return []
             raise
+
+    def external_sound(self) -> bool:
+        """Whether the sound goes to a soundbar or receiver over HDMI. Asked once per
+        call, since it can change between calls; False when the TV cannot say."""
+        if not self._output_asked:
+            self._output_asked = True
+            try:
+                result = self.client.call(
+                    "audio", "getSoundSettings", [{"target": "outputTerminal"}], version="1.1", timeout=STATUS_TIMEOUT_S
+                )
+                self._output = _output_terminal(result)
+            except BraviaError as err:
+                if err.kind not in ("rpc", "bad_reply", "off"):
+                    raise
+        return self._output in EXTERNAL_OUTPUTS
 
     def apps(self) -> list[tuple[str, str]]:
         """(title, uri) of each app, in the TV's order, without repeats."""
@@ -668,22 +709,10 @@ class BraviaDriver(Driver):
         if handler is None:
             return Outcome.fail("unsupported", f"The {device.name} can't {command.replace('_', ' ')}.")
         budget = self.turn_on_budget_s if command in ("turn_on", "toggle") else CALL_BUDGET_S
-        session = self._open(device, budget)
-        if isinstance(session, Outcome):
-            return session
-        try:
-            return handler(session, value)
-        except BraviaError as err:
-            return self._failure(device, err)
+        return self._attempt(device, budget, lambda s: handler(s, value))
 
     def status(self, device: DeviceRecord) -> Outcome:
-        session = self._open(device, CALL_BUDGET_S)
-        if isinstance(session, Outcome):
-            return session
-        try:
-            return self._status(session)
-        except BraviaError as err:
-            return self._failure(device, err, action=False)
+        return self._attempt(device, CALL_BUDGET_S, self._status, action=False)
 
     def describe(self) -> str | None:
         try:
@@ -727,6 +756,47 @@ class BraviaDriver(Driver):
         except BraviaError as err:
             return self._failure(device, err)
         return _Session(self, device, client)
+
+    def _attempt(
+        self, device: DeviceRecord, budget: float, work: Callable[[_Session], Outcome], *, action: bool = True
+    ) -> Outcome:
+        """``work`` on a new session, and once more over https when a TV saved on http
+        refuses the key: it may now take only https."""
+        session = self._open(device, budget)
+        if isinstance(session, Outcome):
+            return session
+        try:
+            return work(session)
+        except BraviaError as err:
+            if err.kind != "auth" or session.client.scheme != "http":
+                return self._failure(device, err, action=action)
+        secure = self._over_https(session)
+        if secure is None:
+            return Outcome.fail(
+                "auth",
+                f"The {device.name} refused the pre-shared key, or now needs a secure connection; "
+                "add it again in home setup.",
+            )
+        try:
+            return work(secure)
+        except BraviaError as err:
+            return self._failure(device, err, action=action)
+
+    def _over_https(self, s: _Session) -> _Session | None:
+        """One getSystemInformation over https, in what is left of the call's time. TVs made
+        since August 2025 answer plain http only with an error, and an older one can be
+        switched to https. When it answers, the TV is saved as https from now on."""
+        client = s.client.over_https()
+        try:
+            info = _first(client.call("system", "getSystemInformation", timeout=STATUS_TIMEOUT_S, retry=False))
+        except BraviaError as err:
+            log.debug("%s: no answer over https either (%s)", s.device.id, err.kind)
+            return None
+        if not info:
+            return None
+        log.info("%s: the TV now answers over https; saved", s.device.id)
+        self._remember(s.device, {"scheme": "https"})
+        return _Session(self, s.device, client)
 
     def _remember(self, device: DeviceRecord, changes: dict[str, Any]) -> None:
         """Saves what the TV taught us (the IRCC path, its buttons, input labels) in its record."""
@@ -792,7 +862,8 @@ class BraviaDriver(Driver):
         elif showing:
             text += f", showing {showing}"
         speaker = _speaker(s.volume_entries())
-        if speaker is not None:
+        # With a soundbar the speakers' level is not what anyone hears, and the soundbar's is unreliable.
+        if speaker is not None and not s.external_sound():
             text += f", volume {_percent(speaker)}%"
             if speaker.get("mute") is True:
                 text += ", muted"
@@ -928,26 +999,30 @@ class BraviaDriver(Driver):
 
     def _volume_step(self, s: _Session, _value: Value = None, *, up: bool) -> Outcome:
         direction = "up" if up else "down"
-        try:
-            step = f"{'+' if up else '-'}{VOLUME_STEP}"
-            s.client.call("audio", "setAudioVolume", [{"target": "speaker", "volume": step}])
-        except BraviaError as err:
-            if err.kind == "rpc" and err.code == ERR_VOLUME_RANGE:
-                return Outcome.done(f"The {s.name} is already at its {'loudest' if up else 'quietest'}.")
-            if not _no_speaker(err):
-                raise
-            # The sound goes to an external audio system: press the remote's volume button instead.
-            if not s.press(("VolumeUp",) if up else ("VolumeDown",), times=VOLUME_STEP, gap=self.key_gap_s):
-                return Outcome.fail("unsupported", f"The {s.name} can't change its sound system's volume.")
-            return Outcome.done(f"Turned the {s.name}'s sound system {direction}.")
-        speaker = _speaker(s.volume_entries())
-        if speaker is None:
-            return Outcome.done(f"Turned the {s.name} {direction}.")
-        return Outcome.done(f"Turned the {s.name} {direction} to {_percent(speaker)}%.")
+        if not s.external_sound():
+            try:
+                step = f"{'+' if up else '-'}{VOLUME_STEP}"
+                s.client.call("audio", "setAudioVolume", [{"target": "speaker", "volume": step}])
+            except BraviaError as err:
+                if err.kind == "rpc" and err.code == ERR_VOLUME_RANGE:
+                    return Outcome.done(f"The {s.name} is already at its {'loudest' if up else 'quietest'}.")
+                if not _no_speaker(err):
+                    raise
+            else:
+                speaker = _speaker(s.volume_entries())
+                if speaker is None:
+                    return Outcome.done(f"Turned the {s.name} {direction}.")
+                return Outcome.done(f"Turned the {s.name} {direction} to {_percent(speaker)}%.")
+        # The sound goes to an external audio system: press the remote's volume button instead.
+        if not s.press(("VolumeUp",) if up else ("VolumeDown",), times=VOLUME_STEP, gap=self.key_gap_s):
+            return Outcome.fail("unsupported", f"The {s.name} can't change its sound system's volume.")
+        return Outcome.done(f"Turned the {s.name}'s sound system {direction}.")
 
     def _set_volume(self, s: _Session, value: Value) -> Outcome:
         percent = _as_percent(value)
         entries = s.volume_entries()
+        if s.external_sound():
+            return self._set_volume_by_keys(s, percent, entries)
         low, high = _range(_speaker(entries))
         level = low + round(percent * (high - low) / 100)
         try:
@@ -975,6 +1050,8 @@ class BraviaDriver(Driver):
         return Outcome.done(f"Set the {s.name}'s sound system to about {percent}%.")
 
     def _mute(self, s: _Session, _value: Value = None, *, on: bool) -> Outcome:
+        if s.external_sound():
+            return self._mute_by_key(s, on)
         try:
             s.client.call("audio", "setAudioMute", [{"status": on}])
         except BraviaError as err:
@@ -1131,8 +1208,9 @@ def discover_tvs(timeout: float = DISCOVERY_S, *, target: tuple[str, int] | None
     """Sony TVs that answer an SSDP search within ``timeout`` seconds.
 
     Soundbars answer the same search, so only devices whose description lists
-    the ``videoScreen`` service count. Firewalls often block the replies,
-    which is why typing the address stays the main path. A multicast leaves
+    the ``videoScreen`` service count. Firewalls often block the replies, and
+    newer firmware may not answer this search at all, which is why typing the
+    address stays the main path. A multicast leaves
     through one network adapter only, which on a PC with a VPN, WSL, Hyper-V
     or Docker may not be the home network's, so the search also goes out from
     each of the computer's private addresses.
@@ -1262,14 +1340,19 @@ def _xml_value(text: str, tag: str) -> str:
 
 TV_STEPS = """\
 First, once, on the TV (keep it switched on while you do this):
-  Google TV (2021 and later): Settings > Network & Internet > IP control:
-    Authentication = Pre-Shared Key, then set a Pre-Shared Key, and Control remotely = On.
-    Then, also under Network & Internet: Remote start = On (so Jarvis can switch the TV on).
+  Google TV (2021 and later), under Settings > Network & Internet:
+    1. IP control (on some models inside Local network setup or Home network setup):
+       Authentication = Pre-Shared Key (Normal and Pre-Shared Key also works), and a
+       Pre-Shared Key of 16 to 20 letters and digits. TVs made since August 2025 have no
+       Authentication item and need at least 16: just set the key.
+    2. Remote device settings > Control remotely = On.
+    3. Remote start = On (or On (Powered on by apps), or On (Networked standby)),
+       so Jarvis can switch the TV on.
+    4. After the Android 14 update, also Settings > System > Power and Energy >
+       Energy Mode = Increased (Low turns the network off in standby).
   Older Android TV: Settings > Network > Home network setup > IP control: Authentication =
     Pre-Shared Key (or Normal and Pre-Shared Key) and set the key; then Remote start = On.
-  Choose a key you use nowhere else: it travels unencrypted on your home network.
-  If Jarvis cannot switch the TV on from standby later, some models also need
-    Settings > System > Power and energy > Energy modes = Increased.
+  Choose a key you use nowhere else: on older TVs it travels unencrypted on your home network.
 Tip: give the TV a fixed address in your router (a DHCP reservation) so it keeps it."""
 
 
@@ -1279,6 +1362,7 @@ class TvProbe:
 
     scheme: str = "http"
     info: dict[str, Any] = field(default_factory=dict)
+    mac: str | None = None
     power: str | None = None
     ircc_path: str = IRCC_PATHS[0]
     codes: dict[str, str] = field(default_factory=dict)
@@ -1291,7 +1375,8 @@ def _probe_problem(err: BraviaError, address: str) -> str:
     if kind == "auth":
         return (
             "The TV refused that key. Check the Pre-Shared Key under IP control on the TV "
-            "(Authentication must be Pre-Shared Key) and type it again."
+            "(Authentication, if the TV has it, must be Pre-Shared Key), and that Settings > Network & Internet > "
+            "Remote device settings > Control remotely is On. Then type the key again."
         )
     if kind in ("unreachable", "timeout"):
         return (
@@ -1299,9 +1384,11 @@ def _probe_problem(err: BraviaError, address: str) -> str:
             "and that this computer is on the same network as the TV."
         )
     if kind == "refused":
+        # Neither http nor https answered: setup tries both before saying this.
         return (
             f"The TV at {address} refused the connection. Check that IP control and "
-            "Control remotely are on in the TV's network settings."
+            "Control remotely are on in the TV's network settings. Some models (BRAVIA 2 II, some BRAVIA 3) "
+            "list only Simple IP control and Control4 under IP control, and cannot be controlled this way."
         )
     if kind == "restarting":
         return (
@@ -1321,45 +1408,84 @@ def _probe_problem(err: BraviaError, address: str) -> str:
     return f"The TV answered with an error ({err.code}). Wait a moment and try again."
 
 
-def _first_contact(address: str, psk: str, scheme: str, probe: TvProbe, retry_wait: float) -> BraviaClient:
-    client = BraviaClient(address, psk, scheme=scheme, budget=PROBE_BUDGET_S, retry_wait=retry_wait)
+_Contact = tuple[BraviaClient, dict[str, Any]] | BraviaError
+
+
+def _first_contact(address: str, psk: str, scheme: str, retry_wait: float) -> _Contact:
+    """A client and the TV's system information over ``scheme`` (empty when it
+    answered with an error code), or why that failed."""
+    try:
+        client = BraviaClient(address, psk, scheme=scheme, budget=PROBE_BUDGET_S, retry_wait=retry_wait)
+    except BraviaError as err:
+        return err
     # A closed port is not worth waiting for here: setup tries https next, and the user can try again.
     client.retry_kinds = frozenset({"restarting"})
+    info: dict[str, Any] = {}
     try:
-        probe.info = _first(client.call("system", "getSystemInformation", timeout=5.0))
+        info = _first(client.call("system", "getSystemInformation", timeout=5.0))
     except BraviaError as err:
         if err.kind != "rpc":  # an error code still means a Sony TV answered
-            raise
-    return client
-
-
-def probe_tv(address: str, psk: str, *, retry_wait: float | None = None) -> TvProbe:
-    """Checks the address and key the way the driver will use them, and collects
-    the model, MAC, power state, IRCC path, button codes and inputs."""
-    retry_wait = RETRY_WAIT_S if retry_wait is None else retry_wait
-    probe = TvProbe()
-    try:
-        client = _first_contact(address, psk, "http", probe, retry_wait)
-    except BraviaError as err:
-        if err.kind != "refused":
-            probe.problem = _probe_problem(err, address)
-            return probe
-        # Port 80 closed: some TVs answer only on https.
-        try:
-            client = _first_contact(address, psk, "https", probe, retry_wait)
-            probe.scheme = "https"
-        except BraviaError as second:
-            probe.problem = _probe_problem(second if second.kind in ("auth", "restarting") else err, address)
-            return probe
-    with contextlib.suppress(BraviaError):
-        probe.power = str(_first(client.call("system", "getPowerStatus")).get("status") or "") or None
+            return err
     # The app list needs the key's full rights: the surest check that the key is right.
     try:
         client.call("appControl", "getApplicationList")
     except BraviaError as err:
         if err.kind == "auth":
-            probe.problem = _probe_problem(err, address)
-            return probe
+            return err
+    return client, info
+
+
+def _pick_scheme(plain: _Contact, secure: _Contact) -> _Contact:
+    """What setup goes on with when plain http did not give the TV's system information."""
+    if not isinstance(secure, BraviaError):
+        # https gave it, or at least got further than http
+        return secure if secure[1] or isinstance(plain, BraviaError) else plain
+    if secure.kind == "auth":
+        return secure  # the key is wrong only when https refuses it too
+    if not isinstance(plain, BraviaError):
+        return plain  # http answered as a Sony TV does, if with an error code: as before https was tried
+    # Both failed: https's own answer says more, unless it gave none.
+    return secure if secure.kind not in GONE | {"budget"} else plain
+
+
+def _network_mac(client: BraviaClient, address: str) -> str | None:
+    """The MAC from getNetworkSettings, for TVs whose system information lacks it: the
+    hwAddr of the interface with the address setup reached the TV on."""
+    host = host_of(address)
+    try:
+        result = client.call("system", "getNetworkSettings", [{"netif": ""}], timeout=5.0)
+    except BraviaError:
+        return None
+    for entry in _first_list(result):
+        if isinstance(entry, dict) and host and str(entry.get("ipAddrV4") or "").strip() == host:
+            return net.normalize_mac(str(entry.get("hwAddr") or ""))
+    return None
+
+
+def probe_tv(address: str, psk: str, *, retry_wait: float | None = None) -> TvProbe:
+    """Checks the address and key the way the driver will use them, and collects
+    the model, MAC, power state, IRCC path, button codes and inputs.
+
+    http goes first. TVs made since August 2025 take only https and answer plain
+    http with an error (often as if the key were wrong), so https is tried
+    whenever http answered without the TV's system information. The key is
+    called wrong only when https refuses it too, or does not answer at all."""
+    retry_wait = RETRY_WAIT_S if retry_wait is None else retry_wait
+    probe = TvProbe()
+    contact = _first_contact(address, psk, "http", retry_wait)
+    if isinstance(contact, BraviaError) and contact.kind not in HTTPS_HINTS:
+        probe.problem = _probe_problem(contact, address)  # no answer at all, or a key it cannot send
+        return probe
+    if isinstance(contact, BraviaError) or not contact[1]:
+        contact = _pick_scheme(contact, _first_contact(address, psk, "https", retry_wait))
+    if isinstance(contact, BraviaError):
+        probe.problem = _probe_problem(contact, address)
+        return probe
+    client, probe.info = contact
+    probe.scheme = client.scheme
+    with contextlib.suppress(BraviaError):
+        probe.power = str(_first(client.call("system", "getPowerStatus")).get("status") or "") or None
+    probe.mac = net.normalize_mac(str(probe.info.get("macAddr") or "")) or _network_mac(client, address)
     # Home Assistant does this too: with the TV's Wake-on-LAN mode off, it ignores the
     # magic packet that turn_on sends when the TV is off the network.
     with contextlib.suppress(BraviaError):
@@ -1408,7 +1534,10 @@ def _ask_discovered(ui: Prompter) -> str | None:
     ui.say("Searching...")
     found = discover_tvs(DISCOVERY_S)
     if not found:
-        ui.say("No Sony TV answered. That is common (a firewall may block the search): type its address instead.")
+        ui.say(
+            "No Sony TV answered. That is common (a firewall may block the search, and newer TVs may not "
+            "answer it): type its address instead."
+        )
         return None
     options = [f"{tv.name} ({tv.model}) at {tv.address}" if tv.model else f"{tv.name} at {tv.address}" for tv in found]
     index = ui.choose("Which TV?", [*options, "Type the address myself"])
@@ -1478,7 +1607,7 @@ def wizard(ui: Prompter, ctx: DriverContext) -> None:
         return
     address, psk, probe = connected
     model = str(probe.info.get("model") or "").strip()
-    mac = net.normalize_mac(str(probe.info.get("macAddr") or ""))
+    mac = probe.mac
     state = {"active": " It is on.", "standby": " It is in standby."}.get(probe.power or "", "")
     ui.say(f"Connected to the Sony {model}.{state}" if model else f"Connected to the TV.{state}")
     if mac is None:

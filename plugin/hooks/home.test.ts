@@ -110,10 +110,11 @@ describe('home_control: registration', () => {
     const [spec] = w.tools
     expect(spec?.description.length).toBeLessThan(1500)
     expect(spec?.description).toContain('Never ask for a PIN, key, password or token in the chat')
+    expect(spec?.description).toContain('"scan" looks for smart devices on the home network')
     expect(spec?.inputSchema).toEqual({
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['list', 'status', 'do', 'setup'] },
+        action: { type: 'string', enum: ['list', 'status', 'do', 'scan', 'setup'] },
         device: expect.objectContaining({ type: 'string' }),
         command: expect.objectContaining({ type: 'string' }),
         value: expect.objectContaining({ type: ['string', 'number'] }),
@@ -193,8 +194,8 @@ describe('home_control: arguments', () => {
     const w = world(on)
     await startHome($, w)
     const cases: [Record<string, unknown>, string][] = [
-      [{ action: 'unlock_door', device: 'Front door' }, 'home_control: unknown action "unlock_door": use list, status, do or setup.'],
-      [{ device: 'Sony TV' }, 'home_control: action is required: list, status, do or setup.'],
+      [{ action: 'unlock_door', device: 'Front door' }, 'home_control: unknown action "unlock_door": use list, status, do, scan or setup.'],
+      [{ device: 'Sony TV' }, 'home_control: action is required: list, status, do, scan or setup.'],
       [{ action: 'do', device: 'Sony TV' }, 'home_control: do needs a device and a command (list shows them).'],
       [{ action: 'status' }, 'home_control: status needs a device (list shows them).'],
       [{ action: 'do', device: 'Sony TV', command: 'set_volume', value: 'x'.repeat(501) }, 'home_control: value is too long (at most 500 characters).'],
@@ -211,6 +212,10 @@ describe('home_control: arguments', () => {
 
   test('parseHomeToolInput keeps only what each action uses', () => {
     expect(parseHomeToolInput({ action: 'setup', device: 'TV', confirmed: true })).toEqual({ action: 'setup' })
+    expect(parseHomeToolInput({ action: ' Scan ', device: 'TV', query: 'lights', confirmed: true })).toEqual({
+      action: 'scan',
+      body: { action: 'scan' },
+    })
     expect(parseHomeToolInput({ action: 'do', device: 'TV', command: 'mute', value: '  ' })).toEqual({
       action: 'do',
       body: { action: 'do', device: 'TV', command: 'mute' },
@@ -246,6 +251,38 @@ describe('home_control: arguments', () => {
     expect(await homeTool($, { action: 'list' })).toEqual({
       result: 'Home control failed: unknown command home. Run /jarvis setup to update the Jarvis helper.',
     })
+  })
+})
+
+describe('home_control: scan', () => {
+  const FOUND = 'I searched the network for 7 seconds and found 2 smart devices.\n\nJarvis controls these:\n- Sony Bravia TV "Living Room TV": not set up yet: add it in home setup.'
+
+  test('looks at the network through the helper, with no device, no rule check and no question', async ($, on) => {
+    const w = world(on)
+    homeReplies(w, () => answer(FOUND, { count: 2 }))
+    w.toolCheck = () => ({ decision: 'ask', reason: 'Permission rule asks', rule: 'mcp__jarvis__home_control' })
+    await startHome($, w)
+    expect(await homeTool($, { action: 'scan', device: 'Sony TV', confirmed: true })).toEqual({ result: FOUND })
+    expect(homeBodies(w)).toEqual([{ action: 'scan' }])
+    expect(w.checks).toEqual([])
+    expect(w.asked).toEqual([])
+  })
+
+  test('without the helper, the one-shot command scans', async ($, on) => {
+    const w = world(on)
+    oneShot(w, () => printed({ ok: true, result: 'done', code: 'ok', text: FOUND, count: 2 }))
+    await startWithoutHelper($, w)
+    expect(await homeTool($, { action: 'scan' })).toEqual({ result: FOUND })
+    expect(w.runs.map(run => run.argv[5])).toEqual(['{"action":"scan"}'])
+    expect(w.runs[0]?.timeoutMs).toBe(60_000)
+  })
+
+  test('a scan already running says so', async ($, on) => {
+    const w = world(on)
+    const busy = "I'm already searching the network. Ask again in a few seconds."
+    homeReplies(w, () => answer(busy, { result: 'failed', code: 'busy' }))
+    await startHome($, w)
+    expect(await homeTool($, { action: 'scan' })).toEqual({ result: busy })
   })
 })
 
@@ -380,7 +417,7 @@ describe('home_control: confirming on screen', () => {
 })
 
 describe('home_control: plan mode', () => {
-  test('do and setup are refused in plan mode; list and status still work', async ($, on) => {
+  test('do and setup are refused in plan mode; list, status and scan still work', async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('Done.'))
     oneShot(w, () => printed({ ok: true, opened: true, text: 'The Jarvis home setup window is open on your desktop.' }))
@@ -393,7 +430,9 @@ describe('home_control: plan mode', () => {
     expect(w.runs).toEqual([])
     await homeTool($, { action: 'list' })
     await homeTool($, { action: 'status', device: 'Sony TV' })
-    expect(homeBodies(w)).toEqual([{ action: 'list' }, { action: 'status', device: 'Sony TV' }])
+    expect(await homeTool($, { action: 'scan' })).toEqual({ result: 'Done.' })
+    expect(homeBodies(w)).toEqual([{ action: 'list' }, { action: 'status', device: 'Sony TV' }, { action: 'scan' }])
+    expect(w.checks).toEqual([])
   })
 
   test('leaving plan mode (a new prompt, or an approved plan) allows changes again', async ($, on) => {
@@ -424,10 +463,12 @@ describe('home_control: plan mode', () => {
     expect(((await homeTool($, { action: 'setup' })) as { result: string }).result).toMatch(MODE_UNKNOWN)
     expect(w.runs).toEqual([])
     await homeTool($, { action: 'status', device: 'Sony TV' }) // reading still works
+    await homeTool($, { action: 'scan' })
     await prompted($)
     expect(await turnOff()).toEqual({ result: 'The Sony TV is off.' })
     expect(homeBodies(w)).toEqual([
       { action: 'status', device: 'Sony TV' },
+      { action: 'scan' },
       { action: 'do', device: 'Sony TV', command: 'turn_off' },
     ])
   })
@@ -676,12 +717,13 @@ describe('/jarvis home', () => {
     )
   })
 
-  test('list, status and do send what was typed', async ($, on) => {
+  test('list, scan, status and do send what was typed', async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('Done.'))
     await startHome($, w)
     await jarvis($, 'home list')
     await jarvis($, 'home list bedroom lights')
+    expect(await jarvis($, 'home scan')).toBe('Done.')
     await jarvis($, 'home status living room TV')
     await jarvis($, 'home do Sony TV -- set_volume 20')
     await jarvis($, 'home do Sony TV -- launch_app Disney Plus')
@@ -689,6 +731,7 @@ describe('/jarvis home', () => {
     expect(homeBodies(w)).toEqual([
       { action: 'list' },
       { action: 'list', query: 'bedroom lights' },
+      { action: 'scan' },
       { action: 'status', device: 'living room TV' },
       { action: 'do', device: 'Sony TV', command: 'set_volume', value: '20' },
       { action: 'do', device: 'Sony TV', command: 'launch_app', value: 'Disney Plus' },
@@ -738,6 +781,7 @@ describe('/jarvis home', () => {
     const cloud = 'Home control runs on your own computer; this session runs in the cloud, so it is not available here.'
     expect(await jarvis($, 'home setup')).toBe(cloud)
     expect(await jarvis($, 'home list')).toBe(cloud)
+    expect(await jarvis($, 'home scan')).toBe(cloud)
     expect(w.runs).toEqual([])
   })
 
@@ -745,5 +789,6 @@ describe('/jarvis home', () => {
     const w = world(on)
     await startHome($, w)
     expect(await jarvis($, 'help')).toContain(HOME_HELP)
+    expect(HOME_HELP).toContain('/jarvis home scan')
   })
 })

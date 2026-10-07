@@ -127,6 +127,7 @@ def run_wizard(data_dir: Path, ui: Prompter | None = None, *, service: HomeServi
             "Jarvis uses it to find devices on your home network."
         )
     menu = [label for _, label, _ in WIZARD_STEPS] + [
+        "Find smart devices on my network",
         "Show my devices",
         "Rename a device, set its room, or remove it",
         "Ask before Jarvis uses a device",
@@ -152,7 +153,7 @@ def run_wizard(data_dir: Path, ui: Prompter | None = None, *, service: HomeServi
                     home.handle({"action": "reload"})
                 else:
                     extra = choice - len(WIZARD_STEPS)
-                    [_show, _edit, _confirm, _try][extra](prompter, home)
+                    [_find, _show, _edit, _confirm, _try][extra](prompter, home)
             except KeyboardInterrupt:
                 prompter.say("\nCancelled.")
             except StoreError as exc:
@@ -184,6 +185,12 @@ def _label(device: DeviceRecord) -> str:
     room = f", {device.room}" if device.room else ""
     asks = "; asks first" if device.confirm == "screen" else ""
     return f"{device.name} ({device.kind}{room}){asks}"
+
+
+def _find(ui: Prompter, home: HomeService) -> None:
+    # Here, in front of the user, so a Windows Firewall question about Python comes up where they can answer it.
+    ui.say("Looking for smart devices on your network. This takes about ten seconds.")
+    ui.say(home.handle({"action": "scan"})["text"])
 
 
 def _show(ui: Prompter, home: HomeService) -> None:

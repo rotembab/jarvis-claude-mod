@@ -48,7 +48,7 @@ def run_console(
     ask: Callable[[str], str] = input,
     service_factory: ServiceFactory = HomeService,
 ) -> dict[str, Any]:
-    """``home info|list|status|do`` typed at a console. A command that needs
+    """``home info|list|status|do|scan`` typed at a console. A command that needs
     confirming is asked about here, if stdin is a terminal, and refused otherwise."""
     body = {k: v for k, v in body.items() if k != "confirmed"}
     service = service_factory(data_dir)

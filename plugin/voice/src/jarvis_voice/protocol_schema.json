@@ -136,9 +136,9 @@
     "ShutdownCommand": { "type": "object", "additionalProperties": false, "properties": {} },
     "HomeCommand": {
       "type": "object", "additionalProperties": false, "required": ["action"],
-      "description": "Home control (the mod's home_control tool). list: the devices and their commands; status: one device's state; do: run a command; info: what is set up and where it is saved; reload: drop cached connections and re-read devices.json. Answered with the home fields of CommandResponse.",
+      "description": "Home control (the mod's home_control tool). list: the devices and their commands; status: one device's state; do: run a command; info: what is set up and where it is saved; scan: look for smart devices on the home network (read-only, about 10 s); reload: drop cached connections and re-read devices.json. Answered with the home fields of CommandResponse.",
       "properties": {
-        "action": { "enum": ["list", "status", "do", "info", "reload"] },
+        "action": { "enum": ["list", "status", "do", "info", "scan", "reload"] },
         "device": { "type": "string", "minLength": 1, "maxLength": 200, "description": "status, do: a device id, name, alias or room and name" },
         "command": { "type": "string", "minLength": 1, "maxLength": 64, "description": "do: e.g. turn_on, set_volume, launch_app" },
         "value": { "type": ["string", "number", "boolean"], "maxLength": 500, "description": "do: the command's value (a level, an app name, a colour)" },
@@ -167,7 +167,7 @@
         "prompt": { "type": "string", "description": "home confirm: the question to ask" },
         "tier": { "enum": ["screen"], "description": "home confirm: how the user must confirm" },
         "device": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } }, "description": "home: the device the request named" },
-        "count": { "type": "integer", "minimum": 0, "description": "home list, info: how many devices" },
+        "count": { "type": "integer", "minimum": 0, "description": "home list, info: how many devices; scan: how many smart devices answered" },
         "devicesFile": { "type": "string", "description": "home info: where the devices are saved" },
         "credentialsFile": { "type": "string", "description": "home info: where the credentials are saved" }
       }

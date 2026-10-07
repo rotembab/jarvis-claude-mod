@@ -120,7 +120,7 @@ export type ConfigCommand = {
 }
 export type TestVoiceCommand = { text?: string }
 /** Home control: the `home_control` tool's request, plus `confirmed` (set by the mod only). */
-export type HomeAction = 'list' | 'status' | 'do' | 'info' | 'reload'
+export type HomeAction = 'list' | 'status' | 'do' | 'info' | 'scan' | 'reload'
 export type HomeCommand = {
   action: HomeAction
   /** status, do: a device id, name, alias or room and name. */

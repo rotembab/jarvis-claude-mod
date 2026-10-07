@@ -15,7 +15,7 @@ plugin/                           the plugin, the only folder that ships
   tsconfig.json                   type-checks the mod (tsc -p plugin)
   protocol/schema.json            helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
-    src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard
+    src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard, network scan
 docs/                             the plan, the phase 1 spec, the home-control guide (HOME.md) and this file
 ```
 
@@ -173,7 +173,7 @@ The doctor reads `FISH_AUDIO_API_KEY` from its own environment, and a plain Powe
 
 ## Home control
 
-The helper answers the `home` command (`list`, `status`, `do`, `info`, `reload`); the mod registers it as the model tool `home_control` and handles on-screen confirmations. User-facing steps are in [HOME.md](HOME.md).
+The helper answers the `home` command (`list`, `status`, `do`, `info`, `scan`, `reload`); the mod registers it as the model tool `home_control` and handles on-screen confirmations. User-facing steps are in [HOME.md](HOME.md).
 
 ```text
 plugin/voice/src/jarvis_voice/home/
@@ -181,18 +181,26 @@ plugin/voice/src/jarvis_voice/home/
   store.py         devices.json and credentials.dat (DPAPI on Windows), shared by the helper and the setup window
   service.py       HomeService: finds the device, checks the tier, runs the driver with a lock and a time limit
   base.py          the Driver interface and the registries (DRIVERS, WIZARD_STEPS)
-  runner.py        one asyncio loop thread for the async libraries (pyatv, the Smart Life SDK)
+  runner.py        one asyncio loop thread for the async libraries (pyatv)
   net.py           plain HTTP without a proxy, Wake-on-LAN
   wizard.py        the setup console (`/jarvis home setup`), run in a window of its own
   commandline.py   `jarvis_voice home ...` without the helper
+  scan.py          the read-only network scan (mDNS, SSDP, Tuya broadcasts, brand UDP discovery): `home scan`
+                   and the setup window's "Find smart devices on my network"
   appletv.py, bravia.py, tuya*.py, homeassistant.py   the drivers and their setup steps
 ```
 
-**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command.
+**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode without checking permission rules, as it does `list` and `status`.
 
 **Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
 
 **Adding a driver.** Subclass `base.Driver` (`commands` reads saved data only, never the network; `run` and `status` finish within `DriverContext.call_timeout`), add it to `DRIVERS`, and add its setup step to `WIZARD_STEPS`. Use the canonical command names in `model.COMMAND_SYNONYMS` so "switch on" and "turn on" mean the same everywhere. Never poll a device in the background: a request to an Apple TV wakes it and, over HDMI-CEC, the TV.
+
+**Buttons.** The `button` kind is a device that presses something it cannot see, such as a Tuya Fingerbot on a wall switch. It has one command, `press` (`push`, `click` and `tap` are synonyms), no power commands, and its status never says on or off. On each press the Tuya driver writes the opposite of the switch value it reads (true when it reads none), so every press moves the arm, and setup saves what the button presses as an alias, so "bedroom light" finds it.
+
+**Tuya's cloud fallback** is opt-in: the choice is `cloud_fallback` in the `tuya:cloud` credential, next to the link and not in `devices.json`. A missing flag means off, and with it off the local path and its timing are unchanged. With it on, `_with_cloud` runs a command locally on the run budget less `CLOUD_SLICE_S`, and after a failure in `FALLBACK_ERRORS` replays the same handler on a `_CloudLink`, which reads and writes DP numbers the way `_Link` does. The replay is idempotent: it starts from what the local attempt read (nothing, once it wrote), and every write is an absolute value, so a toggle or a press is never sent twice. It never follows a refused value (903) or an unsupported command. Every cloud call, scenes included, goes through `tuya._CLOUD`, one session with one lock, which pauses cloud calls for `CLOUD_PAUSE_S` (60 s) after Tuya limits requests or reports a system error. Never log a cloud reply (a device's details carry its local key), a token, or an SDK or requests exception's text (the token refresh puts the refresh token in its URL): only the Tuya id, local or cloud, error codes and exception type names.
+
+**Adding a driver for something the scan finds.** `scan.py` sorts what answered into statuses. A brand Jarvis has no driver for is a `could_add` entry in `_branded`. Once its driver exists (above), move the brand into a rule of its own in `_classify_host`'s list, before `_branded`, the way `_bravia`, `_home_assistant` and `_apple` work: match the device (its address, or an id it advertises) against your driver's saved records, and return `set_up` with the Jarvis name, or `_not_set_up` with how to add it. The scan stays read-only: queries, and an HTTP GET of the description a device pointed to on its own address, but no pairing, sign-in, writes or other connections. Addresses, MACs and ids stay inside `scan.py` (`Sighting.host` and `Sighting.props`, which its repr leaves out): a `ScanEntry` never carries one, and `clean_name` strips them from names. Add a classifier test with recorded TXT or SSDP answers to `tests\test_home_scan.py`.
 
 Try it from a PowerShell window, using your real data folder or a scratch one:
 
@@ -203,6 +211,7 @@ $py = "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe"
 & $py -m jarvis_voice home list
 & $py -m jarvis_voice home status "Sony TV"
 & $py -m jarvis_voice home do "Sony TV" set_volume 20  # asks y/n first for a confirm-tier command
+& $py -m jarvis_voice home scan                       # the network scan, about ten seconds
 ```
 
 ## Logs

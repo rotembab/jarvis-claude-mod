@@ -1,5 +1,5 @@
-"""The Tuya / Smart Life driver against fakes: tinytuya (devices that record every request), its UDP
-scanner, and tuya_sharing (the Smart Life QR login, homes, devices, scenes and token renewal)."""
+"""The Tuya driver against fakes: tinytuya (devices that record every request), its UDP scanner, and
+tuya_sharing (the Tuya QR login, homes, devices, scenes and token renewal)."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ KEYS = {
     "porch": "FAKE-KEY-PRCH-01",
     "fan": "FAKE-KEY-FAN0-01",
     "robot": "FAKE-KEY-ROBO-01",
+    "lost": "FAKE-KEY-LOST-01",
 }
 SECRETS = [*KEYS.values(), "ACCESS-TOKEN-1", "REFRESH-TOKEN-1", "ACCESS-TOKEN-2", "REFRESH-TOKEN-2", "UC-TEST-0001"]
 LOGIN = {
@@ -77,7 +78,18 @@ class Phys:
     dps: dict[str, Any]
     children: dict[str, Phys] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)  # Err codes for the next requests
+    write_errors: list[str] = field(default_factory=list)  # Err codes for the next writes only
     device22: bool = False  # answers a status query only for the DPs it is asked for
+
+
+class FakeClock:
+    """time.monotonic for tests that count seconds without waiting for them."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class FakeNet:
@@ -86,6 +98,9 @@ class FakeNet:
         self.calls: list[tuple[str, str, Any]] = []
         self.opened: list[dict[str, Any]] = []
         self.closed = 0
+        # When set, a request to an address where nothing answers takes its worst case on this clock: two
+        # attempts, each a connect and receives of up to T (4T in all, 8T for v3.4+, as tuya.py counts).
+        self.clock: FakeClock | None = None
 
     def add(self, phys: Phys) -> Phys:
         self.devices[phys.tuya_id] = phys
@@ -155,6 +170,8 @@ class FakeDevice:
         gateway = self.parent or self
         phys = self.net.devices.get(gateway.id)
         if phys is None or phys.address != gateway.address:
+            if self.net.clock is not None:
+                self.net.clock.now += (8 if float(gateway.version) >= 3.4 else 4) * self.timeout
             return _error("905", gateway._key)
         if phys.errors:
             return _error(phys.errors.pop(0), gateway._key)
@@ -178,9 +195,14 @@ class FakeDevice:
             return {"dps": {k: v for k, v in target.dps.items() if k in self.dps_to_request}}
         return {"dps": dict(target.dps)}
 
+    def _write_error(self) -> dict[str, Any] | None:
+        gateway = self.parent or self
+        phys = self.net.devices.get(gateway.id)
+        return _error(phys.write_errors.pop(0), gateway._key) if phys is not None and phys.write_errors else None
+
     def set_value(self, index: str, value: Any) -> Any:
         self.net.calls.append((self.id, "set_value", {str(index): value}))
-        target = self._target()
+        target = self._write_error() or self._target()
         if isinstance(target, dict):
             return target
         target.dps[str(index)] = value
@@ -188,7 +210,7 @@ class FakeDevice:
 
     def set_multiple_values(self, data: dict[str, Any]) -> Any:
         self.net.calls.append((self.id, "set_multiple_values", dict(data)))
-        target = self._target()
+        target = self._write_error() or self._target()
         if isinstance(target, dict):
             return target
         target.dps.update({str(k): v for k, v in data.items()})
@@ -303,7 +325,7 @@ def cloud_device(
 
 
 class FakeCloud:
-    """Smart Life behind tuya_sharing's LoginControl and Manager."""
+    """The Tuya cloud behind tuya_sharing's LoginControl and Manager."""
 
     def __init__(self) -> None:
         self.devices: list[SimpleNamespace] = []
@@ -320,6 +342,15 @@ class FakeCloud:
         self.trigger_error: BaseException | None = None
         self.renew_on_trigger: dict[str, Any] | None = None
         self.trigger_hangs: threading.Event | None = None  # the trigger waits for this (a stuck connection)
+        # The cloud fallback: each device's state by code, as /v1.0/m/life/ha/devices/detail reports it.
+        self.state: dict[str, dict[str, Any]] = {}
+        self.offline: set[str] = set()
+        self.requests: list[tuple[str, str]] = []  # (method, path) of every device request
+        self.commands: list[tuple[str, list[dict[str, Any]]]] = []
+        self.answers: deque[Any] = deque()  # replaces the next requests' answers: None, or an exception to raise
+        self.seconds = 0.0  # each request takes this long on ``clock``
+        self.clock: FakeClock | None = None
+        self.hang: threading.Event | None = None  # requests wait for this (a stuck connection)
 
     def module(self) -> Any:
         cloud = self
@@ -349,7 +380,7 @@ class FakeCloud:
                 self.listener = listener
                 self.device_map: dict[str, Any] = {}
                 self.user_homes = [SimpleNamespace(id="home-1", name="Home")]
-                self.customer_api = SimpleNamespace(get=self._get)
+                self.customer_api = SimpleNamespace(get=self._get, post=self._post)
 
             def update_device_cache(self) -> None:
                 if cloud.load_error is not None:
@@ -358,10 +389,28 @@ class FakeCloud:
                     self.listener.update_token(cloud.renew_on_load)
                 self.device_map = {d.id: d for d in cloud.devices}
 
-            def _get(self, path: str) -> dict[str, Any]:
+            def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+                if path == "/v1.0/m/life/ha/devices/detail":
+                    assert params is not None
+                    tuya_id = params["devIds"]
+                    cloud.request("GET", path)
+                    status = [{"code": code, "value": value} for code, value in cloud.state.get(tuya_id, {}).items()]
+                    # As the real reply: it carries the local key too.
+                    item = {"id": tuya_id, "online": tuya_id not in cloud.offline, "local_key": KEYS["lamp"]}
+                    return cloud.answer({"success": True, "t": 1, "result": [{**item, "status": status}]})
                 tuya_id = path.split("/")[-2]
                 device = next(d for d in cloud.devices if d.id == tuya_id)
                 return {"success": True, "result": {"productKey": "pid", "dpStatusRelationDTOS": device.dtos}}
+
+            def _post(self, path: str, params: Any, body: dict[str, Any]) -> Any:
+                assert path.startswith("/v1.1/m/thing/") and path.endswith("/commands") and params is None
+                tuya_id = path.split("/")[-2]
+                cloud.request("POST", path)
+                cloud.commands.append((tuya_id, list(body["commands"])))
+                answer = cloud.answer({"success": True, "t": 1, "result": True})
+                if answer is not None:
+                    cloud.state.setdefault(tuya_id, {}).update({c["code"]: c["value"] for c in body["commands"]})
+                return answer
 
             def query_room_by_device(self, tuya_id: str) -> Any:
                 name = cloud.rooms.get(tuya_id)
@@ -381,6 +430,21 @@ class FakeCloud:
                 return True
 
         return SimpleNamespace(LoginControl=LoginControl, Manager=Manager)
+
+    def request(self, method: str, path: str) -> None:
+        self.requests.append((method, path))
+        if self.hang is not None:
+            self.hang.wait(10)
+        if self.clock is not None:
+            self.clock.now += self.seconds
+
+    def answer(self, normal: Any) -> Any:
+        if not self.answers:
+            return normal
+        answer = self.answers.popleft()
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
 
 # --------------------------------------------------------------------------- the home: cloud, network, store
@@ -407,7 +471,7 @@ PLUG_POINTS = [
 ]
 KITCHEN_POINTS = [dp(1, "switch_1", "Boolean"), dp(2, "switch_2", "Boolean")]
 CURTAIN_POINTS = [
-    # The motor speaks "0"/"1"/"2"; Smart Life lists the standard words and maps the motor's onto them.
+    # The motor speaks "0"/"1"/"2"; the cloud lists the standard words and maps the motor's onto them.
     dp(
         1,
         "control",
@@ -435,6 +499,14 @@ FAN_POINTS = [
     dp(1, "switch", "Boolean"),
     dp(2, "mode", "Enum", {"range": ["normal", "nature", "sleep"]}),
     dp(3, "fan_speed", "Enum", {"range": ["1", "2", "3", "4"]}),
+]
+# A Fingerbot: a robot finger on a wall switch. In click mode each change of "switch" is one press.
+FINGER_POINTS = [
+    dp(1, "switch", "Boolean"),
+    dp(2, "mode", "Enum", {"range": ["click", "switch", "program"]}),
+    dp(3, "click_sustain_time", "Integer", {"min": 2, "max": 10}),
+    dp(9, "arm_down_percent", "Integer", {"min": 51, "max": 100}),
+    dp(12, "battery_percentage", "Integer", {"min": 0, "max": 100, "unit": "%"}, ro=True),
 ]
 
 
@@ -464,6 +536,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Home]:
     monkeypatch.setattr(tuya, "_scanner", lambda: scanner)
     monkeypatch.setattr(tuya, "_sharing", cloud.module)
     monkeypatch.setattr(tuya, "LOGIN_POLL_S", 0.0)
+    monkeypatch.setattr(tuya, "_CLOUD", tuya._CloudSession())  # the helper's one cloud session, fresh per test
     cloud.devices = [
         cloud_device("lamp-id", "Desk lamp", "dj", KEYS["lamp"], LAMP_POINTS),
         cloud_device("hall-id", "Hall bulb", "dj", KEYS["hall"], HALL_POINTS),
@@ -520,11 +593,12 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Home]:
     ctx.close()
 
 
-LINK_ANSWERS: list[Any] = ["UC-TEST-0001", "Kitchen light", "", True]
+# The User Code, no to the cloud fallback, names for the kitchen switch's two gangs, then save.
+LINK_ANSWERS: list[Any] = ["UC-TEST-0001", False, "Kitchen light", "", True]
 
 
 def link(home: Home, *, check: bool | None = False) -> ScriptedPrompter:
-    """Runs the wizard's Link Smart Life through to the end (``check`` None: no device found, so not asked)."""
+    """Runs the wizard's Link your Tuya account through to the end (``check`` None: no device found, so not asked)."""
     ui = ScriptedPrompter([*LINK_ANSWERS] + ([] if check is None else [check]))
     tuya.wizard(ui, home.ctx)
     assert not ui.answers, f"unused answers: {list(ui.answers)}"
@@ -537,7 +611,7 @@ def assert_no_secrets(*texts: str) -> None:
             assert secret not in text, f"{secret!r} leaked into {text!r}"
 
 
-# --------------------------------------------------------------------------- linking Smart Life
+# --------------------------------------------------------------------------- linking the Tuya account
 
 
 def test_qr_link_saves_devices_scenes_and_keys(home: Home, caplog: pytest.LogCaptureFixture) -> None:
@@ -546,9 +620,10 @@ def test_qr_link_saves_devices_scenes_and_keys(home: Home, caplog: pytest.LogCap
 
     assert home.cloud.qr_requests == [(tuya.CLIENT_ID, tuya.SCHEMA, "UC-TEST-0001")]
     assert ui.qr and ui.qr[0][0] == "tuyaSmart--qrLogin?token=QR-TOKEN-1"
-    assert "Scan" in ui.qr[0][1]
+    assert "Scan" in ui.qr[0][1] and "Confirm login" in ui.qr[0][1] and "Tuya Smart or Smart Life" in ui.qr[0][1]
     assert home.cloud.login_checks == 2
     assert "Account and Security" in ui.text and "Home Assistant" in ui.text
+    assert "case-sensitive" in ui.text and "same app" in ui.text and "case-sensitive" in ui.asked[0]
 
     config = home.store.load()
     by_name = {d.name: d for d in config.devices}
@@ -617,7 +692,7 @@ def test_qr_link_saves_devices_scenes_and_keys(home: Home, caplog: pytest.LogCap
     assert all(entry["name"] == "" and entry["key"] == "" for entry in call["tuyadevices"])
 
     assert "IR blaster (an IR remote" in ui.text and "Hall sensor (a sensor" in ui.text
-    assert "AC cool 24" in ui.text and "tap-to-run scene" in ui.text
+    assert "AC cool 24" in ui.text and "Tap-to-Run scene" in ui.text
     assert "Not found on your home network: Porch light" in ui.text
     assert "Old scene" not in ui.text
     # The check after saving reads each reachable device once.
@@ -645,6 +720,34 @@ def test_qr_not_confirmed_in_time_saves_nothing(home: Home, monkeypatch: pytest.
     assert home.store.load().devices == [] and home.store.secret_keys() == []
 
 
+def test_an_expired_qr_code_stops_the_wait_and_offers_a_new_one(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 30.0)  # a test that waited it out would show here
+    home.cloud.logins = deque([(False, {"success": False, "code": "E0020002", "msg": "expired"}), (True, dict(LOGIN))])
+    ui = ScriptedPrompter(["UC-TEST-0001", True, False, "Kitchen light", "", True, False])
+    started = time.monotonic()
+    tuya.wizard(ui, home.ctx)
+    assert time.monotonic() - started < 10.0
+    assert "The QR code expired" in ui.text and "Show a new QR code" in "\n".join(ui.asked)
+    assert len(ui.qr) == 2 and len(home.cloud.qr_requests) == 2 and home.cloud.login_checks == 2
+    assert home.device("Desk lamp").kind == "light"
+
+
+def test_a_refused_login_says_to_use_the_same_app(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 30.0)
+    refused = {"success": False, "code": "E0020003", "msg": "Please use the designated APP to scan the code to log in"}
+    home.cloud.logins = deque([(False, refused)])
+    ui = ScriptedPrompter(["UC-TEST-0001", False])  # no new QR code
+    tuya.wizard(ui, home.ctx)
+    assert home.cloud.login_checks == 1 and len(ui.qr) == 1
+    assert "The phone refused the login" in ui.text and "same app you took the User Code from" in ui.text
+    assert "designated" not in ui.text and "Nothing was saved." in ui.text
+    assert home.store.load().devices == [] and home.store.secret_keys() == []
+    # Any other failure keeps the wait going, as before.
+    home.cloud.logins = deque([(False, {"success": False, "code": "E9999999"}), (True, dict(LOGIN))])
+    link(home)
+    assert home.cloud.login_checks == 3
+
+
 def test_ctrl_c_while_waiting_for_the_phone_saves_nothing(home: Home) -> None:
     home.cloud.logins = deque([(False, {}), KeyboardInterrupt()])
     ui = ScriptedPrompter(["UC-TEST-0001"])
@@ -654,7 +757,7 @@ def test_ctrl_c_while_waiting_for_the_phone_saves_nothing(home: Home) -> None:
 
 
 def test_declining_the_save_saves_nothing(home: Home) -> None:
-    ui = ScriptedPrompter(["UC-TEST-0001", "", "", False])
+    ui = ScriptedPrompter(["UC-TEST-0001", None, "", "", False])
     tuya.wizard(ui, home.ctx)
     assert "Nothing was saved." in ui.text
     assert home.store.load().devices == [] and home.store.secret_keys() == []
@@ -674,7 +777,7 @@ def test_a_wrong_user_code_or_no_internet_is_explained(home: Home) -> None:
         patch.setattr(tuya, "_sharing", lambda: offline_sharing)
         ui = ScriptedPrompter(["UC-TEST-0001"])
         tuya.wizard(ui, home.ctx)
-    assert "could not reach Smart Life" in ui.text and "Nothing was saved." in ui.text
+    assert "could not reach Tuya" in ui.text and "Nothing was saved." in ui.text
     assert home.store.secret_keys() == []
 
 
@@ -711,7 +814,7 @@ def test_refresh_without_qr_keeps_names_and_follows_smart_life(home: Home) -> No
     assert "TV time" in names and "Kitchen light" in names  # gang names are not asked again
     study = home.device("Study lamp")
     assert study.id == lamp.id and study.settings["address"] == "192.168.1.40"
-    assert "No longer in Smart Life: Ceiling fan" in "\n".join(ui.asked)
+    assert "No longer in your Tuya account: Ceiling fan" in "\n".join(ui.asked)
     assert all(not key.endswith("ceiling-fan") for key in home.store.secret_keys())
     saved = home.store.secret(CLOUD_SECRET)
     assert saved is not None and saved["token_info"]["refresh_token"] == "REFRESH-TOKEN-2"
@@ -722,7 +825,7 @@ def test_refresh_with_an_expired_link_says_so(home: Home) -> None:
     home.cloud.load_error = CloudError("1010", "token invalid")
     ui = ScriptedPrompter(["Refresh"])
     tuya.wizard(ui, home.ctx)
-    assert "The Smart Life link has expired" in ui.text and "Nothing was changed." in ui.text
+    assert "The Tuya link has expired" in ui.text and "Nothing was changed." in ui.text
 
 
 def test_find_devices_again_and_reverse_a_curtain(home: Home) -> None:
@@ -1012,7 +1115,7 @@ def test_a_sub_device_without_a_node_id_is_reached_by_its_uuid(home: Home) -> No
     spot = home.device("Hall spot")
     assert spot.settings["parent"] == "hub-id" and spot.settings["node_id"] == "uuid-spot"
     # Without either, commands would reach only the hub: it is left out, saying why.
-    assert "Hall strip (Smart Life did not say how its hub addresses it)" in ui.text
+    assert "Hall strip (Tuya did not say how its hub addresses it)" in ui.text
     assert all(d.name != "Hall strip" for d in home.store.load().devices)
     home.net.opened.clear()
     assert home.driver().run(spot, "turn_on", None).text == "The Hall spot is on."
@@ -1022,6 +1125,90 @@ def test_a_sub_device_without_a_node_id_is_reached_by_its_uuid(home: Home) -> No
     home.net.opened.clear()
     outcome = home.driver().run(home.device("Hall spot"), "turn_on", None)
     assert outcome.code == "needs_setup" and not home.net.opened
+
+
+def add_fingerbots(home: Home) -> None:
+    """A Fingerbot behind the Zigbee hub's Bluetooth side (reachable), and one paired to the phone only."""
+    home.cloud.devices += [
+        cloud_device("finger-id", "Bedroom Fingerbot", "szjqr", KEYS["hub"], FINGER_POINTS, sub=True, node_id="f1"),
+        cloud_device("ble-id", "Desk Fingerbot", "szjqr", "FAKE-KEY-BLE0-01", FINGER_POINTS),
+    ]
+    home.cloud.rooms["finger-id"] = "Bedroom"
+    child = Phys("finger-id", "", KEYS["hub"], 3.3, {"1": False, "2": "click", "3": 2, "9": 80, "12": 80})
+    home.net.devices["hub-id"].children["f1"] = child
+
+
+def test_a_fingerbot_is_a_button_named_for_what_it_presses(home: Home) -> None:
+    add_fingerbots(home)
+    ui = ScriptedPrompter(["UC-TEST-0001", False, "Kitchen light", "", "bedroom light", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers
+    assert "What does the Bedroom Fingerbot switch on and off? For example: bedroom light (empty to skip)" in ui.asked
+    finger = home.device("Bedroom Fingerbot")
+    assert finger.kind == "button" and finger.aliases == ["bedroom light"] and finger.room == "Bedroom"
+    assert finger.settings["parent"] == "hub-id" and finger.settings["node_id"] == "f1"
+    assert {"switch", "mode", "click_sustain_time", "arm_down_percent", "battery_percentage"} <= set(
+        finger.settings["dps"]
+    )
+    # Bluetooth only, with no gateway: nothing on the network reaches it, so it is left out, saying why.
+    assert "Desk Fingerbot (a Bluetooth device, which Jarvis can reach only through a Tuya Bluetooth" in ui.text
+    assert all(d.name != "Desk Fingerbot" for d in home.store.load().devices)
+    assert "ble-id" not in home.scanner.calls[0]["wantids"]
+    assert_no_secrets(home.config_text(), ui.text)
+    # A refresh keeps the alias and does not ask again; an empty answer skips it.
+    ui = ScriptedPrompter(["Refresh", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert home.device("Bedroom Fingerbot").aliases == ["bedroom light"] and not ui.answers
+    home.store.update(lambda c: c.remove(finger.id))
+    ui = ScriptedPrompter(["Refresh", "", True, False])
+    tuya.wizard(ui, home.ctx)
+    assert home.device("Bedroom Fingerbot").aliases == [] and not ui.answers
+
+
+def test_a_button_presses_and_never_claims_the_light_is_on(home: Home) -> None:
+    add_fingerbots(home)
+    tuya.wizard(ScriptedPrompter(["UC-TEST-0001", False, "Kitchen light", "", "bedroom light", True, False]), home.ctx)
+    finger = home.device("Bedroom Fingerbot")
+    child = home.net.devices["hub-id"].children["f1"]
+    assert command_names(home, "Bedroom Fingerbot") == ["press"]
+    (spec,) = home.driver().commands(finger)
+    assert "cannot see the light" in spec.hint
+    pressed = (
+        "The Bedroom Fingerbot pressed the bedroom light switch. Jarvis cannot see the light, so it cannot tell "
+        "whether it is now on or off."
+    )
+    # Each press writes the opposite of what the switch reports, so the finger always sees a change.
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(pressed)
+    assert run(home, "Bedroom Fingerbot", "press") == Outcome.done(pressed)
+    assert [payload for device, op, payload in home.net.calls if op != "status"][-2:] == [{"1": True}, {"1": False}]
+    # No value to read, or a read that times out: it presses with True.
+    del child.dps["1"]
+    assert run(home, "Bedroom Fingerbot", "press").ok and child.dps["1"] is True
+    child.dps["1"] = True
+    home.net.devices["hub-id"].errors = ["902"]
+    assert run(home, "Bedroom Fingerbot", "press").ok and child.dps["1"] is True
+    # A hub that cannot be reached at all is not sent a press that cannot arrive either.
+    writes = len(home.net.writes("finger-id"))
+    home.net.devices["hub-id"].errors = ["905"]
+    assert run(home, "Bedroom Fingerbot", "press").code == "unreachable"
+    assert len(home.net.writes("finger-id")) == writes
+    assert home.driver().run(finger, "turn_on", None).code == "unsupported"
+    status = home.driver().status(finger).text
+    assert status == (
+        "The Bedroom Fingerbot presses the bedroom light switch. It is in click mode. Its battery is at 80%. "
+        "Jarvis cannot see whether the light is on."
+    )
+    # Through the service: the light's name finds the button, and "click" means press.
+    service = HomeService(home.ctx.data_dir, store=home.store, drivers={"tuya": TuyaDriver}, call_timeout=20.0)
+    try:
+        answer = service.handle({"action": "do", "device": "bedroom light", "command": "click"})
+        assert answer["result"] == "done" and answer["text"] == pressed
+        answer = service.handle({"action": "do", "device": "the clicker", "command": "push"})
+        assert answer["result"] == "done" and " is on" not in answer["text"]
+        listed = service.handle({"action": "list"})["text"]
+        assert "Bedroom Fingerbot (button, Bedroom)" in listed
+    finally:
+        service.close()
 
 
 def test_a_device_that_was_not_found_is_looked_for_again(home: Home) -> None:
@@ -1089,7 +1276,7 @@ def test_a_scan_that_could_not_listen_does_not_hold_back_the_next(home: Home) ->
         ("901", "unreachable", "Is it powered and on the home network?"),
         ("905", "unreachable", "Is it powered and on the home network?"),
         ("902", "timeout", "busy with another app"),
-        ("914", "auth", "refresh from Smart Life in home setup"),
+        ("914", "auth", "refresh your Tuya devices in home setup"),
         ("904", "auth", "busy with another app, so try again in a moment"),
         ("903", "bad_value", "refused that value"),
         ("906", "failed", "Controlling the Heater plug failed."),
@@ -1145,7 +1332,7 @@ def test_missing_key_or_settings_need_setup(home: Home) -> None:
     lamp = home.device("Desk lamp")
     home.store.set_secret(lamp.secret_key, None)
     outcome = home.driver().run(lamp, "turn_on", None)
-    assert outcome.code == "needs_setup" and "refresh from Smart Life" in outcome.text
+    assert outcome.code == "needs_setup" and "refresh your Tuya devices" in outcome.text
     assert "no key saved for Desk lamp" in (home.driver().describe() or "")
     bare = DeviceRecord("tuya-bare", "tuya", "Bare", "plug", settings={})
     assert home.driver().run(bare, "turn_on", None).code == "unsupported"
@@ -1172,7 +1359,7 @@ def test_an_expired_link_or_no_internet_is_said_plainly(home: Home, caplog: pyte
     outcome = run(home, "AC off", "activate")
     assert outcome == Outcome.fail("auth", tuya.EXPIRED)
     home.cloud.trigger_error = CloudError("2008", "scene not found")
-    assert run(home, "AC off", "activate") == Outcome.fail("failed", "Smart Life could not run AC off.")
+    assert run(home, "AC off", "activate") == Outcome.fail("failed", "Tuya could not run AC off.")
     home.cloud.trigger_error = ConnectionError("network down")
     assert run(home, "AC off", "activate").code == "unreachable"
     home.store.set_secret(CLOUD_SECRET, None)
@@ -1183,7 +1370,7 @@ def test_an_expired_link_or_no_internet_is_said_plainly(home: Home, caplog: pyte
 
 def test_a_scene_that_hangs_is_answered_within_the_time_limit(home: Home) -> None:
     link(home)
-    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 1.0  # one second for Smart Life
+    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 1.0  # one second for the Tuya cloud
     home.cloud.trigger_hangs = threading.Event()
     try:
         started = time.monotonic()
@@ -1191,7 +1378,7 @@ def test_a_scene_that_hangs_is_answered_within_the_time_limit(home: Home) -> Non
         assert time.monotonic() - started < 3.0
     finally:
         home.cloud.trigger_hangs.set()
-    assert outcome == Outcome.fail("timeout", "Smart Life did not answer in time; AC off may still run.")
+    assert outcome == Outcome.fail("timeout", "Tuya did not answer in time; AC off may still run.")
 
 
 def scene_tier(name: str, *aliases: str) -> str:
@@ -1249,6 +1436,272 @@ def test_through_the_home_service(home: Home, caplog: pytest.LogCaptureFixture) 
     assert_no_secrets(*texts, *(r.getMessage() for r in caplog.records))
 
 
+# --------------------------------------------------------------------------- the cloud fallback (opt-in)
+
+# As LINK_ANSWERS, with yes to the cloud fallback.
+CLOUD_ANSWERS: list[Any] = ["UC-TEST-0001", True, "Kitchen light", "", True]
+
+
+def link_with_cloud(home: Home) -> ScriptedPrompter:
+    ui = ScriptedPrompter([*CLOUD_ANSWERS, False])
+    tuya.wizard(ui, home.ctx)
+    assert not ui.answers, f"unused answers: {list(ui.answers)}"
+    return ui
+
+
+def saved_link(home: Home) -> dict[str, Any]:
+    saved = home.store.secret(CLOUD_SECRET)
+    assert saved is not None
+    return saved
+
+
+def test_the_cloud_fallback_is_off_unless_chosen(home: Home) -> None:
+    ui = link(home)
+    assert ui.asked.count(tuya.CLOUD_QUESTION) == 1 and saved_link(home)[tuya.FALLBACK] is False
+    # Exactly as without it: the in-command search, the full time for local requests, nothing to the cloud.
+    home.net.devices["plug-id"].errors = ["902"]
+    assert run(home, "Heater plug", "turn_on").code == "timeout"
+    outcome = run(home, "Porch light", "turn_on")
+    assert outcome.code == "unreachable" and "cloud" not in outcome.text
+    assert home.scanner.calls[-1]["wantids"] == ["porch-id"]
+    home.net.opened.clear()
+    run(home, "Desk lamp", "set_color_temp", "warm")  # v3.5, two requests' worth
+    assert home.net.opened[-1]["timeout"] == pytest.approx((tuya.RUN_BUDGET_S - 2 * tuya.UNIT_SLACK_S) / 16, abs=0.01)
+    # A link saved before the choice existed counts as no.
+    old = saved_link(home)
+    del old[tuya.FALLBACK]
+    home.store.set_secret(CLOUD_SECRET, old)
+    assert run(home, "Porch light", "turn_on").code == "unreachable"
+    assert home.cloud.requests == [] and home.cloud.commands == []
+    # On, local requests leave the cloud its share of the time.
+    home.store.set_secret(CLOUD_SECRET, {**old, tuya.FALLBACK: True})
+    home.net.opened.clear()
+    run(home, "Desk lamp", "set_color_temp", "warm")
+    local_s = tuya.RUN_BUDGET_S - tuya.CLOUD_SLICE_S
+    assert home.net.opened[-1]["timeout"] == pytest.approx((local_s - 2 * tuya.UNIT_SLACK_S) / 16, abs=0.01)
+
+
+def test_the_link_asks_once_and_the_menu_changes_the_choice(home: Home) -> None:
+    ui = link_with_cloud(home)
+    assert ui.asked.count(tuya.CLOUD_QUESTION) == 1 and "Bluetooth device with no Tuya gateway" in ui.text
+    assert saved_link(home)[tuya.FALLBACK] is True and tuya.FALLBACK not in home.config_text()
+    run(home, "AC cool 24", "activate")  # the helper's cloud session now holds the link as it was
+    ui = ScriptedPrompter(["does not answer on the network (now on)", False])
+    tuya.wizard(ui, home.ctx)
+    assert saved_link(home)[tuya.FALLBACK] is False and "no longer uses Tuya's cloud" in ui.text
+    # A token renewal by that session keeps the new choice.
+    home.cloud.renew_on_trigger = dict(RENEWED)
+    run(home, "AC cool 24", "activate")
+    assert saved_link(home)[tuya.FALLBACK] is False
+    assert saved_link(home)["token_info"]["refresh_token"] == "REFRESH-TOKEN-2"
+    tuya.wizard(ScriptedPrompter(["(now off)", True]), home.ctx)
+    assert saved_link(home)[tuya.FALLBACK] is True
+
+
+def test_a_device_not_found_goes_through_the_cloud_and_is_looked_for_meanwhile(home: Home) -> None:
+    link_with_cloud(home)
+    managers = len(home.cloud.managers)
+    home.scanner.answers["porch-id"] = ("192.168.1.27", "3.3")
+    driver = home.driver()
+    outcome = driver.run(home.device("Porch light"), "turn_on", None)
+    assert outcome == Outcome.done("The Porch light is on, through Tuya's cloud.")
+    assert home.cloud.commands == [("porch-id", [{"code": "switch_led", "value": True}])]
+    assert home.net.writes("porch-id") == []
+    assert driver._background is not None
+    driver._background.join(5)
+    assert home.device("Porch light").settings["address"] == "192.168.1.27"
+    # Found in the background: the next command is local.
+    assert driver.run(home.device("Porch light"), "turn_off", None) == Outcome.done("The Porch light is off.")
+    assert home.net.writes("porch-id") == [{"20": False}] and len(home.cloud.commands) == 1
+    assert len(home.cloud.managers) == managers + 1  # one session for the helper's cloud calls
+
+
+def test_a_toggle_that_timed_out_locally_is_finished_once_through_the_cloud(home: Home) -> None:
+    link_with_cloud(home)
+    home.net.devices["plug-id"].write_errors = ["902"]
+    outcome = run(home, "Heater plug", "toggle")
+    assert outcome == Outcome.done("The Heater plug is now off, through Tuya's cloud.")
+    # It read on=True locally: the cloud gets the absolute value the local write meant, once, without a read.
+    assert home.net.writes("plug-id") == [{"1": False}]
+    assert home.cloud.commands == [("plug-id", [{"code": "switch_1", "value": False}])]
+    assert [method for method, _ in home.cloud.requests] == ["POST"]
+
+
+def test_a_press_is_never_sent_twice(home: Home) -> None:
+    add_fingerbots(home)
+    ui = ScriptedPrompter(["UC-TEST-0001", True, "Kitchen light", "", "bedroom light", True, False])
+    tuya.wizard(ui, home.ctx)
+    # Even with the cloud on, a Bluetooth device with no gateway is left out: the cloud cannot reach it either.
+    assert "Desk Fingerbot (a Bluetooth device" in ui.text
+    hub = home.net.devices["hub-id"]
+    hub.write_errors = ["902"]
+    outcome = run(home, "Bedroom Fingerbot", "press")
+    assert outcome.ok and outcome.text.startswith(
+        "The Bedroom Fingerbot pressed the bedroom light switch, through Tuya's cloud. Jarvis cannot see"
+    )
+    assert home.cloud.commands == [("finger-id", [{"code": "switch", "value": True}])]
+    # The local read failed too: the press it tried (True) is the one the cloud sends, not a fresh opposite.
+    hub.children["f1"].dps["1"] = True
+    hub.errors, hub.write_errors = ["902"], ["902"]
+    assert run(home, "Bedroom Fingerbot", "press").ok
+    assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": True}])
+    assert [method for method, _ in home.cloud.requests] == ["POST", "POST"]
+
+
+def test_a_refused_value_or_command_does_not_go_to_the_cloud(home: Home) -> None:
+    link_with_cloud(home)
+    home.net.devices["plug-id"].write_errors = ["903"]
+    assert run(home, "Heater plug", "turn_on").code == "bad_value"
+    assert run(home, "Heater plug", "set_color", "red").code == "unsupported"
+    assert home.cloud.requests == []
+
+
+def test_cloud_failures_are_said_plainly(home: Home, caplog: pytest.LogCaptureFixture) -> None:
+    link_with_cloud(home)
+    caplog.set_level(logging.DEBUG)
+    clock = FakeClock()
+    tuya._CLOUD.clock = clock
+    not_found = "The Porch light has not been found on the home network."
+    texts = []
+
+    def porch_on(answer: Any) -> Outcome:
+        home.cloud.answers.append(answer)
+        outcome = run(home, "Porch light", "turn_on")
+        texts.append(outcome.text)
+        return outcome
+
+    outcome = porch_on(None)  # an HTTP error: the SDK logs it and returns None
+    assert outcome.code == "unreachable" and outcome.text.startswith(not_found)
+    assert outcome.text.endswith(" Tuya's cloud could not reach it either.")
+    assert porch_on(CloudError("-9999999", "sign invalid")).text.endswith(tuya.SIGNIN_REFUSED)
+    assert porch_on(CloudError("1010", "token invalid")).text.endswith(tuya.EXPIRED)
+    # requests' errors carry their URL, and the token renewal's URL carries the refresh token.
+    refused = ConnectionError("GET https://apigw.example.invalid/v1.0/m/token/REFRESH-TOKEN-1 failed")
+    assert porch_on(refused).text.endswith("could not reach it either.")
+    # Tuya says it is limiting requests: no cloud calls for a minute, scenes included.
+    assert porch_on(CloudError("-9999999", "API_QPS_LIMIT_OR_DEGRADE")).text.endswith(tuya.CLOUD_BUSY)
+    sent = len(home.cloud.requests)
+    clock.now += tuya.CLOUD_PAUSE_S - 1
+    outcome = run(home, "Porch light", "turn_on")
+    assert outcome.code == "unreachable" and "cloud" not in outcome.text  # as without the cloud
+    assert run(home, "AC off", "activate") == Outcome.fail("busy", tuya.CLOUD_BUSY)
+    assert len(home.cloud.requests) == sent and home.cloud.triggered == []
+    clock.now += 2
+    assert run(home, "Porch light", "turn_on").text == "The Porch light is on, through Tuya's cloud."
+    # The cloud says the device is offline: its last state is not spoken as if current.
+    home.cloud.offline.add("porch-id")
+    home.cloud.state["porch-id"] = {"switch_led": True}
+    outcome = home.driver().status(home.device("Porch light"))
+    assert outcome == Outcome.fail("unreachable", "Tuya's cloud says the Porch light is offline.")
+    messages = [r.getMessage() for r in caplog.records]
+    assert_no_secrets(*texts, *messages)
+    assert not any("apigw" in m or "sign invalid" in m or "network error" in m for m in messages)
+    assert any("porch-id" in m and "-9999999" in m for m in messages)
+
+
+def test_a_device_without_a_key_goes_through_the_cloud(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
+    link_with_cloud(home)
+    plug = home.device("Heater plug")
+    home.store.set_secret(plug.secret_key, None)
+    # Only the cloud reaches it now, so its answer does not say so each time.
+    assert run(home, "Heater plug", "turn_off") == Outcome.done("The Heater plug is off.")
+    assert home.cloud.commands == [("plug-id", [{"code": "switch_1", "value": False}])]
+    home.cloud.state["plug-id"].update({"cur_power": 1205})
+    assert home.driver().status(plug).text == "The Heater plug is off."
+    # A command sent that gets no answer in time may still arrive.
+    monkeypatch.setattr(tuya, "CLOUD_MIN_S", 0.1)
+    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 1.0
+    home.cloud.hang = threading.Event()
+    try:
+        started = time.monotonic()
+        outcome = run(home, "Heater plug", "turn_on")
+        assert time.monotonic() - started < 3.0
+    finally:
+        home.cloud.hang.set()
+    assert outcome == Outcome.fail("timeout", "Tuya's cloud did not answer in time; the Heater plug may still change.")
+
+
+def test_colours_and_states_through_the_cloud(home: Home) -> None:
+    link_with_cloud(home)
+    forget_address(home, "Desk lamp")
+    forget_address(home, "Hall bulb")
+    home.scanner.answers = {}  # not found in the background either
+    home.cloud.state["lamp-id"] = {"switch_led": True, "work_mode": "white", "bright_value_v2": 505}
+    assert run(home, "Desk lamp", "set_color", "red").text == "The Desk lamp is red now, through Tuya's cloud."
+    red = json.dumps({"h": 0, "s": 1000, "v": 500})  # the brightness it read through the cloud: 50 %
+    assert home.cloud.commands[-1] == (
+        "lamp-id",
+        [
+            {"code": "switch_led", "value": True},
+            {"code": "work_mode", "value": "colour"},
+            {"code": "colour_data_v2", "value": red},
+        ],
+    )
+    home.cloud.state["lamp-id"]["colour_data_v2"] = json.dumps({"h": 120, "s": 1000, "v": 600})
+    status = home.driver().status(home.device("Desk lamp")).text
+    assert status == "The Desk lamp is on, green, at 60% brightness, through Tuya's cloud."
+    # A v1 colour: s and v up to 255.
+    run(home, "Hall bulb", "set_color", "#0000ff")
+    assert home.cloud.commands[-1][1][-1] == {
+        "code": "colour_data",
+        "value": json.dumps({"h": 240, "s": 255, "v": 255}),
+    }
+    # Saved before the map kept the cloud's form of a colour: on and off still work, colours say to refresh.
+    lamp = home.device("Desk lamp")
+    home.store.update(lambda c: c.device(lamp.id).settings["dps"]["colour_data_v2"].pop("cloud"))
+    sent = len(home.cloud.commands)
+    outcome = run(home, "Desk lamp", "set_color", "blue")
+    assert outcome.text.startswith("The Desk lamp has not been found") and "refresh your Tuya devices" in outcome.text
+    assert len(home.cloud.commands) == sent
+    assert run(home, "Desk lamp", "turn_off").text == "The Desk lamp is off, through Tuya's cloud."
+
+
+def test_a_dead_address_still_leaves_the_cloud_its_time(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
+    link_with_cloud(home)
+    clock = FakeClock()
+    monkeypatch.setattr(tuya, "time", SimpleNamespace(monotonic=clock, sleep=time.sleep))
+    tuya._CLOUD.clock = clock
+    home.net.clock, home.cloud.clock, home.cloud.seconds = clock, clock, 1.5
+    # A v3.4 device (the slowest worst case) whose address is dead and that no scan finds.
+    home.net.devices["kitchen-id"].address = "192.168.1.99"
+    del home.scanner.answers["kitchen-id"]
+    home.cloud.state["kitchen-id"] = {"switch_1": False, "switch_2": True}
+    for command, text in (
+        ("turn_on", "The Kitchen light is on, through Tuya's cloud."),
+        ("toggle", "The Kitchen light is now off, through Tuya's cloud."),
+    ):
+        started = clock.now
+        assert run(home, "Kitchen light", command).text == text
+        assert clock.now - started <= tuya.RUN_BUDGET_S
+    assert home.cloud.commands[-1] == ("kitchen-id", [{"code": "switch_1", "value": False}])
+
+
+def test_with_the_cloud_on_devices_jarvis_cannot_reach_locally_are_kept(home: Home) -> None:
+    home.cloud.devices += [
+        cloud_device("shared-id", "Shared plug", "cz", "", GARDEN_POINTS, online=False),
+        cloud_device("lost-id", "Lost bulb", "dj", KEYS["lost"], PORCH_POINTS, sub=True, node_id="n9"),
+    ]
+    ui = link_with_cloud(home)
+    shared, lost = home.device("Shared plug"), home.device("Lost bulb")
+    assert shared.settings["cloud_only"] is True and "address" not in shared.settings
+    assert lost.settings["cloud_only"] is True and "parent" not in lost.settings and "node_id" not in lost.settings
+    assert home.store.secret(shared.secret_key) is None and home.store.secret(lost.secret_key) is None
+    assert "Shared plug (plug): through Tuya's cloud only (Tuya's cloud says it is offline;" in ui.text
+    assert "Lost bulb (light): through Tuya's cloud only" in ui.text
+    assert not {"shared-id", "lost-id"} & set(home.scanner.calls[0]["wantids"])
+    assert run(home, "Lost bulb", "turn_on") == Outcome.done("The Lost bulb is on.")
+    assert home.cloud.commands[-1] == ("lost-id", [{"code": "switch_led", "value": True}])
+    assert "Shared plug, Lost bulb work only through Tuya's cloud;" in (home.driver().describe() or "")
+    assert_no_secrets(home.config_text(), ui.text)
+    # Turned off in setup, they say how to turn it on again.
+    ui = ScriptedPrompter(["(now on)", False])
+    tuya.wizard(ui, home.ctx)
+    assert "Shared plug, Lost bulb work only through it" in ui.text
+    outcome = run(home, "Lost bulb", "turn_on")
+    assert outcome.code == "needs_setup" and "Turn it on in home setup" in outcome.text
+    assert "which is turned off" in (home.driver().describe() or "")
+
+
 # --------------------------------------------------------------------------- the real libraries' interfaces
 
 
@@ -1301,7 +1754,7 @@ def test_dp_map_from_dtos_skips_cloud_only_points_and_maps_vendor_words() -> Non
 
 def test_enum_words_map_whichever_words_the_range_lists() -> None:
     mapping = {"0": {"value": "open"}, "1": {"value": "stop"}, "2": {"value": "close"}}
-    # Smart Life lists the standard words; older or hand-made maps list the motor's own.
+    # The cloud lists the standard words; older or hand-made maps list the motor's own.
     for listed in (["open", "stop", "close"], ["0", "1", "2"]):
         relation = {
             "dpId": 1,
@@ -1364,7 +1817,60 @@ def test_kinds_and_left_out_categories() -> None:
     }
     assert tdp.kind_for("tdq", light) == "light"  # a dimmer module sold as a switch
     assert tdp.kind_for("xyz", {"control": {"dp": 1, "type": "enum", "range": ["open", "close"]}}) == "cover"
-    assert tdp.kind_for("wnykq", {}) is None and "Smart Life scenes" in tdp.skip_reason("wnykq")
+    assert tdp.kind_for("wnykq", {}) is None and "Tuya Smart or Smart Life app" in tdp.skip_reason("wnykq")
     assert tdp.kind_for("infrared_ac", {}) is None and "IR" in tdp.skip_reason("infrared_ac")
     assert tdp.kind_for("wg2", {}) is None and "hub" in tdp.skip_reason("wg2")
     assert tdp.kind_for("xyz", {}) is None and "nothing Jarvis can control" in tdp.skip_reason("xyz")
+    # Button pushers: by category, or by their arm's codes or a mode that clicks, even when sold as a switch.
+    switch = {"switch": {"dp": 1, "type": "bool"}}
+    assert tdp.kind_for("szjqr", switch) == tdp.kind_for("znjxs", switch) == "button"
+    assert tdp.kind_for("kg", switch) == "switch"
+    assert tdp.kind_for("kg", {**switch, "arm_down_percent": {"dp": 9, "type": "int"}}) == "button"
+    assert tdp.kind_for("kg", {**switch, "click_sustain_time": {"dp": 3, "type": "int", "ro": True}}) == "button"
+    assert tdp.kind_for("xyz", {**switch, "mode": {"dp": 2, "type": "enum", "range": ["click", "switch"]}}) == "button"
+    assert tdp.kind_for("kg", {**switch, "mode": {"dp": 2, "type": "enum", "range": ["auto", "manual"]}}) == "switch"
+
+
+def test_a_button_without_a_name_or_battery_still_never_says_on() -> None:
+    record = DeviceRecord(
+        "tuya-finger", "tuya", "Fingerbot", "button", settings={"dps": {"switch": {"dp": 1, "type": "bool"}}}
+    )
+    assert tdp.power_code(record) is None and [s.name for s in tdp.command_specs(record)] == ["press"]
+    text = tdp.describe_state(record, {"1": True})
+    assert text == "The Fingerbot presses a wall switch. Jarvis cannot see whether the light is on."
+
+
+def test_cloud_values_round_trip() -> None:
+    spec = {p["code"]: {"type": p["type"], "values": json.dumps(p["desc"])} for p in LAMP_POINTS}
+    colour = tdp.build_dp_map(tdp.relations_from_dtos(dtos(LAMP_POINTS)), spec, {})["colour_data_v2"]
+    assert colour["cloud"] == {"type": "json", "s_max": 1000, "v_max": 1000}
+    raw = tdp.encode_colour("hsv16", 240, 0.5, 0.25)
+    sent = tdp.to_cloud(colour, raw)
+    assert json.loads(sent) == {"h": 240, "s": 500, "v": 250}
+    assert tdp.from_cloud(colour, sent) == raw and tdp.from_cloud(colour, json.loads(sent)) == raw
+    # A v1 colour (s and v up to 255), and a device that types its colour as a String (12 hex characters).
+    v1 = {"dp": 5, "type": "str", "format": "rgb8", "cloud": {"type": "json", "s_max": 255, "v_max": 255}}
+    raw = tdp.encode_colour("rgb8", 120, 1.0, 0.5)
+    assert json.loads(tdp.to_cloud(v1, raw)) == {"h": 120, "s": 255, "v": 128}
+    assert tdp.from_cloud(v1, tdp.to_cloud(v1, raw)) == raw
+    text = {**colour, "cloud": {"type": "str", "s_max": 1000, "v_max": 1000}}
+    assert tdp.to_cloud(text, "00f001f400fa") == "00f001f400fa" == tdp.from_cloud(text, "00f001f400fa")
+    # A range the local protocol converts: hb_range_v1 is 25-255 locally and 0-100 in the cloud.
+    relation = {"dp": 3, "code": "bright_value", "type": "Integer", "convert": "hb_range_v1"}
+    bright = tdp.build_dp_map([relation], {}, {})["bright_value"]
+    assert bright["cloud"] == {"min": 0, "max": 100}
+    assert tdp.to_cloud(bright, 140) == 50 and tdp.from_cloud(bright, 50) == 140
+    assert tdp.to_cloud(bright, 255) == 100 and tdp.from_cloud(bright, 0) == 25
+    # Scaled numbers are the cloud's as they are; enums go by the standard words; booleans stay booleans.
+    temp = {"dp": 2, "type": "int", "min": 160, "max": 300, "scale": 1}
+    assert tdp.to_cloud(temp, 245) == 245 == tdp.from_cloud(temp, 245)
+    control = {"dp": 1, "type": "enum", "range": ["open", "stop", "close"], "raw": {"open": "0", "close": "2"}}
+    assert tdp.to_cloud(control, "2") == "close" and tdp.from_cloud(control, "close") == "2"
+    assert tdp.to_cloud({"dp": 1, "type": "bool"}, False) is False
+    # Saved before the map kept the cloud's form: no guessing.
+    old_colour = {k: v for k, v in colour.items() if k != "cloud"}
+    old_bright = {k: v for k, v in bright.items() if k != "cloud"}
+    for entry, value in ((old_colour, "00f001f400fa"), (old_bright, 140)):
+        with pytest.raises(ValueError):
+            tdp.to_cloud(entry, value)
+    assert tdp.from_cloud(old_colour, sent) is None and tdp.from_cloud(old_bright, 50) is None

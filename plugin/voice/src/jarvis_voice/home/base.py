@@ -38,7 +38,7 @@ QUIET_LOGGERS = {
     "paho": logging.WARNING,
     "srptools": logging.WARNING,
     "websockets": logging.WARNING,
-    # The Smart Life SDK's token refresh puts the refresh token in a URL path, which urllib3 logs at DEBUG.
+    # The Tuya sharing SDK's token refresh puts the refresh token in a URL path, which urllib3 logs at DEBUG.
     "urllib3": logging.WARNING,
 }
 
@@ -144,7 +144,7 @@ DRIVERS: dict[str, str] = {
 WIZARD_STEPS: list[tuple[str, str, str]] = [
     ("appletv", "Add an Apple TV", "jarvis_voice.home.appletv:wizard"),
     ("bravia", "Add a Sony Bravia TV", "jarvis_voice.home.bravia:wizard"),
-    ("tuya", "Link Smart Life / Tuya devices", "jarvis_voice.home.tuya:wizard"),
+    ("tuya", "Link Tuya devices (Tuya Smart or Smart Life)", "jarvis_voice.home.tuya:wizard"),
     ("homeassistant", "Connect Home Assistant", "jarvis_voice.home.homeassistant:wizard"),
 ]
 

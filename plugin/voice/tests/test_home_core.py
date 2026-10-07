@@ -11,15 +11,19 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from jarvis_voice import protocol
+from jarvis_voice import cli, protocol
 from jarvis_voice.audio.fake import FakeCapture, FakePlayback
 from jarvis_voice.daemon import Daemon, DaemonConfig
 from jarvis_voice.home import base as home_base
+from jarvis_voice.home import commandline as home_commandline
+from jarvis_voice.home import scan as home_scan
+from jarvis_voice.home import service as home_service
 from jarvis_voice.home import wizard as home_wizard
 from jarvis_voice.home.commandline import CONFIRM_NEEDS_HELPER, call_once, run_console
 from jarvis_voice.home.model import (
@@ -35,6 +39,7 @@ from jarvis_voice.home.model import (
 )
 from jarvis_voice.home.net import HttpError, broadcast_targets, magic_packet, normalize_mac, request
 from jarvis_voice.home.runner import AsyncRunner
+from jarvis_voice.home.scan import ScanEntry, ScanReport
 from jarvis_voice.home.service import HomeService
 from jarvis_voice.home.store import HomeStore, PlainCodec, StoreError
 from jarvis_voice.logs import secret_filter
@@ -52,6 +57,24 @@ HEATER = DeviceRecord("fake-heater", "fake", "Heater plug", "plug", "Bedroom", c
 LAMP_1 = DeviceRecord("fake-lamp-1", "fake", "Desk lamp", "light", "Office")
 LAMP_2 = DeviceRecord("fake-lamp-2", "fake", "Floor lamp", "light", "Office")
 ALL = [TV, STREAMER, DOOR, HEATER, LAMP_1, LAMP_2]
+
+# What a network scan found: the saved Sony TV, a HomeKit light Siri has, and a printer left out.
+FOUND = ScanReport(
+    [
+        ScanEntry("TV", "Living Room TV", "Sony Bravia", "set_up", jarvis_name="Sony TV"),
+        ScanEntry("light", "Desk Thing", "HomeKit", "apple_home"),
+        ScanEntry("printer", "Office printer", "", "ignored"),
+    ],
+    seconds=7.2,
+    answered=True,
+)
+
+
+def scanning_service(tmp_path: Path, scanner: Callable[[HomeConfig], ScanReport] | None) -> HomeService:
+    """A service with the Sony TV saved and no drivers at all: a scan needs none."""
+    store = make_store(tmp_path)
+    store.update(lambda c: c.upsert(TV))
+    return HomeService(tmp_path, store=store, drivers={}, scanner=scanner)
 
 
 # --------------------------------------------------------------------------- model
@@ -92,7 +115,9 @@ def test_command_names_and_usage() -> None:
     assert canonical_command("on") == "turn_on"
     assert canonical_command("set-volume") == "set_volume"
     assert canonical_command("colour") == "set_color"
+    assert canonical_command("Click") == canonical_command("push") == canonical_command("tap") == "press"
     assert CommandSpec("set_volume", "percent").usage() == "set_volume <0-100>"
+    assert CommandSpec("press", hint="presses a wall switch").usage() == "press (presses a wall switch)"
     assert CommandSpec("set_temperature", "number", low=16, high=30).usage() == "set_temperature <16-30>"
     assert CommandSpec("launch_app", "text", hint="an app name").usage() == "launch_app <an app name>"
     assert CommandSpec("turn_on").usage() == "turn_on"
@@ -466,6 +491,64 @@ def test_handle_never_raises(tmp_path: Path) -> None:
     assert service.handle({"action": "do", "device": 5, "command": None})["code"] == "bad_value"
 
 
+def test_scan_looks_at_the_network_with_no_device_or_tier(tmp_path: Path, reference_validator: Any) -> None:
+    seen: list[HomeConfig] = []
+    service = scanning_service(tmp_path, lambda config: seen.append(config) or FOUND)
+    reply = service.handle({"action": "scan", "device": "Sony TV", "confirmed": True})
+    reference_validator(reply, "CommandResponse")
+    assert reply == {"ok": True, "result": "done", "code": "ok", "text": FOUND.text(), "count": 2}
+    assert 'Sony Bravia TV "Living Room TV": set up as Sony TV.' in reply["text"]
+    assert [d.id for d in seen[0].devices] == [TV.id]  # the saved devices, to say which ones Jarvis has
+    service.close()
+
+
+def test_scan_while_one_runs_failing_and_too_slow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    busy = ScanReport(note="I'm already searching the network. Ask again in a few seconds.", ran=False)
+    release = threading.Event()
+
+    def broken(config: HomeConfig) -> ScanReport:
+        raise OSError("no route to 192.168.1.40")
+
+    def stuck(config: HomeConfig) -> ScanReport:
+        release.wait(5)
+        return FOUND
+
+    service = scanning_service(tmp_path, lambda config: busy)
+    reply = service.handle({"action": "scan"})
+    assert (reply["result"], reply["code"], reply["text"]) == ("failed", "busy", busy.note)
+    assert "count" not in reply
+    service.close()
+
+    service = scanning_service(tmp_path, broken)
+    with caplog.at_level(logging.DEBUG):
+        reply = service.handle({"action": "scan"})
+    assert reply == {"ok": True, "result": "failed", "code": "failed", "text": "The network search failed (OSError)."}
+    assert "192.168" not in caplog.text
+    service.close()
+
+    monkeypatch.setattr(home_service, "SCAN_TIMEOUT_S", 0.2)
+    service = scanning_service(tmp_path, stuck)
+    started = time.monotonic()
+    reply = service.handle({"action": "scan"})
+    assert reply["code"] == "timeout" and "did not finish in time" in reply["text"]
+    assert time.monotonic() - started < 1.5
+    release.set()
+    service.close()
+
+
+def test_scan_runs_the_network_scan_within_its_own_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The searches take SCAN_S and are collected for up to JOIN_MARGIN_S more: the service waits longer than that.
+    assert home_service.SCAN_TIMEOUT_S > home_scan.SCAN_S + home_scan.JOIN_MARGIN_S
+    seen: list[HomeConfig] = []
+    monkeypatch.setattr(home_scan, "scan", lambda config: seen.append(config) or FOUND)
+    service = scanning_service(tmp_path, None)
+    assert service.handle({"action": "scan"})["text"] == FOUND.text()
+    assert [d.id for d in seen[0].devices] == [TV.id]
+    service.close()
+
+
 # --------------------------------------------------------------------------- helper and command line
 
 
@@ -513,6 +596,38 @@ def test_call_once_never_takes_a_confirmation(tmp_path: Path) -> None:
     assert reply["result"] == "confirm" and reply["text"].endswith(CONFIRM_NEEDS_HELPER)
     assert call_once(tmp_path, "{bad", service_factory=factory)["error"]["code"] == "bad_request"
     assert call_once(tmp_path, '{"action": "nuke"}', service_factory=factory)["error"]["code"] == "bad_request"
+
+
+def test_scan_from_the_command_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any, reference_validator: Any
+) -> None:
+    reference_validator({"action": "scan"}, "HomeCommand")
+
+    def factory(data_dir: Path) -> HomeService:
+        return scanning_service(data_dir, lambda config: FOUND)
+
+    assert call_once(tmp_path, '{"action": "scan"}', service_factory=factory)["text"] == FOUND.text()
+    reply = run_console(tmp_path, {"action": "scan"}, stdin=io.StringIO(), service_factory=factory)
+    assert reply["result"] == "done" and reply["count"] == 2
+
+    # jarvis_voice home scan: the console path, printing the text.
+    sent: list[dict[str, Any]] = []
+
+    def console(data_dir: Path, body: dict[str, Any], **_: Any) -> dict[str, Any]:
+        sent.append(body)
+        service = factory(data_dir)
+        try:
+            return service.handle(body)
+        finally:
+            service.close()
+
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_quiet_stderr_logging", lambda: None)
+    monkeypatch.setattr(home_commandline, "run_console", console)
+    args = cli.build_parser().parse_args(["home", "scan", "--data-dir", str(tmp_path)])
+    assert args.func(args) == cli.EXIT_OK
+    assert sent == [{"action": "scan"}]
+    assert capsys.readouterr().out == FOUND.text() + "\n"
 
 
 def test_console_do_confirms_only_at_a_terminal(tmp_path: Path) -> None:
@@ -635,6 +750,17 @@ def test_wizard_sets_confirmation_and_tries_a_device(tmp_path: Path) -> None:
     # Trying it at the console is the user's own confirmation.
     assert (DOOR.id, "unlock", None) in drivers["fake"].calls
     assert "Front door: unlock" in ui.said
+
+
+def test_wizard_finds_smart_devices_on_the_network(tmp_path: Path) -> None:
+    scans: list[HomeConfig] = []
+    service = scanning_service(tmp_path, lambda config: scans.append(config) or FOUND)
+    ui = ScriptedPrompter(["Find smart devices on my network", None])
+    assert home_wizard.run_wizard(tmp_path, ui, service=service) == 0
+    assert len(scans) == 1
+    assert "Looking for smart devices on your network. This takes about ten seconds." in ui.said
+    assert FOUND.text() in ui.said
+    service.close()
 
 
 def test_wizard_driver_steps_load_lazily(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

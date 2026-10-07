@@ -82,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--no-mic", action="store_true", help="skip the one-second microphone test")
     doctor.set_defaults(func=cmd_doctor)
 
-    home = sub.add_parser("home", help="home devices: setup wizard, list, status, do")
+    home = sub.add_parser("home", help="home devices: setup wizard, list, status, do, scan")
     home.add_argument("--data-dir", type=Path, default=None)
     home_sub = home.add_subparsers(dest="home_command", required=True)
     home_sub.add_parser("setup", help="the interactive setup wizard (add, name and try devices)")
@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     home_do.add_argument("device")
     home_do.add_argument("command")
     home_do.add_argument("value", nargs="?", default=None)
+    home_sub.add_parser("scan", help="look for smart devices on the home network (about ten seconds)")
     home_call = home_sub.add_parser("call", help="(internal) answer one home command body, given as JSON; prints JSON")
     home_call.add_argument("body")
     for parser_ in (home, *home_sub.choices.values()):
@@ -488,6 +489,7 @@ def cmd_home(args: argparse.Namespace) -> int:
             "command": getattr(args, "command", ""),
             **({"value": args.value} if getattr(args, "value", None) is not None else {}),
         },
+        "scan": {"action": "scan"},
     }
     response = run_console(data_dir, bodies[what], stdin=sys.stdin)
     print(response.get("text", ""))

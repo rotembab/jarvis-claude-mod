@@ -1,7 +1,7 @@
 """Tuya data points: what a device's numbered values mean, and how Jarvis's commands become them.
 
 A Tuya device is a set of data points (DPs), numbered values such as 20 for
-power and 22 for brightness. Smart Life knows each device's map from DP number
+power and 22 for brightness. Tuya's cloud knows each device's map from DP number
 to a standard code (``switch_led``, ``bright_value_v2``...) with its type and
 range, and, for the local protocol, how the device's own raw values differ from
 the cloud's (``valueConvert`` and ``enumMappingMap``). The wizard keeps a compact
@@ -11,7 +11,9 @@ copy alone: no network and no third-party import.
 Local values are not always the cloud's: a v2 colour is 12 hex characters
 ``hhhhssssvvvv`` (h 0-360, s and v 0-1000), a v1 colour is 14, ``rrggbb0hhhssvv``
 (s and v 0-255); enums may use the vendor's own words; many curtains count
-their position the other way round.
+their position the other way round. Where the cloud's form differs (colours,
+converted ranges), the saved entry carries a small ``cloud`` part, so the
+optional cloud fallback can turn local values into the cloud's and back.
 """
 
 from __future__ import annotations
@@ -68,6 +70,9 @@ CATEGORY_KINDS: dict[str, str] = {
     "jsq": "humidifier",
     "cs": "humidifier",
     "sd": "vacuum",
+    # Button pushers (Fingerbot): a robot finger on a wall switch. Some are sold as "kg"; see kind_for.
+    "szjqr": "button",
+    "znjxs": "button",
 }
 # Categories the wizard leaves out, with the reason it gives.
 SKIP_CATEGORIES: dict[str, str] = {
@@ -108,7 +113,7 @@ SKIP_CATEGORIES: dict[str, str] = {
     **dict.fromkeys(("sp", "dghsxj"), "camera"),
 }
 SKIP_REASONS: dict[str, str] = {
-    "ir": "an IR remote: run what it does through Smart Life scenes",
+    "ir": "an IR remote: run what it does through scenes in the Tuya Smart or Smart Life app",
     "hub": "a hub: the devices paired to it are added on their own",
     "sensor": "a sensor, with nothing to switch",
     "lock": "a lock, which Tuya does not open over the home network",
@@ -140,6 +145,7 @@ KNOWN_CODES = re.compile(
     r"|control|mach_operate|percent_control|percent_state|position|control_back_mode|situation_set"
     r"|doorcontact_state|fan_speed(?:_percent|_enum)?|speed|level|windspeed|mode|temp_set|temp_current"
     r"|humidity_set|dehumidify_set_value|humidity_current|cur_power|status|electricity_left|battery_percentage"
+    r"|click_sustain_time|arm_down_percent|arm_up_percent"
 )
 
 # Tuya's standard ranges, for devices whose description leaves them out.
@@ -157,8 +163,11 @@ DEFAULT_RANGES: dict[str, tuple[float, float]] = {
 }
 # Local conversions (tuya_sharing's strategy_repo) whose raw range is fixed whatever the cloud says.
 CONVERT_RANGES: dict[str, tuple[float, float]] = {"hb_range_v1": (25, 255), "hb_range_v2": (0, 255)}
+# The cloud's range for those conversions, when the device's spec does not give it.
+CLOUD_RANGES: dict[str, tuple[float, float]] = {"hb_range_v1": (0, 100), "hb_range_v2": (1000, 12000)}
 # Local colour encodings named by the conversion.
 COLOUR_FORMATS = {"dj_v2_color_alg": "hsv16", "dj_v1_hsv_alg": "rgb8"}
+COLOUR_CODES = ("colour_data", "colour_data_v2")
 
 
 def norm_type(value: Any) -> str | None:
@@ -316,6 +325,12 @@ def _entry(code: str, dp: int, relation: Mapping[str, Any], cloud: Mapping[str, 
         unit = desc.get("unit") or spec.get("unit")
         if isinstance(unit, str) and unit.strip():
             entry["unit"] = unit.strip()[:8]
+        if convert in CONVERT_RANGES:
+            # The cloud counts these on a range of its own (hb_range_v1: local 25-255, cloud 0-100).
+            cloud_low, cloud_high = _number(spec.get("min")), _number(spec.get("max"))
+            if cloud_low is None or cloud_high is None or cloud_high <= cloud_low:
+                cloud_low, cloud_high = CLOUD_RANGES[convert]
+            entry["cloud"] = {"min": _whole(cloud_low), "max": _whole(cloud_high)}
     elif kind == "enum":
         # enumMappingMap maps the device's own words to the standard ones ({"0": {"value": "open"}}), and
         # the range lists the standard words (tuya_sharing falls back to range[0] as a standard value);
@@ -339,8 +354,19 @@ def _entry(code: str, dp: int, relation: Mapping[str, Any], cloud: Mapping[str, 
         raw_of = {std: raw for std, raw in raw_of.items() if std != raw}
         if raw_of:
             entry["raw"] = raw_of
-    elif code in ("colour_data", "colour_data_v2"):
+    elif code in COLOUR_CODES:
         entry["format"] = COLOUR_FORMATS.get(convert or "", "hsv16" if code.endswith("_v2") else "rgb8")
+        # The cloud takes a colour as JSON {"h","s","v"} (some devices: 12 hex characters), s and v up to
+        # 1000 for a v2 colour and 255 for a v1, unless the spec says otherwise.
+        top = 1000 if code.endswith("_v2") else 255
+        s_spec, v_spec = spec.get("s"), spec.get("v")
+        s_max = _number(s_spec.get("max")) if isinstance(s_spec, dict) else None
+        v_max = _number(v_spec.get("max")) if isinstance(v_spec, dict) else None
+        entry["cloud"] = {
+            "type": "str" if str(cloud.get("type") or "").strip().lower() == "string" else "json",
+            "s_max": _whole(s_max) if s_max and s_max > 0 else top,
+            "v_max": _whole(v_max) if v_max and v_max > 0 else top,
+        }
     if convert and convert not in ("default", "enum"):
         entry["convert"] = convert
     return entry
@@ -375,6 +401,8 @@ def kind_for(category: str, dps: DpMap) -> str | None:
     """The Jarvis kind for a Tuya category, or from the DPs when the category is unknown; None to leave it out."""
     if category in SKIP_CATEGORIES or category.startswith("infrared"):
         return None
+    if is_button(dps):
+        return "button"
     kind = CATEGORY_KINDS.get(category)
     has_light = find(dps, ("bright_value", "bright_value_v2", "bright_value_1", "colour_data", "colour_data_v2"))
     if kind == "switch" and has_light:
@@ -390,6 +418,14 @@ def kind_for(category: str, dps: DpMap) -> str | None:
     if find(dps, ("switch", "switch_1"), "bool"):
         return "switch"
     return None
+
+
+def is_button(dps: DpMap) -> bool:
+    """A button pusher (Fingerbot), whatever its category: its arm's codes, or a mode that clicks."""
+    if find(dps, ("arm_down_percent", "click_sustain_time"), writable=False):
+        return True
+    mode = find(dps, ("mode",), "enum", writable=False)
+    return mode is not None and "click" in choices(dps[mode])
 
 
 def skip_reason(category: str) -> str:
@@ -635,6 +671,68 @@ def temp_words(percent: int) -> str:
     return "neutral white"
 
 
+# --------------------------------------------------------------------------- the cloud's values
+
+
+def _rescale(value: float, low: float, high: float, to_low: float, to_high: float) -> int:
+    value = min(high, max(low, value))
+    return round(min(to_high, max(to_low, to_low + (value - low) * (to_high - to_low) / (high - low))))
+
+
+def to_cloud(entry: DpEntry, raw: Any) -> Any:
+    """The value Tuya's cloud expects for a local one. ValueError when the saved map cannot say: a colour or a
+    converted range saved before the map kept the cloud's form (refreshing the devices fixes that)."""
+    kind, cloud = entry["type"], entry.get("cloud")
+    if kind == "bool":
+        if not isinstance(raw, bool):
+            raise ValueError("not a boolean")
+        return raw
+    if kind == "enum":
+        return enum_std(entry, raw)
+    if "format" in entry:
+        hsv = decode_colour(entry["format"], raw)
+        if hsv is None or not isinstance(cloud, dict):
+            raise ValueError("no cloud form for this colour")
+        h, s, v = round(hsv[0]) % 360, round(hsv[1] * float(cloud["s_max"])), round(hsv[2] * float(cloud["v_max"]))
+        return f"{h:04x}{s:04x}{v:04x}" if cloud.get("type") == "str" else json.dumps({"h": h, "s": s, "v": v})
+    if not entry.get("convert"):
+        return raw  # the local value is the cloud's
+    number = _number(raw)
+    if kind != "int" or number is None or not isinstance(cloud, dict) or not (has_range(cloud) and has_range(entry)):
+        raise ValueError("no cloud form for this value")
+    return _rescale(number, float(entry["min"]), float(entry["max"]), float(cloud["min"]), float(cloud["max"]))
+
+
+def from_cloud(entry: DpEntry, value: Any) -> Any:
+    """The local value for one Tuya's cloud reported (the inverse of to_cloud), or None when it cannot say."""
+    kind, cloud = entry["type"], entry.get("cloud")
+    if value is None:
+        return None
+    if kind == "bool":
+        return value if isinstance(value, bool) else None
+    if kind == "enum":
+        return enum_raw(entry, str(value))
+    if "format" in entry:
+        if not isinstance(cloud, dict):
+            return None
+        data = _json(value)
+        if isinstance(data, dict):
+            h, s, v = (_number(data.get(part)) for part in ("h", "s", "v"))
+        elif isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{12}", value):
+            h, s, v = (float(int(value[i : i + 4], 16)) for i in (0, 4, 8))
+        else:
+            return None
+        if h is None or s is None or v is None:
+            return None
+        return encode_colour(entry["format"], h, s / float(cloud["s_max"]), v / float(cloud["v_max"]))
+    if not entry.get("convert"):
+        return value
+    number = _number(value)
+    if kind != "int" or number is None or not isinstance(cloud, dict) or not (has_range(cloud) and has_range(entry)):
+        return None
+    return _rescale(number, float(cloud["min"]), float(cloud["max"]), float(entry["min"]), float(entry["max"]))
+
+
 # --------------------------------------------------------------------------- parts of a device
 
 LIGHT_POWER = ("switch_led", "switch_led_1", "switch", "switch_1", "light")
@@ -646,7 +744,8 @@ POWER_CODES: dict[str, tuple[str, ...]] = {
     "heater": ("switch", "power", "switch_1"),
 }
 DEFAULT_POWER = ("switch", "switch_1", "switch_led", "power")
-NO_POWER = frozenset({"cover", "garage", "vacuum", "scene"})
+# A button's switch DP is the press itself (see press_code), not the power of what it presses.
+NO_POWER = frozenset({"cover", "garage", "vacuum", "scene", "button"})
 
 
 def power_code(device: DeviceRecord, dps: DpMap | None = None) -> str | None:
@@ -658,6 +757,16 @@ def power_code(device: DeviceRecord, dps: DpMap | None = None) -> str | None:
     if isinstance(chosen, str):
         return find(dps, (chosen,), "bool")
     return find(dps, POWER_CODES.get(device.kind, DEFAULT_POWER), "bool")
+
+
+def press_code(dps: DpMap) -> str | None:
+    """The DP that makes a button pusher press: in click mode, each change of its value is one press."""
+    return find(dps, ("switch", "switch_1"), "bool")
+
+
+def presses(device: DeviceRecord) -> str | None:
+    """What a button pusher switches on and off, as the user named it in setup (its first alias)."""
+    return device.aliases[0] if device.aliases else None
 
 
 @dataclass(frozen=True)
@@ -752,7 +861,7 @@ def mode_code(dps: DpMap) -> str | None:
 
 # --------------------------------------------------------------------------- commands
 
-# Jarvis cannot see what a Smart Life scene does, and the wizard sends what it cannot drive (an RF garage
+# Jarvis cannot see what a Tuya scene does, and the wizard sends what it cannot drive (an RF garage
 # remote on an IR/RF hub, say) to scenes. So a scene that says it unlocks, disarms, or opens a garage, gate
 # or door asks on screen first, as those commands do on a device, and so does one named only for a garage
 # or gate ("Garage", "Front gate 2"), a remote's button that may well open it. "Close garage" or "Garage
@@ -811,6 +920,10 @@ def command_specs(device: DeviceRecord) -> list[CommandSpec]:
         target, _ = cover_position(dps)
         if target and kind == "cover":
             specs.append(CommandSpec("set_position", "percent", hint="0 closed, 100 open"))
+        return specs
+    if kind == "button":
+        if press_code(dps):
+            specs.append(CommandSpec("press", hint="presses the wall switch it sits on; Jarvis cannot see the light"))
         return specs
     if kind == "vacuum":
         if find(dps, ("power_go",), "bool"):
@@ -889,6 +1002,8 @@ def describe_state(device: DeviceRecord, values: Mapping[str, Any]) -> str:
         if position >= 99:
             return f"{the} is open."
         return f"{the} is {position}% open."
+    if kind == "button":
+        return _button_state(device, dps, values)
     if kind == "vacuum":
         state = enum_std(dps["status"], raw("status")) if "status" in dps else None
         battery = raw("electricity_left") if raw("electricity_left") is not None else raw("battery_percentage")
@@ -938,6 +1053,25 @@ def describe_state(device: DeviceRecord, values: Mapping[str, Any]) -> str:
     if kind == "humidifier" and humidity and raw(humidity) is not None:
         sentence += f" The room is at {number_words(scaled(dps[humidity], raw(humidity)) or 0)}% humidity."
     return sentence
+
+
+def _button_state(device: DeviceRecord, dps: DpMap, values: Mapping[str, Any]) -> str:
+    """Never on or off: Jarvis knows what the arm did, not what the light it presses is doing."""
+
+    def raw(code: str | None) -> Any:
+        return None if code is None else values.get(str(dps[code]["dp"]))
+
+    what = presses(device)
+    sentences = [f"The {device.name} presses {f'the {what} switch' if what else 'a wall switch'}."]
+    mode = find(dps, ("mode",), "enum", writable=False)
+    if mode and raw(mode) is not None:
+        sentences.append(f"It is in {words(enum_std(dps[mode], raw(mode)) or '')} mode.")
+    battery = find(dps, ("battery_percentage",), "int", writable=False)
+    level = _number(raw(battery))
+    if level is not None:
+        sentences.append(f"Its battery is at {number_words(level)}%.")
+    sentences.append("Jarvis cannot see whether the light is on.")
+    return " ".join(sentences)
 
 
 def _light_details(dps: DpMap, values: Mapping[str, Any]) -> list[str]:

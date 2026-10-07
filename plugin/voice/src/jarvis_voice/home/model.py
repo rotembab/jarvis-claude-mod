@@ -49,6 +49,7 @@ KINDS = (
     "speaker",
     "light",
     "switch",
+    "button",
     "plug",
     "fan",
     "cover",
@@ -82,9 +83,9 @@ class CommandSpec:
     high: float | None = None
 
     def usage(self) -> str:
-        """``set_volume <0-100>``, ``launch_app <an app name>``, ``turn_on``."""
+        """``set_volume <0-100>``, ``launch_app <an app name>``, ``turn_on``, ``press (what it does)``."""
         if self.value == "none":
-            return self.name
+            return f"{self.name} ({self.hint})" if self.hint else self.name
         if self.value == "percent":
             what = "0-100"
         elif self.value == "choice" and self.choices:
@@ -351,6 +352,9 @@ COMMAND_SYNONYMS: dict[str, str] = {
     "run": "activate",
     "trigger": "activate",
     "return_home": "dock",
+    "push": "press",
+    "click": "press",
+    "tap": "press",
     "ok": "select",
     "enter": "select",
 }
