@@ -399,7 +399,7 @@ class Daemon:
         duration_s = pcm.size / STT_SAMPLERATE
         if duration_s < self.config.min_clip_s:
             log.info("ignoring %.0f ms clip (too short)", duration_s * 1000)
-        elif is_digital_silence(pcm):
+        elif is_digital_silence(pcm) and not self._mic_heard_sound():
             err = digital_silence_error()
             self._emit_error(err.code, err.message, err.hint)
         elif is_silent(pcm):
@@ -475,6 +475,10 @@ class Daemon:
         with self._lock:
             self._awake = opened
         self._refresh_state()
+
+    def _mic_heard_sound(self) -> bool:
+        """The microphone has delivered sound before, so exact zeros in a clip mean a noise gate, not a mute."""
+        return self.listener is not None and self.listener.heard_sound
 
     def _on_digital_silence(self, silent: bool) -> None:
         if silent:

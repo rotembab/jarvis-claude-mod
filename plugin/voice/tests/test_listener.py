@@ -182,14 +182,25 @@ def test_long_utterances_are_cut_at_thirty_seconds() -> None:
     assert kind == "wake" and 30.0 <= seconds <= 30.5
 
 
-def test_digital_silence_is_reported_once_and_cleared() -> None:
+def test_a_microphone_that_never_sent_sound_is_reported_once_and_cleared() -> None:
     rig = Rig()
-    rig.play(np.zeros(int(2.9 * RATE), np.float32))
-    assert rig.kinds("silence") == []
-    rig.play(np.zeros(int(2.0 * RATE), np.float32))
+    rig.play(np.zeros(int(29.9 * RATE), np.float32))
+    assert rig.kinds("silence") == [] and not rig.listener.heard_sound
+    rig.play(np.zeros(int(1.0 * RATE), np.float32))
+    assert rig.kinds("silence") == [True]
+    rig.play(np.zeros(int(40.0 * RATE), np.float32))
     assert rig.kinds("silence") == [True]
     rig.play(hush(0.1))
-    assert rig.kinds("silence") == [True, False]
+    assert rig.kinds("silence") == [True, False] and rig.listener.heard_sound
+
+
+def test_a_noise_gate_is_not_mistaken_for_a_muted_microphone() -> None:
+    # Some headsets send exact zeros whenever the user is quiet.
+    rig = Rig()
+    for _ in range(3):
+        rig.play(hush(0.5))
+        rig.play(np.zeros(int(40.0 * RATE), np.float32))
+    assert rig.kinds("silence") == []
 
 
 def test_the_thread_resamples_sound_card_blocks() -> None:

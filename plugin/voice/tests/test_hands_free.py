@@ -137,10 +137,30 @@ def test_push_to_talk_still_works_beside_the_wake_word(hf: tuple[Rig, ScriptedWa
 def test_a_silent_microphone_is_reported(hf: tuple[Rig, ScriptedWake]) -> None:
     rig, _wake = hf
     ready_with_wake(rig)
+    assert rig.daemon.listener is not None
+    rig.daemon.listener.config.silence_alarm_s = 1.0  # 30 s by default
     mark = rig.sink.mark()
-    rig.capture.push(np.zeros(int(3.5 * RATE), np.float32))
+    rig.capture.push(np.zeros(int(1.5 * RATE), np.float32))
     error = rig.sink.wait_type("error", after=mark)
     assert error["code"] == "mic_blocked"
+
+
+def test_a_silent_clip_from_a_microphone_that_worked_is_not_reported(hf: tuple[Rig, ScriptedWake]) -> None:
+    # A headset with a noise gate sends exact zeros while the user is quiet.
+    rig, _wake = hf
+    ready_with_wake(rig)
+    listener = rig.daemon.listener
+    assert listener is not None
+    rig.capture.push(hush(0.1))
+    wait_until(lambda: listener.heard_sound)
+    mark = rig.sink.mark()
+    rig.capture.next_clip = np.zeros(16_000, np.float32)
+    rig.ptt.press()
+    rig.sink.wait_type("state", after=mark, state="listening")
+    released = rig.sink.mark()
+    rig.ptt.release()
+    rig.sink.wait_type("state", after=released, state="sleeping")
+    assert [e for e in rig.sink.events[mark:] if e["type"] in ("error", "utterance")] == []
 
 
 def test_a_missing_wake_model_is_reported_and_push_to_talk_remains(sink: RecordingSink) -> None:

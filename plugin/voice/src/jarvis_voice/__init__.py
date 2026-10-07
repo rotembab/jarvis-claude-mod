@@ -5,4 +5,4 @@ newline-delimited JSON event stream (stdout) and a token-protected HTTP
 control server on 127.0.0.1. See ``plugin/protocol/schema.json``.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

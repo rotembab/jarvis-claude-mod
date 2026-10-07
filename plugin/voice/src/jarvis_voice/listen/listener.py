@@ -18,6 +18,11 @@ daemon, when an utterance starts and ends:
   "Hey Jarvis" doesn't end it; with no real speech within 5 s it is dropped.
 * **paused**: push-to-talk owns the microphone.
 
+A microphone that has sent nothing but exact zeros since the listener started
+is reported once, after 30 s. Some headsets (a noise gate in the headset or
+its software) send exact zeros whenever the user is quiet, so once any sound
+has arrived, zeros mean quiet, not muted, and are never reported.
+
 Utterances start with some audio from before their start (pre-roll), so the
 first syllable is kept. Time is measured in audio, not on the wall clock, so
 the decisions are the same however the blocks arrive.
@@ -63,7 +68,7 @@ class ListenerConfig:
     wake_preroll_s: float = 0.3
     onset_preroll_s: float = 0.5
     wake_refractory_s: float = 1.5
-    silence_alarm_s: float = 3.0  # exact zeros for this long: the microphone is muted at the source
+    silence_alarm_s: float = 30.0  # only exact zeros since the start for this long: muted at the source
 
 
 def _noop(*_args: Any) -> None:
@@ -109,6 +114,7 @@ class Listener:
         self._silence_run = 0.0
         self._zero_run = 0.0
         self._silence_alarm = False
+        self._heard_sound = False
 
         self._ring: deque[np.ndarray] = deque()
         self._ring_s = 0.0
@@ -143,6 +149,11 @@ class Listener:
     @property
     def barge_mode(self) -> BargeMode:
         return self._barge_mode
+
+    @property
+    def heard_sound(self) -> bool:
+        """The microphone has sent something other than exact zeros since the listener started."""
+        return self._heard_sound
 
     def set_wake_scorer(self, wake: WakeScorer | None) -> None:
         with self._lock:
@@ -357,10 +368,11 @@ class Listener:
         self._mode = "record"
 
     def _watch_digital_silence(self, audio: np.ndarray, seconds: float) -> None:
+        if self._heard_sound:
+            return
         if np.any(audio):
-            self._zero_run = 0.0
+            self._heard_sound = True
             if self._silence_alarm:
-                self._silence_alarm = False
                 self._on_digital_silence(False)
             return
         self._zero_run += seconds

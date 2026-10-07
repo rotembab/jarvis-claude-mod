@@ -211,7 +211,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | --- | --- |
 | `JARVIS · not set up · run /jarvis setup` | Run `/jarvis setup`. |
 | Jarvis does not hear you | Windows may be blocking the microphone: Settings > Privacy & security > Microphone, turn on **Microphone access** and **Let desktop apps access your microphone**. Check the headset's mute switch. `/jarvis devices` shows which microphone is used. |
-| "The microphone delivered pure digital silence" | Something mutes the microphone completely: Windows' microphone privacy settings (above), or the headset itself (a mute button or light, a flipped-up or unplugged boom mic, or its own software, such as Logitech G HUB). |
+| "The microphone delivered pure digital silence" | Something mutes the microphone completely: Windows' microphone privacy settings (above), or the headset itself (a mute button or light, a flipped-up or unplugged boom mic, or its own software, such as Logitech G HUB). Jarvis says this only when the microphone has sent nothing at all since it started, or for a push-to-talk clip before it has heard any sound. Headsets with a noise gate send exact silence between words, which is fine. |
 | Jarvis wakes by mistake, or misses "Hey Jarvis" | Change **Wake word sensitivity** (`low` wakes less often, `high` more easily). Say it clearly, like "hey JAR-vis". |
 | Jarvis stops himself mid-sentence | With speakers he can hear his own voice. Use a headset, or run `/jarvis bargein wake`. |
 | Jarvis does not speak | Check the Fish Audio key (see above) and run `/jarvis test`. |

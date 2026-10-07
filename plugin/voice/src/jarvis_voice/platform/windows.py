@@ -78,7 +78,8 @@ def mic_silent_hint() -> str:
     return (
         "The microphone is sending only silence. Check the headset is switched on and not muted "
         "(mute button or flip-to-mute boom), and that it is the default input under "
-        "Settings > System > Sound > Input."
+        "Settings > System > Sound > Input. Some headsets send exact silence while you are quiet, "
+        "so if Jarvis hears you when you speak, the microphone is fine."
     )
 
 
