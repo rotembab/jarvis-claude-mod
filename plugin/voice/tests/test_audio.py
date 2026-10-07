@@ -6,10 +6,11 @@ import pytest
 from jarvis_voice.audio import chimes
 from jarvis_voice.audio.capture import CaptureBuffer, to_stt_rate
 from jarvis_voice.audio.devices import DeviceInfo, select_device
-from jarvis_voice.audio.errors import AudioError, classify_audio_error
+from jarvis_voice.audio.errors import AudioError, classify_audio_error, digital_silence_error
 from jarvis_voice.audio.fake import FakePlayback
 from jarvis_voice.audio.levels import is_digital_silence, is_silent, meter
 from jarvis_voice.audio.playback import PlaybackMixer
+from jarvis_voice.platform import name as plat_name
 
 from conftest import wait_until
 
@@ -203,6 +204,26 @@ def test_mic_blocked_hint_mentions_privacy_settings(monkeypatch: pytest.MonkeyPa
     assert "Privacy & security > Microphone" in (err.hint or "")
     assert "ms-settings:privacy-microphone" in (err.hint or "")
     assert "Let desktop apps access your microphone" in (err.hint or "")
+
+
+@pytest.mark.parametrize("denied", [True, False])
+def test_windows_digital_silence_hint_follows_the_privacy_switch(monkeypatch: pytest.MonkeyPatch, denied: bool) -> None:
+    from jarvis_voice import platform as plat
+    from jarvis_voice.platform import windows
+
+    monkeypatch.setattr(plat, "current", lambda: windows)
+    monkeypatch.setattr(windows, "mic_access_denied", lambda: denied)
+    hint = digital_silence_error().hint or ""
+    assert ("Privacy & security > Microphone" in hint) is denied
+    assert ("switched on and not muted" in hint) is not denied
+
+
+def test_windows_mic_consent_reads_without_error() -> None:
+    from jarvis_voice.platform import windows
+
+    if plat_name() != "windows":
+        pytest.skip("reads the Windows registry")
+    assert isinstance(windows.mic_access_denied(), bool)
 
 
 def test_output_errors_and_passthrough() -> None:

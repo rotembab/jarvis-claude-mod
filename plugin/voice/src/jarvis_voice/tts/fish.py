@@ -31,7 +31,7 @@ from urllib.parse import urlsplit, urlunsplit
 import ormsgpack
 
 from .. import __version__
-from .base import AudioCallback, SynthError
+from .base import KEY_HINT, AudioCallback, SynthError
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +40,6 @@ LIVE_PATH = "/v1/tts/live"
 DEFAULT_MODEL = "s2.1-pro"
 SAMPLE_RATE = 24_000
 
-KEY_HINT = "Set your Fish Audio API key in the Jarvis plugin settings (fishApiKey) or as FISH_AUDIO_API_KEY."
 AUTH_HINT = "Check the Fish Audio API key (and account balance) at fish.audio, then update fishApiKey."
 NET_HINT = "Check your internet connection or proxy; Jarvis will keep trying on the next reply."
 

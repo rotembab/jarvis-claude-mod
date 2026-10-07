@@ -57,7 +57,7 @@ def _audio_section(env: Mapping[str, str], test_mic: bool) -> dict[str, Any]:
                 "digitalSilence": bool(is_digital_silence(clip)),
             }
             if is_digital_silence(clip):
-                section["mic"]["hint"] = plat.current().mic_blocked_hint()
+                section["mic"]["hint"] = plat.current().digital_silence_hint()
         except AudioError as exc:
             section["mic"] = {"ok": False, "code": exc.code, "message": exc.message, "hint": exc.hint}
         finally:

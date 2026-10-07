@@ -36,6 +36,7 @@ def current() -> ModuleType:
     """The platform module: ``windows``, ``macos`` or ``linux``.
 
     Each exposes: ``make_instance_lock(name, lock_dir)``, ``mic_blocked_hint()``,
+    ``digital_silence_hint()`` (blocked or merely muted, where the OS can tell),
     ``mic_in_use_hint()``, ``no_input_device_hint()``, ``no_output_device_hint()``,
     ``ptt_hint()``, ``open_mic_settings()``, ``suppress_crash_dialogs()`` and
     ``PREFERRED_HOSTAPI``.

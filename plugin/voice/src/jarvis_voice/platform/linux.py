@@ -6,6 +6,7 @@ from .posix_lock import make_instance_lock
 
 __all__ = [
     "PREFERRED_HOSTAPI",
+    "digital_silence_hint",
     "make_instance_lock",
     "mic_blocked_hint",
     "mic_in_use_hint",
@@ -21,6 +22,10 @@ PREFERRED_HOSTAPI: str | None = None  # let PortAudio pick (PulseAudio/PipeWire 
 
 def mic_blocked_hint() -> str:
     return "The microphone delivered no signal. Check it is not muted (pavucontrol or alsamixer)."
+
+
+def digital_silence_hint() -> str:
+    return mic_blocked_hint()
 
 
 def mic_in_use_hint() -> str:

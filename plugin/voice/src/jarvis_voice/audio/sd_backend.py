@@ -381,10 +381,13 @@ class SoundDevicePlayback:
             self._mixer.add_speech(tail, generation)
 
     def stop_speech(self) -> None:
+        pending = self._mixer.speech_pending()
         self._mixer.clear_speech()
         self._resampler = None
         stream = self._stream
-        if stream is None:
+        if stream is None or pending == 0:
+            # Nothing left to cut (the device holds at most one buffer of tail).
+            # Restarting a WASAPI stream can fail on some devices, so don't.
             return
         try:
             # abort() discards what the device already buffered; restart for chimes.

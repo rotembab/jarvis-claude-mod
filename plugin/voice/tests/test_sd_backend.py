@@ -254,6 +254,21 @@ def test_capture_detects_a_stalled_device_and_reopens(sd: FakeSD) -> None:
     cap.close()
 
 
+def test_stop_with_no_speech_left_leaves_the_stream_running(sd: FakeSD) -> None:
+    pb = SoundDevicePlayback("PRO X", idle_close_s=None)
+    pb.open()
+    try:
+        stream = sd.streams[0]
+        pb.stop_speech()  # e.g. a reply that failed before any audio (no Fish key)
+        assert stream.aborts == 0 and stream.active
+        pb.add_speech(np.full(240, 0.3, np.float32), pb.speech_generation)
+        wait_until(pb.speech_idle)
+        pb.stop_speech()  # everything already played: nothing to cut
+        assert stream.aborts == 0 and stream.active and len(sd.streams) == 1
+    finally:
+        pb.close()
+
+
 def test_playback_plays_stops_instantly_and_restarts(sd: FakeSD) -> None:
     pb = SoundDevicePlayback("PRO X", idle_close_s=None)
     pb.open()

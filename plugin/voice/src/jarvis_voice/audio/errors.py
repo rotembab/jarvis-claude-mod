@@ -119,5 +119,5 @@ def digital_silence_error() -> AudioError:
     return AudioError(
         "mic_blocked",
         "The microphone delivered pure digital silence; it is muted or blocked.",
-        plat.current().mic_blocked_hint(),
+        plat.current().digital_silence_hint(),
     )

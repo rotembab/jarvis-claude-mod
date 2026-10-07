@@ -19,6 +19,7 @@ from jarvis_voice.ptt.fake import FakePushToTalk
 from jarvis_voice.ptt.keys import Hotkey
 from jarvis_voice.stt.base import SttError
 from jarvis_voice.stt.fake import FakeTranscriber
+from jarvis_voice.tts.base import SynthError
 from jarvis_voice.tts.fish import FishLiveSynth, FishSettings
 
 from conftest import RecordingSink, wait_until
@@ -279,6 +280,22 @@ def test_test_voice_speaks_default_line(rig: Rig) -> None:
     resp = rig.command("test_voice")
     done = rig.sink.wait_type("speech_done", replyId=resp["replyId"])
     assert done["spokenText"].startswith("Good evening, sir.")
+
+
+def test_test_voice_without_a_key_fails_up_front(sink: RecordingSink) -> None:
+    missing = SynthError("fish_key_missing", "No Fish Audio API key is configured.")
+    rig = start(build(sink, synth=FakeSynth(fail_open=missing)))
+    try:
+        wait_ready(rig)
+        resp = rig.command("test_voice")
+        assert resp["ok"] is False and resp["error"]["code"] == "fish_key_missing"
+        assert "FISH_AUDIO_API_KEY" in resp["error"]["message"]
+        time.sleep(0.2)
+        assert not {"speech_started", "speech_done", "error"} & set(sink.types())
+    finally:
+        rig.daemon.request_exit(0)
+        assert rig.thread is not None
+        rig.thread.join(5)
 
 
 def test_shutdown_command_ends_run(sink: RecordingSink) -> None:

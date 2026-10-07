@@ -9,6 +9,7 @@ from .posix_lock import make_instance_lock
 
 __all__ = [
     "PREFERRED_HOSTAPI",
+    "digital_silence_hint",
     "make_instance_lock",
     "mic_blocked_hint",
     "mic_in_use_hint",
@@ -30,6 +31,10 @@ def mic_blocked_hint() -> str:
         "macOS is blocking microphone access. Open System Settings > Privacy & Security > Microphone "
         "and allow your terminal (or the Claude app)."
     )
+
+
+def digital_silence_hint() -> str:
+    return mic_blocked_hint()
 
 
 def mic_in_use_hint() -> str:

@@ -13,6 +13,7 @@ PREFERRED_HOSTAPI = "Windows WASAPI"
 ERROR_ALREADY_EXISTS = 183
 ERROR_ACCESS_DENIED = 5
 MIC_SETTINGS_URI = "ms-settings:privacy-microphone"
+_MIC_CONSENT_KEY = r"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone"
 
 
 class NamedMutexLock:
@@ -71,6 +72,44 @@ def mic_blocked_hint() -> str:
         f"(Win+R, then {MIC_SETTINGS_URI}). If your headset has a mute switch or flip-to-mute boom, "
         "make sure it is unmuted."
     )
+
+
+def mic_silent_hint() -> str:
+    return (
+        "The microphone is sending only silence. Check the headset is switched on and not muted "
+        "(mute button or flip-to-mute boom), and that it is the default input under "
+        "Settings > System > Sound > Input."
+    )
+
+
+def mic_access_denied() -> bool:
+    """True when a Windows privacy switch denies desktop apps the microphone."""
+    import winreg
+
+    switches = (
+        (winreg.HKEY_LOCAL_MACHINE, _MIC_CONSENT_KEY),  # Microphone access (this device)
+        (winreg.HKEY_CURRENT_USER, _MIC_CONSENT_KEY),  # Microphone access (this user)
+        (winreg.HKEY_CURRENT_USER, _MIC_CONSENT_KEY + r"\NonPackaged"),  # Let desktop apps access
+    )
+    for root, path in switches:
+        try:
+            with winreg.OpenKey(root, path) as key:
+                value, _kind = winreg.QueryValueEx(key, "Value")
+        except OSError:
+            continue  # never set: Windows treats it as allowed
+        if str(value).lower() == "deny":
+            return True
+    return False
+
+
+def digital_silence_hint() -> str:
+    """Pure digital silence comes from a privacy switch or from a muted or switched-off device."""
+    try:
+        denied = mic_access_denied()
+    except Exception:  # registry trouble must not hide the hint
+        log.debug("could not read the microphone consent", exc_info=True)
+        denied = True
+    return mic_blocked_hint() if denied else mic_silent_hint()
 
 
 def mic_in_use_hint() -> str:

@@ -37,6 +37,7 @@ from .ptt.base import PttUnavailable, PushToTalk
 from .ptt.keys import Hotkey, parse_hotkey
 from .speech import SpeechPipeline
 from .stt.base import SttError, Transcriber
+from .tts.base import KEY_HINT as FISH_KEY_HINT
 from .tts.base import SpeechSynth
 
 log = logging.getLogger(__name__)
@@ -474,6 +475,9 @@ class Daemon:
         if name == "status":
             return self._status()
         if name == "test_voice":
+            if not self.pipeline.synth_configured:
+                message = f"No Fish Audio API key is configured. {FISH_KEY_HINT}"
+                return protocol.error_response("fish_key_missing", message)
             reply_id = self.pipeline.speak_now((body.get("text") or "").strip() or DEFAULT_TEST_LINE)
             return {"ok": True, "replyId": reply_id}
         if name == "shutdown":

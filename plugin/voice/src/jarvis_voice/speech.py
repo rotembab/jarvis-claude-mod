@@ -160,6 +160,10 @@ class SpeechPipeline:
             self._cond.notify_all()
         return {"ok": True}
 
+    @property
+    def synth_configured(self) -> bool:
+        return bool(self._synth.configured)
+
     def speak_now(self, text: str) -> str:
         """Speak a one-off line (test_voice) as its own reply; returns the replyId."""
         reply_id = f"test-{uuid.uuid4().hex[:8]}"
