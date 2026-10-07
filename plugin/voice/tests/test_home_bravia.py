@@ -102,6 +102,7 @@ class FakeBravia:
         self.stall: set[str] = set()  # methods the TV takes in but never answers
         self.released = threading.Event()  # lets stalled requests go when the fake stops
         self.asleep = False  # True: no Remote start, the TV is off the network
+        self.wake_after_drops: int | None = None  # asleep: wake up after dropping this many requests
         self.not_found = 0  # how many requests get a 404 (WebApiCore restarting)
         self.auth_shape = "http"  # how a wrong key is refused: "http" 403 or "json" error 403
         # "403" or "error": a TV made since August 2025, whose plain http answers every request
@@ -209,6 +210,9 @@ class FakeBravia:
         self.schemes.append("https" if secure else "http")
         self.header_names.append(names)
         if self.asleep:
+            if self.wake_after_drops is not None:
+                self.wake_after_drops -= 1
+                self.asleep = self.wake_after_drops > 0
             return None
         if self.not_found > 0:
             self.not_found -= 1
@@ -541,7 +545,9 @@ def test_turn_on_wakes_a_tv_that_is_off_the_network(
     """Without Remote start the TV drops off the network; the magic packet brings it back,
     either on or with only its network up (then setPowerStatus switches the screen on)."""
     driver, store = add_tv(tmp_path, tv)
-    tv.power, tv.asleep = wakes_to, True
+    # Its network comes up after the magic packet, once it has let two polls go unanswered (counted
+    # rather than timed: on a slow runner a timer could fire before the first poll).
+    tv.power, tv.asleep, tv.wake_after_drops = wakes_to, True, 2
     packets: list[tuple[bytes, tuple[str, int]]] = []
 
     class RecordingSocket:
@@ -558,8 +564,6 @@ def test_turn_on_wakes_a_tv_that_is_off_the_network(
             pass
 
         def sendto(self, data: bytes, target: tuple[str, int]) -> None:
-            if not packets:  # the TV's network comes up a moment after the first packet
-                threading.Timer(0.4, lambda: setattr(tv, "asleep", False)).start()
             packets.append((data, target))
 
     fake_socket = SimpleNamespace(socket=RecordingSocket, AF_INET=0, SOCK_DGRAM=0, SOL_SOCKET=0, SO_BROADCAST=0)
