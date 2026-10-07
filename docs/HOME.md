@@ -21,6 +21,7 @@ Claude sees your devices through a tool called `home_control`, finds the one you
 - [Find what's on your network](#find-whats-on-your-network)
 - [Siri and Apple Home](#siri-and-apple-home)
 - [Using it](#using-it)
+- [Open a channel or a video](#open-a-channel-or-a-video)
 - [What Jarvis asks you first](#what-jarvis-asks-you-first)
 - [Commands](#commands)
 - [Where your devices and keys are kept](#where-your-devices-and-keys-are-kept)
@@ -49,7 +50,7 @@ The PC and your devices must be on the same home network. Give each TV a fixed a
 3. Name it (for example "Apple TV") and give it a room.
 4. The TV shows a 4-digit code. Type it into the setup window. After three wrong codes, setup stops; start it again for a new code.
 
-Jarvis can turn the Apple TV on and off, play and pause, skip, navigate, type into a search field, list and open apps, and change the volume. Volume works only if the Apple TV controls your TV's volume over HDMI-CEC; otherwise ask Jarvis to change the TV's volume instead. The Apple TV doesn't tell Jarvis which app is open, so "what's on?" only says whether it is on or asleep. To remove Jarvis later, use **Settings > Remotes and Devices > Remote App and Devices** on the Apple TV.
+Jarvis can turn the Apple TV on and off, play and pause, skip, navigate, type into a search field, list and open apps, open a link in its app (such as a Kick channel), and change the volume. Volume works only if the Apple TV controls your TV's volume over HDMI-CEC; otherwise ask Jarvis to change the TV's volume instead. The Apple TV doesn't tell Jarvis which app is open, so "what's on?" only says whether it is on or asleep. To remove Jarvis later, use **Settings > Remotes and Devices > Remote App and Devices** on the Apple TV.
 
 If no code appears, or the right code is refused, restart the Apple TV (**Settings > System > Restart**) and try again. Some Apple TV 4K units on tvOS 26 have a known pairing bug.
 
@@ -66,7 +67,7 @@ If no code appears, or the right code is refused, restart the Apple TV (**Settin
 
 TVs made since August 2025 accept only a secure (HTTPS) connection. Setup tries both kinds and keeps the one that works. If a TV Jarvis already knows starts to need a secure connection, Jarvis switches to it by itself when it can; otherwise it asks you to add the TV again.
 
-Jarvis can turn the TV on and off, set the volume and mute, switch inputs by their names ("Apple TV", "HDMI 2"), open apps, press remote buttons (play, pause, back, home, arrows) and say what is on. With a soundbar or receiver on HDMI (eARC), Jarvis always uses the remote's volume and mute buttons, because the TV's own volume setting can silently do nothing then. So "volume 20" works only if the TV reports the soundbar's level, and the TV's status leaves the volume out. The TV can't tell Jarvis whether something is playing, so "play/pause" pauses; say "play" to carry on.
+Jarvis can turn the TV on and off, set the volume and mute, switch inputs by their names ("Apple TV", "HDMI 2"), open apps, type into the TV's on-screen keyboard, press remote buttons (play, pause, back, home, arrows) and say what is on. With a soundbar or receiver on HDMI (eARC), Jarvis always uses the remote's volume and mute buttons, because the TV's own volume setting can silently do nothing then. So "volume 20" works only if the TV reports the soundbar's level, and the TV's status leaves the volume out. The TV can't tell Jarvis whether something is playing, so "play/pause" pauses; say "play" to carry on.
 
 Some budget models (BRAVIA 2 II and some BRAVIA 3) list only **Simple IP control** and **Control4** under IP control. Jarvis can't control those.
 
@@ -182,6 +183,16 @@ Talk to Jarvis as usual. To see what Jarvis knows, ask "what devices do you have
 - **Values.** Volume, brightness and positions go from 0 to 100: "volume 20", "brightness half". Colours are names or hex codes: "warm white", "blue", "#ff8800".
 - **Apps and inputs.** "Open YouTube on the TV" matches the app list loosely. So does "switch to the Apple TV" for a TV input you have named "Apple TV".
 
+## Open a channel or a video
+
+Ask for a streamer or a link, for example "open xQc on Kick on the Apple TV". Claude gives Jarvis the channel's link (`https://kick.com/xqc`), and Jarvis opens it in the app.
+
+- **Apple TV.** Jarvis checks that Kick is installed, then hands the Apple TV the link. Kick needs tvOS 26 or later; get it from the App Store on the Apple TV. Links to other apps that claim their web links, such as Netflix or Disney+, work the same way. The Apple TV doesn't say whether a link opened, so Jarvis says it *asked*. If Kick opens on its home screen instead of the channel, select Kick's search box with the remote and say the name: Jarvis types it.
+- **Sony TV.** Sony's control API only starts apps; it can't open a link inside one. So Jarvis opens Kick and asks you to select Kick's search box; say the name and Jarvis types it. Get Kick from the Google Play Store on the TV. It needs Android 8 or later: see **Settings > Device Preferences > About**. Typing works only where the TV's own on-screen keyboard comes up. If an app has a keyboard of its own, type with the remote.
+- **Channel names.** A channel's link uses its Kick name, which can differ from how people know the streamer. If Kick shows "Channel Not Found", check the name on kick.com.
+- **Don't have Jarvis type a password.** What Jarvis types passes through the chat.
+- **On this PC**, Claude can open the channel in your browser instead. Claude Code asks before it runs the command.
+
 ## What Jarvis asks you first
 
 Most commands just happen, the way a remote control does. A few need your OK on screen first, in a Claude Code dialog: unlocking a lock, disarming an alarm, and opening a garage door or gate. Jarvis never accepts a spoken "yes" for these, because a TV or a video could say it too.
@@ -248,6 +259,7 @@ To remove a device, use **Rename a device, set its room, or remove it** in the s
 | A device is "off or unreachable" | Check that it is on and connected to the same network as the PC. For a Sony TV, turn on **Remote start**, and after the Android 14 update set **Energy Mode** to **Increased**. Tuya devices must be powered; battery sensors sleep. |
 | The Sony TV "refused the pre-shared key", or "now needs a secure connection" | Re-enter the key: in the setup window, add the TV again with the same address. Setup finds by itself whether the TV needs a secure connection. |
 | Sony setup says the TV "refused the connection" | Check that IP control and **Control remotely** are on (see the [Sony Bravia TV](#sony-bravia-tv) steps). If IP control lists only **Simple IP control** and **Control4**, Jarvis can't control this model. |
+| The Sony TV "has no on-screen keyboard open" | Select the app's search box with the remote first. If it is selected, the app uses a keyboard of its own, which Jarvis can't type into: type with the remote. |
 | The Apple TV says pairing failed | See the [Apple TV](#apple-tv) steps: allow access, restart it, and pair again. |
 | The phone says "Please use the designated APP to scan the code to log in" | Scan with the same app you took the User Code from: Tuya Smart and Smart Life have separate accounts. Only those two apps work; if your devices are in another brand's app, move them to Tuya Smart or Smart Life. Jarvis offers a new QR code to scan. If you already used the same app, Tuya may be having trouble on its side: try again later. |
 | The QR code expired | Say yes when Jarvis offers a new code, and scan it straight away: a code is valid only briefly. If the wait ran out, choose **Link your Tuya account** again. |

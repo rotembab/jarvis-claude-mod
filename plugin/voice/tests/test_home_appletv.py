@@ -424,7 +424,7 @@ def test_commands_come_from_saved_data_without_the_network(rig: Rig, world: Fake
         "type_text",
     ]
     assert specs["set_volume"].value == "percent"
-    assert specs["launch_app"].usage() == "launch_app <an app name>"
+    assert specs["launch_app"].usage() == "launch_app <an app name or a link>"
     assert specs["type_text"].value == "text"
     assert all(spec.tier == "free" for spec in specs.values())
     assert world.scans == [] and world.connects == 0
@@ -732,6 +732,77 @@ def test_launch_app_opens_the_matching_app_and_says_it_asked(rig: Rig, world: Fa
     assert world.connected[0].calls[-1] == ("launch_app", "https://www.netflix.com/title/1")
 
 
+KICK = ("Kick", "com.kick.mobile")
+KICK_CHANNEL = (
+    "Asked the Apple TV to open xqc on Kick. If Kick opens on its home screen instead, "
+    "select its search box and I'll type the name."
+)
+
+
+def test_a_link_without_a_scheme_gets_one_so_it_is_not_sent_as_a_bundle_id(rig: Rig, world: FakePyatv) -> None:
+    assert rig.run("launch_app", "youtube.com/watch?v=abc") == Outcome.done("Asked the Apple TV to open that link.")
+    assert world.calls == ["launch_app"]
+    assert world.connected[0].calls[-1] == ("launch_app", "https://youtube.com/watch?v=abc")
+
+
+def test_a_kick_link_opens_the_channel_and_says_it_only_asked(rig: Rig, world: FakePyatv) -> None:
+    world.apps.append(KICK)
+    assert rig.run("launch_app", "kick.com/xQc") == Outcome.done(KICK_CHANNEL)
+    assert world.connected[0].calls[-1] == ("launch_app", "https://kick.com/xqc")
+    assert world.calls.count("launch_app") == 1
+    out = rig.run("launch_app", "https://www.kick.com/xqc/videos")
+    assert out == Outcome.done("Asked the Apple TV to open that Kick link.")
+    assert world.connected[0].calls[-1] == ("launch_app", "https://kick.com/xqc/videos")
+    assert world.app_lists == 1  # the remembered list has Kick
+
+
+def test_a_kick_link_is_not_sent_when_kick_is_not_installed(rig: Rig, world: FakePyatv) -> None:
+    missing = Outcome.fail(
+        "bad_value",
+        "Kick isn't installed on the Apple TV. Install it from the App Store on the Apple TV "
+        "(it needs tvOS 26 or later), then ask again.",
+    )
+    assert rig.run("launch_app", "kick.com/xqc") == missing
+    assert world.app_lists == 1  # nothing was remembered, so the list just read is fresh
+    assert rig.run("launch_app", "kick.com/xqc") == missing
+    assert world.app_lists == 2  # the remembered list, then one fresh list before saying no
+    assert "launch_app" not in world.calls
+
+
+def test_kick_installed_since_the_list_was_remembered_is_found(rig: Rig, world: FakePyatv) -> None:
+    assert rig.run("launch_app", "netflix").ok  # remembers a list without Kick
+    world.apps.append(KICK)
+    assert rig.run("launch_app", "kick.com/xqc") == Outcome.done(KICK_CHANNEL)
+    assert world.connected[0].calls[-1] == ("launch_app", "https://kick.com/xqc")
+    assert world.app_lists == 2
+
+
+def test_a_kick_link_is_still_sent_when_the_app_list_cannot_be_read(rig: Rig, world: FakePyatv) -> None:
+    world.failures["app_list"] = [refused()]
+    assert rig.run("launch_app", "kick.com/xqc") == Outcome.done(KICK_CHANNEL)
+    assert world.calls == ["app_list", "launch_app"]
+    # A lost connection is not "can't read": it reconnects, and the link still goes out once.
+    world.apps.append(KICK)
+    world.calls.clear()
+    world.failures["app_list"] = [lost()]
+    assert rig.run("launch_app", "kick.com/xqc") == Outcome.done(KICK_CHANNEL)
+    assert world.calls == ["app_list", "app_list", "launch_app"] and world.connects == 2
+
+
+def test_the_kick_home_page_opens_the_app_by_its_bundle_id(rig: Rig, world: FakePyatv) -> None:
+    world.apps.append(KICK)
+    assert rig.run("launch_app", "https://kick.com/") == Outcome.done("Asked the Apple TV to open Kick.")
+    assert world.connected[0].calls[-1] == ("launch_app", "com.kick.mobile")
+
+
+def test_a_refused_link_is_reported_and_not_sent_again(rig: Rig, world: FakePyatv) -> None:
+    world.apps.append(KICK)
+    world.failures["launch_app"] = [refused()]
+    out = rig.run("launch_app", "kick.com/xqc")
+    assert out == Outcome.fail("failed", "The Apple TV didn't accept that command.")
+    assert world.calls.count("launch_app") == 1
+
+
 def test_list_apps_names_them_in_order_and_asks_afresh(rig: Rig, world: FakePyatv) -> None:
     out = rig.run("list_apps")
     assert out.ok
@@ -873,7 +944,7 @@ def test_through_the_service(tmp_path: Path, world: FakePyatv) -> None:
         reply = service.handle({"action": "status", "device": "living room apple tv"})
         assert reply["text"] == "The Apple TV is on."
         listed = service.handle({"action": "list"})["text"]
-        assert "set_volume <0-100>" in listed and "launch_app <an app name>" in listed
+        assert "set_volume <0-100>" in listed and "launch_app <an app name or a link>" in listed
         assert "Apple TV: 1 set up" in service.handle({"action": "info"})["text"]
         assert world.connects == 1
     finally:

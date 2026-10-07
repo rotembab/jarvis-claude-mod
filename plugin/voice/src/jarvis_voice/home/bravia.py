@@ -5,7 +5,7 @@ The TV offers two interfaces, both over HTTP with the pre-shared key in an
 only ever answers with an error):
 
 - the Scalar REST API, JSON-RPC at ``/sony/<service>``: power, volume, apps,
-  inputs and what is on;
+  inputs, typing and what is on;
 - IRCC-IP, remote-control buttons as a SOAP call to ``/sony/ircc`` (some
   models only answer ``/sony/IRCC``: the path is case-sensitive).
 
@@ -42,6 +42,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from . import net
 from .base import Driver, DriverContext, Prompter
+from .links import Link, parse_link
 from .model import CommandSpec, DeviceRecord, HomeConfig, Outcome, Value, normalize, unique_id
 from .store import StoreError
 
@@ -687,6 +688,7 @@ class BraviaDriver(Driver):
             "list_apps": self._list_apps,
             "set_input": self._set_input,
             "list_inputs": self._list_inputs,
+            "type_text": self._type_text,
         }
         for command in KEYS:
             self._handlers[command] = functools.partial(self._key, command)
@@ -703,10 +705,12 @@ class BraviaDriver(Driver):
             CommandSpec(command) for command, (names, _) in KEYS.items() if known is None or known.intersection(names)
         ]
         specs += [
-            CommandSpec("launch_app", "text", hint="an app name"),
+            CommandSpec("launch_app", "text", hint="an app name or a link"),
             CommandSpec("list_apps"),
             CommandSpec("set_input", "text", hint=_input_hint(device)),
             CommandSpec("list_inputs"),
+            # Always offered: nothing saved says whether the TV has setTextForm.
+            CommandSpec("type_text", "text", hint="text for the selected search box"),
         ]
         return specs
 
@@ -1118,6 +1122,9 @@ class BraviaDriver(Driver):
 
     def _launch_app(self, s: _Session, value: Value) -> Outcome:
         wanted = str(value or "").strip()
+        link = parse_link(wanted)
+        if link is not None:
+            return self._open_link(s, link)
         apps = s.apps()
         if not apps:
             return Outcome.fail("failed", f"The {s.name} did not list any apps.")
@@ -1129,6 +1136,10 @@ class BraviaDriver(Driver):
         if len(chosen) > 1:
             return Outcome.fail("ambiguous", f"Which app: {', '.join(t for t, _ in chosen[:6])}?")
         title, uri = chosen[0]
+        return self._start_app(s, title, uri) or Outcome.done(f"Opened {title} on the {s.name}.")
+
+    def _start_app(self, s: _Session, title: str, uri: str) -> Outcome | None:
+        """Starts an app from the TV's list: None once it is starting, else why it isn't."""
         try:
             s.client.call("appControl", "setActiveApp", [{"uri": uri}])
         except BraviaError as err:
@@ -1139,7 +1150,83 @@ class BraviaDriver(Driver):
             if err.code == ERR_APP_FAILED:
                 return Outcome.fail("failed", f"The {s.name} could not open {title}.")
             # 41402: it is starting, the TV just cannot say when it is done.
-        return Outcome.done(f"Opened {title} on the {s.name}.")
+        return None
+
+    def _open_link(self, s: _Session, link: Link) -> Outcome:
+        """Opens the app a link belongs to, never the link itself: Sony's documented setActiveApp
+        takes only an app's uri from the TV's list. A ``localapp://webappruntime`` uri (documented
+        for Pro displays only) and fields Sony doesn't document are never sent."""
+        app = link.app
+        if app is None or app.android_package is None:
+            return Outcome.fail(
+                "unsupported",
+                f"The {s.name} can't open links: Sony's documented control API only starts apps. "
+                "Ask me to open the app instead.",
+            )
+        apps = s.apps()
+        if not apps:
+            return Outcome.fail("failed", f"The {s.name} did not list any apps.")
+        found = _package_app(apps, app.android_package) or _title_app(apps, app.name)
+        if found is None:
+            return Outcome.fail(
+                "bad_value",
+                f"{app.name} isn't installed on the {s.name}. Install it from the Google Play Store on the TV "
+                f"(it needs {app.android_needs}), then ask again.",
+            )
+        if isinstance(found, list):
+            return Outcome.fail("ambiguous", f"Which app: {', '.join(found[:6])}?")
+        failed = self._start_app(s, app.name, found[1])
+        if failed is not None:
+            return failed
+        opened = f"Opened {app.name} on the {s.name}."
+        if link.bare:
+            return Outcome.done(opened)
+        limit = "Sony's documented control API only starts apps"
+        if link.channel:
+            return Outcome.done(
+                f"{opened} {limit}, so it can't open {link.channel}'s channel. "
+                f"Select {app.name}'s search box and I'll type the name."
+            )
+        return Outcome.done(f"{opened} {limit}, so it can't open that link inside {app.name}.")
+
+    def _keyboard_open(self, s: _Session) -> bool | None:
+        """Whether the TV's on-screen keyboard is up (getApplicationStatusList, a read), or None
+        when the TV can't say. Other errors are raised: error 7 there is how a TV that now
+        takes only https answers plain http, which the https try handles."""
+        try:
+            result = s.client.call("appControl", "getApplicationStatusList", timeout=STATUS_TIMEOUT_S)
+        except BraviaError as err:
+            if err.kind == "bad_reply" or (
+                err.kind == "rpc" and err.code in (ERR_NO_METHOD, ERR_VERSION, ERR_UNSUPPORTED)
+            ):
+                return None
+            raise
+        for entry in _first_list(result):
+            if isinstance(entry, dict) and entry.get("name") == "textInput":
+                return {"on": True, "off": False}.get(str(entry.get("status")))
+        return None
+
+    def _type_text(self, s: _Session, value: Value) -> Outcome:
+        """Types into the TV's own on-screen keyboard: setTextForm 1.0 with a plain string (1.1
+        wants an encryption key). Sent once: it may add to what is there, and the client tries
+        again only when the TV took nothing in (404, a refused connection), never after a timeout."""
+        text = str(value or "")
+        if self._keyboard_open(s) is False:
+            return Outcome.fail(
+                "failed", f"No on-screen keyboard is open on the {s.name}. Select the search box first, then ask again."
+            )
+        try:
+            s.client.call("appControl", "setTextForm", [text], version="1.0")
+        except BraviaError as err:
+            if err.kind != "rpc" or err.code != ERR_ILLEGAL_STATE:
+                raise
+            return Outcome.fail(
+                "failed",
+                f"The {s.name} has no on-screen keyboard open, so I can't type there. Select the search box first; "
+                "if it is selected, this app uses a keyboard of its own, so type with the remote.",
+            )
+        shown = f'"{text}"' if len(text) <= 60 else "the text"
+        return Outcome.done(f"Typed {shown} on the {s.name}.")
 
     def _list_apps(self, s: _Session, _value: Value = None) -> Outcome:
         titles = sorted({title for title, _ in s.apps()}, key=str.casefold)
@@ -1200,6 +1287,20 @@ def _as_percent(value: Value) -> int:
     except (TypeError, ValueError):
         number = 0.0
     return max(0, min(100, round(number)))
+
+
+def _package_app(apps: list[tuple[str, str]], package: str) -> tuple[str, str] | None:
+    """The first app, in the TV's order, of an Android package (uris are ``com.sony.dtv.<package>.<activity>``)."""
+    prefix = f"com.sony.dtv.{package}"
+    return next((app for app in apps if app[1] == prefix or app[1].startswith(f"{prefix}.")), None)
+
+
+def _title_app(apps: list[tuple[str, str]], name: str) -> tuple[str, str] | list[str] | None:
+    """The one app whose title best matches ``name``, the titles when several do, or None."""
+    chosen = [apps[i] for i in _best([title for title, _ in apps], name)]
+    if len(chosen) == 1:
+        return chosen[0]
+    return [title for title, _ in chosen] or None
 
 
 def _input_hint(device: DeviceRecord) -> str:

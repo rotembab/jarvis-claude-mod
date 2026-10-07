@@ -256,12 +256,15 @@ plugin/voice/src/jarvis_voice/home/
   commandline.py   `jarvis_voice home ...` without the helper
   scan.py          the read-only network scan (mDNS, SSDP, Tuya broadcasts and discovery request, brand UDP
                    discovery): `home scan` and the setup window's "Find smart devices on my network"
+  links.py         links that open inside an app on a TV (Kick channels): parse_link, LINK_APPS
   appletv.py, bravia.py, tuya*.py, homeassistant.py   the drivers and their setup steps
 ```
 
 **Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode without checking permission rules, as it does `list` and `status`.
 
 **Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
+
+**Links.** `launch_app` takes an app name or a link; `links.parse_link` tells them apart, gives every link a scheme (pyatv sends a string without one as a bundle id), and names the `LinkApp` that claims it. Add an app to `LINK_APPS` only with a primary source for its tvOS bundle id, Android TV package and the paths its apple-app-site-association claims. The Apple TV sends the link (Companion `_urlS`) after checking the app is installed, and says "asked": tvOS can refuse a launch without an error (pyatv #2868). The Sony opens the app from its own list, since Sony's documented `setActiveApp` takes only that list's uri, and says it can't open the link inside; never send it a `localapp://webappruntime` uri or an undocumented field. Sony typing is `setTextForm` version 1.0 with a plain string, sent once.
 
 **Adding a driver.** Subclass `base.Driver` (`commands` reads saved data only, never the network; `run` and `status` finish within `DriverContext.call_timeout`), add it to `DRIVERS`, and add its setup step to `WIZARD_STEPS`. Use the canonical command names in `model.COMMAND_SYNONYMS` so "switch on" and "turn on" mean the same everywhere. Never poll a device in the background: a request to an Apple TV wakes it and, over HDMI-CEC, the TV.
 

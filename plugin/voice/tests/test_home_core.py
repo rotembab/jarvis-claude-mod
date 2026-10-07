@@ -116,6 +116,7 @@ def test_command_names_and_usage() -> None:
     assert canonical_command("set-volume") == "set_volume"
     assert canonical_command("colour") == "set_color"
     assert canonical_command("Click") == canonical_command("push") == canonical_command("tap") == "press"
+    assert canonical_command("open link") == canonical_command("open_url") == "launch_app"
     assert CommandSpec("set_volume", "percent").usage() == "set_volume <0-100>"
     assert CommandSpec("press", hint="presses a wall switch").usage() == "press (presses a wall switch)"
     assert CommandSpec("set_temperature", "number", low=16, high=30).usage() == "set_temperature <16-30>"

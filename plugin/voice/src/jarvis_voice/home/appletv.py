@@ -37,6 +37,7 @@ from pyatv.interface import DeviceListener
 from pyatv.storage.memory_storage import MemoryStorage
 
 from .base import Driver, DriverContext, Prompter
+from .links import Link, parse_link
 from .model import CommandSpec, DeviceRecord, HomeConfig, Outcome, Value, normalize, unique_id
 from .runner import AsyncRunner
 from .store import StoreError
@@ -585,7 +586,6 @@ async def _app_list(conn: _Conn, *, fresh: bool = False) -> list[tuple[str, str]
     return apps
 
 
-_URL = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$", re.IGNORECASE)
 _BUNDLE_ID = re.compile(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+){2,}$")
 # Names people use for Apple's own apps, by bundle id.
 _APP_ALIASES = {
@@ -650,9 +650,9 @@ def match_app(apps: list[tuple[str, str]], wanted: str) -> tuple[tuple[str, str]
 async def _launch_app(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
     wanted = str(value or "").strip()
     # tvOS may ignore a launch without saying so (pyatv #2868), hence "asked".
-    if _URL.match(wanted):
-        await conn.atv.apps.launch_app(wanted)
-        return Outcome.done(f"Asked the {device.name} to open that link.")
+    link = parse_link(wanted)
+    if link is not None:
+        return await _open_link(conn, device, link)
     app, candidates = match_app(await _app_list(conn), wanted)
     if app is None:
         if candidates:
@@ -662,6 +662,56 @@ async def _launch_app(conn: _Conn, device: DeviceRecord, value: Value) -> Outcom
         )
     await conn.atv.apps.launch_app(app[1])
     return Outcome.done(f"Asked the {device.name} to open {app[0]}.")
+
+
+async def _open_link(conn: _Conn, device: DeviceRecord, link: Link) -> Outcome:
+    """Hands the Apple TV a link, which opens in the app that claims it (Companion's ``_urlS``).
+
+    A launch of an app that isn't installed fails as silently as any other, so the app a
+    link belongs to is looked for first; its own host alone opens it by its bundle id.
+    """
+    app = link.app
+    if app is None or app.apple_bundle is None:
+        await conn.atv.apps.launch_app(link.url)
+        return Outcome.done(f"Asked the {device.name} to open that link.")
+    if await _installed(conn, app.apple_bundle) is False:
+        return Outcome.fail(
+            "bad_value",
+            f"{app.name} isn't installed on the {device.name}. Install it from the App Store on the {device.name} "
+            f"(it needs {app.apple_needs}), then ask again.",
+        )
+    if link.bare:
+        await conn.atv.apps.launch_app(app.apple_bundle)
+        return Outcome.done(f"Asked the {device.name} to open {app.name}.")
+    await conn.atv.apps.launch_app(link.url)
+    if link.channel:
+        return Outcome.done(
+            f"Asked the {device.name} to open {link.channel} on {app.name}. If {app.name} opens on its home screen "
+            "instead, select its search box and I'll type the name."
+        )
+    return Outcome.done(f"Asked the {device.name} to open that {app.name} link.")
+
+
+async def _installed(conn: _Conn, bundle: str) -> bool | None:
+    """Whether the app is on the Apple TV, or None when its list can't be read (a lost connection is raised).
+
+    A remembered list without it is asked for afresh before saying no: it may have been installed since.
+    """
+    try:
+        remembered = conn.link.apps
+        apps = await _app_list(conn)
+        if conn.link.apps is remembered and not _has_bundle(apps, bundle):
+            apps = await _app_list(conn, fresh=True)
+    except Exception as exc:
+        if _is_connection_loss(exc):
+            raise
+        log.debug("apple tv %s: the app list could not be read (%s)", conn.link.device_id, type(exc).__name__)
+        return None
+    return _has_bundle(apps, bundle)
+
+
+def _has_bundle(apps: list[tuple[str, str]], bundle: str) -> bool:
+    return any(ident.lower() == bundle.lower() for _, ident in apps)
 
 
 async def _list_apps(conn: _Conn, device: DeviceRecord, value: Value) -> Outcome:
@@ -707,7 +757,7 @@ _COMMANDS: dict[str, tuple[CommandSpec, bool, Op]] = {
     "volume_up": (CommandSpec("volume_up"), False, _volume_step(True)),
     "volume_down": (CommandSpec("volume_down"), False, _volume_step(False)),
     "set_volume": (CommandSpec("set_volume", "percent"), True, _set_volume),
-    "launch_app": (CommandSpec("launch_app", "text", hint="an app name"), True, _launch_app),
+    "launch_app": (CommandSpec("launch_app", "text", hint="an app name or a link"), True, _launch_app),
     "list_apps": (CommandSpec("list_apps"), True, _list_apps),
     "type_text": (CommandSpec("type_text", "text", hint="text for the selected search box"), True, _type_text),
 }

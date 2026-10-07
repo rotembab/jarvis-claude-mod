@@ -140,6 +140,9 @@ class FakeBravia:
         ]
         self.codes = dict(CODES)
         self.active_app: str | None = None
+        self.keyboard = False  # whether the TV's own on-screen keyboard is up
+        self.status_list = True  # False: an older TV without getApplicationStatusList
+        self.typed: list[str] = []
         self.calls: list[tuple[str, str, Any]] = []
         self.ircc: list[str] = []
         self.paths: list[str] = []
@@ -366,6 +369,24 @@ class FakeBravia:
             self.active_app = first["uri"]
             self.playing = 7  # the API cannot say what an app is showing
             return []
+        if (service, method) == ("appControl", "getApplicationStatusList"):
+            if not self.status_list:
+                return 12
+            return [
+                [
+                    {"name": "textInput", "status": "on" if self.keyboard else "off"},
+                    {"name": "cursorDisplay", "status": "off"},
+                    {"name": "webBrowse", "status": "off"},
+                ]
+            ]
+        if (service, method) == ("appControl", "setTextForm"):
+            # Version 1.1 wants {"encKey", "text"}: a plain string is wrong there.
+            if version != "1.0" or len(params) != 1 or not isinstance(params[0], str):
+                return 3
+            if not self.keyboard:
+                return 7  # the software keyboard is not active
+            self.typed.append(params[0])
+            return [0]
         return 12
 
 
@@ -470,9 +491,11 @@ def test_commands_come_from_saved_data(tmp_path: Path, tv: FakeBravia) -> None:
     names = [spec.name for spec in driver.commands(device_of(store))]
     assert names[:8] == ["turn_on", "turn_off", "toggle", "volume_up", "volume_down", "set_volume", "mute", "unmute"]
     assert set(KEYS) <= set(names)
-    assert {"launch_app", "list_apps", "set_input", "list_inputs"} <= set(names)
+    assert {"launch_app", "list_apps", "set_input", "list_inputs", "type_text"} <= set(names)
     specs = {spec.name: spec for spec in driver.commands(device_of(store))}
     assert specs["set_volume"].usage() == "set_volume <0-100>"
+    assert specs["launch_app"].usage() == "launch_app <an app name or a link>"
+    assert specs["type_text"].usage() == "type_text <text for the selected search box>"
     assert specs["set_input"].usage() == "set_input <an input such as HDMI 2>"
     # Once the TV's buttons and inputs are known, only real buttons are offered.
     codes = {k: v for k, v in CODES.items() if k != "Stop"}
@@ -842,6 +865,141 @@ def test_launch_failure_is_spoken(tmp_path: Path, tv: FakeBravia, monkeypatch: p
     assert run(driver, store, "launch_app", "Netflix") == Outcome.fail("failed", "The Sony TV could not open Netflix.")
 
 
+# Kick's Android TV package is com.kick.mobile (Sony's uri is "com.sony.dtv.<package>.<activity>");
+# the activity after it is made up for the fake.
+KICK_URI = "com.sony.dtv.com.kick.mobile.com.kick.mobile.MainActivity"
+NO_LINKS = "Sony's documented control API only starts apps"
+
+
+def test_a_kick_link_opens_kick_and_says_the_channel_needs_typing(
+    tmp_path: Path, tv: FakeBravia, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    tv.apps.append({"title": "Kick", "uri": KICK_URI, "icon": ""})
+    assert run(driver, store, "launch_app", "https://www.kick.com/xQc") == Outcome.done(
+        f"Opened Kick on the Sony TV. {NO_LINKS}, so it can't open xqc's channel. "
+        "Select Kick's search box and I'll type the name."
+    )
+    assert tv.calls[-1] == ("appControl", "setActiveApp", [{"uri": KICK_URI}])
+    assert tv.methods().count("setActiveApp") == 1
+    assert run(driver, store, "launch_app", "kick.com/xqc/videos") == Outcome.done(
+        f"Opened Kick on the Sony TV. {NO_LINKS}, so it can't open that link inside Kick."
+    )
+    assert run(driver, store, "launch_app", "kick.com") == Outcome.done("Opened Kick on the Sony TV.")
+    sent = json.dumps(tv.calls)
+    assert "https://" not in sent and "localapp://" not in sent and "xqc" not in sent
+    original = tv._rpc
+    monkeypatch.setattr(tv, "_rpc", lambda *a: 41401 if a[1] == "setActiveApp" else original(*a))
+    failed = Outcome.fail("failed", "The Sony TV could not open Kick.")
+    assert run(driver, store, "launch_app", "kick.com/xqc") == failed
+
+
+def test_a_kick_link_finds_kick_by_its_package_before_its_title(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    tv.apps += [
+        {"title": "Kickboxing Coach", "uri": "com.sony.dtv.com.example.kickboxing.Main", "icon": ""},
+        {"title": "Kick: Live Streaming", "uri": KICK_URI, "icon": ""},
+    ]
+    assert run(driver, store, "launch_app", "kick.com/xqc").ok
+    assert tv.active_app == KICK_URI
+    # With no uri of Kick's package, the titles decide, and two of them could be Kick.
+    tv.apps[-1]["uri"] = "com.sony.dtv.com.example.streaming.Main"
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+        "ambiguous", "Which app: Kickboxing Coach, Kick: Live Streaming?"
+    )
+    del tv.apps[-2]
+    assert run(driver, store, "launch_app", "kick.com/xqc").ok
+    assert tv.active_app == "com.sony.dtv.com.example.streaming.Main"
+
+
+def test_a_kick_link_without_kick_installed_opens_nothing(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+        "bad_value",
+        "Kick isn't installed on the Sony TV. Install it from the Google Play Store on the TV "
+        "(it needs Android 8 or later), then ask again.",
+    )
+    tv.apps = []
+    assert run(driver, store, "launch_app", "kick.com/xqc") == Outcome.fail(
+        "failed", "The Sony TV did not list any apps."
+    )
+    assert "setActiveApp" not in tv.methods()
+
+
+def test_other_links_are_refused_without_asking_the_tv(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    refused = Outcome.fail("unsupported", f"The Sony TV can't open links: {NO_LINKS}. Ask me to open the app instead.")
+    for link in ("https://example.com/x", "youtube.com/watch?v=abc", "https://kick.com/go-live"):
+        assert run(driver, store, "launch_app", link) == refused
+    assert tv.calls == []
+
+
+def test_type_text_types_into_the_on_screen_keyboard(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    tv.keyboard = True
+    assert run(driver, store, "type_text", "xqc") == Outcome.done('Typed "xqc" on the Sony TV.')
+    # Version 1.0 with a plain string: the fake answers anything else with error 3.
+    assert tv.calls[-1] == ("appControl", "setTextForm", ["xqc"])
+    assert tv.methods() == ["getApplicationStatusList", "setTextForm"]
+    assert run(driver, store, "type_text", "x" * 61) == Outcome.done("Typed the text on the Sony TV.")
+    service = HomeService(tmp_path, store=store, drivers={"bravia": lambda ctx: quick(BraviaDriver(ctx))})
+    try:
+        reply = service.handle({"action": "do", "device": "sony tv", "command": "type", "value": "trainwreck"})
+        assert (reply["result"], reply["text"]) == ("done", 'Typed "trainwreck" on the Sony TV.')
+    finally:
+        service.close()
+    assert tv.typed == ["xqc", "x" * 61, "trainwreck"]
+
+
+def test_type_text_without_a_keyboard_sends_no_text(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    assert run(driver, store, "type_text", "xqc") == Outcome.fail(
+        "failed", "No on-screen keyboard is open on the Sony TV. Select the search box first, then ask again."
+    )
+    assert "setTextForm" not in tv.methods() and tv.typed == []
+
+
+def test_type_text_relies_on_error_7_when_the_tv_cannot_say(
+    tmp_path: Path, tv: FakeBravia, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    tv.status_list = False
+    assert run(driver, store, "type_text", "xqc") == Outcome.fail(
+        "failed",
+        "The Sony TV has no on-screen keyboard open, so I can't type there. Select the search box first; "
+        "if it is selected, this app uses a keyboard of its own, so type with the remote.",
+    )
+    tv.keyboard = True
+    assert run(driver, store, "type_text", "xqc") == Outcome.done('Typed "xqc" on the Sony TV.')
+    assert tv.typed == ["xqc"]
+    # An older TV without setTextForm.
+    tv.status_list = True
+    original = tv._rpc
+    monkeypatch.setattr(tv, "_rpc", lambda *a: 12 if a[1] == "setTextForm" else original(*a))
+    assert run(driver, store, "type_text", "xqc") == Outcome.fail("unsupported", "The Sony TV does not support that.")
+
+
+def test_type_text_on_a_tv_that_now_takes_only_https_types_once(
+    tmp_path: Path, tv: FakeBravia, https_ports: set[int]
+) -> None:
+    """Its plain http answers error 7, which the keyboard check passes on so the https try can run."""
+    driver, store = add_tv(tmp_path, tv)
+    tv.plain_http, tv.keyboard = "error", True
+    https_ports.add(tv.port)
+    assert run(driver, store, "type_text", "xqc") == Outcome.done('Typed "xqc" on the Sony TV.')
+    assert tv.typed == ["xqc"] and device_of(store).settings["scheme"] == "https"
+
+
+def test_type_text_is_sent_once_when_the_tv_is_slow(tmp_path: Path, tv: FakeBravia) -> None:
+    driver, store = add_tv(tmp_path, tv)
+    driver.ctx.call_timeout = 2.5  # a 1 s budget
+    tv.keyboard, tv.stall = True, {"setTextForm"}
+    assert run(driver, store, "type_text", "xqc") == Outcome.fail(
+        "timeout", "The Sony TV did not answer in time; it may still act on it."
+    )
+    assert tv.methods().count("setTextForm") == 1
+
+
 def test_inputs_by_label_name_or_number(tmp_path: Path, tv: FakeBravia) -> None:
     driver, store = add_tv(tmp_path, tv)
     assert run(driver, store, "set_input", "Apple TV") == Outcome.done("Switched the Sony TV to Apple TV (HDMI 2).")
@@ -1088,7 +1246,7 @@ def test_through_the_home_service(tmp_path: Path, tv: FakeBravia) -> None:
     try:
         listing = service.handle({"action": "list"})["text"]
         assert "id=bravia-sony-tv: turn_on, turn_off, toggle, volume_up" in listing
-        assert "launch_app <an app name>" in listing
+        assert "launch_app <an app name or a link>" in listing
         reply = service.handle({"action": "do", "device": "the TV", "command": "volume", "value": "30%"})
         assert (reply["result"], reply["text"]) == ("done", "Set the Sony TV's volume to 30%.")
         assert tv.volume == 30

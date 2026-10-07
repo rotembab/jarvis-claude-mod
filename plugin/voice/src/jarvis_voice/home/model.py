@@ -334,6 +334,8 @@ COMMAND_SYNONYMS: dict[str, str] = {
     "launch": "launch_app",
     "open_app": "launch_app",
     "start_app": "launch_app",
+    "open_link": "launch_app",
+    "open_url": "launch_app",
     "apps": "list_apps",
     "input": "set_input",
     "source": "set_input",
