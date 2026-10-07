@@ -7,7 +7,9 @@
 // turn, else a click) and pass (no question). It only ever adds a question:
 // a command it does not know passes, and the engine's own rules, mode and
 // dialogs still decide everything that reaches them. Anything it cannot read,
-// that is hidden, or that is built at run time goes to screen.
+// that is hidden, or that is built at run time goes to screen. It is a
+// best-effort reading of command text (and of the files a command runs), not
+// a sandbox: Claude Code's own permission rules stay the real boundary.
 //
 // A command's tier is the strictest over all of its parts: every segment of a
 // chain or pipeline, every nested `$( )`, `( )`, `{ }` and backtick, and the
@@ -19,14 +21,26 @@
 export type Tier = 'pass' | 'voice' | 'screen' | 'never'
 /**
  * Something the guard must read off the file system before it can judge a call, which judge() is too
- * pure to do: pc.ts fetches it and judges again with the answer in `Resolved`. A `script` run and a
- * Write/Edit to a path spelled as an 8.3 short name both wait on one.
+ * pure to do: pc.ts fetches it and judges again with the answer in `Resolved`. A local file a command
+ * runs (`script`) and every Write/Edit/NotebookEdit path (`realpath`) wait on one. An `optional` read
+ * is of a file that may not be there (a name cmd or PowerShell looks up, a file Claude wrote that was
+ * deleted since): its absence is an answer, not a failure.
  */
-export type Need = { kind: 'script'; path: string } | { kind: 'realpath'; path: string }
+export type Need = { kind: 'script'; path: string; optional?: true } | { kind: 'realpath'; path: string }
 /** A judgement: the tier, the rule that set it, a short plain reason ("deletes files"), and what it still needs read. */
 export type Verdict = { tier: Tier; rule: string; reason: string; needs?: readonly Need[] }
-/** What pc.ts read for the second pass: a Write/Edit path's real target, and script files' contents (null when it could not be read). */
-export type Resolved = { realPath?: string | null; scripts?: Readonly<Record<string, string | null>> }
+/**
+ * What pc.ts knows that judge() cannot find out by itself: a file tool's real target (null when it
+ * cannot be placed), files' contents (null when they cannot be read, false when an optional one is not
+ * there), the files Claude wrote or edited this session (Write, Edit, NotebookEdit, as the tools named
+ * them), and the user's home folder (for `~`, `$HOME`, `$env:USERPROFILE` and `%USERPROFILE%`).
+ */
+export type Resolved = {
+  realPath?: string | null
+  scripts?: Readonly<Record<string, string | null | false>>
+  written?: readonly string[]
+  home?: string
+}
 
 /** The command languages the guard reads: the PowerShell tool, the Bash tool (and Monitor), and `cmd /c` text. */
 export type Dialect = 'pwsh' | 'bash' | 'cmd'
@@ -85,10 +99,14 @@ export type Command = {
   code: string
   /** It writes a file through a redirection (`>`, `>>`) other than to null. */
   writes: boolean
+  /** The files it writes through a redirection (not null). */
+  targets: Word[]
   /** It reads a pipe: the command before it ended in `|`. */
   piped: boolean
   /** Here-documents and here-strings it reads (bash `<<EOF`, `<<<`). */
   stdin: string[]
+  /** The files it reads on stdin (`< x.sh`); one named at run time sets `piped` instead. */
+  reads: Word[]
   /** Scripts nested in its words: `$( )`, `( )`, `{ }`, backticks. */
   inner: Script[]
 }
@@ -108,8 +126,8 @@ type Redirect = 'write' | 'read' | 'string' | { strip: boolean }
 type Heredoc = { delim: string; strip: boolean; expand: boolean; into: Command; depth: number }
 
 const newWord = (): Word => ({ text: '', items: [''], quoted: false, dynamic: false, block: false })
-const newCommand = (piped: boolean): Command => ({ words: [], code: '', writes: false, piped, stdin: [], inner: [] })
-const isEmpty = (c: Command): boolean => c.words.length === 0 && c.inner.length === 0 && c.stdin.length === 0 && !c.writes
+const newCommand = (piped: boolean): Command => ({ words: [], code: '', writes: false, targets: [], piped, stdin: [], reads: [], inner: [] })
+const isEmpty = (c: Command): boolean => c.words.length === 0 && c.inner.length === 0 && c.stdin.length === 0 && c.reads.length === 0 && !c.writes
 
 function addText(word: Word, text: string): void {
   word.text += text
@@ -157,9 +175,14 @@ class Lexer {
       const kind = redirect
       redirect = undefined
       if (kind === undefined) cur.words.push(...this.expandBraces(done))
-      else if (kind === 'write') cur.writes ||= !NULL_TARGETS.has(done.text.toLowerCase())
-      else if (kind === 'read') cur.piped ||= done.dynamic // `< <(curl ...)`, `< "$f"`: it reads what is known only at run time
-      else if (kind === 'string') cur.stdin.push(done.text)
+      else if (kind === 'write') {
+        const isNull = NULL_TARGETS.has(done.text.toLowerCase())
+        cur.writes ||= !isNull
+        if (!isNull) cur.targets.push(done)
+      } else if (kind === 'read') {
+        cur.piped ||= done.dynamic // `< <(curl ...)`, `< "$f"`: it reads what is known only at run time
+        if (!done.dynamic) cur.reads.push(done)
+      } else if (kind === 'string') cur.stdin.push(done.text)
       else this.heredocs.push({ delim: done.text, strip: kind.strip, expand: !done.quoted, into: cur, depth })
     }
     const endCommand = (piped: boolean): void => {
@@ -711,8 +734,25 @@ type Found = {
   built: boolean
 }
 
-/** What one judge() call learns as it walks: after a loop, every move counts as many. */
-type State = { loop: boolean }
+/**
+ * The folder a command's later parts run in: where the call started, a folder a `cd` named (as
+ * written, joined onto the one before when relative; `isLiteral` when it can be read as it stands,
+ * not just matched, as `$HOME\x` can), or one Jarvis cannot place.
+ */
+type Cwd = { kind: 'here' } | { kind: 'at'; path: string; isLiteral: boolean } | { kind: 'unknown' }
+const HERE: Cwd = { kind: 'here' }
+const UNPLACEABLE: Cwd = { kind: 'unknown' }
+
+/**
+ * What one judge() call learns as it walks: after a loop, every move counts as many; after a `cd`,
+ * a relative path lands in that folder (`stack` holds pushd's folders). By file name (fileName):
+ * `made` holds what the command's parts so far may write, `ran` the local files they run, `named`
+ * the files Claude wrote that the command names, and `namedIn` in how many of its typed parts each
+ * name stands. A file run after a part that may write it is run as that part left it, not as Jarvis
+ * read it.
+ */
+type State = { loop: boolean; cwd: Cwd; stack: Cwd[]; made: Set<string>; ran: string[]; named: Set<string>; namedIn: Map<string, number> }
+const newState = (): State => ({ loop: false, cwd: HERE, stack: [], made: new Set(), ran: [], named: new Set(), namedIn: new Map() })
 
 const BASH_PREFIXES = new Set(['!', '{', '}', 'if', 'then', 'else', 'elif', 'do', 'while', 'until', 'time', 'coproc'])
 const BASH_ENDS = new Set(['for', 'select', 'case', 'esac', 'fi', 'done', 'in', ';;'])
@@ -899,7 +939,7 @@ const PWSH_ALIASES: Record<string, string> = {
   iex: 'invoke-expression', icm: 'invoke-command', sajb: 'start-job', r: 'invoke-history', ihy: 'invoke-history',
   iwr: 'invoke-webrequest', wget: 'invoke-webrequest', curl: 'invoke-webrequest', irm: 'invoke-restmethod',
   saps: 'start-process', start: 'start-process', kill: 'stop-process', spps: 'stop-process',
-  gcb: 'get-clipboard', scb: 'set-clipboard', ii: 'invoke-item',
+  gcb: 'get-clipboard', scb: 'set-clipboard', ii: 'invoke-item', ipmo: 'import-module',
   sal: 'set-alias', nal: 'new-alias',
   '%': 'foreach-object', foreach: 'foreach-object', '?': 'where-object', where: 'where-object',
   cat: 'get-content', gc: 'get-content', type: 'get-content',
@@ -937,8 +977,12 @@ type Ctx = {
   text: string
   depth: number
   state: State
-  /** What pc.ts read for the second pass (script contents, a resolved path); empty on the first. */
+  /** What pc.ts knows (files' contents, a real path, the files Claude wrote, the home folder); nothing read yet on the first pass. */
   resolved: Resolved
+  /** The folder of the script file being judged, for `$PSScriptRoot` and `%~dp0`. */
+  scriptDir?: string
+  /** The files being judged further up (normalized): each is judged once, so a script that names itself does not loop. */
+  files?: readonly string[]
 }
 
 /**
@@ -957,6 +1001,8 @@ type Call = {
   low: readonly string[]
   piped: boolean
   stdin: readonly string[]
+  /** The files it reads on stdin (`bash < x.sh`). */
+  reads: readonly Word[]
   /** A loop came before it (or it runs inside one). */
   loop: boolean
   text: string
@@ -967,8 +1013,8 @@ const DOWNLOAD_RUN = verdict('screen', 'download-run', 'downloads and runs code'
 const CLAUDE_OWN = "changes Claude Code's own permissions or plugins"
 const CLAUDE_SETTINGS = verdict('never', 'claude-settings', CLAUDE_OWN)
 const CLAUDE_CONFIG = verdict('screen', 'claude-config', "changes Claude Code's configuration")
-/** The screen tier for a Write/Edit whose path cannot be resolved but carries an 8.3 short name that could hide a protected path. */
-const SHORTNAME_UNRESOLVED = verdict('screen', 'claude-settings', 'edits a path Jarvis cannot resolve')
+/** A Write/Edit/NotebookEdit whose real path is not known: it cannot be placed, or it still carries an 8.3 short name. */
+const UNRESOLVED_PATH = verdict('screen', 'unresolved-path', 'edits a path Jarvis cannot resolve')
 const JARVIS_SECRETS = verdict('never', 'jarvis-secrets', "reaches Jarvis's secrets")
 const JARVIS_HELPER = verdict('never', 'jarvis-helper', "talks to Jarvis's helper")
 const DOWNLOADING = /downloadstring|downloaddata|downloadfile|net\.webclient|invoke-webrequest|invoke-restmethod|\b(iwr|irm|curl|wget)\b|https?:\/\//
@@ -976,16 +1022,30 @@ const DOWNLOADING = /downloadstring|downloaddata|downloadfile|net\.webclient|inv
 function judgeScript(script: Script, ctx: Ctx): Verdict {
   const inner = { ...ctx, dialect: script.dialect }
   let v = script.problem === undefined ? PASS : verdict('screen', 'unreadable', script.problem)
-  for (const command of script.commands) v = stricter(v, judgeCommand(command, inner))
+  script.commands.forEach((command, i) => {
+    const cwd = ctx.state.cwd
+    v = stricter(v, judgeCommand(command, inner))
+    // A pipeline's parts run apart: a `cd` there may not last.
+    if (ctx.state.cwd !== cwd && (command.piped || script.commands[i + 1]?.piped === true)) ctx.state.cwd = UNPLACEABLE
+  })
   return v
 }
 
 function judgeCommand(command: Command, ctx: Ctx): Verdict {
+  const ranBefore = ctx.state.ran.length
   let v = judgeCode(command, ctx)
   const found = findCommand(command.words, ctx.dialect, ctx.state)
+  // Its relative paths land where it starts, before its own `cd` moves on.
+  v = stricter(v, judgeMovedPaths(found, command, ctx))
   v = stricter(v, judgeFound(found, command.words, command, ctx))
-  if (ctx.dialect === 'pwsh') v = stricter(v, judgeBarewords(command, found.at, ctx))
-  for (const inner of command.inner) v = stricter(v, judgeScript(inner, { ...ctx, depth: ctx.depth + 1 }))
+  if (ctx.dialect === 'pwsh') v = stricter(v, stricter(judgeBarewords(command, found.at, ctx), usingModule(command, ctx)))
+  for (const inner of command.inner) {
+    const cwd = ctx.state.cwd
+    v = stricter(v, judgeScript(inner, { ...ctx, depth: ctx.depth + 1 }))
+    // A bash subshell's `cd` ends with it; PowerShell's and cmd's blocks share the folder, maybe or maybe not moved.
+    if (ctx.state.cwd !== cwd) ctx.state.cwd = ctx.dialect === 'bash' ? cwd : UNPLACEABLE
+  }
+  noteMade(found, command, ranBefore, ctx)
   return v
 }
 
@@ -995,16 +1055,17 @@ function judgeFound(found: Found, words: readonly Word[], command: Command, ctx:
   const word = found.at === undefined ? undefined : words[found.at]
   if (found.at === undefined || word === undefined || word.block) return v
   const args = words.slice(found.at + 1)
-  // cmd ignores a leading run of its token delimiters (space, tab, `;`, `,`, `=`) before the
-  // program name, so the guard must too: `=vssadmin` and `,rd` are vssadmin and rd, not a name of
-  // their own (the DOSfuscation `cmd /c ,;=cmd` trick). It then ends the name at `/`, `,`, `;` or
-  // `=`: `rd/s/q x` is rd with /s /q, `cmd/c` is cmd.
-  if (ctx.dialect === 'cmd' && !word.quoted) {
-    const head = word.text.replace(/^[\s;,=]+/, '')
-    const cut = head.search(/[/,;=]/)
+  // cmd ignores a leading run of its token delimiters (space, tab, `;`, `,`, `=`) and the echo-off `@`
+  // before the program name, quoted or not, so the guard must too: `=vssadmin`, `,rd`, `="vssadmin"`,
+  // `=v"ss"admin` and `@ vssadmin` are vssadmin and rd, not names of their own (the DOSfuscation
+  // `cmd /c ,;=cmd` trick). It then ends an unquoted name at `/`, `,`, `;` or `=`: `rd/s/q x` is rd
+  // with /s /q, `cmd/c` is cmd.
+  if (ctx.dialect === 'cmd') {
+    const head = word.text.replace(/^[\s;,=@]+/, '')
+    const cut = word.quoted ? -1 : head.search(/[/,;=]/)
     if (head !== word.text || cut >= 0) {
       const nameText = cut < 0 ? head : head.slice(0, cut)
-      const name = nameText === '' ? [] : [{ ...newWord(), text: nameText, items: [nameText], dynamic: word.dynamic }]
+      const name = nameText === '' ? [] : [{ ...newWord(), text: nameText, items: [nameText], quoted: word.quoted, dynamic: word.dynamic }]
       const extra = (cut < 0 ? '' : head.slice(cut))
         .split(/(?=\/)|[,;=]+/)
         .filter(part => part !== '')
@@ -1014,19 +1075,19 @@ function judgeFound(found: Found, words: readonly Word[], command: Command, ctx:
       return rest.length === 0 ? v : stricter(v, judgeFound({ ...found, at: 0 }, rest, command, ctx))
     }
   }
-  // A leading `=` or `,` is never part of a real program name. An outer shell can split a cmd
-  // delimiter run off into a word of its own (pwsh/bash break `cmd /c ;=vssadmin ...` at the `;`,
+  // A leading `=` or `,` is never part of a real program name, quoted or not. An outer shell can split
+  // a cmd delimiter run off into a word of its own (pwsh/bash break `cmd /c ;=vssadmin ...` at the `;`,
   // leaving `=vssadmin` as a word judged in that shell): strip it and re-judge.
-  if (!word.quoted && !word.dynamic && ctx.dialect !== 'cmd' && /^[=,]+\S/.test(word.text)) {
+  if (!word.dynamic && ctx.dialect !== 'cmd' && /^[=,]+\S/.test(word.text)) {
     const nameText = word.text.replace(/^[=,]+/, '')
-    return stricter(v, judgeFound({ ...found, at: 0 }, [{ ...newWord(), text: nameText, items: [nameText] }, ...args], command, ctx))
+    return stricter(v, judgeFound({ ...found, at: 0 }, [{ ...newWord(), text: nameText, items: [nameText], quoted: word.quoted }, ...args], command, ctx))
   }
   // `gsudo "Remove-Item x"`: a wrapper given one quoted command line.
   if (found.wrapped && args.length === 0 && word.quoted && !word.dynamic && /\s/.test(word.text.trim())) {
     return stricter(v, judgeText(word.text, ctx.dialect, ctx))
   }
-  // A variable or subexpression names the program (a folder in a variable is fine: "$HOME/bin/tool"),
-  // or bash `$'\x72\x6d'` spells it in escapes.
+  // A variable or subexpression names the program, or bash `$'\x72\x6d'` spells it in escapes.
+  // (A folder in a variable, "$HOME/bin/tool", is a local file named at run time: launch() below.)
   if (word.dynamic && (/[$%!(`…]/.test(baseName(word.text)) || (ctx.dialect === 'bash' && word.text.includes('\\')))) {
     return stricter(v, BUILT)
   }
@@ -1039,6 +1100,7 @@ function judgeFound(found: Found, words: readonly Word[], command: Command, ctx:
       low: args.map(w => switchText(w.text, ctx.dialect).toLowerCase()),
       piped: command.piped,
       stdin: command.stdin,
+      reads: command.reads,
       loop: ctx.state.loop,
       text: ctx.text,
     }
@@ -1046,32 +1108,44 @@ function judgeFound(found: Found, words: readonly Word[], command: Command, ctx:
     const evaluate = EVALUATORS[name]
     if (evaluate !== undefined) v = stricter(v, evaluate(call, ctx))
   }
-  // The program is itself a local shell script (`.\deploy.ps1`, `./build.sh`, `run.bat`, pwsh `& .\x.ps1`):
-  // read its text and judge it, since the engine's own rules would run its whole content on one yes.
-  if (!word.quoted && !word.block) {
-    const dialect = scriptDialect(word.text)
-    if (dialect !== undefined) v = stricter(v, word.dynamic ? BUILT : scriptFileRun(word.text, dialect, ctx))
-  }
-  return v
+  changeDir(word, args, ctx)
+  // The program may be a local file (`.\deploy.ps1`, `& "C:\x\a.ps1"`, `./deploy`, cmd's `x` for x.bat):
+  // read and judged, since the engine's own rules would run its whole content on one yes.
+  return stricter(v, launch(word, ctx.dialect, ctx))
 }
 
-/** Judges a list of words as a command of its own (`find -exec ...`, `wsl -e ...`, cmd's `start ...`). */
+/** Judges a list of words as a command of its own (`find -exec ...`, `wsl -e ...`, cmd's `start ...`), run apart from this one. */
 function judgeWords(words: readonly Word[], from: Call, ctx: Ctx, dialect: Dialect = ctx.dialect): Verdict {
   if (ctx.depth + 1 > MAX_DEPTH) return verdict('screen', 'unreadable', TOO_DEEP)
   const inner = { ...ctx, dialect, depth: ctx.depth + 1 }
-  const command: Command = { ...newCommand(from.piped), words: [...words], stdin: [...from.stdin] }
-  return judgeFound(findCommand(command.words, dialect, ctx.state), command.words, command, inner)
+  const command: Command = { ...newCommand(from.piped), words: [...words], stdin: [...from.stdin], reads: [...from.reads] }
+  const cwd = ctx.state.cwd
+  const v = judgeFound(findCommand(command.words, dialect, ctx.state), command.words, command, inner)
+  if (ctx.state.cwd !== cwd) ctx.state.cwd = UNPLACEABLE
+  return v
 }
 
-/** Judges literal text handed to another shell (or decoded), one level deeper. */
-function judgeText(text: string, dialect: Dialect, ctx: Ctx): Verdict {
+/** Windows line ends, and the dashes PowerShell also takes as a parameter's hyphen: a typed command and a script file alike. */
+const normalizeText = (raw: string): string => raw.replace(/\r\n?/g, '\n').replace(/[\u2013\u2014\u2015]/g, '-')
+
+/**
+ * Judges literal text handed to another shell (or decoded, or read from a script file), one level
+ * deeper, normalized as a typed command is. It runs apart from the command that hands it on: a `cd`
+ * inside may or may not last, so after one the folder is not known.
+ */
+function judgeText(raw: string, dialect: Dialect, ctx: Ctx): Verdict {
   if (ctx.depth + 1 > MAX_DEPTH) return verdict('screen', 'unreadable', TOO_DEEP)
+  const text = normalizeText(raw)
   const script = new Lexer(text, dialect, ctx.depth + 1).lex()
-  let v = stricter(secrets(text), encoded(text))
+  let v = HIDDEN_CHARS.test(text) ? HIDDEN_TEXT : PASS
+  v = stricter(v, stricter(secrets(text), encoded(text)))
   if (dialect === 'bash') v = stricter(v, devClipboard(text))
-  if (!readsOnly(script)) v = stricter(v, writePathVerdict(text))
   const inner = { ...ctx, dialect, depth: ctx.depth + 1, text: `${ctx.text}\n${text.toLowerCase()}` }
-  return stricter(v, judgeScript(script, inner))
+  if (!readsOnly(script)) v = stricter(v, stricter(writePathVerdict(text), judgeWritten(text, inner)))
+  const cwd = ctx.state.cwd
+  v = stricter(v, judgeScript(script, inner))
+  if (ctx.state.cwd !== cwd) ctx.state.cwd = UNPLACEABLE
+  return v
 }
 
 /** Judges words handed to another shell as one command line; any word known only at run time makes it screen. */
@@ -1083,42 +1157,547 @@ function judgeLine(words: readonly Word[], dialect: Dialect, ctx: Ctx): Verdict 
 /** A shell or interpreter that reads its program from a pipe: what came down the pipe is unknown. */
 const runsInput = (c: Call): Verdict => (DOWNLOADING.test(c.text) ? DOWNLOAD_RUN : BUILT)
 
-/**
- * A script file named at run time: a process substitution (`bash <(curl
- * ...)`) or a variable for the file itself. A folder in a variable is fine
- * ("$HOME/bin/x.sh"): such a file is the engine's own rules' to decide.
- */
+/** A script file named at run time: a process substitution (`bash <(curl ...)`) or a variable for the file itself. */
 const isBuiltFile = (word: Word): boolean => word.dynamic && /[$%!(`…]/.test(baseName(word.text))
 
-/** A local script file the command runs, read and judged like any other command (if it cannot be read, screen). */
-const SCRIPT_UNREADABLE = verdict('screen', 'script-file', 'runs a script file Jarvis cannot read')
+// ---- Local files a command runs ----
 
-/** The content of the script file at `path`, or a screen verdict (carrying the read need on the first pass) when it is not in hand. */
-function scriptContent(path: string, ctx: Ctx): string | Verdict {
+/** A local file the command runs that cannot be read (or is named only at run time): screen. */
+const SCRIPT_UNREADABLE = verdict('screen', 'script-file', 'runs a script file Jarvis cannot read')
+/** A file Windows starts by its type (Windows Script Host, a shortcut, an installer) or a script for an interpreter Jarvis does not read. */
+const RUNS_FILE = verdict('screen', 'script-host', 'runs a file Jarvis cannot judge')
+/** A file the same command writes before it runs it: it runs as the command left it, not as Jarvis read it. */
+const MADE_FIRST = verdict('screen', 'script-file', 'runs a file it writes first')
+
+/** Programs that name files without changing what is in them: a file they name is not written (`chmod +x x.sh && ./x.sh`). */
+const KEEPS_CONTENT = new Set([
+  'chmod', 'chown', 'chgrp', 'attrib', 'icacls', 'takeown', 'unblock-file', 'test', '[', '[[', 'echo', 'printf', 'write-output',
+  'write-host', 'stat', 'file', 'which', 'where', 'get-command', 'touch',
+])
+
+/**
+ * The file names a command may write, for the parts after it (State.made): its redirections, and
+ * every word after a program that may write what it names (not one that only reads, changes folder
+ * or keeps content), but for the files it runs itself (`python build.py` does not write build.py).
+ */
+function noteMade(found: Found, command: Command, ranBefore: number, ctx: Ctx): void {
+  const state = ctx.state
+  const ranHere = new Set(state.ran.slice(ranBefore))
+  const add = (text: string): void => {
+    const name = fileName(text.replace(/^-[^=:]*[=:]/, '')) // --output=x.sh, -OutFile:x.ps1
+    if (name !== '' && !ranHere.has(name)) state.made.add(name)
+  }
+  // A typed part (not a script file's own text) that names a file, for the check in judgeShell.
+  if (ctx.files === undefined) {
+    const here = new Set([...command.words, ...command.targets].map(w => fileName(w.text)))
+    for (const name of here) state.namedIn.set(name, (state.namedIn.get(name) ?? 0) + 1)
+  }
+  for (const target of command.targets) add(target.text)
+  const word = found.at === undefined ? undefined : command.words[found.at]
+  if (found.at === undefined || word === undefined || word.block) return
+  const names = programNames(word.text, ctx.dialect)
+  if (names.some(name => READERS.has(name) || CD_NAMES.has(name) || KEEPS_CONTENT.has(name))) return
+  for (const operand of command.words.slice(found.at + 1)) if (!operand.block) add(operand.text)
+}
+
+/** A relative path run or written after a `cd` to a folder Jarvis cannot place. */
+const UNPLACED = verdict('screen', 'unplaced', 'runs or writes a path in a folder Jarvis cannot place')
+const HIDDEN_TEXT = verdict('screen', 'hidden', 'has hidden characters')
+
+/** What a file is read and judged as: a shell's script, an interpreter's code, a program, or how its first line says to run it (`exec`). */
+type ReadAs = Dialect | 'python' | 'node' | 'perl' | 'ruby' | 'php' | 'osascript' | 'binary' | 'host'
+type FileKind = ReadAs | 'exec'
+
+/** Script files by extension, wherever they run: their dialect. */
+const SCRIPT_EXT: Record<string, Dialect> = { ps1: 'pwsh', psm1: 'pwsh', sh: 'bash', bash: 'bash', ksh: 'bash', zsh: 'bash', bat: 'cmd', cmd: 'cmd' }
+/** What Windows runs a file as, by its extension (through its file type); any other type but a document is screen. */
+const WINDOWS_KINDS: Record<string, FileKind> = { ...SCRIPT_EXT, py: 'python', pyw: 'python' }
+/** Interpreters' files by extension, for a file with no shebang. */
+const CODE_EXT: Record<string, ReadAs> = { py: 'python', js: 'node', mjs: 'node', cjs: 'node', ts: 'node', mts: 'node', rb: 'ruby', pl: 'perl', php: 'php' }
+/** What a shebang's program runs a file as; any other interpreter is one Jarvis cannot judge. */
+const INTERPRETER_KINDS: Record<string, ReadAs> = {
+  sh: 'bash', bash: 'bash', dash: 'bash', zsh: 'bash', ksh: 'bash', mksh: 'bash', ash: 'bash', pwsh: 'pwsh', powershell: 'pwsh',
+  python: 'python', py: 'python', pypy: 'python', node: 'node', nodejs: 'node', deno: 'node', bun: 'node', tsx: 'node', 'ts-node': 'node',
+  perl: 'perl', ruby: 'ruby', php: 'php', osascript: 'osascript',
+}
+/** The extensions cmd, ShellExecute and PowerShell try in a folder for a name given without one (PATHEXT's scripts; PowerShell adds .ps1). */
+const LOOKUP_EXTS = ['bat', 'cmd', 'vbs', 'vbe', 'js', 'jse', 'wsf', 'wsh', 'msc', 'py', 'pyw']
+/** File types Windows opens in a viewer or editor, where nothing of the file runs. */
+const DOCUMENTS = new Set([
+  'txt', 'md', 'markdown', 'log', 'csv', 'tsv', 'json', 'jsonc', 'yaml', 'yml', 'toml', 'xml', 'html', 'htm', 'pdf', 'png', 'jpg', 'jpeg', 'gif',
+  'bmp', 'webp', 'svg', 'ico', 'tif', 'tiff', 'heic', 'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'mp4', 'm4v', 'mkv', 'mov', 'avi', 'webm', 'wmv',
+  'docx', 'xlsx', 'pptx', 'odt', 'ods', 'odp', 'rtf', 'epub', 'zip',
+])
+/** cmd's own commands: never looked up as files. */
+const CMD_BUILTINS = new Set([
+  'assoc', 'break', 'call', 'cd', 'chdir', 'cls', 'color', 'copy', 'date', 'del', 'dir', 'dpath', 'echo', 'endlocal', 'erase', 'exit', 'for',
+  'ftype', 'goto', 'if', 'keys', 'md', 'mkdir', 'mklink', 'move', 'path', 'pause', 'popd', 'prompt', 'pushd', 'rd', 'rem', 'ren', 'rename',
+  'rmdir', 'set', 'setlocal', 'shift', 'start', 'time', 'title', 'type', 'ver', 'verify', 'vol',
+])
+
+/** A file name's extension, lowercased, without the dot; '' for none (`python3.12` has none). */
+const extensionOf = (name: string): string => /\.([a-z][a-z0-9_-]*)$/.exec(name)?.[1] ?? ''
+/** A path's last name, lowercased, as Windows reads it: trailing dots and spaces dropped (`x.bat.` is x.bat). */
+const fileName = (path: string): string => baseName(path).replace(/[. ]+$/, '').toLowerCase()
+/** The folder a path is in: '.' for a bare name. */
+function dirOf(path: string): string {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return cut < 0 ? '.' : cut === 0 ? path.slice(0, 1) : path.slice(0, cut)
+}
+/** A path that does not depend on the folder a command runs in: absolute, from home, or from a variable. */
+const isAnchored = (path: string): boolean => /^([\\/~$%]|[a-z]:)/i.test(path)
+/** A link (`https:`, `spotify:`, `ms-settings:`), not a file: two letters or more before the colon. */
+const isLink = (text: string): boolean => /^[a-z][a-z0-9+.-]+:(?!:)/i.test(text)
+/** `path` in `folder` (a leading `./` dropped), with the folder's own separator (else the path's). */
+function joinPath(folder: string, path: string): string {
+  const separator = folder.includes('\\') || (!folder.includes('/') && path.includes('\\')) ? '\\' : '/'
+  return `${folder.replace(/[\\/]+$/, '')}${separator}${path.replace(/^\.[\\/]+/, '')}`
+}
+
+/** The home folder at a word's start, as each shell spells it (`~` aside). */
+const HOME_PREFIXES: Record<Dialect, RegExp> = {
+  bash: /^\$\{?(HOME|USERPROFILE)\}?(?=$|[\\/])/,
+  pwsh: /^\$\{?(home|env:home|env:userprofile)\}?(?=$|[\\/])/i,
+  cmd: /^%(userprofile|home)%(?=$|[\\/])/i,
+}
+
+/**
+ * A word as a path the guard can read: the home folder pc.ts gave for `~`, `$HOME`,
+ * `$env:USERPROFILE` or `%USERPROFILE%` at its start, and the folder of the script being judged for
+ * `$PSScriptRoot` and `%~dp0`. Undefined while any other part is known only at run time.
+ */
+function literalText(word: Word, ctx: Ctx): string | undefined {
+  const home = ctx.resolved.home
+  const folder = ctx.scriptDir
+  let text = word.text
+  if (home !== undefined && !word.quoted && ctx.dialect !== 'cmd') text = text.replace(/^~(?=$|[\\/])/, () => home)
+  if (word.dynamic || ctx.dialect === 'cmd') {
+    if (home !== undefined) text = text.replace(HOME_PREFIXES[ctx.dialect], () => home)
+    if (folder !== undefined) text = text.replace(/^\$\{?psscriptroot\}?(?=$|[\\/])/i, () => folder).replace(/^%~dp0/i, () => `${folder}\\`)
+  }
+  if (!word.dynamic) return text
+  return /[$%!(`…]/.test(text) || (ctx.dialect === 'bash' && text.includes('\\')) ? undefined : text
+}
+
+/** A word as a path written there, for matching only: its literal text, or as written when only a folder in it is a variable (`$HOME\.claude`). */
+const pathText = (word: Word, ctx: Ctx): string | undefined => literalText(word, ctx) ?? (isBuiltFile(word) ? undefined : word.text)
+
+/** Where a path a command names lands after its `cd`s: joined onto the folder named, or undefined when that folder cannot be read. */
+function placed(path: string, ctx: Ctx): string | undefined {
+  const cwd = ctx.state.cwd
+  if (cwd.kind === 'here' || isAnchored(path)) return path
+  return cwd.kind === 'at' && cwd.isLiteral ? joinPath(cwd.path, path) : undefined
+}
+
+/**
+ * The content of a local file at `path`: its text; false when an optional file is not there; else a
+ * verdict, screen when it cannot be read, and on the first pass the read need (pass for an optional
+ * file, which may well not be there; screen for one the command runs by that very path).
+ */
+function fileContent(path: string, ctx: Ctx, isOptional = false): string | false | Verdict {
   const content = ctx.resolved.scripts?.[path]
-  if (content === undefined) return withNeed(SCRIPT_UNREADABLE, { kind: 'script', path })
-  if (content === null) return SCRIPT_UNREADABLE
+  if (content === undefined) return isOptional ? withNeed(PASS, { kind: 'script', path, optional: true }) : withNeed(SCRIPT_UNREADABLE, { kind: 'script', path })
+  if (content === null || (content === false && !isOptional)) return SCRIPT_UNREADABLE
   return content
 }
 
-/** Runs a local shell script file: its text, read and judged as `dialect`; screen until pc.ts reads it. */
-function scriptFileRun(path: string, dialect: Dialect, ctx: Ctx): Verdict {
-  const got = scriptContent(path, ctx)
-  if (typeof got !== 'string') return got
-  if (ctx.depth + 1 > MAX_DEPTH) return verdict('screen', 'unreadable', TOO_DEEP)
-  return judgeText(got, dialect, ctx)
+/** A local file the command runs: read (in the folder a `cd` moved to) and judged as `kind`; screen until pc.ts reads it, or when it cannot. */
+function runFile(path: string, kind: FileKind, ctx: Ctx): Verdict {
+  if (ctx.state.made.has(fileName(path))) return MADE_FIRST
+  ctx.state.ran.push(fileName(path))
+  const at = placed(path, ctx)
+  if (at === undefined) return UNPLACED
+  const got = fileContent(at, ctx)
+  if (typeof got === 'string') return judgeFile(got, kind, at, ctx)
+  return got === false ? SCRIPT_UNREADABLE : got
 }
 
-/** A bare program word that is a local shell script file (`.\deploy.ps1`, `./build.sh`, `x.bat`): the dialect to read it as. */
-const SCRIPT_EXT: Record<string, Dialect> = { ps1: 'pwsh', psm1: 'pwsh', sh: 'bash', bash: 'bash', ksh: 'bash', zsh: 'bash', bat: 'cmd', cmd: 'cmd' }
-const scriptDialect = (text: string): Dialect | undefined => SCRIPT_EXT[/\.([a-z0-9]+)$/.exec(baseName(text).toLowerCase())?.[1] ?? '']
+/** Files a name may run (cmd's and PowerShell's lookup by extension, Git Bash's x.exe for x): every one there is judged; with none there, `none`. */
+function lookup(candidates: readonly { path: string; kind: FileKind }[], none: Verdict, ctx: Ctx): Verdict {
+  let v = PASS
+  let isThere = false
+  for (const candidate of candidates) {
+    if (ctx.state.made.has(fileName(candidate.path))) return MADE_FIRST
+    ctx.state.ran.push(fileName(candidate.path))
+    const at = placed(candidate.path, ctx)
+    if (at === undefined) return UNPLACED
+    const got = fileContent(at, ctx, true)
+    if (got === false) continue
+    if (typeof got === 'string') {
+      isThere = true
+      v = stricter(v, judgeFile(got, candidate.kind, at, ctx))
+    } else if (got.needs !== undefined) {
+      v = stricter(v, got) // not read yet
+    } else {
+      // There but unreadable: screen, but for a program (`x.exe`), which is judged by its name.
+      isThere = true
+      if (candidate.kind !== 'binary') v = stricter(v, got)
+    }
+  }
+  return isThere ? v : stricter(v, none)
+}
+
+/** The kind a shebang names (`#!/usr/bin/env bash`); undefined without one, 'host' for an interpreter Jarvis cannot judge. */
+function shebangKind(text: string): ReadAs | undefined {
+  const line = /^#!([^\n]*)/.exec(text)?.[1]
+  if (line === undefined) return undefined
+  const words = line.trim().split(/\s+/)
+  let program = baseName(words[0] ?? '').toLowerCase()
+  if (program === 'env') program = baseName(words.slice(1).find(word => !word.startsWith('-') && !/^\w+=/.test(word)) ?? '').toLowerCase()
+  return INTERPRETER_KINDS[program.replace(/[\d.]+$/, '')] ?? 'host'
+}
+
+/**
+ * A file's text judged as `kind`. An `exec` file (one run straight by its path) is a program when
+ * binary, else read as its shebang says; with none, a shell runs it, so it is judged as bash (and as
+ * its extension's language too). A file already being judged further up is judged there.
+ */
+function judgeFile(text: string, kind: FileKind, path: string, ctx: Ctx): Verdict {
+  const key = normalizePath(path)
+  if (ctx.files?.includes(key) === true) return PASS
+  const inner: Ctx = { ...ctx, scriptDir: dirOf(path), files: [...(ctx.files ?? []), key] }
+  const body = text.replace(/^\ufeff/, '')
+  if (kind !== 'exec') return judgeAs(body, kind, inner)
+  if (body.slice(0, 4096).includes('\u0000')) return PASS
+  const shebang = shebangKind(body)
+  if (shebang !== undefined) return judgeAs(body, shebang, inner)
+  const code = CODE_EXT[extensionOf(fileName(path))]
+  return code === undefined ? judgeAs(body, 'bash', inner) : stricter(judgeAs(body, 'bash', inner), judgeAs(body, code, inner))
+}
+
+function judgeAs(body: string, kind: ReadAs, ctx: Ctx): Verdict {
+  switch (kind) {
+    case 'pwsh':
+    case 'bash':
+    case 'cmd':
+      return judgeText(body, kind, ctx)
+    case 'binary':
+      return PASS
+    case 'host':
+      return RUNS_FILE
+    default: {
+      const text = normalizeText(body)
+      return HIDDEN_CHARS.test(text) ? HIDDEN_TEXT : inlineVerdict(kind, text)
+    }
+  }
+}
+
+/** A program file straight in a system folder: /bin, /sbin, /usr/bin, /usr/sbin (in Git Bash, Git's own). */
+const SYSTEM_PROGRAM = /^(\/usr)?\/s?bin\/[^\\/]+$/
+
+/** How a file named as a program is started: by a shell's own rules, or (`shell`) by its type, as Start-Process, Invoke-Item and cmd's start do. */
+type RunMode = Dialect | 'shell'
+
+/**
+ * A program word or a launcher's argument that may name a local file: read and judged as `mode`
+ * starts it (runLocal). One whose folder or name is known only at run time cannot be read: screen,
+ * unless it is a program by name (`.exe`, a bare name a shell finds on PATH).
+ */
+function launch(word: Word, mode: RunMode, ctx: Ctx): Verdict {
+  if (word.block) return PASS
+  const text = literalText(word, ctx)
+  if (text !== undefined) return runLocal(text, mode, ctx)
+  const ext = extensionOf(fileName(word.text))
+  if (ext === 'exe' || ext === 'com') return PASS
+  return /[\\/]/.test(word.text) || ext !== '' || mode === 'cmd' || mode === 'shell' ? SCRIPT_UNREADABLE : PASS
+}
+
+/**
+ * A program named by `path`, as `mode` starts it:
+ * - a program by name or `.exe` is judged by its name alone (the rows);
+ * - a script by extension (`.ps1`, `.sh`, `.bat`, `.cmd`) is read and judged in its dialect;
+ * - bash runs a path straight: a binary is a program, a text file runs as its shebang says (else as
+ *   a shell script), and Git Bash finds `x.exe` for `./x`; neither there is screen;
+ * - Windows (PowerShell, cmd, Start-Process) starts other files by their type: `.py` is read, a
+ *   document opens in its viewer, and anything else (Windows Script Host, a shortcut, an installer)
+ *   is screen. A name without an extension is looked up in its folder (cmd and Start-Process for a
+ *   bare name too, PowerShell for a path, with .ps1 first), and each script found there is judged.
+ */
+function runLocal(path: string, mode: RunMode, ctx: Ctx): Verdict {
+  const url = /^file:(?:\/\/)?(.*)$/i.exec(path)
+  const plain = path.replace(/^(microsoft\.powershell\.core\\)?filesystem::/i, '')
+  if (url === null && isLink(plain)) return PASS
+  const file = url === null ? plain : (url[1] ?? '').replace(/^\/(?=[a-z]:)/i, '')
+  const name = fileName(file)
+  if (name === '' || name.startsWith(':') || /^[a-z]:$/i.test(file)) return PASS // a folder (`.`, `..`), a cmd label, a drive
+  // A program in the system's own folders (only an administrator writes there) is judged by its name, as on PATH.
+  if (SYSTEM_PROGRAM.test(file)) return PASS
+  const isQualified = /[\\/]/.test(file)
+  const ext = extensionOf(name)
+  if (ext === 'exe' || ext === 'com') return PASS
+  const dialect = SCRIPT_EXT[ext]
+  if (mode === 'bash') {
+    if (dialect !== undefined) return runFile(file, dialect, ctx)
+    if (!isQualified) return PASS
+    return lookup([{ path: file, kind: 'exec' }, ...(ext === '' ? [{ path: `${file}.exe`, kind: 'binary' as const }] : [])], SCRIPT_UNREADABLE, ctx)
+  }
+  if (mode === 'cmd' && !isQualified && ext === '' && CMD_BUILTINS.has(name)) return PASS
+  if (ext !== '') {
+    const kind = WINDOWS_KINDS[ext]
+    if (kind !== undefined) return runFile(file, kind, ctx)
+    return DOCUMENTS.has(ext) ? PASS : RUNS_FILE
+  }
+  if (mode === 'pwsh' && !isQualified) return PASS // PowerShell runs a bare name only from PATH
+  const exts = mode === 'pwsh' ? ['ps1', ...LOOKUP_EXTS] : LOOKUP_EXTS
+  return lookup(exts.map(one => ({ path: `${file}.${one}`, kind: WINDOWS_KINDS[one] ?? 'host' })), PASS, ctx)
+}
+
+// ---- Where a command runs: cd ----
+
+const CD_NAMES = new Set(['cd', 'chdir', 'sl', 'set-location', 'pushd', 'push-location', 'popd', 'pop-location'])
+
+/** A `cd` (Set-Location, pushd, popd): where the command's later relative paths land. */
+function changeDir(word: Word, args: readonly Word[], ctx: Ctx): void {
+  const state = ctx.state
+  // cmd's and PowerShell's `cd..` and `cd\`, and a drive switch (`D:`): somewhere Jarvis does not follow.
+  if (/^(cd|chdir)[.\\]/i.test(word.text) || (ctx.dialect !== 'bash' && /^[a-z]:$/i.test(word.text))) {
+    state.cwd = UNPLACEABLE
+    return
+  }
+  const name = programNames(word.text, ctx.dialect)[0] ?? ''
+  if (!CD_NAMES.has(name)) return
+  if (name === 'popd' || name === 'pop-location') {
+    state.cwd = state.stack.pop() ?? UNPLACEABLE
+    return
+  }
+  if (name === 'pushd' || name === 'push-location') state.stack.push(state.cwd)
+  const target = cdTarget(args, ctx)
+  if (target === 'stays') return
+  if (target === undefined) {
+    state.cwd = UNPLACEABLE
+    return
+  }
+  const cwd = state.cwd
+  if (isAnchored(target.path) || cwd.kind === 'here') state.cwd = { kind: 'at', ...target }
+  else state.cwd = cwd.kind === 'at' ? { kind: 'at', path: joinPath(cwd.path, target.path), isLiteral: cwd.isLiteral && target.isLiteral } : UNPLACEABLE
+}
+
+/**
+ * The folder a `cd` names: its text and whether it can be read as it stands (`$HOME\x` can be matched
+ * but not read); undefined when it is not known (a variable, `cd -`, a drive's own folder, a registry
+ * or other provider drive), and 'stays' for cmd's bare `cd`, which only prints the folder.
+ */
+function cdTarget(args: readonly Word[], ctx: Ctx): { path: string; isLiteral: boolean } | undefined | 'stays' {
+  const values: Word[] = []
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]
+    if (word === undefined || word.block) return undefined
+    const low = word.text.toLowerCase()
+    if (ctx.dialect === 'cmd' && low === '/d') continue
+    if (word.quoted || !low.startsWith('-') || low === '-') {
+      values.push(word)
+      continue
+    }
+    if (ctx.dialect !== 'pwsh') continue // bash's -L, -P, -e, -@ and --
+    const option = low.slice(1).split(':')[0] ?? ''
+    const isPath = ['path', 'literalpath', 'pspath', 'lp'].some(one => one.startsWith(option))
+    if (!isPath && !'stackname'.startsWith(option)) continue // -PassThru
+    if (low.includes(':')) {
+      if (isPath) values.push({ ...word, text: word.text.slice(word.text.indexOf(':') + 1) })
+      continue
+    }
+    const value = args[++i]
+    if (isPath && value !== undefined) values.push(value)
+  }
+  if (values.length === 0) return ctx.dialect === 'cmd' ? 'stays' : ctx.dialect === 'bash' ? { path: ctx.resolved.home ?? '~', isLiteral: true } : undefined
+  // cmd's cd takes the rest of the line as the folder, spaces and all.
+  const parts = ctx.dialect === 'cmd' ? values : values.slice(0, 1)
+  const texts = parts.map(word => pathText(word, ctx))
+  if (texts.some(text => text === undefined)) return undefined
+  const path = texts.join(' ')
+  if (/^[-+]\d*$/.test(path) || /^[a-z][\w.-]+:/i.test(path) || /^[a-z]:(?![\\/])/i.test(path)) return undefined
+  return { path, isLiteral: parts.every(word => literalText(word, ctx) !== undefined) }
+}
+
+/**
+ * A command's word that may name a path in a folder Jarvis cannot place: it has a separator, an
+ * extension or a dot (`.`, `a.bat`, `sub/x`), or would name a protected place in Claude Code's or
+ * Jarvis's folder (`plugins`, `settings.json`). A plain word (`test`, `build`, `status`) does not.
+ */
+function mayBePath(text: string): boolean {
+  if (/[\\/.]/.test(text)) return true
+  return writePathVerdict(`/.claude/${text}`).tier !== 'pass' || secrets(`/.jarvis/home/${text}`).tier !== 'pass'
+}
+
+/**
+ * After a `cd` in the same command, a relative path a later part names lands in that folder: what is
+ * written there (any operand of a command that does not only read, or a redirection) takes the tier
+ * that path earns, and what is read there is checked for Jarvis's secrets. When the folder cannot be
+ * placed, a redirection there, or an operand that may be a path, is screen (reading there is not).
+ */
+function judgeMovedPaths(found: Found, command: Command, ctx: Ctx): Verdict {
+  const cwd = ctx.state.cwd
+  if (cwd.kind === 'here') return PASS
+  const word = found.at === undefined ? undefined : command.words[found.at]
+  const names = word === undefined || word.dynamic || word.block ? [] : programNames(word.text, ctx.dialect)
+  if (names.some(name => CD_NAMES.has(name))) return PASS
+  const onlyReads = names.some(name => READERS.has(name))
+  const operands = found.at === undefined ? [] : command.words.slice(found.at + 1).filter(w => !w.block && (w.quoted || !w.text.startsWith('-')))
+  let v = PASS
+  for (const [i, operand] of [...operands, ...command.targets].entries()) {
+    const isTarget = i >= operands.length
+    const writes = !onlyReads || isTarget
+    const text = pathText(operand, ctx)
+    if (text === undefined || isAnchored(text) || isLink(text)) continue
+    if (cwd.kind === 'unknown') {
+      const reachesSecrets = secrets(`/.jarvis/home/${text}`).tier !== 'pass'
+      if (isTarget || reachesSecrets || (writes && mayBePath(text))) v = stricter(v, UNPLACED)
+      continue
+    }
+    const path = joinPath(cwd.path, text)
+    v = stricter(v, secrets(path))
+    if (writes) v = stricter(v, writePathVerdict(path))
+  }
+  return v
+}
+
+// ---- Launchers ----
 
 /** bash `source` and `.`: the file runs in this shell; its text is read and judged as bash. */
 const sourceFile: Evaluator = (c, ctx) => {
   const file = c.args.find(w => !w.text.startsWith('-'))
-  if (file === undefined) return PASS
+  if (file === undefined || file.block) return PASS
   if (isBuiltFile(file)) return runsInput(c)
-  return file.dynamic || file.block ? PASS : scriptFileRun(file.text, 'bash', ctx)
+  const path = literalText(file, ctx)
+  return path === undefined ? SCRIPT_UNREADABLE : runFile(path, 'bash', ctx)
+}
+
+/** A script file a shell or interpreter reads on stdin (`bash < x.sh`), judged as `kind`. */
+const stdinFiles = (c: Call, kind: FileKind, ctx: Ctx): Verdict =>
+  c.reads.reduce((v, word) => {
+    const path = literalText(word, ctx)
+    return stricter(v, path === undefined ? SCRIPT_UNREADABLE : runFile(path, kind, ctx))
+  }, PASS)
+
+/** Invoke-Item (ii) and explorer open each file by its type, which may run it: each is judged as Windows starts it. */
+const openItems: Evaluator = (c, ctx) => {
+  let v = PASS
+  for (const [i, word] of c.args.entries()) {
+    const low = c.low[i] ?? ''
+    if (word.block || (!word.quoted && (low.startsWith('-') || (c.name === 'explorer' && low.startsWith('/'))))) continue
+    v = stricter(v, launch(word, 'shell', ctx))
+  }
+  return v
+}
+
+/** A module file Import-Module or `using module` loads runs its code: a .psm1 or .ps1 is read and judged; a manifest, a binary module or a module folder is not read: screen. */
+const MODULE_UNREADABLE = verdict('screen', 'script-file', 'loads a module Jarvis cannot read')
+function moduleFile(word: Word, ctx: Ctx): Verdict {
+  if (word.block) return PASS
+  const text = literalText(word, ctx)
+  const isPath = /[\\/]/.test(word.text) || extensionOf(fileName(word.text)) !== ''
+  if (text === undefined) return isPath || isBuiltFile(word) ? MODULE_UNREADABLE : PASS
+  if (!isPath) return PASS // a module by name, from PSModulePath
+  const ext = extensionOf(fileName(text))
+  return ext === 'psm1' || ext === 'ps1' ? runFile(text, 'pwsh', ctx) : MODULE_UNREADABLE
+}
+
+const importModule: Evaluator = (c, ctx) => {
+  let v = PASS
+  for (const [i, word] of c.args.entries()) {
+    if (!word.quoted && (c.low[i] ?? '').startsWith('-')) continue
+    v = stricter(v, moduleFile(word, ctx))
+  }
+  return v
+}
+
+/** PowerShell's `using module .\x.psm1` statement loads the module as Import-Module does. */
+function usingModule(command: Command, ctx: Ctx): Verdict {
+  const [first, second, third] = command.words
+  if (first?.text.toLowerCase() !== 'using' || second?.text.toLowerCase() !== 'module' || third === undefined) return PASS
+  return moduleFile(third, ctx)
+}
+
+/** Rename-Item and cmd's ren: the new name lands in the item's own folder, so it is judged there. */
+const renameItem: Evaluator = (c, ctx) => {
+  if (c.dialect === 'bash') return PASS // bash's rename is another tool (`rename 's/a/b/' files`)
+  let source: Word | undefined
+  let name: Word | undefined
+  for (let i = 0; i < c.args.length; i++) {
+    const word = c.args[i]
+    const low = c.low[i] ?? ''
+    if (word === undefined || word.block) continue
+    if (c.dialect === 'pwsh' && !word.quoted && /^-[a-z]/.test(low)) {
+      const option = low.slice(1).split(':')[0] ?? ''
+      const takesValue = ['newname', 'path', 'literalpath', 'pspath', 'lp', 'credential'].some(one => one.startsWith(option))
+      const glued = low.includes(':') ? { ...word, text: word.text.slice(word.text.indexOf(':') + 1) } : undefined
+      const value = glued ?? (takesValue ? c.args[++i] : undefined)
+      if ('newname'.startsWith(option)) name = value
+      else if (['path', 'literalpath', 'pspath', 'lp'].some(one => one.startsWith(option))) source = value
+      continue
+    }
+    if (source === undefined) source = word
+    else name ??= word
+  }
+  const from = source === undefined ? undefined : pathText(source, ctx)
+  const to = name === undefined ? undefined : pathText(name, ctx)
+  if (from === undefined || to === undefined) return PASS
+  const target = /[\\/]/.test(to) ? to : `${from.slice(0, Math.max(from.lastIndexOf('/'), from.lastIndexOf('\\')) + 1)}${to}`
+  const cwd = ctx.state.cwd
+  const path = isAnchored(target) || cwd.kind !== 'at' ? target : joinPath(cwd.path, target)
+  return stricter(secrets(path), writePathVerdict(path))
+}
+
+/** A link or junction to Claude Code's or Jarvis's folder lets a later write or read reach it under another name. */
+const LINKS_PROTECTED = verdict('screen', 'link', "links to Claude Code's or Jarvis's folder")
+
+/** New-Item -ItemType SymbolicLink/Junction/HardLink, mklink, ln and fsutil hardlink: screen when any path names a protected folder. */
+const makesLink: Evaluator = (c, ctx) => {
+  if (c.name === 'new-item' && !/^(sym|jun|har|\$)/.test(paramValue(c, 'itemtype') ?? paramValue(c, 'type') ?? '')) return PASS
+  if (c.name === 'fsutil' && !(c.low.includes('hardlink') && c.low.includes('create'))) return PASS
+  const cwd = ctx.state.cwd
+  return c.args.some(word => {
+    const text = word.block ? undefined : pathText(word, ctx)
+    if (text === undefined) return false
+    return namesProtectedFolder(isAnchored(text) || cwd.kind !== 'at' ? text : joinPath(cwd.path, text))
+  })
+    ? LINKS_PROTECTED
+    : PASS
+}
+
+// ---- Files Claude wrote ----
+
+/** The files Claude may write and a command then run, by extension: what they are read as. Others (source code, data) are not followed. */
+const WRITTEN_KINDS: Record<string, FileKind> = {
+  ps1: 'pwsh', psm1: 'pwsh', sh: 'bash', bash: 'bash', zsh: 'bash', ksh: 'bash', bat: 'cmd', cmd: 'cmd',
+  vbs: 'host', vbe: 'host', jse: 'host', wsf: 'host', wsh: 'host', hta: 'host',
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * A script Claude wrote or edited this session (pc.ts keeps the list) that a command names, by any
+ * launcher or spelling Jarvis does not know (`wt deploy.ps1`, `nohup ship &`, `--file=C:/x/run.bat`):
+ * read and judged as it would run. Its name counts with its extension, or without one after a path
+ * separator (`.\deploy`); a file without an extension counts only when it starts with a shebang. A
+ * file no longer there adds nothing; one that cannot be read is screen.
+ */
+function judgeWritten(text: string, ctx: Ctx): Verdict {
+  const written = ctx.resolved.written
+  if (written === undefined || written.length === 0) return PASS
+  const hay = ` ${normalizePath(text)} `
+  const end = '(?=[\\s,;)&|<>]|$)'
+  let v = PASS
+  for (const path of written) {
+    const name = fileName(path)
+    const ext = extensionOf(name)
+    const kind = ext === '' ? 'exec' : WRITTEN_KINDS[ext]
+    if (name === '' || kind === undefined) continue
+    const stem = ext === '' ? name : name.slice(0, -(ext.length + 1))
+    const named =
+      new RegExp(`[\\s/=:,;(&|<>@]${escapeRegExp(name)}${end}`).test(hay) || (ext !== '' && new RegExp(`/${escapeRegExp(stem)}${end}`).test(hay))
+    if (!named) continue
+    ctx.state.named.add(name)
+    const got = fileContent(path, ctx, true)
+    if (got === false) continue
+    if (typeof got !== 'string') {
+      v = stricter(v, got)
+      continue
+    }
+    if (kind === 'exec' && !got.replace(/^\ufeff/, '').startsWith('#!')) continue
+    v = stricter(v, judgeFile(got, kind, path, ctx))
+  }
+  return v
 }
 
 /** pwsh: a cmdlet name from the table standing as a plain word anywhere (`Set-Alias x Remove-Item`). */
@@ -1128,7 +1707,7 @@ function judgeBarewords(command: Command, at: number | undefined, ctx: Ctx): Ver
     if (i === at || word.quoted || word.dynamic || word.block) return
     const name = word.text.toLowerCase()
     if (!BAREWORDS.has(name)) return
-    v = stricter(v, judgeRows({ name, dialect: 'pwsh', args: [], low: [], piped: false, stdin: [], loop: false, text: ctx.text }))
+    v = stricter(v, judgeRows({ name, dialect: 'pwsh', args: [], low: [], piped: false, stdin: [], reads: [], loop: false, text: ctx.text }))
   })
   return v
 }
@@ -1146,6 +1725,7 @@ const CODE_RULES: readonly { tier: Tier; rule: string; reason: string; code: Reg
   { tier: 'screen', rule: 'email', reason: 'sends email or messages', code: /\.send\s*\(/, text: /outlook\.application/ },
   { tier: 'screen', rule: 'built', reason: BUILT.reason, code: /\[scriptblock\]::create\s*\(|\.invoke(returnasis)?\s*\(|\$executioncontext\.invokecommand/ },
   { tier: 'screen', rule: 'add-type', reason: 'compiles and runs code', code: /\[(system\.)?reflection\.assembly\]::load/ },
+  { tier: 'screen', rule: 'link', reason: LINKS_PROTECTED.reason, code: /create(symbolic|hard)link\s*\(|createjunction\s*\(/, text: /\.claude|\.jarvis|claude~|jarvis~/ },
   // Programs started through .NET or COM, out of the shell's sight.
   { tier: 'screen', rule: 'hidden', reason: HIDDEN.reason, code: /process\]::start\s*\(|processstartinfo|\.shellexecute\s*\(/ },
   { tier: 'screen', rule: 'hidden', reason: HIDDEN.reason, code: /\.(run|exec)\s*\(/, text: /wscript\.shell/ },
@@ -1170,26 +1750,60 @@ function judgeCode(command: Command, ctx: Ctx): Verdict {
 
 // ---- Raw-text checks ----
 
-/** Lowercased, `\` as `/`, quotes and pwsh backticks dropped, `//` and `/./` collapsed: a path in any spelling. */
+/** A `..` after a name, folded away (`a/x/../b` is `a/b`): mid-path, and at a token's start. */
+const DOTDOT_MID = /\/(?!\.\.?(?:\/|$|[\s,;)]))[^/\s,;()]+\/\.\.(?=\/|$|[\s,;)])/
+const DOTDOT_START = /(^|[\s=:,;(])(?!\.\.?(?:\/|$|[\s,;)]))[^/\s=:,;()]+\/\.\.(?:\/|(?=$|[\s,;)]))/
+
+/**
+ * A path in any spelling, as Windows reads it: lowercased, `\` as `/`, quotes and pwsh backticks
+ * dropped, doubled separators and `.` segments collapsed, the trailing dots Windows drops from a name
+ * dropped (`.claude.\` is `.claude\`), and `x/..` folded away.
+ */
 function normalizePath(text: string): string {
-  return text
+  let path = text
     .toLowerCase()
     .replace(/\\/g, '/')
     .replace(/['"`]/g, '')
-    .replace(/\/(\.\/)+/g, '/')
     .replace(/\/{2,}/g, '/')
+    .replace(/\/(\.\/)+/g, '/')
+    .replace(/\/\.(?=$|[\s,;)])/g, '')
+    .replace(/([^/.\s])\.+(?=\/|$|[\s,;)])/g, '$1')
+  for (let i = 0; i < 32; i++) {
+    const next = path.replace(DOTDOT_MID, '').replace(DOTDOT_START, '$1')
+    if (next === path) break
+    path = next
+  }
+  return path
+}
+
+/**
+ * The spellings a path check looks at: normalized with `..` folded, and before folding (a `..` after
+ * a link leads where the link's target leads, so the stricter of the two wins).
+ */
+function pathForms(text: string): string[] {
+  const folded = normalizePath(text)
+  const unfolded = text.toLowerCase().replace(/\\/g, '/').replace(/['"`]/g, '').replace(/\/{2,}/g, '/')
+  return folded === unfolded ? [folded] : [folded, unfolded]
 }
 
 /** Claude Code's own settings, permissions and plugins. */
 const PROTECTED_PATH =
   /\.claude\/settings(\.local)?\.json|\.claude\.json|managed-settings\.json|\/claudecode(\/|$|[\s,;)])|\/etc\/claude-code(\/|$|[\s,;)])|\.claude\/plugins(\/|$|[\s,;)])/
 
+/** A `.claude` folder named apart from what is in it (`Join-Path $HOME .claude plugins`, `[IO.Path]::Combine($HOME, '.claude', 'skills')`). */
+const CLAUDE_APART = /(^|[\s=:,;(/])\.claude\/?([\s,;)]|$)/
+/** A word standing apart, after a `.claude` named apart: `plugins`, `skills x`. */
+const apart = (word: string): RegExp => new RegExp(`(^|[\\s=:,;(])${word}([\\s/,;)]|$)`)
+const PLUGINS_APART = apart('plugins')
+const CONFIG_APART = apart('(skills|agents|commands|hooks)')
+
 function mentionsProtected(text: string): boolean {
-  const path = normalizePath(text)
-  if (PROTECTED_PATH.test(path)) return true
-  if (hasProtectedShortName(path)) return true
-  // A `.claude` folder and a settings file named apart: `Join-Path $HOME .claude settings.json`.
-  return /(^|[\s/=:,;(])\.claude([\s/,;)]|$)/.test(path) && /settings(\.local)?\.json/.test(path)
+  return pathForms(text).some(path => {
+    if (PROTECTED_PATH.test(path)) return true
+    if (hasProtectedShortName(path)) return true
+    // A `.claude` folder and a settings file or the plugins folder named apart: `Join-Path $HOME .claude settings.json`.
+    return CLAUDE_APART.test(path) && (/settings(\.local)?\.json/.test(path) || PLUGINS_APART.test(path))
+  })
 }
 
 /** The stems of the 8.3 short-name tokens (`.../SETTIN~1.JSO x` -> `settin`) in a normalized path or command, lowercased. */
@@ -1197,8 +1811,13 @@ function shortNameStems(text: string): string[] {
   return [...text.matchAll(/(?:^|[\s/=:,;("'`])([a-z0-9]+)~\d/g)].map(m => m[1] ?? '')
 }
 
-/** Whether `stem` could be the first characters of one of `fulls` (either is a prefix of the other). */
-const stemCouldBe = (stem: string, ...fulls: string[]): boolean => fulls.some(full => full.startsWith(stem) || stem.startsWith(full))
+/**
+ * Whether `stem` could be the short name of one of `fulls`: either is a prefix of the other
+ * (`SETTIN~1`), or it is the hashed form Windows makes once four such names clash in a folder
+ * (`SE12AB~1`: the first two letters, then four hex digits).
+ */
+const stemCouldBe = (stem: string, ...fulls: string[]): boolean =>
+  fulls.some(full => full.startsWith(stem) || stem.startsWith(full) || (/^[a-z0-9]{2}[0-9a-f]{4}$/.test(stem) && full.startsWith(stem.slice(0, 2))))
 
 /**
  * Windows makes 8.3 short names (`SETTIN~1.JSO` for settings.json, `CLAUDE~1` for .claude) on the
@@ -1210,7 +1829,7 @@ function hasProtectedShortName(path: string): boolean {
   return shortNameStems(path).some(stem => stemCouldBe(stem, 'claude', 'settin', 'manage', 'plugin', 'mcp'))
 }
 
-/** Whether a path carries an 8.3 short-name token at all (a Write/Edit then has its real path resolved before it is judged). */
+/** Whether a path carries an 8.3 short-name token at all (a Write/Edit then is not resolved until its real path has none). */
 export function hasShortName(path: string): boolean {
   return typeof path === 'string' && path.split(/[\\/]/).some(segment => /^[^\\/]*[a-z0-9]~\d/i.test(segment))
 }
@@ -1224,19 +1843,36 @@ export function hasShortName(path: string): boolean {
 const CLAUDE_CONFIG_PATH = /\.claude\/(skills|agents|commands|hooks)(\/|$|[\s,;)])|(^|[\s/=:,;(])\.mcp\.json([\s,;)]|$)/
 
 function mentionsClaudeConfig(text: string): boolean {
-  return CLAUDE_CONFIG_PATH.test(normalizePath(text))
+  return pathForms(text).some(path => CLAUDE_CONFIG_PATH.test(path) || (CLAUDE_APART.test(path) && CONFIG_APART.test(path)))
 }
 
 /**
- * Places a file written there runs on its own, so a write into one is screen tier: a Startup folder,
- * a PowerShell `$PROFILE`, a Git hook, or a scheduled-task folder. Catching the path means a write
- * that side-steps schtasks or the profile cmdlets (`Set-Content ...\Startup\a.bat`) is not missed.
+ * Places a file written there runs on its own, so a write into one is screen tier: a Startup folder
+ * (by its path, or as .NET or Windows Script Host name it), a PowerShell profile (`$PROFILE`, or a
+ * profile file by its name), a shell's startup file (`~/.bashrc`, `~/.profile`: Git Bash runs them),
+ * a Git hook or a repository's git config (core.hooksPath, core.fsmonitor), or a scheduled-task
+ * folder. Catching the path means a write that side-steps schtasks or the profile cmdlets
+ * (`Set-Content ...\Startup\a.bat`) is not missed.
  */
-const AUTORUN_PATH =
-  /\/start menu\/programs\/startup\/|(^|[\s/=:,;(])\$profile\b|\/(microsoft\.powershell|powershell)_profile\.ps1|\/profile\.ps1(\/|$|[\s,;)])|\.git\/hooks\/|\/(system32|windows)\/tasks\//
+const AUTORUN_PATH = new RegExp(
+  [
+    String.raw`\/start menu\/programs\/startup(\/|$|[\s,;)])`,
+    String.raw`getfolderpath\s*\(\s*(\[[\w.+]*\]::)?\s*(common)?startup\b`,
+    String.raw`getfolderpath\s*\(\s*(7|24)\s*\)`,
+    String.raw`specialfolders?\s*\(\s*(allusers)?startup\b`,
+    String.raw`specialfolder\]::(common)?startup\b`,
+    String.raw`(^|[\s/=:,;(])\$profile\b`,
+    String.raw`(^|[\s/=:,;(])(microsoft\.powershell|microsoft\.vscode|powershell)_profile\.ps1`,
+    String.raw`\/profile\.ps1(\/|$|[\s,;)])`,
+    String.raw`\.git\/hooks(\/|$|[\s,;)])`,
+    String.raw`\.git\/config(\/|$|[\s,;)])`,
+    String.raw`\/(system32|windows)\/tasks\/`,
+    String.raw`(^|[\s/=:,;(])\.(bashrc|bash_profile|bash_login|bash_logout|profile|zshrc|zprofile|zshenv|zlogin)([\s,;)]|$)`,
+  ].join('|'),
+)
 
 function mentionsAutorun(text: string): boolean {
-  return AUTORUN_PATH.test(normalizePath(text))
+  return pathForms(text).some(path => AUTORUN_PATH.test(path))
 }
 
 const AUTORUN = verdict('screen', 'autorun', 'writes to a startup location')
@@ -1249,19 +1885,32 @@ function writePathVerdict(text: string): Verdict {
   return PASS
 }
 
+/**
+ * Whether a link's path or target names Claude Code's or Jarvis's own folder (`.claude`, `.jarvis`,
+ * `.claude.json`, by any spelling, a short name too) or anything a write there would make stricter.
+ */
+function namesProtectedFolder(text: string): boolean {
+  if (writePathVerdict(text).tier !== 'pass' || secrets(text).tier !== 'pass') return true
+  return pathForms(text).some(
+    path =>
+      /(^|[\s/=:,;(])\.(claude|jarvis)(\.json)?(\/|$|[\s,;)])/.test(path) ||
+      shortNameStems(path).some(stem => stemCouldBe(stem, 'claude', 'jarvis')),
+  )
+}
+
 /** Programs that only read, so naming a protected path with them is allowed. */
 const READERS = new Set(['get-content', 'cat', 'type', 'test-path', 'ls', 'get-childitem', 'dir', 'get-item', 'select-string', 'grep'])
 
-/** Whether every command of the script (nested ones too) only reads, with no redirection into a file. */
+/** Whether every command of the script (nested ones too) only reads or changes folder, with no redirection into a file. */
 function readsOnly(script: Script): boolean {
   if (script.problem !== undefined) return false
   return script.commands.every(command => {
     if (command.writes) return false
-    const found = findCommand(command.words, script.dialect, { loop: false })
+    const found = findCommand(command.words, script.dialect, newState())
     const word = found.at === undefined ? undefined : command.words[found.at]
     if (word === undefined) {
       if (command.words.length > 0) return false
-    } else if (word.dynamic || word.block || !programNames(word.text, script.dialect).some(name => READERS.has(name))) {
+    } else if (word.dynamic || word.block || !programNames(word.text, script.dialect).some(name => READERS.has(name) || CD_NAMES.has(name))) {
       return false
     }
     return command.inner.every(readsOnly)
@@ -1409,9 +2058,13 @@ function gitArgs(c: Call): { sub: string; rest: string[] } {
   return { sub: c.low[i] ?? '', rest: c.args.slice(i + 1).map(w => w.text) }
 }
 
+/** git settings that name a program to run (or a file of more settings). */
+const GIT_RUNS_KEY =
+  /^(alias\.|core\.(pager|editor|sshcommand|hookspath|fsmonitor|askpass|gitproxy)\b|credential\.|sequence\.editor|diff\.|difftool\.|merge\.|mergetool\.|filter\.|pager\.|gpg\.|uploadpack\.|receivepack\.|protocol\.|remote\..*\.(uploadpack|receivepack|vcs)|include\.|includeif\.|ssh\.)/
+
 /** `git -c alias.x='!cmd'`, `-c core.pager=...` and the like: settings given on the command line that run a program. */
 function gitRunsOption(c: Call): boolean {
-  const risky = /^(alias\.|core\.(pager|editor|sshcommand|hookspath|fsmonitor|askpass|gitproxy)\b|credential\.|sequence\.editor|diff\.|difftool\.|merge\.|mergetool\.|filter\.|pager\.|gpg\.|uploadpack\.|receivepack\.|protocol\.|remote\..*\.(uploadpack|receivepack|vcs)|include\.|includeif\.|ssh\.)/
+  const risky = GIT_RUNS_KEY
   for (let i = 0; i < c.low.length; i++) {
     const a = c.low[i] ?? ''
     if (!a.startsWith('-')) return false // the subcommand: its own options are not settings
@@ -1425,6 +2078,33 @@ function gitRunsOption(c: Call): boolean {
     }
   }
   return false
+}
+
+/** `git config` options that read or remove a setting, not set one. */
+const GIT_CONFIG_READS = /^(--get(-all|-regexp|-urlmatch|-color|-colorbool)?|--list|-l|--unset(-all)?|--remove-section|--rename-section|--edit|-e|--show-origin|--show-scope|--name-only)$/
+/** `git config` options that take a value. */
+const GIT_CONFIG_VALUES = new Set(['-f', '--file', '--blob', '--type', '--default', '--comment', '--value'])
+
+/**
+ * `git config core.hooksPath x`, `git config alias.x '!cmd'`: a setting that runs a program later,
+ * at a git command that looks harmless. An alias runs a program only when it starts with `!`.
+ */
+function gitConfigRuns(c: Call): boolean {
+  const { sub, rest } = gitArgs(c)
+  if (sub !== 'config') return false
+  const words: string[] = []
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i] ?? ''
+    if (GIT_CONFIG_READS.test(a)) return false
+    if (GIT_CONFIG_VALUES.has(a)) i++
+    else if (!a.startsWith('-') || a === '-') words.push(a)
+  }
+  // git 2.46's `git config set key value` and `git config get key`.
+  if (['get', 'list', 'unset', 'remove-section', 'rename-section', 'edit'].includes(words[0] ?? '')) return false
+  if (words[0] === 'set') words.shift()
+  const [key = '', value] = words
+  if (value === undefined || !GIT_RUNS_KEY.test(key.toLowerCase())) return false
+  return !key.toLowerCase().startsWith('alias.') || value.trimStart().startsWith('!') || value.includes('$')
 }
 
 function gitDiscards(c: Call): boolean {
@@ -1819,6 +2499,7 @@ const TIER_TABLE: readonly Row[] = [
     when: c => gitArgs(c).sub === 'branch' && (gitArgs(c).rest.includes('-D') || (flagIn(gitArgs(c).rest, 'd', '--delete') && flagIn(gitArgs(c).rest, 'f', '--force'))),
   },
   { id: 'built', tier: 'screen', reason: 'runs a command set in its options', names: ['git'], when: gitRunsOption },
+  { id: 'autorun', tier: 'screen', reason: 'sets a git setting that runs a program', names: ['git'], when: gitConfigRuns },
   { id: 'git-output', tier: 'screen', reason: 'writes a file outside the project', names: ['git'], when: c => gitOutput(c) === 'outside' },
   { id: 'hidden', tier: 'screen', reason: HIDDEN.reason, names: ['invoke-cimmethod', 'invoke-wmimethod'], in: PWSH, when: c => /win32_process\b/.test(joined(c)) },
   { id: 'shutdown', tier: 'screen', reason: SHUTDOWN, names: ['stop-computer', 'restart-computer'], in: PWSH },
@@ -2042,31 +2723,43 @@ function inlineCode(c: Call): { code: Word[]; file: Word | undefined } {
   return { code, file: undefined }
 }
 
+/** What an interpreter's code is checked as: its kind of file. */
+const INTERPRETER_FILE: Record<string, FileKind> = {
+  python: 'python', py: 'python', node: 'node', bun: 'node', deno: 'node', perl: 'perl', ruby: 'ruby', php: 'php', osascript: 'osascript',
+}
+
+/** Code for an interpreter (inline, piped in, or a file's text): what it does that needs a say. */
+function inlineVerdict(kind: string, text: string): Verdict {
+  const low = text.toLowerCase()
+  let v = PASS
+  if (kind === 'osascript' && /keystroke|key code/.test(low)) v = verdict('never', 'keystrokes', KEYSTROKES)
+  if (kind === 'osascript' && /\b(mail|messages)\b/.test(low) && /\bsend\b/.test(low)) v = stricter(v, verdict('screen', 'email', EMAIL))
+  if (INLINE_TRIGGERS.test(text)) v = stricter(v, INLINE)
+  return stricter(v, secrets(text))
+}
+
 const interpreter: Evaluator = (c, ctx) => {
   const { code, file } = inlineCode(c)
   if (code.some(w => w.dynamic)) return BUILT
   if (file !== undefined && isBuiltFile(file)) return runsInput(c)
+  const kind = INTERPRETER_FILE[c.name] ?? 'python'
   let v = PASS
-  // A script file (`python app.py`, `node build.js`): read its text and run the same content checks on it.
-  let fileText: string | undefined
-  if (file !== undefined && !file.dynamic && !file.block) {
-    const got = scriptContent(file.text, ctx)
-    if (typeof got === 'string') fileText = got
-    else v = stricter(v, got)
+  // A script file (`python app.py`, `node build.js`): its text gets the same checks; one that cannot be read is screen.
+  if (file !== undefined && !file.block) {
+    const path = literalText(file, ctx)
+    v = stricter(v, path === undefined ? SCRIPT_UNREADABLE : runFile(path, kind, ctx))
   }
-  const texts = [...code.map(w => w.text), ...(fileText === undefined ? [] : [fileText]), ...(file !== undefined || code.length > 0 ? [] : c.stdin)]
-  for (const text of texts) {
-    const low = text.toLowerCase()
-    if (c.name === 'osascript' && /keystroke|key code/.test(low)) v = stricter(v, verdict('never', 'keystrokes', KEYSTROKES))
-    if (c.name === 'osascript' && /\b(mail|messages)\b/.test(low) && /\bsend\b/.test(low)) v = stricter(v, verdict('screen', 'email', EMAIL))
-    if (INLINE_TRIGGERS.test(text)) v = stricter(v, INLINE)
-    v = stricter(v, secrets(text))
+  const texts = [...code.map(w => w.text), ...(file !== undefined || code.length > 0 ? [] : c.stdin)]
+  for (const text of texts) v = stricter(v, inlineVerdict(c.name, text))
+  if (code.length === 0 && file === undefined) {
+    // A file fed on stdin (`python3 < x.py`) is the program.
+    v = stricter(v, stdinFiles(c, kind, ctx))
+    if (c.stdin.length === 0 && c.reads.length === 0 && c.piped && c.name !== 'osascript') v = stricter(v, runsInput(c))
   }
-  if (code.length === 0 && file === undefined && c.stdin.length === 0 && c.piped && c.name !== 'osascript') v = stricter(v, runsInput(c))
   return v
 }
 
-/** bash, sh, zsh ...: `-c 'text'` is judged as bash; with no script file the program comes from a pipe or here-document. */
+/** bash, sh, zsh ...: `-c 'text'` is judged as bash; with no script file (or `-s`) the program comes from stdin: a pipe, a here-document or a file. */
 const unixShell: Evaluator = (c, ctx) => {
   let v = PASS
   for (const text of c.stdin) v = stricter(v, judgeText(text, 'bash', ctx))
@@ -2077,18 +2770,23 @@ const unixShell: Evaluator = (c, ctx) => {
       if (script === undefined) return v
       return stricter(v, script.dynamic ? BUILT : judgeText(script.text, 'bash', ctx))
     }
+    // -s: the program is read from stdin; what follows are its arguments.
+    if (/^-[A-Za-z]*s[A-Za-z]*$/.test(text)) break
     if (/^[-+][oO]$/.test(text)) {
       i++
       continue
     }
     if (/^[-+]/.test(text)) continue
-    // A script file the shell runs: read its text and judge it as bash, unless its name is only known at run time.
+    // A script file the shell runs: read its text and judge it as bash; one named only at run time is screen.
     const file = c.args[i]
     if (file === undefined) return v
     if (isBuiltFile(file)) return stricter(v, runsInput(c))
-    return file.dynamic || file.block ? v : stricter(v, scriptFileRun(file.text, 'bash', ctx))
+    if (file.block) return v
+    const path = literalText(file, ctx)
+    return stricter(v, path === undefined ? SCRIPT_UNREADABLE : runFile(path, 'bash', ctx))
   }
-  return c.piped && c.stdin.length === 0 ? stricter(v, runsInput(c)) : v
+  v = stricter(v, stdinFiles(c, 'bash', ctx))
+  return c.piped && c.stdin.length === 0 && c.reads.length === 0 ? stricter(v, runsInput(c)) : v
 }
 
 /** `wmic process call create "cmd"` starts a program out of sight; its command line is judged as cmd too. */
@@ -2127,7 +2825,7 @@ const powershell: Evaluator = (c, ctx) => {
     const name = text.slice(1).replace(/^-/, '').split(':')[0] ?? ''
     if ('command'.startsWith(name) && name.startsWith('c')) {
       const rest = c.args.slice(i + 1)
-      if (rest[0]?.text === '-') return c.piped ? runsInput(c) : PASS
+      if (rest[0]?.text === '-') return pwshInput(c, ctx)
       return rest[0]?.block === true ? PASS : judgeLine(rest, 'pwsh', ctx)
     }
     if (name === 'ec' || ('encodedcommand'.startsWith(name) && name.startsWith('e'))) {
@@ -2136,15 +2834,24 @@ const powershell: Evaluator = (c, ctx) => {
       return decoded === undefined ? HIDDEN : stricter(HIDDEN, judgeText(decoded, 'pwsh', ctx))
     }
     if ('file'.startsWith(name) && name.startsWith('f')) {
-      // -File runs a script; read its text and judge it as pwsh, unless its name is only known at run time.
+      // -File runs a script: its text is read and judged as pwsh; one named only at run time is screen.
       const script = c.args[i + 1]
-      if (script === undefined) return PASS
-      return script.dynamic || script.block ? BUILT : scriptFileRun(script.text, 'pwsh', ctx)
+      if (script === undefined || script.block) return PASS
+      if (isBuiltFile(script)) return BUILT
+      const path = literalText(script, ctx)
+      return path === undefined ? SCRIPT_UNREADABLE : runFile(path, 'pwsh', ctx)
     }
     if (PWSH_SWITCHES.some(option => option.startsWith(name))) continue
     if (PWSH_VALUES.some(option => option.startsWith(name))) i++
   }
-  return c.piped || c.stdin.length > 0 ? runsInput(c) : PASS
+  return pwshInput(c, ctx)
+}
+
+/** PowerShell reading its commands from stdin (`-Command -`, or no command at all): a file there is read and judged as pwsh; a pipe or here-document is screen. */
+function pwshInput(c: Call, ctx: Ctx): Verdict {
+  let v = stdinFiles(c, 'pwsh', ctx)
+  for (const text of c.stdin) v = stricter(v, judgeText(text, 'pwsh', ctx))
+  return c.piped || c.stdin.length > 0 ? stricter(v, runsInput(c)) : v
 }
 
 /** cmd's own switches before /c, /k or /r: /a /u /q /d /s /x /y /?, and /e: /f: /v: /t: with their values. */
@@ -2171,7 +2878,9 @@ const cmd: Evaluator = (c, ctx) => {
       if (!CMD_SWITCH.test(part)) return CMD_UNREADABLE
     }
   }
-  return c.piped || c.stdin.length > 0 ? runsInput(c) : PASS
+  // No /c: cmd reads its commands from stdin, a file (`cmd < x.bat`) judged as cmd.
+  const v = stdinFiles(c, 'cmd', ctx)
+  return c.piped || c.stdin.length > 0 ? stricter(v, runsInput(c)) : v
 }
 
 /** wsl: `wsl cmd ...`, `wsl -e cmd ...`, `wsl -- cmd ...` run in the default Linux shell. */
@@ -2227,7 +2936,10 @@ const startProcess: Evaluator = (c, ctx) => {
   if (file === undefined || file.block) return v
   if (file.dynamic && /[$(`…]/.test(baseName(file.text))) return stricter(v, BUILT)
   if (list?.dynamic === true) return stricter(v, BUILT)
-  const line = `& '${file.text.replace(/'/g, "''")}' ${list === undefined ? '' : list.items.join(' ')}`
+  // Windows starts the file by its type, looking a bare name up in the current folder too.
+  v = stricter(v, launch(file, 'shell', ctx))
+  const program = literalText(file, ctx) ?? file.text
+  const line = `& '${program.replace(/'/g, "''")}' ${list === undefined ? '' : list.items.join(' ')}`
   return stricter(v, judgeText(line, 'pwsh', ctx))
 }
 
@@ -2301,6 +3013,10 @@ const EVALUATORS: Record<string, Evaluator> = {
   wsl,
   'start-process': startProcess,
   start: cmdStart,
+  'invoke-item': openItems, explorer: openItems,
+  'import-module': importModule,
+  'rename-item': renameItem, ren: renameItem, rename: renameItem,
+  'new-item': makesLink, mklink: makesLink, ln: makesLink, fsutil: makesLink,
   runas,
   schtasks: optionText(/^\/tr$/),
   forfiles: optionText(/^\/c$/),
@@ -2360,35 +3076,50 @@ function judgeTool(tool: string, input: Readonly<Record<string, unknown>>, resol
   }
 }
 
+/** A file tool's path as Windows opens it: each name's trailing dots and spaces dropped (`settings.json. ` is settings.json). */
+const windowsNames = (path: string): string =>
+  path
+    .split(/([\\/])/)
+    .map(part => (part === '.' || part === '..' ? part : part.replace(/[. ]+$/, '')))
+    .join('')
+
+/**
+ * Write, Edit and NotebookEdit: judged by the path as given and by its real path (every link and
+ * junction followed, which pc.ts asks the engine for), and the stricter wins. A path that is not yet
+ * resolved waits on that (screen if it never comes); one whose real path still carries an 8.3 short
+ * name is not resolved either: screen.
+ */
 function judgePath(path: unknown, resolved: Resolved): Verdict {
   if (typeof path !== 'string') return verdict('screen', 'unreadable', 'unreadable file path')
-  let v = stricter(secrets(path), writePathVerdict(path))
-  // An 8.3 short name (`SETTIN~1.JSO`, `CLAUDE~1`) can hide a protected path behind an innocent
-  // spelling, so resolve the real target and judge it too; screen when it cannot be resolved.
-  if (hasShortName(path)) {
-    const real = resolved.realPath
-    if (real === undefined) v = stricter(v, withNeed(SHORTNAME_UNRESOLVED, { kind: 'realpath', path }))
-    else if (real === null) v = stricter(v, SHORTNAME_UNRESOLVED)
-    else v = stricter(v, stricter(secrets(real), writePathVerdict(real)))
-  }
-  return v
+  const given = (spelling: string): Verdict => stricter(stricter(secrets(spelling), writePathVerdict(spelling)), stricter(secrets(windowsNames(spelling)), writePathVerdict(windowsNames(spelling))))
+  let v = given(path)
+  if (v.tier === 'never') return v
+  const real = resolved.realPath
+  if (real === undefined) return stricter(v, withNeed(UNRESOLVED_PATH, { kind: 'realpath', path }))
+  if (real === null) return stricter(v, UNRESOLVED_PATH)
+  v = stricter(v, given(real))
+  return hasShortName(real) ? stricter(v, UNRESOLVED_PATH) : v
 }
 
 const HIDDEN_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f\u0085\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/
 
 function judgeShell(raw: string, dialects: readonly Dialect[], resolved: Resolved): Verdict {
-  // Windows line ends, and the dashes PowerShell also takes as a parameter's hyphen.
-  const text = raw.replace(/\r\n?/g, '\n').replace(/[\u2013\u2014\u2015]/g, '-')
+  const text = normalizeText(raw)
   const secret = secrets(text)
   if (secret.tier === 'never') return secret
   if (text.length > MAX_CHARS) return mentionsProtected(text) ? CLAUDE_SETTINGS : verdict('screen', 'unreadable', 'is too long to check')
-  let v = HIDDEN_CHARS.test(text) ? verdict('screen', 'hidden', 'has hidden characters') : PASS
+  let v = HIDDEN_CHARS.test(text) ? HIDDEN_TEXT : PASS
   v = stricter(v, encoded(text))
   if (dialects.includes('bash')) v = stricter(v, devClipboard(text))
   for (const dialect of dialects) {
     const script = new Lexer(text, dialect, 0).lex()
-    if (!readsOnly(script)) v = stricter(v, writePathVerdict(text))
-    v = stricter(v, judgeScript(script, { dialect, text: text.toLowerCase(), depth: 0, state: { loop: false }, resolved }))
+    const ctx: Ctx = { dialect, text: text.toLowerCase(), depth: 0, state: newState(), resolved }
+    // A file Claude wrote this session, named in a command that does more than read: its contents decide too.
+    if (!readsOnly(script)) v = stricter(v, stricter(writePathVerdict(text), judgeWritten(text, ctx)))
+    v = stricter(v, judgeScript(script, ctx))
+    // Such a file that one part of the command may write and another names runs as the first left it, not as Jarvis read it.
+    const state = ctx.state
+    if ([...state.named].some(name => state.made.has(name) && (state.namedIn.get(name) ?? 0) > 1)) v = stricter(v, MADE_FIRST)
   }
   return v
 }

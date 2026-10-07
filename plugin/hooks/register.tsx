@@ -20,6 +20,8 @@ const foldedAtom = atom({ plugin: 'jarvis', key: 'folded' } as const, false)
 
 /** The HUD pane; its size follows the screen (hud.ts paneSize). */
 const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', ...PANE_START }
+/** How many folders up the guard looks for one that is there when it places a new file. */
+const REAL_PATH_DEPTH = 64
 
 export const register: Register = (on, options) => {
   const app = new Jarvis(readSettings(options))
@@ -49,19 +51,36 @@ export const register: Register = (on, options) => {
       writeFile: (path, text) => $.fs.write(path, text),
       readFileText: path => $.fs.read(path).catch(() => null),
       realPath: async path => {
-        // Where the path lands, so the guard judges the real file an 8.3 short name hides. The file
-        // itself when it stats; else its folder (a Write names a file not there yet) plus the name.
-        const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+        // Where a file tool's path lands, every link and junction followed, so the guard judges the
+        // real file (a link or an 8.3 short name can hide a protected one). The file itself when it
+        // stats; else the nearest folder above that does (a Write may name a file, and folders, not
+        // there yet) plus the rest. Null when it cannot be placed: a spelling with no folder to stand
+        // on, a rest with `.` or `..` in it, or a link there that leads nowhere (a write through it
+        // would make its target).
+        let cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
         const name = path.slice(cut + 1)
         const placeable = !/^[A-Za-z]:(?![\\/])/.test(path) && !/^[\\/][\\/]/.test(path) && !/^[A-Za-z]:/.test(name) && name !== '' && name !== '.' && name !== '..'
         if (!placeable) return null
         const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
-        if (own?.realPath !== undefined) return own.realPath
-        const folder = cut < 0 ? '.' : path.slice(0, cut + 1)
-        const dir = await $.fs.stat(folder, { resolve: true }).catch(() => undefined)
-        if (dir?.realPath === undefined) return null
-        const sep = dir.realPath.includes('\\') ? '\\' : '/'
-        return `${dir.realPath.replace(/[\\/]$/, '')}${sep}${name}`
+        if (own !== undefined) return own.realPath ?? null
+        for (let depth = 0; depth < REAL_PATH_DEPTH; depth++) {
+          const folder = cut < 0 ? '.' : path.slice(0, cut + 1)
+          const rest = path.slice(cut + 1).split(/[\\/]/)
+          if (rest.some(part => part === '.' || part === '..')) return null
+          const dir = await $.fs.stat(folder, { resolve: true }).catch(() => undefined)
+          if (dir !== undefined) {
+            if (dir.realPath === undefined) return null
+            const first = (rest[0] ?? '').toLowerCase()
+            const entries = await $.fs.list(folder).catch(() => undefined)
+            if (entries === undefined || entries.some(entry => entry.isLink && entry.name.toLowerCase() === first)) return null
+            const sep = dir.realPath.includes('\\') ? '\\' : '/'
+            return `${dir.realPath.replace(/[\\/]$/, '')}${sep}${rest.join(sep)}`
+          }
+          if (cut <= 0) return null
+          cut = Math.max(path.lastIndexOf('/', cut - 1), path.lastIndexOf('\\', cut - 1))
+          if (cut < 0) return null
+        }
+        return null
       },
       storeGet: key => $.store.get(key),
       storeSet: (key, value) => $.store.set(key, value),
