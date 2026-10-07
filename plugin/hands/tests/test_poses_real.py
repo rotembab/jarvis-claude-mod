@@ -1,9 +1,11 @@
-"""Poses on MediaPipe's own test photos, through the real hand landmarker. Optional.
+"""Poses on MediaPipe's own test photos, through the real tracker. Optional.
 
 Skipped unless ``JARVIS_HANDS_MODELS_DIR`` is set (CI sets it). The model and
 the photos are downloaded into that directory when missing; the model is
-checked against its sha256. The frames go through the same mirroring the
-tracker applies, and also unmirrored, since a camera may already mirror.
+checked against its sha256. Each photo goes through ``MediaPipeTracker`` raw
+and unflipped, like a camera frame, and its poses through ``PoseTracker``
+with the photo's aspect, exactly as the runtime does. A still photo is one
+frame, so every photo gets a tracker of its own.
 """
 
 from __future__ import annotations
@@ -12,28 +14,29 @@ import hashlib
 import os
 import urllib.request
 from pathlib import Path
-from typing import Any
 
-import numpy as np
+import cv2
 import pytest
 
-from jarvis_hands.landmarks import HandObservation
+from jarvis_hands import models
+from jarvis_hands.landmarks import Frame
 from jarvis_hands.poses import PoseTracker
+from jarvis_hands.tracker.mediapipe_tracker import MediaPipeTracker
 
 MODELS_ENV = "JARVIS_HANDS_MODELS_DIR"
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-)
-MODEL_SHA256 = "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
 IMAGE_URL = "https://storage.googleapis.com/mediapipe-assets/{name}.jpg"
 
+#: The poses of the hands in each photo, sorted.
 EXPECTED = {
     "fist": ["fist"],
-    "thumb_up": ["fist"],
+    "thumb_up": ["fist"],  # the thumb does not count: four curled fingers
     "pointing_up": ["hover"],
     "victory": ["two"],
     "right_hands": ["palm", "palm"],
     "left_hands": ["palm", "palm"],
+    "man-woman-okay": ["pinch", "pinch"],  # OK signs: thumb and index tips touching
+    "woman_hands": ["palm", "palm"],
+    "hand-woman-man": ["hover", "palm"],  # one open hand, one relaxed (fingers neither straight nor curled)
 }
 
 pytestmark = pytest.mark.skipif(not os.environ.get(MODELS_ENV), reason=f"set {MODELS_ENV} to run the real model")
@@ -63,66 +66,35 @@ def models_dir() -> Path:
 
 
 @pytest.fixture(scope="module")
-def landmarker(models_dir: Path) -> Any:
-    from mediapipe.tasks.python import BaseOptions, vision
-
-    model = _fetch(MODEL_URL, models_dir / "hand_landmarker.task", MODEL_SHA256)
-    options = vision.HandLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=str(model)),
-        running_mode=vision.RunningMode.IMAGE,
-        num_hands=2,
-    )
-    detector = vision.HandLandmarker.create_from_options(options)
-    yield detector
-    detector.close()
+def model(models_dir: Path) -> Path:
+    return _fetch(models.MODEL_URL, models_dir / models.MODEL_NAME, models.MODEL_SHA256)
 
 
-def detect(landmarker: Any, models_dir: Path, name: str, *, mirror: bool) -> list[tuple[str, HandObservation, float]]:
-    """MediaPipe's own handedness label, the HandObservation and the photo's aspect for each hand in a test photo."""
-    import cv2
-    import mediapipe as mp
-
+def track(model: Path, models_dir: Path, name: str) -> Frame:
+    """One test photo, as the camera would hand it over (BGR, unflipped), through a fresh tracker."""
     path = _fetch(IMAGE_URL.format(name=name), models_dir / f"{name}.jpg")
-    bgr = cv2.imread(str(path))
-    assert bgr is not None, path
-    if mirror:
-        bgr = cv2.flip(bgr, 1)
-    rgb = np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-    result = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-    hands = []
-    for i, world in enumerate(result.hand_world_landmarks):
-        category = result.handedness[i][0]
-        label = category.category_name.lower()
-        # The landmarker names the hand as seen in an unmirrored photo; in a mirrored frame that is the other one.
-        user_hand = ("left" if label == "right" else "right") if mirror else label
-        hands.append(
-            (
-                label,
-                HandObservation(
-                    handedness=user_hand,
-                    score=float(category.score),
-                    image=np.array([[p.x, p.y, p.z] for p in result.hand_landmarks[i]], dtype=float),
-                    world=np.array([[p.x, p.y, p.z] for p in world], dtype=float),
-                ),
-                bgr.shape[0] / bgr.shape[1],
-            )
-        )
-    return hands
+    image = cv2.imread(str(path))
+    assert image is not None, path
+    tracker = MediaPipeTracker(model, num_hands=2)
+    try:
+        return tracker.process(image, 1.0)
+    finally:
+        tracker.close()
 
 
-@pytest.mark.parametrize("mirror", [True, False], ids=["mirrored", "unmirrored"])
 @pytest.mark.parametrize("name", list(EXPECTED))
-def test_poses_on_mediapipe_test_photos(landmarker: Any, models_dir: Path, name: str, mirror: bool) -> None:
-    hands = detect(landmarker, models_dir, name, mirror=mirror)
-    poses = sorted(PoseTracker().classify(obs, aspect=aspect).pose for _, obs, aspect in hands)
+def test_poses_on_mediapipe_test_photos(model: Path, models_dir: Path, name: str) -> None:
+    frame = track(model, models_dir, name)
+    aspect = frame.height / frame.width
+    poses = sorted(PoseTracker().classify(hand, aspect=aspect).pose for hand in frame.hands)
     assert poses == EXPECTED[name]
 
 
-def test_handedness_labels_name_the_hand_as_photographed(landmarker: Any, models_dir: Path) -> None:
-    """right_hands.jpg shows two right hands, photographed directly (not a selfie).
+def test_handedness_names_the_hand_as_photographed(model: Path, models_dir: Path) -> None:
+    """right_hands.jpg shows two right hands, photographed directly (not a selfie); left_hands.jpg is its mirror.
 
-    MediaPipe Tasks labels them "right"; mirrored, as the tracker feeds frames, it labels them "left". So
-    the tracker must swap the label after mirroring for ``handedness`` to name the user's own hand.
+    MediaPipe Tasks labels the raw frame anatomically, and the tracker keeps that label while it mirrors
+    the landmarks, so ``handedness`` names the user's own hand.
     """
-    assert [label for label, _, _ in detect(landmarker, models_dir, "right_hands", mirror=False)] == ["right", "right"]
-    assert [label for label, _, _ in detect(landmarker, models_dir, "right_hands", mirror=True)] == ["left", "left"]
+    assert [h.handedness for h in track(model, models_dir, "right_hands").hands] == ["right", "right"]
+    assert [h.handedness for h in track(model, models_dir, "left_hands").hands] == ["left", "left"]

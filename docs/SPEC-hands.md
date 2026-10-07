@@ -74,7 +74,7 @@ Same contract as the voice helper ([SPEC-phase1.md](SPEC-phase1.md#process-model
 - **Camera space**: mirrored, so it reads like a mirror: moving your right hand to your right moves it right. The model runs on the raw camera frame, where MediaPipe's Tasks handedness is anatomical (a right hand is "Right"; flipping the frame would swap the label), and the tracker then mirrors the landmarks: image `x' = 1 - x`, world `x' = -x`. Normalized `x, y` in `[0, 1]`, origin top-left; `x` can stray slightly outside when a hand is cut by the frame edge.
 - **Pose space**: image landmarks as `(x, y * height / width, z)`, all in frame widths (MediaPipe's `z` uses roughly the scale of `x`). Pose features are ratios of distances here. World landmarks (metres) are kept for reference, but their depth is poor: on MediaPipe's OK-sign photo the world thumb-index distance is 4 to 7 cm with the tips touching.
 - **Desktop space**: physical pixels in Windows' virtual-screen coordinates. The helper makes itself per-monitor DPI aware (v2) before any other Windows call, so every rect and cursor position is in physical pixels, and monitors left of or above the primary have negative coordinates.
-- **Time**: seconds from `time.monotonic()`; the engine and executor take `now` as an argument so tests drive the clock.
+- **Time**: seconds from `jarvis_hands.clock.now` (`time.perf_counter`; on Windows, Python 3.12's `time.monotonic` moves in 15.6 ms steps, which would make 30 fps frame intervals read 31 or 47 ms). Frame times, gestures, filters and the executor all use it; the engine and executor take `now` as an argument so tests drive the clock. Plain timeouts may use `time.monotonic`.
 
 ## Hand data
 
@@ -88,7 +88,7 @@ class HandObservation:
 
 @dataclass(frozen=True)
 class Frame:
-    t: float                                # capture time, monotonic seconds
+    t: float                                # capture time, clock.now() seconds
     hands: tuple[HandObservation, ...]      # 0..2 hands
     width: int                              # camera frame size in pixels (for aspect)
     height: int
