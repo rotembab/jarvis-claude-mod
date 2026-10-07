@@ -10,7 +10,7 @@
 
 import type { Jarvis } from './app'
 import { delay, describeError } from './engine'
-import type { Verdict } from './guard'
+import type { Resolved, Verdict } from './guard'
 import { judge, rulesSnippet } from './guard'
 import { DESKTOP_TOOL, DesktopTool } from './desktop'
 import { actionLabel } from './hud'
@@ -287,7 +287,7 @@ export class PcControl {
   private async decide(call: GuardCall, ask: CallAsk, signal: AbortSignal | undefined): Promise<string | undefined> {
     // A cloud session runs nothing on the user's PC (and its platform is set before isLocal).
     if (this.app.platform !== undefined && !this.app.isLocal) return undefined
-    const verdict = judge(String(call.tool), call)
+    const verdict = await this.classify(call)
     switch (verdict.tier) {
       case 'pass':
         return undefined
@@ -308,6 +308,24 @@ export class PcControl {
       default:
         return await this.askOnScreen(guardQuestion(call, verdict), ask, signal, call.agentId)
     }
+  }
+
+  /**
+   * The guard's judgement. judge() is pure, so a `never` stands on its own, but a script run and a
+   * Write to an 8.3 short name leave a read for Jarvis: reads it (through the engine's file system,
+   * never the real clipboard or keys) and judges again. A read that fails leaves the call at screen.
+   */
+  private async classify(call: GuardCall): Promise<Verdict> {
+    const first = judge(String(call.tool), call)
+    if (first.tier === 'never' || first.needs === undefined || first.needs.length === 0) return first
+    const engine = this.app.engine
+    const resolved: Resolved = { scripts: {} }
+    const scripts = resolved.scripts as Record<string, string | null>
+    for (const need of first.needs) {
+      if (need.kind === 'script') scripts[need.path] = engine === undefined ? null : await engine.readFileText(need.path).catch(() => null)
+      else resolved.realPath = engine === undefined ? null : await engine.realPath(need.path).catch(() => null)
+    }
+    return judge(String(call.tool), call, resolved)
   }
 
   /**

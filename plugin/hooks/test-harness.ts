@@ -137,6 +137,10 @@ export type World = {
   existing: Set<string>
   /** Every path `$.fs.exists` was asked about. */
   checked: string[]
+  /** What `$.fs.read` returns per path (the guard reads a script it is about to run); a missing path rejects. */
+  fileText: Map<string, string>
+  /** What `$.fs.stat(path, { resolve: true })` resolves a path to (an 8.3 short name's real target); a missing path rejects. */
+  realPaths: Map<string, string>
   /** When set, `$.fs.write` fails (the hook beneath throws this). */
   writeError: string | undefined
   /** When set, `$.prompt.submit` answers `{ drop }` with it (a hook beneath refused). */
@@ -229,6 +233,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     state: new Map(),
     existing: new Set(installed ? [VENV_PYTHON] : []),
     checked: [],
+    fileText: new Map(),
+    realPaths: new Map(),
     writeError: undefined,
     submitDrop: undefined,
     exists: path => w.existing.has(path),
@@ -349,6 +355,16 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     if (w.writeError !== undefined) throw new Error(w.writeError)
     w.existing.add(windowsPath(e.path))
     return { value: undefined }
+  })
+  on('fs.read', ($, e) => {
+    const text = w.fileText.get(windowsPath(e.path))
+    if (text === undefined) throw new Error('ENOENT')
+    return { value: text }
+  })
+  on('fs.stat', ($, e) => {
+    const real = w.realPaths.get(windowsPath(e.path))
+    if (real === undefined) throw new Error('ENOENT')
+    return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: real } : {}) } }
   })
   on('process.run', async ($, e) => {
     const [command] = e.argv

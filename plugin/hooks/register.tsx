@@ -47,6 +47,22 @@ export const register: Register = (on, options) => {
       run: (argv, init) => $.process.run(argv, init),
       exists: path => $.fs.exists(path),
       writeFile: (path, text) => $.fs.write(path, text),
+      readFileText: path => $.fs.read(path).catch(() => null),
+      realPath: async path => {
+        // Where the path lands, so the guard judges the real file an 8.3 short name hides. The file
+        // itself when it stats; else its folder (a Write names a file not there yet) plus the name.
+        const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+        const name = path.slice(cut + 1)
+        const placeable = !/^[A-Za-z]:(?![\\/])/.test(path) && !/^[\\/][\\/]/.test(path) && !/^[A-Za-z]:/.test(name) && name !== '' && name !== '.' && name !== '..'
+        if (!placeable) return null
+        const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
+        if (own?.realPath !== undefined) return own.realPath
+        const folder = cut < 0 ? '.' : path.slice(0, cut + 1)
+        const dir = await $.fs.stat(folder, { resolve: true }).catch(() => undefined)
+        if (dir?.realPath === undefined) return null
+        const sep = dir.realPath.includes('\\') ? '\\' : '/'
+        return `${dir.realPath.replace(/[\\/]$/, '')}${sep}${name}`
+      },
       storeGet: key => $.store.get(key),
       storeSet: (key, value) => $.store.set(key, value),
       storeDelete: key => $.store.delete(key),

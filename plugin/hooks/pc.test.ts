@@ -180,6 +180,53 @@ describe('the guard hook', () => {
     expect(w.asked).toEqual([])
   })
 
+  test('a script file is read and judged before it runs; what it contains decides the tier', async ($, on) => {
+    const ran: string[] = []
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: '', stderr: '', interrupted: false } }
+    })
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    // A harmless script reads clean and runs with no question.
+    w.fileText.set('/home/rotem/build.sh', 'npm run build\necho done')
+    expect(await bash($, 'bash /home/rotem/build.sh')).toMatchObject({ result: { stdout: '' } })
+    expect(w.asked).toEqual([])
+    // A script that deletes files is held for a click.
+    w.fileText.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
+    expect(await bash($, 'bash /home/rotem/clean.sh')).toMatchObject({ result: { stdout: '' } })
+    expect(w.asked).toHaveLength(1)
+    // A script that runs a never-list command is blocked with no question.
+    w.fileText.set('/home/rotem/evil.sh', 'mkfs.ext4 /dev/sdb1')
+    expect(await bash($, 'bash /home/rotem/evil.sh')).toMatchObject({ deny: expect.stringMatching(/Jarvis blocks this/) })
+    // A script Jarvis cannot read is held for a click (it does not run unasked).
+    w.askAnswer = "Don't run it"
+    expect(await bash($, 'bash /home/rotem/missing.sh')).toEqual({ deny: DECLINED })
+    expect(ran).toEqual(['bash /home/rotem/build.sh', 'bash /home/rotem/clean.sh'])
+  })
+
+  test('an 8.3 short name is resolved to its real path before a Write is judged', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    // A short name whose stem names a settings file is blocked outright (no file system needed).
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\Rotem\\.claude\\SETTIN~1.JSO', content: '{}' })).toEqual({
+      deny: expect.stringMatching(/^Jarvis blocks this: it changes Claude Code's own permissions or plugins/),
+    })
+    // A short name whose stem looks innocent is resolved: if it lands on the settings file, it is blocked.
+    w.realPaths.set('C:\\Users\\Rotem\\AB1234~1.JSO', 'C:\\Users\\Rotem\\.claude\\settings.json')
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\Rotem\\AB1234~1.JSO', content: '{}' })).toEqual({
+      deny: expect.stringMatching(/^Jarvis blocks this/),
+    })
+    // One that resolves to an ordinary file runs with no question.
+    w.realPaths.set('C:\\Users\\Rotem\\NOTES~1.TXT', 'C:\\Users\\Rotem\\notes-of-mine.txt')
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\Rotem\\NOTES~1.TXT', content: 'x' })).toMatchObject({ result: 'ok' })
+    // One that cannot be resolved is held for a click, never run unasked.
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\Rotem\\GONE~1.TXT', content: 'x' })).toMatchObject({ result: 'ok' })
+    expect(w.asked).toHaveLength(1)
+  })
+
   test('a call abandoned while its question is open runs nothing, whatever is clicked later', { plugins: [INTERRUPTER] }, async ($, on) => {
     const ran: string[] = []
     on('tool.call', { tool: 'Bash' }, ($, e) => {

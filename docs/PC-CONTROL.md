@@ -6,16 +6,18 @@ Jarvis only ever makes Claude Code stricter. It never answers a permission decis
 
 ## The guard
 
-Every Bash, PowerShell and Monitor command Claude runs passes through Jarvis's guard first. Writes and edits are checked too, but only for Claude Code's own settings and Jarvis's secrets. The guard sorts each command into one of four tiers. When a command does several things, the strictest tier wins.
+Every Bash, PowerShell and Monitor command Claude runs passes through Jarvis's guard first. Writes and edits are checked too: for Claude Code's own settings, Jarvis's secrets, the rest of Claude Code's configuration (skills, agents, commands and hooks, and `.mcp.json`), and places a file runs on its own from (a Startup folder, a PowerShell `$PROFILE`, a Git hook, a scheduled-task folder). The guard sorts each command into one of four tiers. When a command does several things, the strictest tier wins.
+
+When a command runs a local script file (`& x.ps1`, `.\x`, `-File x.ps1`, `bash`/`sh`/`source x.sh`, `cmd /c x.bat`, `python x.py`, `node x.js`), Jarvis reads that file and judges its contents with the same rules, taking the strictest tier the file earns; a file it cannot read is screen tier. So writing a script and then running it cannot slip a never- or screen-tier action past the guard. A package manager's own scripts (`npm test`, `npm run build`) are not read, so they stay pass and Claude Code's own rules decide them.
 
 | Tier | What happens | Examples |
 | --- | --- | --- |
-| never | Blocked. Claude is told not to retry or work around it; you can still run it yourself. | `Set-MpPreference -DisableRealtimeMonitoring $true` (turns off Windows Defender), `Format-Volume -DriveLetter D`, `bcdedit /set safeboot minimal`, `vssadmin delete shadows /all`, `New-LocalUser bob`, SendKeys or `xdotool type` (types keystrokes into a window), `claude mcp add ...`, writing `~/.claude/settings.json` or Jarvis's credentials |
-| screen | A question on screen. Nothing runs until you click "Run it". | `Remove-Item -Recurse -Force $env:USERPROFILE\Downloads`, `git reset --hard`, `git push --force`, `Stop-Computer`, `logoff`, `Set-ItemProperty HKCU:\...`, `Restart-Service Spooler`, `schtasks /create ...`, `iwr ... \| iex`, `Start-Process powershell -Verb RunAs`, `Send-MailMessage`, `Set-ExecutionPolicy`, `icacls ... /grant`, `manage-bde -off C:` |
+| never | Blocked. Claude is told not to retry or work around it; you can still run it yourself. | `Set-MpPreference -DisableRealtimeMonitoring $true` (turns off Windows Defender), `Format-Volume -DriveLetter D`, `bcdedit /set safeboot minimal`, `vssadmin delete shadows /all`, `New-LocalUser bob`, SendKeys or `xdotool type` (types keystrokes into a window), `claude mcp add ...`, writing `~/.claude/settings.json` or Jarvis's credentials (its 8.3 short name, such as `.claude\SETTIN~1.JSO`, too) |
+| screen | A question on screen. Nothing runs until you click "Run it". | `Remove-Item -Recurse -Force $env:USERPROFILE\Downloads`, `git reset --hard`, `git push --force`, `Stop-Computer`, `logoff`, `Set-ItemProperty HKCU:\...`, `Restart-Service Spooler`, `schtasks /create ...`, `iwr ... \| iex`, `Start-Process powershell -Verb RunAs`, `Send-MailMessage`, `Set-ExecutionPolicy`, `icacls ... /grant`, `manage-bde -off C:`, writing a skill, agent, command, hook or `.mcp.json` under `.claude`, writing into a Startup folder, `$PROFILE` or `.git\hooks` |
 | voice | In a voice conversation, a spoken yes. Otherwise the same on-screen question. | `git push`, `gh pr create`, `npm publish`, `winget install Spotify.Spotify`, `npm install -g typescript`, `Stop-Process -Name notepad`, `Move-Item *.jpg ~\Pictures`, `Get-Clipboard` (or `cat /dev/clipboard` in Git Bash), `git diff --output=changes.diff`, `shutdown /h` (sleep), `curl.exe -X POST -d @notes.txt https://...` |
 | pass | Runs without a question from Jarvis. Claude Code's own rules still apply. | `Get-ChildItem`, `git status`, `npm test`, `New-Item notes.md`, `Rename-Item a.txt b.txt`, `Start-Process spotify` |
 
-Commands the guard cannot read are treated as screen tier, not pass: a command built at run time (`Invoke-Expression $s`, `bash $SCRIPT`), a hidden or encoded command, unbalanced quotes, a brace expansion too big to check, `cmd` with arguments it cannot place, or a PowerShell call whose input Jarvis does not recognise. If the guard itself fails, the command is refused.
+Commands the guard cannot read are treated as screen tier, not pass: a command built at run time (`Invoke-Expression $s`, `bash $SCRIPT`), a script file Jarvis cannot read, a hidden or encoded command, unbalanced quotes, a brace expansion too big to check, `cmd` with arguments it cannot place (or a program name hidden behind leading `=`, `,`, `;` or spaces, which the guard strips the way cmd.exe does), or a PowerShell call whose input Jarvis does not recognise. If the guard itself fails, the command is refused.
 
 The guard is off in cloud sessions, because nothing there runs on your PC.
 
@@ -58,6 +60,8 @@ Jarvis writes no settings. `/jarvis pc rules` prints a snippet built from the sa
 - There are **no allow rules**. Jarvis only makes Claude Code stricter, so it suggests nothing that would skip Claude Code's own dialog.
 - There are **no ask rules**. Jarvis asks for itself, and an ask rule would add a second dialog.
 - The **env line** turns on the PowerShell tool.
+
+The screen-tier protections (writing a skill, agent, command or hook under `.claude`, or into a Startup folder, `$PROFILE` or `.git\hooks`) get no rules here. A deny rule would block authoring them for good, and an ask rule is the very thing Jarvis does itself; so these apply only while Jarvis is running, and Claude Code's own rules are the backstop when it is not. The never-tier settings and credentials files still get deny rules.
 
 Its shape, shortened (`/jarvis pc rules` prints the full, current list):
 
