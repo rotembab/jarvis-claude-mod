@@ -23,9 +23,9 @@ import queue
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -60,6 +60,14 @@ _WAKE_PREFIX = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|a)\W+)?jarvis\b\W*", 
 
 def strip_wake_phrase(text: str) -> str:
     return _WAKE_PREFIX.sub("", text, count=1).strip()
+
+
+class HomeHandler(Protocol):
+    """What the daemon needs of home control (``jarvis_voice.home.HomeService``)."""
+
+    def handle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass
@@ -103,6 +111,7 @@ class Daemon:
         rescan_audio: Callable[[], None] | None = None,
         vad: VoiceDetector | None = None,
         wake_loader: Callable[[], WakeScorer] | None = None,
+        home_factory: Callable[[], HomeHandler] | None = None,
     ) -> None:
         self.config = config
         self._events = events
@@ -128,6 +137,11 @@ class Daemon:
         self._ready_sent = False
         self._awake = False  # the follow-up window is open
         self._wake_loader = wake_loader
+        # Home control is built on its first command, so a helper that never
+        # controls a device never loads its libraries.
+        self._home_factory = home_factory
+        self._home: HomeHandler | None = None
+        self._home_lock = threading.Lock()
 
         self._transcriber: Transcriber | None = None
         self._stt_error: SttError | None = None
@@ -247,6 +261,10 @@ class Daemon:
         close_synth = getattr(self._synth, "close", None)  # the local voice owns a child process
         if callable(close_synth):
             steps.insert(2, close_synth)
+        with self._home_lock:
+            home, self._home, self._home_factory = self._home, None, None
+        if home is not None:
+            steps.append(home.close)
         for step in steps:
             try:
                 step()
@@ -632,11 +650,22 @@ class Daemon:
                 return protocol.error_response("fish_key_missing", message)
             reply_id = self.pipeline.speak_now((body.get("text") or "").strip() or DEFAULT_TEST_LINE)
             return {"ok": True, "replyId": reply_id}
+        if name == "home":
+            return self._home_command(body)
         if name == "shutdown":
             # Answer first, then exit.
             threading.Timer(0.1, self.request_exit, args=(0,)).start()
             return {"ok": True}
         return protocol.error_response("bad_request", f"unknown command {name!r}")
+
+    def _home_command(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._home_lock:
+            if self._home is None and self._home_factory is not None:
+                self._home = self._home_factory()
+            home = self._home
+        if home is None:
+            return protocol.error_response("bad_request", "home control is not available in this helper")
+        return home.handle(body)
 
     def _apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
         """Apply every valid field; a bad pttKey is reported but does not void the rest."""

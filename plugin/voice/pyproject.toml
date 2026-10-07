@@ -75,4 +75,4 @@ ignore = ["SIM105", "RUF001", "RUF002", "RUF003", "N818"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["jarvis_voice"]
-known-local-folder = ["conftest", "fakes", "fish_fake"]
+known-local-folder = ["conftest", "fakes", "fish_fake", "home_fakes"]
