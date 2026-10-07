@@ -2,12 +2,16 @@
 
 Two steps: a homography ``H`` takes the anchor (mirrored, normalized camera
 coordinates) to the unit square, either the default box from the settings or
-a calibrated one; the unit square then spans the bounding rect of the chosen
-displays, as Windows arranges them, so a projector set up to the right of the
-monitor is reached by moving the hand right. Displays of different sizes
-leave gaps in that rect, so the point is clamped into the nearest chosen
-display; overshooting the box therefore pins the cursor to screen edges and
-corners, which is how the taskbar and the corners are reached.
+a calibrated one; the unit square then spans the chosen displays as Windows
+arranges them, so a projector set up to the right of the monitor is reached
+by moving the hand right. The x and y spans that no chosen display covers are
+taken out first: a display left out between two chosen ones (a virtual
+display Windows put between the monitor and the projector, or a ``display``
+choice that skips one) costs no share of the hand's range, and the cursor
+goes straight from one chosen display's edge to the next one's. Displays of
+different sizes still leave gaps, so the point is clamped into the nearest
+chosen display; overshooting the box therefore pins the cursor to screen
+edges and corners, which is how the taskbar and the corners are reached.
 
 The runtime changes displays, selection and calibration from the control
 server's thread while the engine thread maps, so one lock guards the state
@@ -17,6 +21,8 @@ and every method works on a consistent snapshot.
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -77,6 +83,69 @@ def display_in_direction(displays: list[Display], origin: Display, direction: Di
     return min(candidates, key=lambda c: c[2])[3]
 
 
+@dataclass(frozen=True)
+class _Axis:
+    """One axis of the used displays with the spans no display covers taken out.
+
+    ``spans`` are the merged ``[start, end)`` desktop intervals the displays
+    cover, ascending; laid end to end they make the compact axis, which runs
+    from 0 to ``length``.
+    """
+
+    spans: tuple[tuple[float, float], ...]
+
+    @staticmethod
+    def covering(intervals: Iterable[tuple[float, float]]) -> _Axis:
+        merged: list[tuple[float, float]] = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return _Axis(tuple(merged) or ((0.0, 1.0),))
+
+    @property
+    def length(self) -> float:
+        return sum(end - start for start, end in self.spans)
+
+    def to_desktop(self, c: float) -> float:
+        """The desktop coordinate of compact coordinate ``c``; beyond either end it runs on from that end."""
+        offset = 0.0
+        for start, end in self.spans:
+            if c < offset + (end - start):
+                return start + (c - offset)
+            offset += end - start
+        return self.spans[-1][1] + (c - offset)
+
+
+@dataclass(frozen=True)
+class _Layout:
+    """The used displays and their compact layout: one immutable snapshot for a mapping call."""
+
+    used: list[Display]
+    xs: _Axis
+    ys: _Axis
+    #: Top-left at the used displays' bounding rect, the compact layout's size.
+    region: Rect
+
+    @staticmethod
+    def of(used: list[Display]) -> _Layout:
+        if not used:
+            return _Layout([], _Axis(((0.0, 1.0),)), _Axis(((0.0, 1.0),)), Rect(0, 0, 1, 1))
+        xs = _Axis.covering((d.rect.left, d.rect.right) for d in used)
+        ys = _Axis.covering((d.rect.top, d.rect.bottom) for d in used)
+        box = bounding_rect([d.rect for d in used])
+        return _Layout(list(used), xs, ys, Rect(box.x, box.y, xs.length, ys.length))
+
+    def desktop_point(self, uv: Point) -> Point:
+        """Unit-square coordinates through the compact layout to desktop pixels, clamped into the nearest display."""
+        p = Point(self.xs.to_desktop(uv.x * self.xs.length), self.ys.to_desktop(uv.y * self.ys.length))
+        return _clamp_into(p, self.used)
+
+    def region_point(self, uv: Point) -> Point:
+        return Point(self.region.x + uv.x * self.region.width, self.region.y + uv.y * self.region.height)
+
+
 class ScreenMapper:
     def __init__(self, displays: list[Display], settings: HandsSettings, homography: np.ndarray | None = None) -> None:
         self._lock = threading.Lock()
@@ -85,8 +154,7 @@ class ScreenMapper:
         self._selection: DisplaySelection = settings.displays
         self._homography: np.ndarray | None = None
         self._h = box_homography(*settings.box)
-        self._used: list[Display] = []
-        self._region = Rect(0, 0, 1, 1)
+        self._layout = _Layout.of([])
         self._set_homography(homography)
         self._recompute()
 
@@ -119,11 +187,7 @@ class ScreenMapper:
         self._h = matrix
 
     def _recompute(self) -> None:
-        self._used = select_displays(self._displays, self._selection)
-        if self._used:
-            self._region = bounding_rect([d.rect for d in self._used])
-        else:
-            self._region = Rect(0, 0, 1, 1)
+        self._layout = _Layout.of(select_displays(self._displays, self._selection))
 
     # -- state ------------------------------------------------------------------------
 
@@ -135,12 +199,13 @@ class ScreenMapper:
     @property
     def used(self) -> list[Display]:
         with self._lock:
-            return list(self._used)
+            return list(self._layout.used)
 
     @property
     def region(self) -> Rect:
+        """What the unit square spans: the used displays' layout with the spans none of them covers taken out."""
         with self._lock:
-            return self._region
+            return self._layout.region
 
     @property
     def calibrated(self) -> bool:
@@ -162,33 +227,33 @@ class ScreenMapper:
         return apply_homography(h, anchor)
 
     def to_region(self, anchor: Point) -> Point:
-        """Desktop pixels of a camera point in the region, NOT clamped to the displays.
+        """Pixels of a camera point in the region, NOT clamped to the displays.
 
         For relative motion (scrolling, throw speed), which must keep counting
-        when the hand overshoots an edge.
+        when the hand overshoots an edge. In the region's compact layout, so it
+        moves as many pixels as the cursor does on a display and never jumps
+        where a left-out display was.
         """
         with self._lock:
-            h, region = self._h, self._region
-        uv = apply_homography(h, anchor)
-        return Point(region.x + uv.x * region.width, region.y + uv.y * region.height)
+            h, layout = self._h, self._layout
+        return layout.region_point(apply_homography(h, anchor))
 
     def to_desktop(self, anchor: Point) -> Point:
         """Desktop pixels of a camera point, clamped into the nearest used display."""
         with self._lock:
-            h, region, used = self._h, self._region, self._used
-        uv = apply_homography(h, anchor)
-        return _clamp_into(Point(region.x + uv.x * region.width, region.y + uv.y * region.height), used)
+            h, layout = self._h, self._layout
+        return layout.desktop_point(apply_homography(h, anchor))
 
     def target_point(self, u: float, v: float) -> Point:
-        """Desktop pixels of unit-square coordinates in the region, clamped like ``to_desktop``."""
+        """Desktop pixels of unit-square coordinates, clamped like ``to_desktop``."""
         with self._lock:
-            region, used = self._region, self._used
-        return _clamp_into(Point(region.x + u * region.width, region.y + v * region.height), used)
+            layout = self._layout
+        return layout.desktop_point(Point(u, v))
 
     def display_at(self, p: Point) -> Display:
         """The used display containing ``p``, else the nearest used one."""
         with self._lock:
-            used = self._used
+            used = self._layout.used
         if not used:
             raise LookupError("no displays")
         return _nearest(p, used)

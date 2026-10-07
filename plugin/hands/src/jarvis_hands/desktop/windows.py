@@ -39,7 +39,14 @@ Why it is built this way:
   and a window's rect right after a restore. A move waits (a few
   milliseconds at most) until the cursor has left its old spot, and a
   restore, which like every show command is only queued to the app, waits up
-  to a quarter of a second for the window to leave the maximized state.
+  to a quarter of a second for the window to leave the maximized state. When
+  the cursor cannot get there at all (another app has it confined with
+  ClipCursor, or the target is in a gap between monitors and clamps back to
+  where the cursor already is) the wait would burn its whole budget on every
+  move, 120 times a second. So after a wait that ran out, moves from that
+  same spot wait half a millisecond instead of four: still long enough to
+  read a freed cursor's next move where it went, which skipping the wait
+  would not (the executor would take that stale read for the user's mouse).
 
 Every module-level name imports on any OS; the DLLs are loaded on first use,
 on Windows only, with a prototype for every function called (the default
@@ -107,10 +114,9 @@ DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1
 DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2
 DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED = 16
 DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL = 17
-#: Output technologies of indirect display drivers: virtual displays, streaming dummies (and USB display adapters).
-VIRTUAL_OUTPUT_TECHNOLOGIES = frozenset(
-    {DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL}
-)
+#: Output technologies that are virtual displays (streaming dummies, virtual display drivers). Not INDIRECT_WIRED:
+#: that is a physical screen on a USB display adapter or a DisplayLink dock, which may well be the projector.
+VIRTUAL_OUTPUT_TECHNOLOGIES = frozenset({DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL})
 #: An adapter or monitor whose name contains one of these is virtual. "Virtual Display Driver" and most others
 #: say so; older builds of it kept the name of Microsoft's sample driver, and often report HDMI as their output.
 VIRTUAL_NAME_HINTS = ("virtual", "iddsampledriver")
@@ -172,6 +178,9 @@ SHELL_WINDOW_CLASSES = frozenset(
 MAX_BORDER_PX = 64
 #: How long a move waits for the cursor to leave its old spot.
 MOVE_SETTLE_S = 0.004
+#: How long a move waits instead while the cursor is still where a whole wait ran out (confined, or clamped back
+#: to where it was): the executor moves 120 times a second, so this costs about 6% of a core rather than half.
+STUCK_SETTLE_S = 0.0005
 #: How long a restore waits for the window to leave the maximized (or minimized) state.
 RESTORE_WAIT_S = 0.25
 #: Per-window UIPI verdicts kept before the cache starts over.
@@ -444,8 +453,9 @@ def build_displays(
     would not say. A display is named after its monitors (the device name
     when they have none; two displays with one name get their device name
     added) and is virtual when its adapter's name says so, or when every
-    monitor showing it is virtual (an indirect output, or a name that says
-    so): a source duplicated onto one real monitor is still visible.
+    monitor showing it is virtual (an indirect virtual output, or a name that
+    says so): a source duplicated onto one real monitor is still visible. A
+    screen on a USB display adapter (an indirect wired output) is real.
     """
     targets_by_key = {_device_key(k): list(v) for k, v in targets.items()}
     adapters_by_key = {_device_key(k): v for k, v in adapters.items()}
@@ -786,6 +796,9 @@ class WindowsDesktop(Desktop):
         #: The display-config lookups that failed last time (warned about once, until they work again).
         self._names_failing: set[str] = set()
         self._awake_thread: int | None = None
+        #: Where the cursor stayed after a move's whole wait ran out, until it is seen anywhere else. A plain
+        #: attribute: the executor's thread is the one that moves the cursor, and a lost update costs one wait.
+        self._stuck_at: tuple[int, int] | None = None
         log.info(
             "Windows desktop: DPI awareness %s, integrity %s, pid %d",
             self.dpi_awareness,
@@ -999,13 +1012,31 @@ class WindowsDesktop(Desktop):
         The executor reads the cursor right after a move to learn where Windows
         put it; if the injected move were still queued it would read the old
         spot, and then take our own move for the user's hand on the mouse.
+
+        A cursor that cannot get there never leaves ``before``, and polling that
+        out would cost the whole budget on every move. So once a wait has run
+        out, a move from that same spot waits STUCK_SETTLE_S only: enough for a
+        move Windows applies at once when the cursor is free again, whose stale
+        read-back the executor would take for the user's mouse. The cursor seen
+        anywhere else, after a move or before one, ends the spell.
         """
-        deadline = clock_now() + MOVE_SETTLE_S
-        while clock_now() < deadline:
+        stuck = before == self._stuck_at
+        deadline = clock_now() + (STUCK_SETTLE_S if stuck else MOVE_SETTLE_S)
+        while True:
             now = self._cursor_or_none()
             if now is None or now != before:
+                self._stuck_at = None
                 return
+            if clock_now() >= deadline:
+                break
             time.sleep(0)
+        if not stuck:  # said once per spell, not 120 times a second
+            self._stuck_at = before
+            log.info(
+                "the cursor stayed at (%d, %d) after a move; while it is there, moves wait %g ms for it",
+                *before,
+                STUCK_SETTLE_S * 1000,
+            )
 
     def _send(self, events: list[tuple[int, int, int, int]]) -> None:
         """One SendInput call of mouse events ``(flags, dx, dy, mouseData)``: Windows inserts them back to back.

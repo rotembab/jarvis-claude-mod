@@ -19,17 +19,38 @@ Why it is built this way (OpenCV 5.0's backends, read from their source):
   some UVC webcams fail every MSMF grab (format negotiation, MJPG decoding)
   and stream fine on DirectShow. A reopen tries the backend that last
   streamed first, so such a webcam does not wait out MSMF again.
+- The two backends count devices in different lists, so the camera is looked
+  up by device before DirectShow opens it: DirectShow walks the monikers of
+  CLSID_VideoInputDeviceCategory, which also holds filter-based virtual
+  cameras (OBS Virtual Camera and the like) that MFEnumDeviceSources does not
+  list, so the same number can be another device. Media Foundation's symbolic
+  link and DirectShow's DevicePath name the same device interface, which is
+  what they are matched on (a friendly name only one of them has will do);
+  when neither tells them apart, DirectShow is skipped rather than opening
+  something else and calling it the user's camera.
 - ``isOpened()`` stays True after an unplug on both backends, and an MSMF read
   on a busy or vanished device blocks up to 10 s, so health comes from reads
   alone: about 2 s without a frame releases and reopens the device with
   backoff, and when that keeps failing ``read()`` raises ``camera_lost``.
+  Every later read raises too, and so does a read that was waiting when the
+  reader gave up: a read that returned None would look like a slow camera and
+  the caller would wait for frames that are not coming.
 - Windows privacy settings let the camera be listed but not opened; another
   app holding it lets it open but sends no frames on any backend. That is how
   ``camera_blocked`` and ``camera_in_use`` are told apart.
 - Frames are stamped with ``clock.now()`` (``perf_counter``), the clock the
   engine's filters run on; deadlines inside this module use ``monotonic``.
-- ``list_cameras`` asks Media Foundation directly (ctypes, no pywin32), the
-  same enumeration OpenCV's MSMF backend uses, so its indices are CAP_MSMF's.
+- ``list_mf_devices`` asks Media Foundation directly (ctypes, no pywin32),
+  the same enumeration OpenCV's MSMF backend uses, so its indices are
+  CAP_MSMF's; ``list_dshow_devices`` walks DirectShow's own device monikers
+  the way OpenCV's ``videoInput::getDevice`` does. The camera is the device
+  Media Foundation listed at that number; a reopen keeps matching that
+  device (or the one now at that number) against DirectShow's list, so an
+  unplugged webcam is never replaced by the filter camera that moved up to
+  its DirectShow number. DirectShow is opened by its own number only while
+  Media Foundation has never answered (a Windows N install has none); once
+  it has, a camera it does not list is not opened on DirectShow at all, and
+  neither is one DirectShow's list does not tell apart.
 """
 
 from __future__ import annotations
@@ -130,6 +151,15 @@ def msmf_params(width: int, height: int, fps: int) -> list[int]:
 # --------------------------------------------------------------------------- pure helpers
 
 
+def _named(devices: Sequence[MfDevice]) -> list[tuple[int, str]]:
+    """``(index, name)`` of each device, the form the name resolution and the hints work on."""
+    return [(d.index, d.name) for d in devices]
+
+
+def _at(devices: Sequence[MfDevice], index: int) -> MfDevice | None:
+    return next((d for d in devices if d.index == index), None)
+
+
 def cameras_hint(cameras: Sequence[tuple[int, str]]) -> str:
     listed = ", ".join(f"{index} {name!r}" for index, name in cameras)
     return f"Cameras found: {listed}. Choose one by its number or part of its name."
@@ -160,6 +190,61 @@ def resolve_camera(spec: str | None, cameras: Sequence[tuple[int, str]]) -> int:
     if cameras:
         raise CameraError("no_camera", f"No camera's name contains {text!r}.", cameras_hint(cameras))
     raise CameraError("no_camera", f"No camera named {text!r} was found.", plat.no_camera_hint())
+
+
+@dataclass(frozen=True)
+class MfDevice:
+    """One video capture device as Media Foundation lists it; ``index`` is CAP_MSMF's."""
+
+    index: int
+    name: str
+    #: MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK: the device interface path it streams from,
+    #: None when Media Foundation would not say.
+    link: str | None = None
+
+
+@dataclass(frozen=True)
+class DshowDevice:
+    """One video input device as DirectShow's moniker enumeration lists it; ``index`` is CAP_DSHOW's."""
+
+    index: int
+    name: str
+    #: The moniker's DevicePath property: the same device interface path, under another interface class.
+    path: str | None = None
+
+
+def device_instance(path: str | None) -> str | None:
+    r"""The part of a device interface path that names the device itself, or None when there is none.
+
+    A path is ``\\?\usb#vid_2bdf&pid_0287&mi_00#7&1e3b1b2&0&0000#{<interface class>}\global``. Media
+    Foundation's symbolic link and DirectShow's DevicePath are two interfaces of one device, so their class
+    GUIDs differ while everything before them is the same.
+    """
+    if not path:
+        return None
+    text = path.strip().lower()
+    for prefix in ("\\\\?\\", "\\\\.\\"):
+        text = text.removeprefix(prefix)
+    return text.split("#{", 1)[0].rstrip("\\") or None
+
+
+def dshow_position(device: MfDevice, dshow: Sequence[DshowDevice]) -> int | None:
+    """Where DirectShow counts ``device``, or None when nothing tells it apart from the others.
+
+    Its own interface path first, then a friendly name only one DirectShow
+    device has. None means DirectShow must not be opened for this camera:
+    its numbering holds devices Media Foundation never listed.
+    """
+    wanted = device_instance(device.link)
+    if wanted is not None:
+        same = [d.index for d in dshow if device_instance(d.path) == wanted]
+        if len(same) == 1:
+            return same[0]
+        if same:
+            return None  # two monikers for one device: nothing to choose between them
+    named = device.name.strip().casefold()
+    by_name = [d.index for d in dshow if d.name.strip().casefold() == named] if named else []
+    return by_name[0] if len(by_name) == 1 else None
 
 
 def as_bgr(image: Any) -> np.ndarray | None:
@@ -210,8 +295,14 @@ class _Session:
 
     index: int
     name: str
-    cameras: list[tuple[int, str]]
+    #: What Media Foundation listed when the session started, refreshed on a reopen ([] when it would not say).
+    devices: list[MfDevice]
     meter: FrameRate
+    #: The camera as Media Foundation listed it, what DirectShow's list is matched against; None when it was not
+    #: listed. Kept across a reopen that finds nothing at the camera's number (an unplugged webcam).
+    device: MfDevice | None = None
+    #: Whether Media Foundation has answered in this session: until it has, DirectShow's numbering is all there is.
+    mf_answered: bool = False
     cond: threading.Condition = field(default_factory=threading.Condition)
     stop: threading.Event = field(default_factory=threading.Event)
     #: opening <-> starting (a backend opened; waiting for its first picture) -> streaming <-> reopening;
@@ -255,6 +346,7 @@ class OpenCVCamera:
         reopen_delays: Sequence[float] = DEFAULT_REOPEN_DELAYS_S,
         fps_window: float = DEFAULT_FPS_WINDOW_S,
         join_timeout: float = DEFAULT_JOIN_TIMEOUT_S,
+        dshow_devices: Callable[[], Sequence[DshowDevice]] | None = None,
     ) -> None:
         if width <= 0 or height <= 0 or fps <= 0:
             raise ValueError(f"camera size and rate must be positive, got {width} x {height} at {fps}")
@@ -265,6 +357,8 @@ class OpenCVCamera:
         if unknown or not self.backends:
             raise ValueError(f"unknown camera backends {unknown or self.backends}")
         self._factory: CaptureFactory = capture_factory or open_capture
+        #: DirectShow's own device list, for mapping the camera's Media Foundation index onto it.
+        self._dshow_devices = dshow_devices
         self.open_timeout = open_timeout
         self.first_frame_timeout = first_frame_timeout
         self.lost_after = lost_after
@@ -285,10 +379,18 @@ class OpenCVCamera:
                 self._session = None
                 self._stop(current)
             # Resolved here, so a name that matches nothing fails at once on the caller's thread.
-            cameras = list_cameras()
-            index = resolve_camera(self.spec, cameras)
-            name = dict(cameras).get(index, f"camera {index}")
-            session = _Session(index=index, name=name, cameras=cameras, meter=FrameRate(self.fps_window))
+            listing = list_mf_devices()
+            devices = listing or []
+            index = resolve_camera(self.spec, _named(devices))
+            device = _at(devices, index)
+            session = _Session(
+                index=index,
+                name=device.name if device is not None else f"camera {index}",
+                devices=devices,
+                meter=FrameRate(self.fps_window),
+                device=device,
+                mf_answered=listing is not None,
+            )
             session.thread = threading.Thread(target=self._run, args=(session,), name="jarvis-camera", daemon=True)
             self._session = session
             session.thread.start()
@@ -324,9 +426,10 @@ class OpenCVCamera:
                 if frame is not None and frame.seq > session.returned:
                     session.returned = frame.seq
                     return frame
-                if session.state == "lost" and session.error is not None:
-                    raise _copy(session.error)
-                if session.state in ("stopped", "failed", "lost"):
+                if session.state in ("failed", "lost"):
+                    # The reader has given up: say why, every time, instead of looking like a slow camera.
+                    raise self._gave_up(session)
+                if session.state == "stopped":  # closed: not an error
                     return None
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -408,6 +511,12 @@ class OpenCVCamera:
             if thread.is_alive():
                 log.warning("the camera is still busy in a read; it is released as soon as that read returns")
 
+    def _gave_up(self, s: _Session) -> CameraError:
+        """Why the reader stopped: the error it ended with (its code and hint), else a plain ``camera_lost``."""
+        if s.error is not None:
+            return _copy(s.error)
+        return CameraError("camera_lost", f"{s.name} stopped sending pictures.", LOST_HINT)
+
     def _no_picture(self, s: _Session) -> CameraError:
         tried = f" on {' or '.join(s.silent)}" if s.silent else ""
         return CameraError(
@@ -421,7 +530,7 @@ class OpenCVCamera:
     def _run(self, s: _Session) -> None:
         cap: Capture | None = None
         try:
-            started = self._start_device(s, s.index, self.backends, announce=True)
+            started = self._start_device(s, s.index, s.device, self.backends, announce=True)
             if started is None:
                 if not s.stop.is_set():
                     # Opened somewhere but never a picture: something else has the camera.
@@ -484,9 +593,14 @@ class OpenCVCamera:
             s.cond.notify_all()
 
     def _start_device(
-        self, s: _Session, index: int, order: Sequence[str], *, announce: bool = False
+        self, s: _Session, index: int, device: MfDevice | None, order: Sequence[str], *, announce: bool = False
     ) -> tuple[Capture, str] | None:
         """Camera ``index`` on the first backend in ``order`` that opens it and sends a picture.
+
+        ``index`` is Media Foundation's and ``device`` what it listed there;
+        each backend is asked for the device where that backend counts it,
+        and a backend that cannot be told which device that is (see
+        ``_device_index``) is skipped.
 
         Returns the capture and its BACKENDS key, with that first picture
         published; None when no backend got that far (``s.silent`` then lists
@@ -499,9 +613,12 @@ class OpenCVCamera:
         for key in order:
             if s.stop.is_set():
                 return None
+            at = self._device_index(s, index, device, key)
+            if at is None:
+                continue
             if announce:
                 self._set_state(s, "opening")
-            cap = self._open_backend(s, index, key)
+            cap = self._open_backend(s, at, key)
             if cap is None:
                 continue
             if announce:
@@ -517,6 +634,41 @@ class OpenCVCamera:
                 s.silent.append(key)
             log.info("camera %d opened with %s but sent no picture within %g s", index, key, self.first_frame_timeout)
         return None
+
+    def _device_index(self, s: _Session, index: int, device: MfDevice | None, backend: str) -> int | None:
+        """Where ``backend`` counts the camera, or None when it must be skipped.
+
+        Only DirectShow counts differently: its list also holds filter-based
+        virtual cameras Media Foundation never listed, so ``device`` is looked
+        up in it. With no device to look up, DirectShow's own numbering is
+        used only while Media Foundation has never answered (a Windows N
+        install has none): once it has, a camera it does not list is not there
+        (unplugged, or a number past its list), and whatever DirectShow counts
+        at that number is some other device, typically a filter camera such
+        as OBS Virtual Camera that "streams" a placeholder picture.
+        """
+        if backend != "dshow":
+            return index
+        if device is None:
+            if s.mf_answered:
+                log.info("not trying DirectShow for camera %d: Media Foundation does not list it", index)
+                return None
+            return index
+        at = dshow_position(device, self._dshow_list())
+        if at is None:
+            log.info("not trying DirectShow for %s: DirectShow's device list does not say which device it is", s.name)
+        elif at != index:
+            log.info("%s is camera %d for Media Foundation and camera %d for DirectShow", s.name, index, at)
+        return at
+
+    def _dshow_list(self) -> list[DshowDevice]:
+        """DirectShow's devices; [] when they cannot be listed, which means DirectShow is skipped."""
+        lister = self._dshow_devices or list_dshow_devices
+        try:
+            return list(lister())
+        except Exception as exc:  # noqa: BLE001 - a listing we only use to choose a device: never fatal
+            log.warning("could not list the DirectShow cameras: %s", exc)
+            return []
 
     def _open_backend(self, s: _Session, index: int, backend: str) -> Capture | None:
         """Camera ``index`` opened and configured on ``backend``; None when it does not open."""
@@ -621,17 +773,26 @@ class OpenCVCamera:
         for attempt, delay in enumerate(self.reopen_delays, 1):
             if s.stop.wait(delay):
                 return None
-            index = s.index
-            if names_a_camera(self.spec):
-                # Indices shift when devices come and go; a camera chosen by name is looked up again.
-                try:
-                    index = resolve_camera(self.spec, list_cameras())
-                except CameraError:
-                    log.info("reopen %d: no camera matches %r yet", attempt, self.spec)
-                    continue
+            index, device = s.index, s.device
+            # Indices shift when devices come and go. When Media Foundation will not say this time, the camera
+            # is still the device it listed before.
+            listing = list_mf_devices()
+            if listing is not None:
+                with s.cond:
+                    s.devices, s.mf_answered = listing, True
+                if names_a_camera(self.spec):
+                    # A camera chosen by name is looked up again, in case its index moved.
+                    try:
+                        index = resolve_camera(self.spec, _named(listing))
+                    except CameraError:
+                        log.info("reopen %d: no camera matches %r yet", attempt, self.spec)
+                        continue
+                # What Media Foundation now lists at that number, which is what MSMF opens; with nothing there
+                # (the webcam is unplugged) DirectShow still looks only for the camera it was.
+                device = _at(listing, index) or device
             # The backend that streamed before goes first: a webcam MSMF cannot read is not waited out again.
             order = sorted(self.backends, key=lambda backend: backend != s.streamed_on)
-            started = self._start_device(s, index, order)
+            started = self._start_device(s, index, device, order)
             if started is None:
                 if s.silent:
                     log.info("reopen %d: the camera opened on %s but sent no picture", attempt, " and ".join(s.silent))
@@ -641,15 +802,18 @@ class OpenCVCamera:
             cap, key = started
             with s.cond:
                 s.index, s.backend, s.streamed_on = index, self._backend_name(cap, key), key
+                if device is not None:
+                    s.device, s.name = device, device.name
             log.info("%s reopened on %s", s.name, key)
             return cap
         return None
 
     def _open_error(self, s: _Session) -> CameraError:
         """Why no backend opened the camera, as well as it can be told."""
-        if s.cameras and s.index not in dict(s.cameras):
+        cameras = _named(s.devices)
+        if cameras and s.index not in dict(cameras):
             return CameraError(
-                "no_camera", f"There is no camera {s.index}; {len(s.cameras)} found.", cameras_hint(s.cameras)
+                "no_camera", f"There is no camera {s.index}; {len(cameras)} found.", cameras_hint(cameras)
             )
         try:
             denied = plat.camera_access_denied()
@@ -660,7 +824,7 @@ class OpenCVCamera:
             return CameraError(
                 "camera_blocked", "The camera is turned off in the privacy settings.", plat.camera_blocked_hint()
             )
-        if s.cameras:
+        if cameras:
             # Listed but no backend could open it: what Windows does when privacy settings block desktop apps.
             return CameraError("camera_blocked", f"{s.name} is there but would not open.", plat.camera_blocked_hint())
         return CameraError("no_camera", "No camera found.", plat.no_camera_hint())
@@ -669,15 +833,25 @@ class OpenCVCamera:
 # --------------------------------------------------------------------------- listing cameras (Windows)
 
 
-def list_cameras() -> list[tuple[int, str]]:
-    """(index, name) of the video capture devices Media Foundation lists, in CAP_MSMF order; [] elsewhere."""
+def list_mf_devices() -> list[MfDevice] | None:
+    """The video capture devices Media Foundation lists, in CAP_MSMF order; None elsewhere or when it won't say.
+
+    None and [] differ: [] is Media Foundation saying there is no camera, so
+    DirectShow is not opened at a number it does not list; None leaves
+    DirectShow's own numbering as all there is.
+    """
     if sys.platform != "win32":
-        return []
+        return None
     try:
         return enumerate_msmf(_load_media_foundation())
     except Exception as exc:  # noqa: BLE001 - no Media Foundation (Windows N), COM trouble: just no names
         log.warning("could not list the cameras: %s", exc)
-        return []
+        return None
+
+
+def list_cameras() -> list[tuple[int, str]]:
+    """(index, name) of the video capture devices Media Foundation lists, in CAP_MSMF order; [] elsewhere."""
+    return _named(list_mf_devices() or [])
 
 
 class GUID(ctypes.Structure):
@@ -697,6 +871,7 @@ class GUID(ctypes.Structure):
 MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE = GUID.parse("c60ac5fe-252a-478f-a0ef-bc8fa5f7cad3")
 MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID = GUID.parse("8ac3587a-4ae7-42d8-99e0-0a6013eef90f")
 MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME = GUID.parse("60d0e559-52f8-4fa2-bbce-acdb34a8ec01")
+MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK = GUID.parse("58f0aad8-22bf-4f8a-bb3d-d2c4978c6e2f")
 
 MF_VERSION = 0x00020070  # MF_SDK_VERSION << 16 | MF_API_VERSION
 MFSTARTUP_LITE = 0x1  # no sockets: we only enumerate
@@ -767,14 +942,16 @@ def _check(hr: int, what: str) -> None:
         raise OSError(f"{what} failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
 
 
-def _com_method(api: MediaFoundation, this: int, slot: int, restype: Any, *argtypes: Any) -> Callable[..., Any]:
+def _com_method(
+    api: MediaFoundation | DirectShow, this: int, slot: int, restype: Any, *argtypes: Any
+) -> Callable[..., Any]:
     """Method ``slot`` of the COM object at address ``this``, bound to it."""
     vtable = ctypes.cast(this, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
     function = api.functype(restype, ctypes.c_void_p, *argtypes)(vtable[slot])
     return lambda *args: function(this, *args)
 
 
-def _com_release(api: MediaFoundation, this: int) -> None:
+def _com_release(api: MediaFoundation | DirectShow, this: int) -> None:
     _com_method(api, this, SLOT_RELEASE, ctypes.c_uint32)()
 
 
@@ -797,7 +974,7 @@ def _allocated_string(api: MediaFoundation, this: int, key: GUID) -> str | None:
         api.co_task_mem_free(text.value)
 
 
-def enumerate_msmf(api: MediaFoundation) -> list[tuple[int, str]]:
+def enumerate_msmf(api: MediaFoundation) -> list[MfDevice]:
     """MFEnumDeviceSources for video capture devices, the call OpenCV's MSMF backend makes. Raises OSError."""
     hr = api.co_initialize_ex(None, COINIT_MULTITHREADED)
     if hr < 0 and hr != RPC_E_CHANGED_MODE:
@@ -813,7 +990,7 @@ def enumerate_msmf(api: MediaFoundation) -> list[tuple[int, str]]:
             api.co_uninitialize()
 
 
-def _enumerate_sources(api: MediaFoundation) -> list[tuple[int, str]]:
+def _enumerate_sources(api: MediaFoundation) -> list[MfDevice]:
     attributes = ctypes.c_void_p()
     _check(api.mf_create_attributes(ctypes.byref(attributes), 1), "MFCreateAttributes")
     if not attributes.value:
@@ -839,8 +1016,12 @@ def _enumerate_sources(api: MediaFoundation) -> list[tuple[int, str]]:
         try:
             cameras = []
             for index, activate in enumerate(activates):
-                name = _allocated_string(api, activate, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME) if activate else None
-                cameras.append((index, name or f"camera {index}"))
+                name = link = None
+                if activate:
+                    name = _allocated_string(api, activate, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)
+                    # The device interface this source streams from: what the DirectShow mapping matches on.
+                    link = _allocated_string(api, activate, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK)
+                cameras.append(MfDevice(index, name or f"camera {index}", link))
             return cameras
         finally:
             for activate in activates:
@@ -849,3 +1030,213 @@ def _enumerate_sources(api: MediaFoundation) -> list[tuple[int, str]]:
             api.co_task_mem_free(ctypes.cast(devices, ctypes.c_void_p).value)
     finally:
         _com_release(api, attributes.value)
+
+
+# --------------------------------------------------------------------------- listing DirectShow devices (Windows)
+
+CLSID_SYSTEM_DEVICE_ENUM = GUID.parse("62be5d10-60eb-11d0-bd3b-00a0c911ce86")
+IID_CREATE_DEV_ENUM = GUID.parse("29840822-5b84-11d0-bd3b-00a0c911ce86")
+CLSID_VIDEO_INPUT_DEVICE_CATEGORY = GUID.parse("860bb310-5d01-11d0-bd3b-00a0c911ce86")
+IID_PROPERTY_BAG = GUID.parse("55272a00-42cb-11ce-8135-00aa004bb851")
+
+CLSCTX_INPROC_SERVER = 0x1
+VT_BSTR = 8
+#: Devices past this are not even reachable through OpenCV's DirectShow backend (VI_MAX_CAMERAS).
+MAX_DSHOW_DEVICES = 20
+
+# Vtable slots after IUnknown's 0-2: ICreateDevEnum has one method; IEnumMoniker's Next is its first;
+# IMoniker is an IPersistStream (GetClassID 3, IsDirty 4, Load 5, Save 6, GetSizeMax 7), so BindToStorage
+# is 9; IPropertyBag::Read is its first.
+SLOT_CREATE_CLASS_ENUMERATOR = 3
+SLOT_ENUM_NEXT = 3
+SLOT_BIND_TO_STORAGE = 9
+SLOT_PROPERTY_BAG_READ = 3
+
+
+class VARIANT(ctypes.Structure):
+    """Only as much of VARIANT as a BSTR property needs; the union is 16 bytes wide (DECIMAL, BRECORD)."""
+
+    _fields_ = [
+        ("vt", ctypes.c_uint16),
+        ("reserved", ctypes.c_uint16 * 3),
+        ("value", ctypes.c_void_p),
+        ("union_tail", ctypes.c_void_p),
+    ]
+
+
+@dataclass(frozen=True)
+class DirectShow:
+    """The ole32 and oleaut32 functions the moniker enumeration calls, prototyped; tests pass fakes."""
+
+    functype: Callable[..., Any]
+    co_initialize_ex: Callable[..., int]
+    co_uninitialize: Callable[[], None]
+    co_create_instance: Callable[..., int]
+    variant_clear: Callable[[Any], int]
+
+
+def _load_directshow() -> DirectShow:
+    from ctypes import wintypes
+
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)  # type: ignore[attr-defined]
+    oleaut32 = ctypes.WinDLL("oleaut32", use_last_error=True)  # type: ignore[attr-defined]
+    ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    ole32.CoInitializeEx.restype = HRESULT
+    ole32.CoUninitialize.argtypes = []
+    ole32.CoUninitialize.restype = None
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(GUID),
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = HRESULT
+    oleaut32.VariantClear.argtypes = [ctypes.POINTER(VARIANT)]
+    oleaut32.VariantClear.restype = HRESULT
+    return DirectShow(
+        functype=ctypes.WINFUNCTYPE,  # type: ignore[attr-defined]
+        co_initialize_ex=ole32.CoInitializeEx,
+        co_uninitialize=ole32.CoUninitialize,
+        co_create_instance=ole32.CoCreateInstance,
+        variant_clear=oleaut32.VariantClear,
+    )
+
+
+def list_dshow_devices() -> list[DshowDevice]:
+    """The devices DirectShow counts, in CAP_DSHOW order; [] elsewhere or when the enumeration fails.
+
+    [] means no device can be matched, so DirectShow is skipped for a listed
+    camera: better than opening whatever sits at that number.
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        return enumerate_dshow(_load_directshow())
+    except Exception as exc:  # noqa: BLE001 - COM trouble, a filter that misbehaves: just no DirectShow
+        log.warning("could not list the DirectShow cameras: %s", exc)
+        return []
+
+
+def enumerate_dshow(api: DirectShow) -> list[DshowDevice]:
+    """The monikers of CLSID_VideoInputDeviceCategory, the list OpenCV's DirectShow backend counts.
+
+    ``videoInput::getDevice`` binds the n-th moniker of that category, counting
+    every moniker it walks past, so this counts them the same way: a moniker
+    whose property bag will not open still takes its number (with no name).
+    Raises OSError.
+    """
+    hr = api.co_initialize_ex(None, COINIT_MULTITHREADED)
+    if hr < 0 and hr != RPC_E_CHANGED_MODE:
+        _check(hr, "CoInitializeEx")
+    try:
+        return _enumerate_monikers(api)
+    finally:
+        if hr in (S_OK, S_FALSE):
+            api.co_uninitialize()
+
+
+def _enumerate_monikers(api: DirectShow) -> list[DshowDevice]:
+    device_enum = ctypes.c_void_p()
+    _check(
+        api.co_create_instance(
+            ctypes.byref(CLSID_SYSTEM_DEVICE_ENUM),
+            None,
+            CLSCTX_INPROC_SERVER,
+            ctypes.byref(IID_CREATE_DEV_ENUM),
+            ctypes.byref(device_enum),
+        ),
+        "CoCreateInstance(CLSID_SystemDeviceEnum)",
+    )
+    if not device_enum.value:
+        raise OSError("CoCreateInstance gave no system device enumerator")
+    try:
+        create_enumerator = _com_method(
+            api,
+            device_enum.value,
+            SLOT_CREATE_CLASS_ENUMERATOR,
+            HRESULT,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32,
+        )
+        monikers = ctypes.c_void_p()
+        hr = create_enumerator(ctypes.byref(CLSID_VIDEO_INPUT_DEVICE_CATEGORY), ctypes.byref(monikers), 0)
+        _check(hr, "ICreateDevEnum::CreateClassEnumerator")
+        if hr != S_OK or not monikers.value:  # S_FALSE: the category is empty (no capture device at all)
+            return []
+        try:
+            return _read_monikers(api, monikers.value)
+        finally:
+            _com_release(api, monikers.value)
+    finally:
+        _com_release(api, device_enum.value)
+
+
+def _read_monikers(api: DirectShow, enumerator: int) -> list[DshowDevice]:
+    next_moniker = _com_method(
+        api,
+        enumerator,
+        SLOT_ENUM_NEXT,
+        HRESULT,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    devices: list[DshowDevice] = []
+    for index in range(MAX_DSHOW_DEVICES):
+        moniker, fetched = ctypes.c_void_p(), ctypes.c_uint32()
+        if next_moniker(1, ctypes.byref(moniker), ctypes.byref(fetched)) != S_OK:
+            break
+        if not moniker.value:
+            break
+        try:
+            devices.append(_moniker_device(api, index, moniker.value))
+        finally:
+            _com_release(api, moniker.value)
+    return devices
+
+
+def _moniker_device(api: DirectShow, index: int, moniker: int) -> DshowDevice:
+    """One moniker's device: its friendly name and device path, as far as the property bag gives them."""
+    bind = _com_method(
+        api,
+        moniker,
+        SLOT_BIND_TO_STORAGE,
+        HRESULT,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    bag = ctypes.c_void_p()
+    if bind(None, None, ctypes.byref(IID_PROPERTY_BAG), ctypes.byref(bag)) < 0 or not bag.value:
+        log.debug("DirectShow device %d has no property bag", index)
+        return DshowDevice(index, "")
+    try:
+        name = _bag_string(api, bag.value, "FriendlyName") or _bag_string(api, bag.value, "Description")
+        return DshowDevice(index, name or "", _bag_string(api, bag.value, "DevicePath"))
+    finally:
+        _com_release(api, bag.value)
+
+
+def _bag_string(api: DirectShow, bag: int, name: str) -> str | None:
+    """``IPropertyBag::Read`` of a string property, or None when it is absent or not a string."""
+    read = _com_method(
+        api,
+        bag,
+        SLOT_PROPERTY_BAG_READ,
+        HRESULT,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(VARIANT),
+        ctypes.c_void_p,
+    )
+    variant = VARIANT()  # zeroed: VT_EMPTY, which is what VariantInit leaves
+    if read(name, ctypes.byref(variant), None) < 0:
+        return None
+    try:
+        if variant.vt != VT_BSTR or not variant.value:
+            return None
+        return ctypes.wstring_at(variant.value) or None
+    finally:
+        api.variant_clear(ctypes.byref(variant))  # frees the BSTR

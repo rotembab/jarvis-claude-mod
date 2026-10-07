@@ -27,6 +27,7 @@ from jarvis_hands.synthetic import HEIGHT, WIDTH, hand
 from jarvis_hands.tracker.base import TrackerError
 from jarvis_hands.tracker.fake import FakeTracker
 
+from conftest import real_model
 from scripted import display
 
 KEYS = {
@@ -146,15 +147,10 @@ def test_displays_are_listed_with_virtual_ones_flagged(tmp_path: Path, monkeypat
     assert desktop.closed and "displays" not in checks(report)
 
 
-@pytest.mark.skipif(
-    not os.environ.get("JARVIS_HANDS_MODELS_DIR"), reason="set JARVIS_HANDS_MODELS_DIR to run the real model"
-)
-def test_doctor_runs_the_real_model_once(tmp_path: Path) -> None:
-    source = Path(os.environ["JARVIS_HANDS_MODELS_DIR"]) / models.MODEL_NAME
-    if not source.is_file():
-        pytest.skip(f"no {models.MODEL_NAME} in JARVIS_HANDS_MODELS_DIR")
+@real_model
+def test_doctor_runs_the_real_model_once(tmp_path: Path, real_model_path: Path) -> None:
     models.models_dir(tmp_path).mkdir(parents=True)
-    shutil.copy(source, models.model_path(tmp_path))
+    shutil.copy(real_model_path, models.model_path(tmp_path))
     report = doctor.run_doctor(tmp_path, camera=False)
     assert report["model"]["installed"] is True and "model" not in checks(report)
     assert report["tracker"]["ok"] is True and report["tracker"]["hands"] == 0

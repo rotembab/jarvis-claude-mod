@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -100,6 +101,59 @@ def test_two_displays_of_different_heights_plus_an_excluded_virtual_one() -> Non
     assert PRIMARY.rect.contains(gap_near_primary) and gap_near_primary.x == 1919
     # Nothing ever maps onto the virtual display.
     assert not VIRTUAL.rect.contains(mapper.to_desktop(Point(0.99, 0.5)))
+
+
+# Monitor | Virtual Display Driver | projector: Windows extends new displays to the right, so the virtual one can
+# end up between the two that hand control uses.
+MONITOR = display(1, 0, 0, 1920, 1080, primary=True)
+MIDDLE_VIRTUAL = display(2, 1920, 0, 1920, 1080, virtual=True, name="Virtual Display Driver")
+FAR_PROJECTOR = display(3, 3840, 0, 1920, 1080, name="EPSON PJ")
+
+
+def test_an_unused_display_between_two_used_ones_is_no_dead_band() -> None:
+    mapper = ScreenMapper([MONITOR, MIDDLE_VIRTUAL, FAR_PROJECTOR], HandsSettings())
+    assert mapper.used == [MONITOR, FAR_PROJECTOR]
+    assert mapper.region == Rect(0, 0, 3840, 1080)  # the two used displays, without the one between them
+    xs = [mapper.to_desktop(Point(*camera_point(i / 600, 0.5))).x for i in range(601)]
+    assert all(a < b for a, b in pairwise(xs)), "the cursor must follow every step of the hand"
+    assert not any(MIDDLE_VIRTUAL.rect.contains(Point(x, 540)) for x in xs)
+    assert xs[0] == 0 and xs[-1] == 5759
+    # Half the hand's range for each display: the cursor steps from the monitor's last column to the projector's
+    # first one.
+    assert mapper.to_desktop(Point(*camera_point(0.25, 0.5))).x == pytest.approx(960)
+    assert mapper.to_desktop(Point(*camera_point(0.4999, 0.5))).x == 1919
+    assert mapper.to_desktop(Point(*camera_point(0.5001, 0.5))).x == pytest.approx(3840, abs=1)
+    assert mapper.to_desktop(Point(*camera_point(0.75, 0.5))).x == pytest.approx(4800)
+    # Corner targets and overshoot still reach the outer edges.
+    assert mapper.target_point(1, 1) == Point(5759, 1079)
+    assert mapper.to_desktop(Point(0.99, 0.5)).x == 5759
+
+
+def test_the_motion_point_keeps_the_cursors_pace_and_never_jumps_the_unused_display() -> None:
+    # Scrolling and throw speed read the unclamped motion point: crossing the left-out display must not look
+    # like a 1920 px flick, and a hand movement must count as many pixels as it moves the cursor.
+    mapper = ScreenMapper([MONITOR, MIDDLE_VIRTUAL, FAR_PROJECTOR], HandsSettings())
+    xs = [mapper.to_region(Point(*camera_point(i / 100, 0.5))).x for i in range(-10, 111)]
+    steps = [b - a for a, b in pairwise(xs)]
+    assert steps == pytest.approx([38.4] * len(steps))
+
+
+def test_a_display_chosen_away_between_two_stacked_ones_is_no_dead_band() -> None:
+    top = display(1, 0, -1080, 1920, 1080)
+    middle, bottom = display(2, 0, 0, 1920, 1080), display(3, 0, 1080, 1920, 1080)
+    mapper = ScreenMapper([top, middle, bottom], HandsSettings(displays=(1, 3)))
+    assert mapper.region == Rect(0, -1080, 1920, 2160)
+    ys = [mapper.to_desktop(Point(*camera_point(0.5, i / 400))).y for i in range(401)]
+    assert all(a < b for a, b in pairwise(ys))
+    assert not any(middle.rect.contains(Point(960, y)) for y in ys)
+    assert (ys[0], ys[-1]) == (-1080, 2159)
+
+
+def test_calibration_maps_through_the_same_layout() -> None:
+    mapper = ScreenMapper([MONITOR, MIDDLE_VIRTUAL, FAR_PROJECTOR], HandsSettings())
+    mapper.set_homography(box_homography(0.1, 0.1, 0.9, 0.9))
+    assert mapper.to_desktop(Point(0.3, 0.5)) == Point(pytest.approx(960), pytest.approx(540))
+    assert mapper.to_desktop(Point(0.7, 0.5)) == Point(pytest.approx(4800), pytest.approx(540))
 
 
 def test_choosing_displays() -> None:

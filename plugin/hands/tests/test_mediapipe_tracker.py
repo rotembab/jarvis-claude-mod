@@ -1,21 +1,18 @@
 """The MediaPipe tracker: result conversion and recovery with a fake landmarker, then the real model on test photos.
 
 The real-model tests are skipped unless ``JARVIS_HANDS_MODELS_DIR`` is set
-(CI sets it); the model and photos are downloaded there when missing, the
-model checked against its sha256.
+(CI sets it); conftest downloads the model and the photos there when missing,
+the model checked against its sha256.
 """
 
 from __future__ import annotations
 
 import gc
-import hashlib
 import logging
-import os
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,6 +27,8 @@ from jarvis_hands.landmarks import INDEX_MCP, MIDDLE_MCP, PINKY_MCP, PINKY_TIP, 
 from jarvis_hands.tracker import TrackerError, create_tracker
 from jarvis_hands.tracker import mediapipe_tracker as mpt
 from jarvis_hands.tracker.mediapipe_tracker import MediaPipeTracker, observations_from_result
+
+from conftest import fetch_photo, real_model
 
 # --------------------------------------------------------------------------- fake results
 
@@ -510,37 +509,9 @@ def test_close_does_not_wait_for_a_hung_landmarker(
 
 # --------------------------------------------------------------------------- the real model
 
-MODELS_ENV = "JARVIS_HANDS_MODELS_DIR"
-IMAGE_URL = "https://storage.googleapis.com/mediapipe-assets/{name}.jpg"
-
-real_model = pytest.mark.skipif(not os.environ.get(MODELS_ENV), reason=f"set {MODELS_ENV} to run the real model")
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _fetch(url: str, path: Path, sha256: str | None = None) -> Path:
-    if path.exists() and (sha256 is None or _sha256(path) == sha256):
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(path.name + ".part")
-    with urllib.request.urlopen(url, timeout=120) as response:
-        partial.write_bytes(response.read())
-    if sha256 is not None and _sha256(partial) != sha256:
-        partial.unlink()
-        raise AssertionError(f"{url} does not match its sha256")
-    os.replace(partial, path)
-    return path
-
-
-@pytest.fixture(scope="module")
-def real_model_path() -> Path:
-    return _fetch(models.MODEL_URL, Path(os.environ[MODELS_ENV]) / models.MODEL_NAME, models.MODEL_SHA256)
-
 
 def photo(name: str) -> np.ndarray:
-    path = _fetch(IMAGE_URL.format(name=name), Path(os.environ[MODELS_ENV]) / f"{name}.jpg")
+    path = fetch_photo(name)
     image = cv2.imread(str(path))
     assert image is not None, path
     return image
@@ -691,8 +662,7 @@ print("survived", flush=True)
 
 @real_model
 def test_close_while_a_frame_is_in_mediapipe_does_not_crash(real_model_path: Path) -> None:
-    photo("right_hands")
-    path = Path(os.environ[MODELS_ENV]) / "right_hands.jpg"
+    path = fetch_photo("right_hands")
     run = subprocess.run(
         [sys.executable, "-c", CLOSE_MID_FRAME, str(real_model_path), str(path)],
         capture_output=True,

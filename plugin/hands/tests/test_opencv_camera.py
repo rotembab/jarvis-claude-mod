@@ -25,6 +25,7 @@ import pytest
 from jarvis_hands import platform as plat
 from jarvis_hands.camera import CameraError, create_camera
 from jarvis_hands.camera import opencv_camera as oc
+from jarvis_hands.camera.base import CameraFrame
 from jarvis_hands.camera.opencv_camera import FrameRate, OpenCVCamera, as_bgr, resolve_camera
 
 MSMF_PARAMS = [
@@ -37,6 +38,20 @@ MSMF_PARAMS = [
     cv2.CAP_PROP_HW_ACCELERATION,
     cv2.VIDEO_ACCELERATION_NONE,
 ]
+
+
+#: The device interface classes one camera appears under: KSCATEGORY_VIDEO_CAMERA for Media Foundation's
+#: symbolic link, KSCATEGORY_CAPTURE for DirectShow's DevicePath.
+INTERFACE = {"mf": "e5323777-f976-4f5b-9b55-b94699c46e44", "dshow": "65e8773d-8f56-11d0-a3b9-00a0c9223196"}
+
+
+def interface_path(name: str, kind: str) -> str:
+    """A device interface path for ``name``: the same device as Media Foundation or as DirectShow names it."""
+    slug = name.lower().replace(" ", "_")
+    return rf"\\?\usb#vid_2bdf&pid_0287&mi_00#7&{slug}&0&0000#{{{INTERFACE[kind]}}}\global"
+
+
+LINKS = {name: interface_path(name, "mf") for name in ("UGREEN Camera", "Caméra intégrée", "Integrated Webcam")}
 
 
 def picture(n: int, shape: tuple[int, ...] = (4, 6, 3)) -> np.ndarray:
@@ -111,13 +126,35 @@ class FakeFactory:
 
 @pytest.fixture(autouse=True)
 def no_real_devices(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never enumerate or read the privacy switches of the machine running the tests."""
-    monkeypatch.setattr(oc, "list_cameras", lambda: [])
+    """Never enumerate or read the privacy switches of the machine running the tests.
+
+    Media Foundation cannot be asked (as off Windows, or on Windows N), so a
+    test that lists nothing opens DirectShow by its own number.
+    """
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: None)
+    monkeypatch.setattr(oc, "list_dshow_devices", lambda: [])
     monkeypatch.setattr(plat, "camera_access_denied", lambda: False)
 
 
-def listed(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
-    monkeypatch.setattr(oc, "list_cameras", lambda: list(enumerate(names)))
+def listed(monkeypatch: pytest.MonkeyPatch, *names: str, links: bool = False) -> None:
+    """What Media Foundation lists, by name; ``list_cameras`` follows from it.
+
+    ``links`` gives each device its symbolic link, as Windows does; without
+    one only the friendly names can tell the devices apart.
+    """
+    devices = [
+        oc.MfDevice(index, name, interface_path(name, "mf") if links else None) for index, name in enumerate(names)
+    ]
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: devices)
+
+
+def dshow_listed(monkeypatch: pytest.MonkeyPatch, *names: str, paths: bool = True) -> None:
+    """What DirectShow's own moniker enumeration lists, by name, with each device's path unless turned off."""
+    devices = [
+        oc.DshowDevice(index, name, interface_path(name, "dshow") if paths else None)
+        for index, name in enumerate(names)
+    ]
+    monkeypatch.setattr(oc, "list_dshow_devices", lambda: devices)
 
 
 def make_camera(factory: FakeFactory, spec: str | None = None, **overrides: Any) -> OpenCVCamera:
@@ -267,6 +304,403 @@ def test_a_reopen_tries_the_backend_that_streamed_first(cameras: list[OpenCVCame
     assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_DSHOW]
     info = camera.info
     assert info is not None and info.backend == "dshow"
+
+
+# -- DirectShow counts devices in its own list ---------------------------------------------
+
+
+def test_the_two_interfaces_of_one_device_have_the_same_device_instance() -> None:
+    assert oc.device_instance(interface_path("UGREEN Camera", "mf")) == oc.device_instance(
+        interface_path("UGREEN Camera", "dshow")
+    )
+    assert oc.device_instance(interface_path("UGREEN Camera", "mf")).startswith("usb#vid_2bdf&pid_0287")
+    assert oc.device_instance(interface_path("Integrated Webcam", "mf")) != oc.device_instance(
+        interface_path("UGREEN Camera", "dshow")
+    )
+    # Windows writes these paths in either case, with either prefix, and the trailing \global is optional.
+    plain = r"USB#VID_2BDF&PID_0287&MI_00#7&x&0&0000#{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+    assert oc.device_instance(plain) == oc.device_instance(rf"\\.\{plain.lower()}\GLOBAL".replace("GLOBAL", "global"))
+
+
+@pytest.mark.parametrize("path", [None, "", "   ", "#{65e8773d-8f56-11d0-a3b9-00a0c9223196}"])
+def test_a_path_that_names_no_device_is_none(path: str | None) -> None:
+    assert oc.device_instance(path) is None
+
+
+def test_the_device_path_wins_over_the_names() -> None:
+    device = oc.MfDevice(1, "UGREEN Camera", interface_path("UGREEN Camera", "mf"))
+    dshow = [
+        oc.DshowDevice(0, "UGREEN Camera", interface_path("Integrated Webcam", "dshow")),  # same name, other device
+        oc.DshowDevice(1, "USB2.0 PC CAMERA", interface_path("UGREEN Camera", "dshow")),
+    ]
+    assert oc.dshow_position(device, dshow) == 1
+
+
+def test_the_name_decides_when_only_one_device_has_it() -> None:
+    device = oc.MfDevice(0, "UGREEN  camera ")  # no symbolic link, and Windows pads names
+    dshow = [oc.DshowDevice(0, "OBS Virtual Camera"), oc.DshowDevice(1, "ugreen  CAMERA")]
+    assert oc.dshow_position(device, dshow) == 1
+    assert oc.dshow_position(oc.MfDevice(0, "UGREEN Camera"), dshow) is None  # a different name entirely
+
+
+@pytest.mark.parametrize(
+    "dshow",
+    [
+        [],
+        [oc.DshowDevice(0, "USB Camera"), oc.DshowDevice(1, "USB Camera")],  # two of that name: a guess either way
+        [oc.DshowDevice(0, ""), oc.DshowDevice(1, "")],  # monikers whose property bag would not open
+    ],
+)
+def test_without_an_unambiguous_match_there_is_no_position(dshow: list[oc.DshowDevice]) -> None:
+    assert oc.dshow_position(oc.MfDevice(0, "USB Camera"), dshow) is None
+    assert oc.dshow_position(oc.MfDevice(0, ""), dshow) is None
+
+
+def test_one_device_behind_two_monikers_is_not_chosen_between() -> None:
+    path = interface_path("UGREEN Camera", "dshow")
+    device = oc.MfDevice(0, "UGREEN Camera", interface_path("UGREEN Camera", "mf"))
+    assert oc.dshow_position(device, [oc.DshowDevice(0, "UGREEN Camera", path), oc.DshowDevice(1, "x", path)]) is None
+
+
+def silent_then_streaming() -> FakeFactory:
+    """MSMF opens the camera and sends nothing (the webcams this fallback exists for); DirectShow streams."""
+    return FakeFactory([FakeCapture(frames=lambda n: None, delay=0.01), FakeCapture()])
+
+
+def test_directshow_opens_the_device_where_directshow_counts_it(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    # DirectShow's list also holds filter-based virtual cameras (OBS and the like) that Media Foundation never
+    # lists, so the UGREEN is camera 1 for Media Foundation and camera 2 for DirectShow.
+    listed(monkeypatch, "Integrated Webcam", "UGREEN Camera", links=True)
+    dshow_listed(monkeypatch, "Integrated Webcam", "OBS Virtual Camera", "UGREEN Camera")
+    factory = silent_then_streaming()
+    info = opened(cameras, factory, "ugreen", first_frame_timeout=0.2).info
+    assert [c[:2] for c in factory.calls] == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW)]
+    # The camera keeps the name and number the user chose it by, which are Media Foundation's.
+    assert info is not None and (info.name, info.index, info.backend) == ("UGREEN Camera", 1, "dshow")
+
+
+def test_the_device_path_matches_the_camera_even_when_directshow_calls_it_something_else(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    listed(monkeypatch, "UGREEN Camera", links=True)
+    devices = [
+        oc.DshowDevice(0, "OBS Virtual Camera"),
+        oc.DshowDevice(1, "USB2.0 PC CAMERA", interface_path("UGREEN Camera", "dshow")),
+    ]
+    monkeypatch.setattr(oc, "list_dshow_devices", lambda: devices)
+    factory = silent_then_streaming()
+    info = opened(cameras, factory, "ugreen", first_frame_timeout=0.2).info
+    assert [c[:2] for c in factory.calls] == [(0, cv2.CAP_MSMF), (1, cv2.CAP_DSHOW)]
+    assert info is not None and info.backend == "dshow"
+
+
+def test_a_unique_friendly_name_is_enough_when_there_is_no_device_path(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    listed(monkeypatch, "Integrated Webcam", "UGREEN Camera")  # no symbolic link from Media Foundation
+    dshow_listed(monkeypatch, "OBS Virtual Camera", "Integrated Webcam", "UGREEN Camera", paths=False)
+    factory = silent_then_streaming()
+    info = opened(cameras, factory, "ugreen", first_frame_timeout=0.2).info
+    assert [c[:2] for c in factory.calls] == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW)]
+    assert info is not None and info.backend == "dshow"
+
+
+def test_directshow_is_skipped_when_nothing_tells_the_device_apart(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two DirectShow devices of that name and no paths to tell them apart: opening one of them would be a guess.
+    listed(monkeypatch, "USB Camera")
+    dshow_listed(monkeypatch, "USB Camera", "USB Camera", paths=False)
+    factory = silent_then_streaming()
+    camera = make_camera(factory, "usb camera", first_frame_timeout=0.2)
+    with pytest.raises(CameraError) as error:
+        camera.open()
+    assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF]
+    assert error.value.code == "camera_in_use" and "msmf" in error.value.message
+    camera.close()
+
+
+def test_directshow_is_skipped_when_it_does_not_list_the_camera_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    listed(monkeypatch, "UGREEN Camera", links=True)
+    dshow_listed(monkeypatch, "OBS Virtual Camera")
+    factory = silent_then_streaming()
+    camera = make_camera(factory, "ugreen", first_frame_timeout=0.2)
+    with pytest.raises(CameraError):
+        camera.open()
+    assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF]
+    camera.close()
+
+
+def test_a_directshow_listing_that_fails_skips_directshow_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    listed(monkeypatch, "UGREEN Camera", links=True)
+
+    def broken() -> list[oc.DshowDevice]:
+        raise OSError("CoCreateInstance failed with HRESULT 0x80004005")
+
+    monkeypatch.setattr(oc, "list_dshow_devices", broken)
+    factory = silent_then_streaming()
+    camera = make_camera(factory, "ugreen", first_frame_timeout=0.2)
+    with caplog.at_level("WARNING", logger=oc.__name__), pytest.raises(CameraError):
+        camera.open()
+    assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF]
+    assert "could not list the DirectShow cameras" in caplog.text
+    camera.close()
+
+
+def test_when_media_foundation_cannot_be_asked_directshow_keeps_the_number_it_was_given(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    # Windows N has no Media Foundation at all: DirectShow's own numbering is all there is, so it is tried as
+    # before rather than skipped.
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: None)
+    asked: list[int] = []
+
+    def never_listed() -> list[oc.DshowDevice]:
+        asked.append(1)
+        return []
+
+    factory = silent_then_streaming()
+    info = opened(cameras, factory, "1", first_frame_timeout=0.2, dshow_devices=never_listed).info
+    assert [c[:2] for c in factory.calls] == [(1, cv2.CAP_MSMF), (1, cv2.CAP_DSHOW)]
+    assert info is not None and info.backend == "dshow" and asked == []
+
+
+UGREEN, OBS, WEBCAM = "UGREEN Camera", "OBS Virtual Camera", "Integrated Webcam"
+
+
+class Machine:
+    """Cameras as both backends see them, by name: each backend opens whatever its own list holds at the number
+    it is given, the way OpenCV does, so opening the wrong device shows up in ``opened``.
+
+    The UGREEN opens on MSMF and sends nothing (the webcams the DirectShow fallback exists for); everything
+    else streams. OBS Virtual Camera is a DirectShow filter: Media Foundation never lists it.
+    """
+
+    def __init__(self, mf: list[str], dshow: list[str]) -> None:
+        self.mf, self.dshow = list(mf), list(dshow)
+        #: ``(name, backend)`` of every device a backend opened.
+        self.opened: list[tuple[str, str]] = []
+        self.unplugged: set[str] = set()
+        #: Media Foundation listings left before ``plug_back`` puts the UGREEN back (None: it stays out).
+        self._back_after: int | None = None
+        self._back: tuple[int, int] = (0, 0)
+
+    def list_mf(self) -> list[oc.MfDevice]:
+        if self._back_after is not None:
+            if self._back_after == 0:
+                self.plug(UGREEN, *self._back)
+                self._back_after = None
+            else:
+                self._back_after -= 1
+        return [oc.MfDevice(i, name, interface_path(name, "mf")) for i, name in enumerate(self.mf)]
+
+    def list_dshow(self) -> list[oc.DshowDevice]:
+        return [
+            oc.DshowDevice(i, name, None if name == OBS else interface_path(name, "dshow"))
+            for i, name in enumerate(self.dshow)
+        ]
+
+    def unplug(self, name: str) -> None:
+        self.unplugged.add(name)
+        self.mf = [n for n in self.mf if n != name]
+        self.dshow = [n for n in self.dshow if n != name]
+
+    def plug(self, name: str, mf_at: int, dshow_at: int) -> None:
+        self.unplugged.discard(name)
+        self.mf.insert(mf_at, name)
+        self.dshow.insert(dshow_at, name)
+
+    def plug_back_after(self, listings: int, mf_at: int, dshow_at: int) -> None:
+        self._back_after, self._back = listings, (mf_at, dshow_at)
+
+    def factory(self, index: int, api: int, params: Any) -> FakeCapture:
+        backend = "msmf" if api == cv2.CAP_MSMF else "dshow"
+        names = self.mf if backend == "msmf" else self.dshow
+        if index >= len(names):
+            return FakeCapture(opened=False)
+        name = names[index]
+        self.opened.append((name, backend))
+        if backend == "msmf" and name == UGREEN:
+            return FakeCapture(frames=lambda n: None, delay=0.01)
+        return FakeCapture(frames=lambda n: None if name in self.unplugged else picture(n))
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(oc, "list_mf_devices", self.list_mf)
+        monkeypatch.setattr(oc, "list_dshow_devices", self.list_dshow)
+
+
+def machine_camera(machine: Machine, spec: str | None, **overrides: Any) -> OpenCVCamera:
+    options: dict[str, Any] = {
+        "backends": ("msmf", "dshow"),
+        "first_frame_timeout": 0.2,
+        "lost_after": 0.1,
+        "reopen_delays": (0.01, 0.01, 0.01),
+        "join_timeout": 1.0,
+    }
+    options.update(overrides)
+    return OpenCVCamera(spec, capture_factory=machine.factory, **options)
+
+
+def read_until(camera: OpenCVCamera, done: Callable[[], bool], seconds: float = 5.0) -> CameraError | None:
+    """Read frames until ``done()`` or the camera raises (returned); fails the test after ``seconds``."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            camera.read(0.05)
+        except CameraError as exc:
+            return exc
+        if done():
+            return None
+    pytest.fail("the camera neither got there nor gave up")
+
+
+@pytest.mark.parametrize("spec", [None, "0", "ugreen"])
+def test_a_reopen_after_the_webcam_is_unplugged_never_opens_another_device_on_directshow(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str | None
+) -> None:
+    # The webcam streams on DirectShow (MSMF sends it nothing), then it is unplugged: Media Foundation lists no
+    # camera and DirectShow's list is down to the OBS filter, now at the number the webcam had. Opening that
+    # would stream OBS's placeholder as "UGREEN Camera" for good, and hand control would never see a hand.
+    machine = Machine(mf=[UGREEN], dshow=[UGREEN, OBS])
+    machine.install(monkeypatch)
+    camera = machine_camera(machine, spec)
+    cameras.append(camera)
+    info = camera.open()
+    assert (info.name, info.backend) == (UGREEN, "dshow")
+    machine.unplug(UGREEN)
+    error = read_until(camera, lambda: (OBS, "dshow") in machine.opened)
+    assert (OBS, "dshow") not in machine.opened, "the reopen streams OBS's placeholder as the user's camera"
+    assert error is not None and error.code == "camera_lost"
+    assert machine.opened == [(UGREEN, "msmf"), (UGREEN, "dshow")]
+
+
+@pytest.mark.parametrize("spec", [None, "0"])
+def test_a_webcam_plugged_back_in_is_found_where_directshow_now_counts_it(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str | None
+) -> None:
+    machine = Machine(mf=[UGREEN], dshow=[UGREEN, OBS])
+    machine.install(monkeypatch)
+    camera = machine_camera(machine, spec, reopen_delays=(0.01, 0.01, 0.01, 0.01))
+    cameras.append(camera)
+    camera.open()
+    machine.plug_back_after(2, mf_at=0, dshow_at=1)  # two reopens find nothing, then it is back, after OBS
+    machine.unplug(UGREEN)
+    error = read_until(camera, lambda: (OBS, "dshow") in machine.opened or machine.opened[2:] == [(UGREEN, "dshow")])
+    assert (OBS, "dshow") not in machine.opened, "a reopen streamed OBS's placeholder as the user's camera"
+    assert error is None and machine.opened == [(UGREEN, "msmf"), (UGREEN, "dshow"), (UGREEN, "dshow")]
+    info = camera.info
+    assert info is not None and (info.name, info.index, info.backend) == (UGREEN, 0, "dshow")
+
+
+def test_with_no_camera_plugged_in_directshow_does_not_open_a_virtual_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Media Foundation answers and lists nothing; DirectShow still has the OBS filter at 0. Opening it would
+    # report hand control running on "camera 0" instead of saying no camera was found.
+    machine = Machine(mf=[], dshow=[OBS])
+    machine.install(monkeypatch)
+    camera = machine_camera(machine, None)
+    with pytest.raises(CameraError) as error:
+        camera.open()
+    camera.close()
+    assert (error.value.code, error.value.message) == ("no_camera", "No camera found.")
+    assert machine.opened == []
+
+
+def test_a_number_media_foundation_does_not_list_is_not_opened_on_directshow(monkeypatch: pytest.MonkeyPatch) -> None:
+    machine = Machine(mf=[WEBCAM], dshow=[WEBCAM, OBS])
+    machine.install(monkeypatch)
+    camera = machine_camera(machine, "1")
+    with pytest.raises(CameraError) as error:
+        camera.open()
+    camera.close()
+    assert error.value.code == "no_camera" and "There is no camera 1" in error.value.message
+    assert machine.opened == []
+
+
+@pytest.mark.parametrize("spec", ["ugreen", "1"])
+def test_a_reopen_while_media_foundation_will_not_answer_maps_the_camera_it_had(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str
+) -> None:
+    # Media Foundation listed the cameras at open, then fails (COM trouble) when the reopen asks again: the
+    # camera is still the device it listed, so DirectShow is matched against that device, never opened at
+    # the Media Foundation number (1, which is OBS for DirectShow).
+    machine = Machine(mf=[WEBCAM, UGREEN], dshow=[WEBCAM, OBS, UGREEN])
+    listings = iter([machine.list_mf()])
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: next(listings, None))
+    monkeypatch.setattr(oc, "list_dshow_devices", machine.list_dshow)
+    capture = FakeCapture(frames=fails_after(3))  # the stream DirectShow opens first, which then stops
+    opens: list[tuple[int, int]] = []
+
+    def factory(index: int, api: int, params: Any) -> FakeCapture:
+        opens.append((index, api))
+        if len(opens) == 2:
+            return capture
+        return machine.factory(index, api, params)
+
+    camera = OpenCVCamera(
+        spec,
+        capture_factory=factory,
+        backends=("msmf", "dshow"),
+        first_frame_timeout=0.2,
+        lost_after=0.1,
+        reopen_delays=(0.01,),
+        join_timeout=1.0,
+    )
+    cameras.append(camera)
+    camera.open()
+    error = read_until(camera, lambda: len(opens) > 2)
+    assert error is None
+    assert opens == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW), (2, cv2.CAP_DSHOW)]
+    assert (OBS, "dshow") not in machine.opened
+
+
+def test_a_reopen_maps_the_directshow_index_against_the_current_listing(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    mf = [
+        [
+            oc.MfDevice(0, "Integrated Webcam", LINKS["Integrated Webcam"]),
+            oc.MfDevice(1, "UGREEN Camera", LINKS["UGREEN Camera"]),
+        ]
+    ]
+    dshow = [
+        [
+            oc.DshowDevice(0, "Integrated Webcam", interface_path("Integrated Webcam", "dshow")),
+            oc.DshowDevice(1, "OBS Virtual Camera"),
+            oc.DshowDevice(2, "UGREEN Camera", interface_path("UGREEN Camera", "dshow")),
+        ]
+    ]
+    # The integrated webcam is unplugged while hand control runs: both lists lose it and the UGREEN moves up.
+    later_mf = [oc.MfDevice(0, "UGREEN Camera", LINKS["UGREEN Camera"])]
+    later_dshow = [
+        oc.DshowDevice(0, "OBS Virtual Camera"),
+        oc.DshowDevice(1, "UGREEN Camera", interface_path("UGREEN Camera", "dshow")),
+    ]
+    mf_listings, dshow_listings = iter(mf), iter(dshow)
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: next(mf_listings, later_mf))
+    monkeypatch.setattr(oc, "list_dshow_devices", lambda: next(dshow_listings, later_dshow))
+    factory = FakeFactory(
+        [
+            FakeCapture(frames=lambda n: None, delay=0.01),  # MSMF: open but silent
+            FakeCapture(frames=fails_after(3)),  # DirectShow streams, then the webcam is unplugged
+            FakeCapture(frames=lambda n: picture(100 + n)),  # the reopen, DirectShow first: its new position
+        ]
+    )
+    camera = opened(cameras, factory, "ugreen", first_frame_timeout=0.2, lost_after=0.1, reopen_delays=(0.01,))
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        frame = camera.read(0.2)
+        if frame is not None and frame.image[0, 0, 0] >= 100:
+            break
+    else:
+        pytest.fail("no frame from the reopened camera")
+    # The reopen tries the backend that streamed first, and maps the camera onto DirectShow's new numbering.
+    assert [c[:2] for c in factory.calls] == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW), (1, cv2.CAP_DSHOW)]
+    info = camera.info
+    assert info is not None and (info.index, info.backend) == (0, "dshow")
 
 
 def test_a_backend_that_raises_counts_as_not_opening(cameras: list[OpenCVCamera]) -> None:
@@ -535,11 +969,63 @@ def test_repeated_reopen_failures_lose_the_camera(cameras: list[OpenCVCamera]) -
         camera.read(0.0)
 
 
+def test_a_read_waiting_while_the_reader_gives_up_raises_instead_of_going_quiet() -> None:
+    # A read that started before the reader gave up must learn why: otherwise it returns None for ever, the
+    # runtime keeps asking for frames that never come and nothing tells the user why the camera stopped.
+    capture = FakeCapture(frames=lambda n: None, delay=0.01)
+    camera = make_camera(FakeFactory([capture]), backends=("msmf",), first_frame_timeout=0.3)
+    errors: list[CameraError] = []
+    reads: list[CameraFrame | None] = []
+
+    def open_it() -> None:
+        try:
+            camera.open()
+        except CameraError as exc:
+            errors.append(exc)
+
+    def read_it() -> None:
+        deadline = time.monotonic() + 2.0
+        while camera._session is None and time.monotonic() < deadline:  # until open() has started the reader
+            time.sleep(0.001)
+        try:
+            reads.append(camera.read(3.0))
+        except CameraError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_it), threading.Thread(target=read_it)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5.0)
+        assert not thread.is_alive()
+    assert reads == [], "the read must not report 'no frame yet' when the camera is not coming back"
+    assert len(errors) == 2 and {e.code for e in errors} == {"camera_in_use"}
+    assert all(e.hint == plat.camera_in_use_hint() for e in errors)
+    camera.close()
+
+
+def test_a_reader_that_gave_up_without_saying_why_is_still_camera_lost(cameras: list[OpenCVCamera]) -> None:
+    camera = opened(cameras, FakeFactory([FakeCapture(frames=fails_after(2))]), lost_after=0.1)
+    deadline = time.monotonic() + 3.0
+    with pytest.raises(CameraError):
+        while time.monotonic() < deadline:
+            camera.read(0.2)
+    session = camera._session  # a reader that ended without recording an error must still raise
+    assert session is not None
+    with session.cond:
+        session.error = None
+    with pytest.raises(CameraError) as error:
+        camera.read(0.0)
+    assert error.value.code == "camera_lost" and error.value.hint == oc.LOST_HINT
+
+
 def test_a_camera_chosen_by_name_is_looked_up_again_on_reopen(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
 ) -> None:
-    listings = iter([[(0, "Integrated Webcam"), (1, "UGREEN Camera")]])
-    monkeypatch.setattr(oc, "list_cameras", lambda: next(listings, [(0, "UGREEN Camera")]))
+    first = [oc.MfDevice(0, "Integrated Webcam"), oc.MfDevice(1, "UGREEN Camera")]
+    later = [oc.MfDevice(0, "UGREEN Camera")]  # the integrated webcam is gone: the UGREEN moved to 0
+    listings = iter([first])
+    monkeypatch.setattr(oc, "list_mf_devices", lambda: next(listings, later))
     factory = FakeFactory([FakeCapture(frames=fails_after(2)), FakeCapture(frames=lambda n: picture(100 + n))])
     camera = opened(cameras, factory, "ugreen", lost_after=0.1, reopen_delays=(0.01,))
     deadline = time.monotonic() + 3.0
@@ -626,6 +1112,7 @@ E_FAIL = 0x80004005 - (1 << 32)
 SOURCE_TYPE = "c60ac5fe-252a-478f-a0ef-bc8fa5f7cad3"
 VIDCAP = "8ac3587a-4ae7-42d8-99e0-0a6013eef90f"
 FRIENDLY_NAME = "60d0e559-52f8-4fa2-bbce-acdb34a8ec01"
+SYMBOLIC_LINK = "58f0aad8-22bf-4f8a-bb3d-d2c4978c6e2f"
 
 
 class FakeMediaFoundation:
@@ -706,9 +1193,13 @@ class FakeMediaFoundation:
         return 0
 
     def _get_allocated_string(self, this: int, key: Any, out: Any, length: Any) -> int:
-        if bytes(key.contents) != uuid.UUID(FRIENDLY_NAME).bytes_le:
-            return E_FAIL
         name = self._names[this]
+        if bytes(key.contents) == uuid.UUID(SYMBOLIC_LINK).bytes_le:
+            name = LINKS.get(name, "")
+            if not name:
+                return E_FAIL  # a device whose symbolic link Media Foundation will not give
+        elif bytes(key.contents) != uuid.UUID(FRIENDLY_NAME).bytes_le:
+            return E_FAIL
         buffer = ctypes.create_unicode_buffer(name)
         self.allocated[ctypes.addressof(buffer)] = buffer
         out[0] = ctypes.addressof(buffer)
@@ -781,7 +1272,10 @@ def test_guids_have_the_windows_memory_layout() -> None:
 
 def test_media_foundation_lists_names_in_order_and_frees_everything() -> None:
     fake = FakeMediaFoundation(["UGREEN Camera", "Caméra intégrée"])
-    assert oc.enumerate_msmf(fake.api()) == [(0, "UGREEN Camera"), (1, "Caméra intégrée")]
+    assert oc.enumerate_msmf(fake.api()) == [
+        oc.MfDevice(0, "UGREEN Camera", LINKS["UGREEN Camera"]),
+        oc.MfDevice(1, "Caméra intégrée", LINKS["Caméra intégrée"]),
+    ]
     assert fake.set_guids == [(uuid.UUID(SOURCE_TYPE).bytes_le, uuid.UUID(VIDCAP).bytes_le)]
     assert fake.wrong_slots == [] and fake.errors == []
     assert fake.allocated == {}, "every string and the device array go back to CoTaskMemFree"
@@ -806,7 +1300,7 @@ def test_a_failed_enumeration_still_shuts_everything_down() -> None:
 
 def test_com_set_up_by_someone_else_is_left_alone() -> None:
     fake = FakeMediaFoundation(["UGREEN Camera"], init_hr=oc.RPC_E_CHANGED_MODE)
-    assert oc.enumerate_msmf(fake.api()) == [(0, "UGREEN Camera")]
+    assert [d.name for d in oc.enumerate_msmf(fake.api())] == ["UGREEN Camera"]
     assert "CoUninitialize" not in fake.calls and fake.errors == []
 
 
@@ -814,6 +1308,7 @@ def test_com_set_up_by_someone_else_is_left_alone() -> None:
 def test_list_cameras_is_empty_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.undo()  # the real function, not the autouse stand-in
     assert oc.list_cameras() == []
+    assert oc.list_mf_devices() is None, "off Windows Media Foundation cannot be asked; it did not say 'none'"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Media Foundation is Windows-only")
@@ -823,3 +1318,344 @@ def test_list_cameras_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(cameras, list)
     assert all(isinstance(i, int) and isinstance(name, str) and name for i, name in cameras)
     assert [i for i, _ in cameras] == list(range(len(cameras)))
+
+
+# --------------------------------------------------------------------------- DirectShow's device monikers
+
+S_FALSE = 1
+DEVICE_ENUM_CLSID = "62be5d10-60eb-11d0-bd3b-00a0c911ce86"
+CREATE_DEV_ENUM_IID = "29840822-5b84-11d0-bd3b-00a0c911ce86"
+VIDEO_INPUT_CATEGORY = "860bb310-5d01-11d0-bd3b-00a0c911ce86"
+PROPERTY_BAG_IID = "55272a00-42cb-11ce-8135-00aa004bb851"
+VT_I4 = 3
+
+
+@dataclass
+class FakeMoniker:
+    """One device moniker: the properties its bag holds (an int value is a non-string property)."""
+
+    properties: dict[str, str | int] = field(default_factory=dict)
+    #: False for a moniker whose BindToStorage fails, as a filter that is registered but broken does.
+    bindable: bool = True
+
+
+class FakeDirectShow:
+    """DirectShow's moniker enumeration as C callbacks over COM objects laid out like real ones.
+
+    Like ``FakeMediaFoundation``: one vtable per interface with every other
+    slot trapped, GUIDs by reference, out-pointers, BSTRs that have to go back
+    through VariantClear and reference counts. A wrong slot, a leak or a
+    missed release shows up here instead of on Windows.
+    """
+
+    SLOTS = 24
+
+    def __init__(
+        self,
+        monikers: list[FakeMoniker],
+        *,
+        init_hr: int = 0,
+        instance_hr: int = 0,
+        enumerator_hr: int = 0,
+        endless: bool = False,
+    ) -> None:
+        self.monikers, self.init_hr = monikers, init_hr
+        self.instance_hr, self.enumerator_hr = instance_hr, enumerator_hr
+        self.endless = endless
+        self.calls: list[str] = []
+        self.guids: list[str] = []
+        self.refs: dict[int, int] = {}
+        #: BSTRs handed out and not yet freed through VariantClear.
+        self.allocated: dict[int, Any] = {}
+        self.wrong_slots: list[tuple[str, int]] = []
+        self.errors: list[str] = []
+        self.bound = 0
+        self._of: dict[int, FakeMoniker] = {}
+        self._handed: list[FakeMoniker] = []
+        self._keep: list[Any] = []
+        c, p = ctypes.CFUNCTYPE, ctypes.POINTER
+        self._vtables = {
+            "devenum": self._vtable(
+                "devenum",
+                {
+                    oc.SLOT_CREATE_CLASS_ENUMERATOR: (
+                        c(HR, ctypes.c_void_p, p(oc.GUID), p(ctypes.c_void_p), ctypes.c_uint32),
+                        self._create_class_enumerator,
+                    )
+                },
+            ),
+            "enum": self._vtable(
+                "enum",
+                {
+                    oc.SLOT_ENUM_NEXT: (
+                        c(HR, ctypes.c_void_p, ctypes.c_uint32, p(ctypes.c_void_p), p(ctypes.c_uint32)),
+                        self._next,
+                    )
+                },
+            ),
+            "moniker": self._vtable(
+                "moniker",
+                {
+                    oc.SLOT_BIND_TO_STORAGE: (
+                        c(HR, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, p(oc.GUID), p(ctypes.c_void_p)),
+                        self._bind_to_storage,
+                    )
+                },
+            ),
+            "bag": self._vtable(
+                "bag",
+                {
+                    oc.SLOT_PROPERTY_BAG_READ: (
+                        c(HR, ctypes.c_void_p, ctypes.c_wchar_p, p(oc.VARIANT), ctypes.c_void_p),
+                        self._read,
+                    )
+                },
+            ),
+        }
+
+    # -- the C side
+    def _guard(self, function: Callable[..., Any], default: Any = E_FAIL) -> Callable[..., Any]:
+        def guarded(*args: Any) -> Any:
+            try:
+                return function(*args)
+            except Exception as exc:  # noqa: BLE001 - ctypes would only print it; reported through self.errors
+                self.errors.append(f"{function.__name__}: {exc!r}")
+                return default
+
+        return guarded
+
+    def _thunk(self, prototype: Any, function: Callable[..., Any], default: Any = E_FAIL) -> int:
+        made = prototype(self._guard(function, default))
+        self._keep.append(made)
+        return ctypes.cast(made, ctypes.c_void_p).value or 0
+
+    def _vtable(self, kind: str, methods: dict[int, tuple[Any, Callable[..., Any]]]) -> Any:
+        table = (ctypes.c_void_p * self.SLOTS)()
+        for slot in range(self.SLOTS):
+            table[slot] = self._thunk(ctypes.CFUNCTYPE(HR, ctypes.c_void_p), self._trap(kind, slot))
+        table[oc.SLOT_RELEASE] = self._thunk(
+            ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p), self._release, default=0
+        )
+        for slot, (prototype, function) in methods.items():
+            table[slot] = self._thunk(prototype, function)
+        self._keep.append(table)
+        return table
+
+    def _trap(self, kind: str, slot: int) -> Callable[[int], int]:
+        def trap(this: int) -> int:
+            self.wrong_slots.append((kind, slot))
+            return E_FAIL
+
+        return trap
+
+    def _new_object(self, kind: str, of: FakeMoniker | None = None) -> int:
+        obj = (ctypes.c_void_p * 1)(ctypes.addressof(self._vtables[kind]))
+        self._keep.append(obj)
+        address = ctypes.addressof(obj)
+        self.refs[address] = 1
+        if of is not None:
+            self._of[address] = of
+        return address
+
+    def _release(self, this: int) -> int:
+        self.refs[this] -= 1
+        return self.refs[this]
+
+    # -- the interfaces
+    def _create_class_enumerator(self, this: int, category: Any, out: Any, flags: int) -> int:
+        self.guids.append(str(uuid.UUID(bytes_le=bytes(category.contents))))
+        self.calls.append(f"CreateClassEnumerator {flags}")
+        if self.enumerator_hr:
+            return self.enumerator_hr
+        if not self.monikers and not self.endless:
+            return S_FALSE  # the category is empty: no capture device at all
+        out[0] = self._new_object("enum")
+        return 0
+
+    def _next(self, this: int, count: int, out: Any, fetched: Any) -> int:
+        assert count == 1, "one moniker at a time, as videoInput does"
+        if self.endless:
+            moniker = FakeMoniker({"FriendlyName": f"camera {len(self._handed)}"})
+        elif len(self._handed) >= len(self.monikers):
+            fetched[0] = 0
+            return S_FALSE
+        else:
+            moniker = self.monikers[len(self._handed)]
+        self._handed.append(moniker)
+        out[0] = self._new_object("moniker", moniker)
+        fetched[0] = 1
+        return 0
+
+    def _bind_to_storage(self, this: int, context: int | None, left: int | None, iid: Any, out: Any) -> int:
+        assert context is None and left is None
+        self.guids.append(str(uuid.UUID(bytes_le=bytes(iid.contents))))
+        self.bound += 1
+        if not self._of[this].bindable:
+            return E_FAIL
+        out[0] = self._new_object("bag", self._of[this])
+        return 0
+
+    def _read(self, this: int, name: str, variant: Any, errors: int | None) -> int:
+        assert errors is None
+        value = self._of[this].properties.get(name)
+        if value is None:
+            return E_FAIL
+        if isinstance(value, int):
+            variant.contents.vt, variant.contents.value = VT_I4, value
+            return 0
+        buffer = ctypes.create_unicode_buffer(value)
+        self._keep.append(buffer)
+        self.allocated[ctypes.addressof(buffer)] = buffer
+        variant.contents.vt, variant.contents.value = oc.VT_BSTR, ctypes.addressof(buffer)
+        return 0
+
+    # -- the functions
+    def api(self) -> oc.DirectShow:
+        c, g = ctypes.CFUNCTYPE, self._guard
+        functions = {
+            "co_initialize_ex": c(HR, ctypes.c_void_p, ctypes.c_uint32)(g(self._co_initialize_ex)),
+            "co_uninitialize": c(None)(g(self._co_uninitialize, None)),
+            "co_create_instance": c(
+                HR,
+                ctypes.POINTER(oc.GUID),
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(oc.GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            )(g(self._co_create_instance)),
+            "variant_clear": c(HR, ctypes.POINTER(oc.VARIANT))(g(self._variant_clear)),
+        }
+        self._keep.extend(functions.values())
+        return oc.DirectShow(functype=ctypes.CFUNCTYPE, **functions)
+
+    def _co_initialize_ex(self, reserved: int | None, mode: int) -> int:
+        self.calls.append(f"CoInitializeEx {mode}")
+        return self.init_hr
+
+    def _co_uninitialize(self) -> None:
+        self.calls.append("CoUninitialize")
+
+    def _co_create_instance(self, clsid: Any, outer: int | None, context: int, iid: Any, out: Any) -> int:
+        assert outer is None and context == oc.CLSCTX_INPROC_SERVER
+        self.guids.extend(str(uuid.UUID(bytes_le=bytes(g.contents))) for g in (clsid, iid))
+        self.calls.append("CoCreateInstance")
+        if self.instance_hr:
+            return self.instance_hr
+        out[0] = self._new_object("devenum")
+        return 0
+
+    def _variant_clear(self, variant: Any) -> int:
+        address = variant.contents.value
+        if variant.contents.vt == oc.VT_BSTR and self.allocated.pop(address, None) is None:
+            self.errors.append(f"VariantClear of {address:#x}, which was never allocated")
+        variant.contents.vt, variant.contents.value = 0, None
+        return 0
+
+
+def dshow_moniker(name: str | None, *, path: str | None = None, description: str | None = None) -> FakeMoniker:
+    properties: dict[str, str | int] = {}
+    if name is not None:
+        properties["FriendlyName"] = name
+    if description is not None:
+        properties["Description"] = description
+    if path is not None:
+        properties["DevicePath"] = path
+    return FakeMoniker(properties)
+
+
+def test_the_directshow_guids_and_the_variant_layout_match_windows() -> None:
+    for text, guid in [
+        (DEVICE_ENUM_CLSID, oc.CLSID_SYSTEM_DEVICE_ENUM),
+        (CREATE_DEV_ENUM_IID, oc.IID_CREATE_DEV_ENUM),
+        (VIDEO_INPUT_CATEGORY, oc.CLSID_VIDEO_INPUT_DEVICE_CATEGORY),
+        (PROPERTY_BAG_IID, oc.IID_PROPERTY_BAG),
+    ]:
+        assert bytes(guid) == uuid.UUID(text).bytes_le
+    wide = ctypes.sizeof(ctypes.c_void_p) == 8
+    assert ctypes.sizeof(oc.VARIANT) == (24 if wide else 16)
+    assert oc.VARIANT.value.offset == 8
+
+
+def test_directshow_lists_the_monikers_in_order_and_frees_everything() -> None:
+    webcam, ugreen = interface_path("Integrated Webcam", "dshow"), interface_path("UGREEN Camera", "dshow")
+    fake = FakeDirectShow(
+        [
+            dshow_moniker("Integrated Webcam", path=webcam),
+            dshow_moniker("OBS Virtual Camera"),  # a software filter: a name, no device path
+            dshow_moniker(None, description="UGREEN Camera", path=ugreen),  # no FriendlyName: the Description
+        ]
+    )
+    assert oc.enumerate_dshow(fake.api()) == [
+        oc.DshowDevice(0, "Integrated Webcam", webcam),
+        oc.DshowDevice(1, "OBS Virtual Camera", None),
+        oc.DshowDevice(2, "UGREEN Camera", ugreen),
+    ]
+    assert fake.wrong_slots == [] and fake.errors == []
+    assert fake.allocated == {}, "every BSTR goes back through VariantClear"
+    assert set(fake.refs.values()) == {0}, "the enumerator, every moniker and every property bag are released"
+    assert fake.guids == [
+        DEVICE_ENUM_CLSID,
+        CREATE_DEV_ENUM_IID,
+        VIDEO_INPUT_CATEGORY,
+        *[PROPERTY_BAG_IID] * 3,
+    ]
+    assert fake.calls[:2] == ["CoInitializeEx 0", "CoCreateInstance"] and fake.calls[-1] == "CoUninitialize"
+
+
+def test_a_moniker_whose_property_bag_will_not_open_still_takes_its_number() -> None:
+    # videoInput::getDevice binds the n-th moniker it walks past, counting the ones it cannot read too.
+    path = interface_path("UGREEN Camera", "dshow")
+    fake = FakeDirectShow([FakeMoniker(bindable=False), dshow_moniker("UGREEN Camera", path=path)])
+    assert oc.enumerate_dshow(fake.api()) == [oc.DshowDevice(0, ""), oc.DshowDevice(1, "UGREEN Camera", path)]
+    assert fake.bound == 2 and set(fake.refs.values()) == {0} and fake.errors == []
+
+
+def test_a_property_that_is_not_a_string_is_no_name() -> None:
+    fake = FakeDirectShow([FakeMoniker({"FriendlyName": 42, "DevicePath": 7})])
+    assert oc.enumerate_dshow(fake.api()) == [oc.DshowDevice(0, "", None)]
+    assert fake.allocated == {} and fake.errors == []
+
+
+def test_an_empty_video_input_category_is_an_empty_list() -> None:
+    fake = FakeDirectShow([])
+    assert oc.enumerate_dshow(fake.api()) == []
+    assert set(fake.refs.values()) == {0} and fake.errors == []
+    assert fake.calls[-1] == "CoUninitialize"
+
+
+def test_the_number_of_monikers_read_is_bounded() -> None:
+    # A filter that keeps answering Next must not spin: OpenCV's DirectShow backend cannot reach past
+    # VI_MAX_CAMERAS anyway.
+    fake = FakeDirectShow([], endless=True)
+    assert len(oc.enumerate_dshow(fake.api())) == oc.MAX_DSHOW_DEVICES
+    assert set(fake.refs.values()) == {0} and fake.errors == []
+
+
+@pytest.mark.parametrize("failure", ["instance_hr", "enumerator_hr"])
+def test_a_failed_directshow_enumeration_raises_and_undoes_com(failure: str) -> None:
+    fake = FakeDirectShow([dshow_moniker("UGREEN Camera")], **{failure: E_FAIL})
+    with pytest.raises(OSError, match=r"CoCreateInstance|CreateClassEnumerator"):
+        oc.enumerate_dshow(fake.api())
+    assert set(fake.refs.values()) <= {0} and fake.errors == []
+    assert fake.calls[-1] == "CoUninitialize"
+
+
+def test_com_already_set_up_by_someone_else_is_left_alone_by_the_directshow_listing() -> None:
+    fake = FakeDirectShow([dshow_moniker("UGREEN Camera")], init_hr=oc.RPC_E_CHANGED_MODE)
+    assert [d.name for d in oc.enumerate_dshow(fake.api())] == ["UGREEN Camera"]
+    assert "CoUninitialize" not in fake.calls and fake.errors == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has DirectShow")
+def test_list_dshow_devices_is_empty_off_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()  # the real function, not the autouse stand-in
+    assert oc.list_dshow_devices() == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="DirectShow is Windows-only")
+def test_list_dshow_devices_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()
+    devices = oc.list_dshow_devices()  # a CI runner has no camera; it must still not raise
+    assert isinstance(devices, list)
+    assert [d.index for d in devices] == list(range(len(devices)))
+    assert all(isinstance(d.name, str) and (d.path is None or d.path) for d in devices)

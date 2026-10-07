@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from jarvis_hands.actions import Button, ReleaseAll
+from jarvis_hands.actions import Button, MoveCursor, ReleaseAll
 from jarvis_hands.desktop import windows as win
 from jarvis_hands.desktop.base import InputBlocked, UnsupportedPlatform, Window
 from jarvis_hands.desktop.windows import (
@@ -39,6 +39,7 @@ from jarvis_hands.desktop.windows import (
 )
 from jarvis_hands.executor import Executor
 from jarvis_hands.geometry import Rect
+from jarvis_hands.mapping import select_displays
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="needs Windows")
 
@@ -156,16 +157,40 @@ def test_displays_rotems_pc_monitor_and_the_virtual_display_driver() -> None:
     assert (second.id, second.name, second.primary, second.virtual) == (2, "VDD by MTT", False, True)
 
 
-def test_indirect_outputs_and_names_that_say_virtual_are_virtual() -> None:
+def test_indirect_virtual_outputs_and_names_that_say_virtual_are_virtual() -> None:
     monitors = [
         _monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, primary=True),
         _monitor(r"\\.\DISPLAY3", 1920, 0, 1920, 1080),
     ]
-    for target in (TargetRecord("", 17), TargetRecord("Dummy", 16), TargetRecord("Parsec Virtual Display", HDMI)):
+    for target in (
+        TargetRecord("", win.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL),
+        TargetRecord("Parsec Virtual Display", HDMI),
+        TargetRecord("Virtual Dummy", win.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED),
+    ):
         displays = build_displays(monitors, {r"\\.\DISPLAY3": [target]}, {})
         assert [d.virtual for d in displays] == [False, True], target
     displays = build_displays(monitors, {}, {r"\\.\display3": "IddSampleDriver Device"})  # keys in any case
     assert [d.virtual for d in displays] == [False, True]
+
+
+def test_a_projector_on_a_usb_display_adapter_is_a_real_display() -> None:
+    # DisplayLink docks and USB display adapters are indirect *wired* outputs: a physical screen hand control
+    # must reach under "all". Only the names (and the indirect *virtual* technology) make a display virtual.
+    monitors = [
+        _monitor(r"\\.\DISPLAY1", 0, 0, 1920, 1080, primary=True),
+        _monitor(r"\\.\DISPLAY5", 1920, 0, 1920, 1080, taskbar=0),
+    ]
+    targets = {
+        r"\\.\DISPLAY1": [TargetRecord("DELL S2721DGF", HDMI)],
+        r"\\.\DISPLAY5": [TargetRecord("EPSON PJ", win.DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED)],
+    }
+    adapters = {r"\\.\DISPLAY1": "NVIDIA GeForce RTX 4070 Ti", r"\\.\DISPLAY5": "DisplayLink USB Device"}
+    displays = build_displays(monitors, targets, adapters)
+    assert [(d.name, d.virtual) for d in displays] == [("DELL S2721DGF", False), ("EPSON PJ", False)]
+    assert [d.name for d in select_displays(displays, "all")] == ["DELL S2721DGF", "EPSON PJ"]
+    # Rotem's Virtual Display Driver stays virtual whatever output it claims: its adapter says so.
+    adapters[r"\\.\DISPLAY5"] = "Virtual Display Driver"
+    assert [d.virtual for d in build_displays(monitors, targets, adapters)] == [False, True]
 
 
 def test_a_display_duplicated_onto_a_real_monitor_is_not_virtual() -> None:
@@ -284,6 +309,7 @@ class FakeWin32:
         }
         self.cursor = (100, 100)
         self.cursor_ok = True
+        self.cursor_reads = 0
         #: GetCursorPos reads before an injected move shows (0: at once; -1: never).
         self.move_lag = 0
         self._pending_move: tuple[int, int] | None = None
@@ -331,6 +357,7 @@ class FakeWin32:
         return self.metrics.get(index, 0)
 
     def GetCursorPos(self, ref: Any) -> int:
+        self.cursor_reads += 1
         if not self.cursor_ok:
             return self._fail(win.ERROR_ACCESS_DENIED)
         if self._pending_move is not None and self._lag_left >= 0:
@@ -720,15 +747,135 @@ def test_move_cursor_injects_a_tagged_absolute_move_onto_the_exact_pixel(api: Fa
     assert wdesk.cursor() == (2559, -200)
 
 
-def test_move_cursor_waits_for_a_move_windows_has_not_applied_yet(api: FakeWin32, wdesk: WindowsDesktop) -> None:
-    api.move_lag = 3
+class StepClock:
+    """``clock.now`` for the backend: every reading is ``step`` later, so a wait is counted in polls, not in
+    milliseconds of a machine that may be busy."""
+
+    def __init__(self, step: float = 0.0002, start: float = 1000.0) -> None:
+        self.step, self.t = step, start
+
+    def __call__(self) -> float:
+        self.t += self.step
+        return self.t
+
+    def skip(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def test_move_cursor_waits_for_a_move_windows_has_not_applied_yet(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(win, "clock_now", StepClock())  # the wait lasts as many polls as the fake clock allows
+    api.move_lag = 3  # Windows shows the move on the fourth read
     wdesk.move_cursor(500, 400)
     assert wdesk.cursor() == (500, 400)
-    api.move_lag = -1  # never shows: the wait is bounded
+
+
+def test_a_move_the_cursor_never_makes_is_not_waited_out(api: FakeWin32, wdesk: WindowsDesktop) -> None:
+    api.move_lag = -1  # it never gets there: another app confines the cursor, or the point clamps back
     started = time.perf_counter()
     wdesk.move_cursor(600, 400)
-    assert time.perf_counter() - started < 0.5
-    assert wdesk.cursor() == (500, 400)
+    assert time.perf_counter() - started < 0.5  # real time, a loose bound on MOVE_SETTLE_S
+    assert wdesk.cursor() == (100, 100)
+
+
+def test_a_cursor_stuck_where_a_wait_ran_out_costs_each_move_only_a_short_wait(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 120 moves a second each polling out the whole MOVE_SETTLE_S would cost half a core for nothing.
+    clock = StepClock()
+    monkeypatch.setattr(win, "clock_now", clock)
+    api.move_lag = -1
+    wdesk.move_cursor(500, 400)
+    full = api.cursor_reads
+    assert full >= win.MOVE_SETTLE_S / clock.step - 2, "the first move waits for the cursor"
+    for x in range(501, 621):  # the executor's next second of moves, the cursor still stuck
+        before = api.cursor_reads
+        wdesk.move_cursor(x, 400)
+        assert api.cursor_reads - before <= win.STUCK_SETTLE_S / clock.step + 3
+    assert api.cursor_reads - full <= 120 * (win.STUCK_SETTLE_S / clock.step + 3) < 120 * full / 2
+
+
+def test_after_the_cursor_was_stuck_a_free_move_that_lags_is_still_read_where_it_went(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The executor reads the cursor right after each move: a move Windows has not applied yet would read back as
+    # the old spot, and on the next tick the cursor at the new one would look like the user's hand on the mouse.
+    monkeypatch.setattr(win, "clock_now", StepClock())
+    api.move_lag = -1  # confined for a moment (ClipCursor): the wait runs out
+    wdesk.move_cursor(500, 400)
+    wdesk.move_cursor(510, 400)
+    api.move_lag = 1  # free again; Windows applies the move a moment later
+    wdesk.move_cursor(520, 400)
+    assert wdesk.cursor() == (520, 400)
+    api.move_lag = 3  # once it has moved, a move gets the whole wait again
+    wdesk.move_cursor(530, 400)
+    assert wdesk.cursor() == (530, 400)
+
+
+def test_a_cursor_that_got_away_from_where_it_was_stuck_gets_the_whole_wait(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(win, "clock_now", StepClock())
+    api.move_lag = -1
+    wdesk.move_cursor(500, 400)
+    api.move_lag = 0
+    api.cursor = (300, 300)  # the user's mouse, or a move that landed after its wait
+    api.move_lag = 3
+    wdesk.move_cursor(600, 400)
+    assert wdesk.cursor() == (600, 400)
+
+
+def test_a_short_pin_does_not_make_the_executor_take_its_own_moves_for_the_mouse(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(win, "clock_now", StepClock())
+    let_go: list[int] = []
+    t = [0.0]
+    ex = Executor(wdesk, displays=wdesk.displays, clock=lambda: t[0], on_user_input=lambda: let_go.append(1))
+
+    def frame(x: float) -> None:
+        ex.submit([MoveCursor(x, 400)], now=t[0])
+        for _ in range(4):  # a camera frame's worth of 120 Hz ticks
+            ex.tick(t[0])
+            t[0] += 1 / 120
+
+    frame(500)
+    frame(520)
+    api.move_lag = -1  # confined for a frame
+    frame(560)
+    api.move_lag = 1  # free again, each move applied a moment after it is sent
+    for x in (600, 640, 680, 720):
+        frame(x)
+    assert let_go == [], "our own move was taken for the user's mouse"
+    assert api.cursor[0] > 640
+
+
+def test_a_cursor_that_would_not_move_is_reported_once_per_spell(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(win, "clock_now", StepClock())
+    api.move_lag = -1
+    with caplog.at_level("DEBUG", logger=win.__name__):
+        for x in (500, 600, 700):
+            wdesk.move_cursor(x, 400)
+        notices = [r for r in caplog.records if "stayed at" in r.message]
+        assert [r.levelname for r in notices] == ["INFO"]  # stuck three times, said once
+        api.move_lag = 0  # the cursor is free again
+        wdesk.move_cursor(700, 400)
+        api.move_lag = -1
+        wdesk.move_cursor(800, 400)
+    assert [r.levelname for r in caplog.records if "stayed at" in r.message] == ["INFO", "INFO"]
+
+
+def test_a_move_that_settles_keeps_waiting_for_the_next_ones(
+    api: FakeWin32, wdesk: WindowsDesktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(win, "clock_now", StepClock())
+    api.move_lag = 2
+    for x in (300, 400, 500):
+        wdesk.move_cursor(x, 400)
+        assert wdesk.cursor() == (x, 400)
 
 
 def test_move_cursor_raises_when_input_is_blocked_or_there_is_no_screen(api: FakeWin32, wdesk: WindowsDesktop) -> None:
