@@ -7,11 +7,16 @@ import type { Register } from 'claude-code'
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
-import { bandTree, isBandShown } from './ui'
+import { actionLabel, HUD_PANE, hudMode, ringSize } from './hud'
+import { bandTree, HUD_TEXT_ROWS, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
 
 // The session state this mod owns (types/index.d.ts declares it).
 const viewAtom = atom({ plugin: 'jarvis', key: 'view' } as const, { phase: 'stopped' })
 const helperRefAtom = atom({ plugin: 'jarvis', key: 'helper' } as const, null)
+const hudAtom = atom({ plugin: 'jarvis', key: 'hud' } as const, { isThinking: false, actions: [] })
+
+/** The HUD pane: about as tall as the ring and its log, as wide when docked. */
+const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', rows: 24, columns: 52 }
 
 export const register: Register = (on, options) => {
   const app = new Jarvis(readSettings(options))
@@ -48,10 +53,17 @@ export const register: Register = (on, options) => {
       writeView: async view => {
         await update($, viewAtom, () => view)
       },
+      writeHud: async hud => {
+        await update($, hudAtom, () => hud)
+      },
       status: text => $.ui.status(text),
       toast: (text, toastOptions) => $.ui.toast(text, toastOptions),
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
+      openPane: () => $.ui.open(HUD_OPEN),
+      closePane: () => $.ui.close({ id: HUD_PANE }),
+      blit: args => $.ui.blit(args),
+      invalidate: () => $.ui.invalidate('ui.render'),
       submitPrompt: text => $.prompt.submit({ text, asUser: true }),
       complete: request => $.model.complete(request),
       contextTokens: async () => (await $.session.usage()).context.tokens,
@@ -59,8 +71,8 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices]',
+      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud]',
       immediate: true,
     })
     await app.onSessionStart(engine, e.surface)
@@ -73,10 +85,12 @@ export const register: Register = (on, options) => {
     return attached
   })
 
-  on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args))
+  // The command opens the HUD through its own `$`: the person asked, so it is placed at any width.
+  on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: () => $.ui.open(HUD_OPEN) }))
 
   on('turn.start', ($, e, next) => {
     app.voice?.onTurnStart(e)
+    app.hud?.onTurnStart()
     return next(e)
   })
 
@@ -88,8 +102,24 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', ($, e, next) => {
     app.voice?.onTurnComplete(e)
+    if (e.agentId === undefined) app.hud?.onTurnComplete()
     return next(e)
   })
+
+  // The HUD's action log: each tool call, and how it ended.
+  on('tool.call', async ($, e, next) => {
+    const hud = app.hud
+    if (hud === undefined) return next(e)
+    const id = hud.onToolStart(actionLabel(e as unknown as { tool: string } & Record<string, unknown>))
+    let isOk = false
+    try {
+      const result = await next(e)
+      isOk = result.deny === undefined && result.isError !== true
+      return result
+    } finally {
+      hud.onToolEnd(id, isOk)
+    }
+  }).catch(($, e, next) => next(e)) // never in the way of a tool: next is replay-safe here
 
   // The persona: a constant section once voice is in use, plus a per-turn
   // flag only when a voice prompt's note could not ride along with it.
@@ -104,6 +134,28 @@ export const register: Register = (on, options) => {
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const result = await next(e)
     return app.voice?.markPrompt(e.prompt, result) ?? result
+  }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'Pane', requestId: HUD_PANE }, async ($, e) => {
+    const view = await read($, viewAtom)
+    const hud = await read($, hudAtom)
+    const data = { mode: hudMode(view.phase, hud.isThinking), view, hud }
+    if (e.surface === 'terminal') {
+      const { Box, Text, Raster } = $.ui.resolve(e)
+      const bodyRows = e.props.scroll.bodyRows
+      const ring = ringSize(e.props.bodyColumns, bodyRows, 1 + HUD_TEXT_ROWS)
+      const cells = app.hud?.mountTerminal(HUD_PANE, ring.columns, ring.rows) ?? ''
+      const actionRows = bodyRows - 1 - ring.rows - (view.lastUtterance ? 1 : 0)
+      return hudTerminalTree({ Box, Text, Raster }, data, { ...ring, cells }, actionRows)
+    }
+    const { Box, Text, Svg } = $.ui.resolve(e)
+    app.hud?.mountDesktop()
+    return hudSvgTree({ Box, Text, Svg }, data, app.hud?.levels() ?? { mic: 0, out: 0 })
+  })
+
+  on('ui.close', ($, e, next) => {
+    if (e.id === HUD_PANE) app.hud?.onClosed()
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

@@ -9,6 +9,7 @@ import type {
   ModelCompleteInput,
   ModelCompleteResult,
   On,
+  PaneOpenArgs,
   ProcessSpawnChunk,
   ProcessSpawnRequest,
   PromptSubmitInput,
@@ -16,6 +17,7 @@ import type {
   TurnStepChunk,
   TurnStepInput,
   TurnStepResult,
+  UiBlitArgs,
 } from 'claude-code'
 
 export const WINDOWS_ENV = {
@@ -147,6 +149,14 @@ export type World = {
   completions: ModelCompleteInput[]
   /** Answers `$.model.complete` (default: the judge says "simple"). */
   complete: (input: ModelCompleteInput) => ModelCompleteResult | Promise<ModelCompleteResult>
+  /** Every pane the mod opened, and the ids it closed. */
+  opens: PaneOpenArgs[]
+  closes: string[]
+  /** Every repaint of a Raster, and how many redraws the mod asked for. */
+  blits: UiBlitArgs[]
+  invalidations: number
+  /** When set, `$.ui.blit` answers `{ deny }` with it (the Raster is gone). */
+  blitDeny: string | undefined
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
 }
@@ -185,6 +195,11 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     contextTokens: undefined,
     completions: [],
     complete: () => answered('simple'),
+    opens: [],
+    closes: [],
+    blits: [],
+    invalidations: 0,
+    blitDeny: undefined,
     onSpawn: () => undefined,
     respond: () => ({ status: 200, body: { ok: true } }),
     helpers: () => w.children.filter(child => child.isHelperRun),
@@ -311,6 +326,23 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       rateLimits: [],
     },
   }))
+  on('ui.open', ($, e) => {
+    w.opens.push(e)
+    return { value: { isPlaced: true as const } }
+  })
+  on('ui.close', ($, e) => {
+    w.closes.push(e.id)
+    return { value: undefined }
+  })
+  on('ui.blit', ($, e) => {
+    w.blits.push(e)
+    return { value: w.blitDeny === undefined ? {} : { deny: w.blitDeny } }
+  })
+  on('ui.invalidate', () => {
+    w.invalidations += 1
+    return { value: undefined }
+  })
+  on('tool.call', () => ({ result: 'ok' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
   return w

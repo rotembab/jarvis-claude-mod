@@ -2,13 +2,14 @@
 // settings, bound to the engine port at session.start, it owns the helper
 // supervisor, the voice controller and the view the status line and band draw.
 
-import type { PluginOptions, RenderSurface } from 'claude-code'
+import type { PluginOptions, RenderSurface, UiOpenResult } from 'claude-code'
 
 import type { JarvisPhase, JarvisView } from '../types'
 import type { Engine } from './engine'
 import { describeError } from './engine'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
+import { Hud } from './hud'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
@@ -96,6 +97,8 @@ const ENGINE_OVERRIDE_KEY = 'voiceEngine'
 const WAKE_OVERRIDE_KEY = 'wakeWord'
 const BARGE_IN_OVERRIDE_KEY = 'bargeIn'
 const ROUTING_OVERRIDE_KEY = 'modelRouting'
+/** Whether the HUD pane opens by itself (/jarvis hud on|off). */
+const HUD_OVERRIDE_KEY = 'hud'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -110,6 +113,8 @@ export class Jarvis {
   platform: Platform | undefined
   helper: Helper | undefined
   voice: Voice | undefined
+  /** The HUD pane's ring and action log (local sessions). */
+  hud: Hud | undefined
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined
@@ -155,6 +160,10 @@ export class Jarvis {
       this.publish({ phase: 'unavailable' })
       return
     }
+    this.hud?.dispose()
+    this.hud = new Hud(engine)
+    this.hud.setPhase(this.view.phase)
+    if (await this.isHudOn()) void this.openHud()
     // The desktop app starts its sessions with no surface, then attaches one
     // (perhaps while the awaits above ran).
     if ((surface !== null && LOCAL_SURFACES.has(surface)) || this.hasLocalAttach) this.autoStart()
@@ -163,6 +172,8 @@ export class Jarvis {
   onAttach(surface: RenderSurface): void {
     if (!LOCAL_SURFACES.has(surface)) return
     this.hasLocalAttach = true
+    // The desktop app attaches its surface after session.start: show the HUD there too.
+    if (this.isLocal && this.hud !== undefined) void this.isHudOn().then(isOn => (isOn ? this.openHud() : false))
     // Before session.start has finished, it starts the helper itself.
     if (this.isLocal) this.autoStart()
   }
@@ -212,6 +223,39 @@ export class Jarvis {
 
   async setBargeIn(mode: BargeInMode): Promise<void> {
     await this.engine?.storeSet(BARGE_IN_OVERRIDE_KEY, mode)
+  }
+
+  /** Whether the HUD opens with the session: /jarvis hud's choice, on by default. */
+  async isHudOn(): Promise<boolean> {
+    const stored = await this.engine?.storeGet(HUD_OVERRIDE_KEY).catch(() => undefined)
+    return stored !== false
+  }
+
+  async setHudOn(isOn: boolean): Promise<void> {
+    await this.engine?.storeSet(HUD_OVERRIDE_KEY, isOn)
+  }
+
+  /**
+   * Opens the HUD pane; false when the surface could not place it yet (a
+   * narrow terminal). `open` is the person's own when they asked for it
+   * (/jarvis hud), which the engine places at any width.
+   */
+  async openHud(open?: () => Promise<UiOpenResult>): Promise<boolean> {
+    const engine = this.engine
+    if (engine === undefined || this.hud === undefined) return false
+    try {
+      const opened = await (open ?? engine.openPane)()
+      if (!opened.isPlaced) engine.debug(`jarvis: HUD waits to be placed (${opened.reason})`)
+      return opened.isPlaced
+    } catch (error) {
+      engine.debug(`jarvis: HUD did not open: ${describeError(error)}`)
+      return false
+    }
+  }
+
+  async closeHud(): Promise<void> {
+    await this.engine?.closePane().catch(() => undefined)
+    this.hud?.onClosed()
   }
 
   /** Whether voice requests are routed between Sonnet, Opus and Fable: /jarvis routing's choice, else the setting. */
@@ -419,6 +463,7 @@ export class Jarvis {
         return
       }
       case 'level': {
+        this.hud?.setLevels(event.mic, event.out)
         const now = performance.now()
         if (this.view.phase !== 'listening' || now - this.lastLevelAt < LEVEL_INTERVAL_MS) return
         this.lastLevelAt = now
@@ -427,6 +472,9 @@ export class Jarvis {
       }
       case 'utterance':
         this.patch({ lastUtterance: event.text })
+        return
+      case 'barge_in':
+        this.hud?.onBargeIn()
         return
       case 'error': {
         const detail = event.hint ? `${event.message} (${event.hint})` : event.message
@@ -465,6 +513,7 @@ export class Jarvis {
     // undefined fields are dropped: $.state holds JSON data.
     const clean = JSON.parse(JSON.stringify(view)) as JarvisView
     this.view = clean
+    this.hud?.setPhase(clean.phase)
     const engine = this.engine
     if (engine === undefined) return
     void engine.writeView(clean).catch(() => undefined)
