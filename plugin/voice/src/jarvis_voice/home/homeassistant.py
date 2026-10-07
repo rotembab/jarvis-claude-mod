@@ -24,7 +24,9 @@ plain-text 500, from 2026.10 a JSON ``{"message"}``. Both are handled, and
 plain-text bodies are never spoken.
 
 The entity list is cached for 30 seconds and fetched only when Jarvis is
-asked something: nothing polls.
+asked something: nothing polls. Every request lists the hubs first, so a
+listing that failed (Home Assistant off or hung) is not tried again for 20
+seconds, rather than costing each request for another device its timeout.
 """
 
 from __future__ import annotations
@@ -65,6 +67,9 @@ DEFAULT_PORT = 8123
 # Timings. A listing runs on the service's worker within its 20 s limit, and
 # so does a command: the request timeouts below add up to less than that.
 CACHE_S = 30.0
+# A listing that failed is not tried again for this long (a new address or token is tried at once): every
+# request lists the hubs first, so a Home Assistant that is off would cost each one its whole timeout.
+FAILED_HOLD_S = 20.0
 LIST_BUDGET_S = 12.0
 STATES_TIMEOUT_S = 6.0
 WS_BUDGET_S = 6.0
@@ -81,6 +86,9 @@ PROBE_TIMEOUT_S = 4.0
 REFUSED_HOLD_S = 600.0
 WS_MAX_MESSAGE = 32 * 1024 * 1024  # the registries of a large home run to megabytes
 MAX_CHOICES = 40
+# Inputs and apps (an Apple TV lists every installed app) and light effects (WLED has some 180): a value
+# left out could never be chosen, so these keep far more than the modes do.
+MAX_SOURCES = 300
 MAX_NAME = 80
 MAX_DETAIL = 160
 MAX_SETUP_TRIES = 5
@@ -264,6 +272,12 @@ class HaError(Exception):
         self.detail = detail
         self.spoken = spoken
         self.during = ""
+
+    def again(self) -> HaError:
+        """The same failure, to raise anew: re-raising one object would grow its traceback each time."""
+        copied = HaError(self.kind, str(self), status=self.status, detail=self.detail, spoken=self.spoken)
+        copied.during = self.during
+        return copied
 
 
 _refused: dict[str, float] = {}
@@ -476,26 +490,44 @@ class HaSocket:
     def _left(self) -> float:
         return self._deadline - time.monotonic()
 
-    def __enter__(self) -> HaSocket:
-        context = None
-        if self.url.startswith("wss://"):
-            context = ssl.create_default_context()
-            if not self._verify:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-        try:
-            self._conn = self._stack.enter_context(
-                ws_connect(
-                    self.url,
-                    ssl=context,
-                    proxy=None,  # a hub on the home network: never through a proxy
-                    open_timeout=max(MIN_REQUEST_S, min(WS_OPEN_TIMEOUT_S, self._left())),
-                    close_timeout=1.0,
-                    ping_interval=None,
-                    max_size=WS_MAX_MESSAGE,
-                    logger=_ws_log,
-                )
+    def _tls(self, *, newest: bool) -> ssl.SSLContext | None:
+        if not self.url.startswith("wss://"):
+            return None
+        context = ssl.create_default_context()
+        if not self._verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        if not newest:
+            # websockets' sync client reads on one thread while it writes on another. Over TLS 1.3 a
+            # session ticket (most servers send two after the handshake) read while the upgrade request is
+            # written stalls that request until the open times out: about one open in twenty, in tests.
+            # TLS 1.2 sends no such message after the handshake; a server that refuses 1.2 gets 1.3.
+            context.maximum_version = ssl.TLSVersion.TLSv1_2
+        return context
+
+    def _open(self, context: ssl.SSLContext | None) -> Any:
+        return self._stack.enter_context(
+            ws_connect(
+                self.url,
+                ssl=context,
+                proxy=None,  # a hub on the home network: never through a proxy
+                open_timeout=max(MIN_REQUEST_S, min(WS_OPEN_TIMEOUT_S, self._left())),
+                close_timeout=1.0,
+                ping_interval=None,
+                max_size=WS_MAX_MESSAGE,
+                logger=_ws_log,
             )
+        )
+
+    def __enter__(self) -> HaSocket:
+        try:
+            try:
+                self._conn = self._open(self._tls(newest=False))
+            except (ssl.SSLError, ConnectionError) as exc:  # a refusal may come as a reset, not an alert
+                if isinstance(exc, ssl.SSLCertVerificationError) or not self.url.startswith("wss://"):
+                    raise
+                log.debug("Home Assistant's WebSocket refused TLS 1.2 (%s); trying TLS 1.3", type(exc).__name__)
+                self._conn = self._open(self._tls(newest=True))
         except (OSError, TimeoutError, WebSocketException) as exc:  # ssl.SSLError is an OSError
             raise HaError("ws", f"{self.url}: {type(exc).__name__}") from None
         try:
@@ -681,10 +713,10 @@ def _text(value: Any) -> str:
     return " ".join(value.split())[:MAX_NAME] if isinstance(value, str) else ""
 
 
-def _strings(value: Any) -> list[str]:
+def _strings(value: Any, limit: int = MAX_CHOICES) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [item.strip() for item in value if isinstance(item, str) and item.strip()][:MAX_CHOICES]
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()][:limit]
 
 
 def _display_name(friendly: Any, entity_id: str) -> str:
@@ -714,11 +746,11 @@ def _domain_settings(domain: str, attributes: dict[str, Any]) -> dict[str, Any]:
 
     if domain == "light":
         keep("color_modes", _strings(attributes.get("supported_color_modes")))
-        keep("effects", _strings(attributes.get("effect_list")))
+        keep("effects", _strings(attributes.get("effect_list"), MAX_SOURCES))
         keep("min_kelvin", _number(attributes.get("min_color_temp_kelvin")))
         keep("max_kelvin", _number(attributes.get("max_color_temp_kelvin")))
     elif domain == "media_player":
-        keep("sources", _strings(attributes.get("source_list")))
+        keep("sources", _strings(attributes.get("source_list"), MAX_SOURCES))
     elif domain == "climate":
         keep("hvac_modes", _strings(attributes.get("hvac_modes")))
         keep("fan_modes", _strings(attributes.get("fan_modes")))
@@ -791,7 +823,7 @@ def entity_commands(device: DeviceRecord) -> list[CommandSpec]:
             specs.append(CommandSpec("set_color", "text", hint="a colour name or #rrggbb"))
         if "color_temp" in modes:
             specs.append(CommandSpec("set_color_temp", "text", hint="warm|neutral|cool, or 0-100 (0 = warmest)"))
-        effects = _strings(s.get("effects"))
+        effects = _strings(s.get("effects"), MAX_SOURCES)
         if has(LIGHT_EFFECT) and effects:
             specs.append(CommandSpec("set_mode", "choice", choices=tuple(effects)))
     elif domain in ("switch", "input_boolean"):
@@ -887,7 +919,7 @@ def _media_commands(device: DeviceRecord, has: Any) -> list[CommandSpec]:
     if has(MP_VOLUME_MUTE):
         specs += [CommandSpec("mute"), CommandSpec("unmute")]
     if has(MP_SELECT_SOURCE):
-        sources = _strings(device.settings.get("sources"))
+        sources = _strings(device.settings.get("sources"), MAX_SOURCES)
         if sources:
             specs += [CommandSpec("set_input", "choice", choices=tuple(sources)), CommandSpec("list_inputs")]
         else:
@@ -1029,7 +1061,7 @@ def plan_action(device: DeviceRecord, command: str, value: Value) -> Action | Ou
             return Action("volume_mute", {"is_volume_muted": command == "mute"}, f"{command} {the}")
         if command == "set_input":
             return Action("select_source", {"source": value}, f"switch {the} to {value}")
-        sources = _strings(s.get("sources"))
+        sources = _strings(s.get("sources"), MAX_SOURCES)
         return Outcome.done(f"{_capital(the)} can switch to: {', '.join(sources)}.")
     if domain == "vacuum":
         return Action("set_fan_speed", {"fan_speed": value}, f"set {the}'s suction to {value}")
@@ -1272,41 +1304,62 @@ class _Listing:
     exposed_only: bool
 
 
+@dataclass(slots=True)
+class _Failed:
+    key: tuple[Any, ...]
+    at: float
+    error: HaError
+
+
 class HomeAssistantDriver(Driver):
     name = DRIVER
     label = "Home Assistant"
 
     # As attributes so tests can shorten them.
     cache_s = CACHE_S
+    failed_hold_s = FAILED_HOLD_S
     recheck_wait_s = RECHECK_WAIT_S
 
     def __init__(self, ctx: DriverContext) -> None:
         super().__init__(ctx)
         self._lock = threading.Lock()
         self._listing: _Listing | None = None
+        self._failed: _Failed | None = None
 
     # ------------------------------------------------------------------ Driver
 
     def hub_devices(self) -> list[DeviceRecord]:
-        """Home Assistant's controllable entities, read at most every 30 seconds (and only when asked)."""
+        """Home Assistant's controllable entities, read at most every 30 seconds (and only when asked).
+        After a failure the same settings are not tried again for 20 seconds: the failure is raised again."""
         with self._lock:
             try:
                 hub = self.settings()
-                listing = self._listing
-                if (
-                    listing is not None
-                    and listing.key == hub.cache_key
-                    and time.monotonic() - listing.at < self.cache_s
-                ):
-                    return copy.deepcopy(listing.devices)
+            except HaError as err:
+                self._listing_failed(err)
+                raise
+            now = time.monotonic()
+            listing = self._listing
+            if listing is not None and listing.key == hub.cache_key and now - listing.at < self.cache_s:
+                return copy.deepcopy(listing.devices)
+            failed = self._failed
+            if failed is not None and failed.key == hub.cache_key and now - failed.at < self.failed_hold_s:
+                # Raised again as it was; asking again within the hold does not extend it.
+                log.debug("Home Assistant devices: %s a moment ago; not asked again yet", failed.error.kind)
+                raise failed.error.again()
+            try:
                 devices = self.fetch(hub)
             except HaError as err:
-                self._listing = None
-                err.spoken = hub_problem(err)
-                log.info("Home Assistant devices: %s (%s)", err.kind, err)
+                self._listing_failed(err)
+                self._failed = _Failed(hub.cache_key, time.monotonic(), err.again())
                 raise
             self._listing = _Listing(hub.cache_key, time.monotonic(), devices, hub.exposed_only)
+            self._failed = None
             return copy.deepcopy(devices)
+
+    def _listing_failed(self, err: HaError) -> None:
+        self._listing = None
+        err.spoken = hub_problem(err)
+        log.info("Home Assistant devices: %s (%s)", err.kind, err)
 
     def commands(self, device: DeviceRecord) -> list[CommandSpec]:
         return entity_commands(device)
@@ -1371,6 +1424,7 @@ class HomeAssistantDriver(Driver):
 
     def close(self) -> None:
         self._listing = None
+        self._failed = None
 
     # ------------------------------------------------------------------ plumbing
 

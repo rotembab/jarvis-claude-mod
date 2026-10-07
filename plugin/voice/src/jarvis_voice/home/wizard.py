@@ -110,7 +110,7 @@ def _open_file(path: Path) -> None:
 def run_wizard(data_dir: Path, ui: Prompter | None = None, *, service: HomeService | None = None) -> int:
     """The interactive menu. Returns a process exit code."""
     console = ui is None
-    if console and not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if console and not all(stream is not None and stream.isatty() for stream in (sys.stdin, sys.stdout)):
         # It asks for PINs, codes and keys: a person types them at a console,
         # never a program (Claude's shell included) through a pipe.
         print("Jarvis home setup asks for codes and keys: run it in a terminal window of your own.", file=sys.stderr)
@@ -252,6 +252,10 @@ def _try(ui: Prompter, home: HomeService) -> None:
         return
     status = home.handle({"action": "status", "device": wanted})
     ui.say(status["text"])
+    # Typing the command here is the user's own confirmation, for the device whose state was just shown.
+    shown = status.get("device")
+    if isinstance(shown, dict) and isinstance(shown.get("id"), str) and shown["id"]:
+        wanted = shown["id"]
     command = ui.ask("Command to try (empty to skip), e.g. turn_on, set_volume")
     if not command:
         return

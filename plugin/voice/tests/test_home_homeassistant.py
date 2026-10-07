@@ -46,7 +46,7 @@ from jarvis_voice.home.model import DeviceRecord, Outcome, Value
 from jarvis_voice.home.service import HomeService
 from jarvis_voice.home.store import HomeStore
 
-from home_fakes import ScriptedPrompter, make_store
+from home_fakes import FakeDriver, ScriptedPrompter, make_store
 
 TOKEN = "fake-ha-token-for-jarvis-tests"
 WRONG_TOKEN = "not-the-home-assistant-token"
@@ -491,13 +491,7 @@ class FakeHomeAssistant:
             self._http.socket = tls.wrap_socket(self._http.socket, server_side=True)
         quiet = logging.getLogger("fake_home_assistant.websocket")
         quiet.setLevel(logging.CRITICAL)  # the server would log the auth frame, token and all
-        if tls is not None:
-            tls.sslsocket_class = SturdyServerSocket  # serve() wraps its listening socket right away
-        try:
-            self._ws = serve(self.ws_session, "127.0.0.1", 0, ssl=tls, logger=quiet)
-        finally:
-            if tls is not None:
-                tls.sslsocket_class = ssl.SSLSocket
+        self._ws = serve(self.ws_session, "127.0.0.1", 0, ssl=tls, logger=quiet)
         scheme = "https" if tls is not None else "http"
         self.url = f"{scheme}://127.0.0.1:{self._http.server_address[1]}"
         ws_port = self._ws.socket.getsockname()[1]
@@ -820,8 +814,11 @@ def test_exposed_only_shows_nothing_when_the_assist_list_cannot_be_read(tmp_path
         driver.hub_devices()
     assert caught.value.kind == "exposure" and caught.value.spoken == NOT_ADMIN_ANY_MORE
     assert "homeassistant/expose_entity/list" not in ha.ws_types
+    sessions = ha.ws_sessions
     assert driver.describe() == NOT_ADMIN_ANY_MORE
+    assert ha.ws_sessions == sessions  # held a moment, not asked again
     # The WebSocket is down: no list, so no devices rather than all of them.
+    driver.failed_hold_s = 0.0
     ha.admin, ha.ws_down = True, True
     with pytest.raises(HaError) as caught:
         driver.hub_devices()
@@ -855,6 +852,87 @@ def test_the_list_is_cached_and_read_again_when_stale_or_changed(tmp_path: Path,
     driver.close()
     driver.hub_devices()
     assert ha.paths().count("/api/states") == 4
+
+
+class SilentServer:
+    """A Home Assistant that is hung (or a host that holds connections): it accepts and never answers."""
+
+    def __init__(self) -> None:
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.1)  # so the accepting thread sees close() on every OS
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.accepted: list[socket.socket] = []
+        self.closed = False
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while not self.closed:
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            self.accepted.append(conn)
+
+    def connections(self) -> int:
+        time.sleep(0.15)  # lets the accepting thread catch up
+        return len(self.accepted)
+
+    def close(self) -> None:
+        self.closed = True
+        self.sock.close()
+        for conn in self.accepted:
+            conn.close()
+
+
+def test_a_failed_list_is_not_asked_for_again_by_every_request(
+    tmp_path: Path, ha: FakeHomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ha_mod, "STATES_TIMEOUT_S", 0.3)
+    silent = SilentServer()
+    store = make_store(tmp_path)
+    save_hub(store, silent.url)
+    store.update(lambda c: c.upsert(DeviceRecord("tv", "fake", "Sony TV", "tv")))
+    hubs: list[HomeAssistantDriver] = []
+
+    def build(ctx: DriverContext) -> HomeAssistantDriver:
+        hubs.append(HomeAssistantDriver(ctx))
+        return hubs[-1]
+
+    service = HomeService(tmp_path, store=store, drivers={"fake": FakeDriver, "homeassistant": build})
+    try:
+        # Every request lists the hubs first: the first one waits for Home Assistant, the next do not.
+        assert service.handle({"action": "status", "device": "tv"})["text"] == "The Sony TV is on."
+        assert service.handle({"action": "do", "device": "Sony TV", "command": "turn_on"})["result"] == "done"
+        assert silent.connections() == 1
+        driver = hubs[0]
+        assert driver._failed is not None
+        held_at = driver._failed.at
+        raised = []
+        for _ in range(2):
+            with pytest.raises(HaError) as caught:
+                driver.hub_devices()
+            raised.append(caught.value)
+        # Raised anew each time (a re-raised object would grow its traceback), with the same words.
+        assert raised[0] is not raised[1] and raised[0].__traceback__ is not None
+        assert {(err.kind, err.spoken) for err in raised} == {("timeout", "Home Assistant did not answer in time.")}
+        assert driver.describe() == "Home Assistant did not answer in time."
+        # Asking again within the hold does not make it longer.
+        assert silent.connections() == 1 and driver._failed.at == held_at
+        # Once the hold is over, Home Assistant is asked again.
+        driver.failed_hold_s = 0.0
+        assert "did not answer in time" in service.handle({"action": "list"})["text"]
+        assert silent.connections() == 2
+        # A new address (or token) is tried at once.
+        driver.failed_hold_s = 300.0
+        save_hub(store, ha.url)
+        assert len(driver.hub_devices()) == len(CONTROLLABLE) and driver._failed is None
+    finally:
+        service.close()
+        silent.close()
 
 
 # --------------------------------------------------------------------------- commands
@@ -1032,6 +1110,40 @@ def test_answers_name_the_new_state_or_what_was_asked(tmp_path: Path, ha: FakeHo
     assert run(driver, "button.doorbell_chime", "activate").text == "Pressed the Doorbell chime."
     listed = run(driver, "media_player.lounge_tv", "list_inputs")
     assert listed.text == "The Lounge TV can switch to: HDMI 1, Netflix, YouTube."
+
+
+def test_every_input_app_and_effect_can_be_chosen_not_only_the_first_few(tmp_path: Path, ha: FakeHomeAssistant) -> None:
+    # Home Assistant's Apple TV lists every installed app as a source, by name; WLED has some 180 effects.
+    apps = sorted([f"Game {i:02d}" for i in range(60)] + ["Netflix", "Spotify", "YouTube"])
+    ha.states["media_player.lounge_tv"]["attributes"]["source_list"] = apps
+    ha.states["light.kitchen"]["attributes"]["effect_list"] = [f"Effect {i}" for i in range(150)] + ["Candle"]
+    store = make_store(tmp_path)
+    save_hub(store, ha.url)
+    service = HomeService(tmp_path, store=store, drivers={"homeassistant": HomeAssistantDriver})
+    try:
+        reply = service.handle({"action": "do", "device": "lounge tv", "command": "set_input", "value": "youtube"})
+        assert reply["result"] == "done", reply["text"]
+        reply = service.handle({"action": "do", "device": "kitchen light", "command": "set_mode", "value": "candle"})
+        assert reply["result"] == "done", reply["text"]
+        assert [call[1:] for call in ha.service_calls] == [
+            ("select_source", {"entity_id": "media_player.lounge_tv", "source": "YouTube"}),
+            ("turn_on", {"entity_id": "light.kitchen", "effect": "Candle"}),
+        ]
+        listed = service.handle({"action": "do", "device": "lounge tv", "command": "list_inputs"})["text"]
+        assert listed.startswith("The Lounge TV can switch to: Game 00, ") and listed.endswith(", Spotify, YouTube.")
+        # The model's list shows a few; the rest are still there to choose.
+        assert (
+            "set_input <Game 00|Game 01|Game 02|Game 03|Game 04|Game 05|Game 06|Game 07|...>"
+            in service.handle({"action": "list", "query": "lounge tv"})["text"]
+        )
+    finally:
+        service.close()
+    # Modes stay short lists, and no list is kept without end.
+    ha.states["media_player.lounge_tv"]["attributes"]["source_list"] = [f"Channel {i}" for i in range(1000)]
+    ha.states["climate.hall"]["attributes"]["hvac_modes"] = [f"mode {i}" for i in range(100)]
+    driver, _ = connect(tmp_path / "again", ha)
+    assert len(device(driver, "media_player.lounge_tv").settings["sources"]) == ha_mod.MAX_SOURCES
+    assert len(device(driver, "climate.hall").settings["hvac_modes"]) == ha_mod.MAX_CHOICES
 
 
 def test_a_state_reported_after_the_call_is_still_seen(tmp_path: Path, ha: FakeHomeAssistant) -> None:
@@ -1275,7 +1387,11 @@ def test_through_the_home_service(tmp_path: Path, ha: FakeHomeAssistant) -> None
         assert "Outdoor temperature" not in text
         reply = service.handle({"action": "do", "device": "front door", "command": "unlock"})
         assert reply["result"] == "confirm" and ha.service_calls == []
-        reply = service.handle({"action": "do", "device": "front door", "command": "unlock", "confirmed": True})
+        # The yes is for the device the prompt named: it is sent again by that device's id.
+        assert reply["device"] == {"id": "ha:lock.front_door", "name": "Front door"}
+        reply = service.handle(
+            {"action": "do", "device": reply["device"]["id"], "command": "unlock", "confirmed": True}
+        )
         assert (reply["result"], reply["text"]) == ("done", "The Front door is unlocked.")
         assert service.handle({"action": "do", "device": "garage door", "command": "open"})["result"] == "confirm"
         reply = service.handle({"action": "do", "device": "kitchen light", "command": "brightness", "value": "40%"})
@@ -1441,25 +1557,6 @@ def test_wizard_changes_the_settings_then_disconnects(tmp_path: Path, ha: FakeHo
     assert ui.asked == ["Home Assistant's address, as you open it in your browser"]
 
 
-class SturdyServerSocket(ssl.SSLSocket):
-    """The fake WebSocket server's listening TLS socket: it keeps accepting after one connection fails.
-
-    SSLSocket.accept() asks each new socket for its peer, which on macOS fails (EINVAL) for a
-    connection its client already dropped; the websockets server stops accepting on any error
-    from accept(), and every later client of the fake would wait until its own timeout.
-    """
-
-    def accept(self) -> tuple[socket.socket, Any]:
-        while True:
-            try:
-                return super().accept()
-            except OSError:
-                if self.fileno() == -1:  # closed: the server is shutting down
-                    raise
-                # Wait for the next connection, a little at a time, so a shutdown is noticed.
-                self.settimeout(0.2)
-
-
 def self_signed(tmp_path: Path) -> ssl.SSLContext:
     """A server context with a certificate made up on the spot (nothing a client trusts)."""
     from cryptography import x509
@@ -1525,6 +1622,44 @@ def test_a_certificate_that_cannot_be_checked_is_refused_by_default(tmp_path: Pa
         driver.hub_devices()
     assert caught.value.kind == "tls"
     assert ha_tls.service_calls == [] and ha_tls.auth_failures == 0
+
+
+def test_secure_websocket_sessions_open_every_time(
+    tmp_path: Path, ha_tls: FakeHomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Over TLS 1.3 the session tickets sent after the handshake stalled about one open in twenty.
+    hub = HubSettings(ha_tls.url, TOKEN, verify_tls=False)
+    for _ in range(25):
+        with ha_mod.HaSocket(hub) as ws:
+            assert ws.ask("auth/current_user")["is_admin"] is True
+            assert ws._conn.socket.version() == "TLSv1.2"
+    # A certificate that cannot be checked is not tried again with another version.
+    opened: list[str] = []
+    real_connect = ha_mod.ws_connect
+
+    def counting(url: str, **kwargs: Any) -> Any:
+        opened.append(url)
+        return real_connect(url, **kwargs)
+
+    monkeypatch.setattr(ha_mod, "ws_connect", counting)
+    with pytest.raises(HaError) as caught, ha_mod.HaSocket(HubSettings(ha_tls.url, TOKEN)):
+        pass
+    assert caught.value.kind == "ws" and len(opened) == 1
+
+
+def test_a_server_that_refuses_tls_1_2_gets_tls_1_3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    context = self_signed(tmp_path)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.num_tickets = 0  # what stalls the sync client over TLS 1.3 (see above)
+    fake = FakeHomeAssistant(tls=context)
+    fake.start()
+    monkeypatch.setattr(ha_mod, "websocket_url", fake.websocket_url)
+    try:
+        with ha_mod.HaSocket(HubSettings(fake.url, TOKEN, verify_tls=False)) as ws:
+            assert ws.ask("auth/current_user")["is_admin"] is True
+            assert ws._conn.socket.version() == "TLSv1.3"
+    finally:
+        fake.stop()
 
 
 def test_timing_budget_fits_the_service_limit() -> None:

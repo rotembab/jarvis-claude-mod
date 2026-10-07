@@ -352,9 +352,12 @@ def test_screen_tier_needs_confirmation_and_never_is_refused(tmp_path: Path, ref
         "device": {"id": DOOR.id, "name": "Front door"},
     }
     assert drivers["fake"].calls == []
-    assert service.handle({"action": "do", "device": "front door", "command": "unlock", "confirmed": True})[
-        "result"
-    ] == ("done")
+    # A yes comes back with the id the prompt named; words could find another device by now, so they ask again.
+    by_name = service.handle({"action": "do", "device": "front door", "command": "unlock", "confirmed": True})
+    assert by_name["result"] == "confirm" and drivers["fake"].calls == []
+    assert service.handle({"action": "do", "device": DOOR.id, "command": "unlock", "confirmed": True})["result"] == (
+        "done"
+    )
     assert service.handle({"action": "do", "device": "front door", "command": "lock"})["result"] == "done"
     reply = service.handle({"action": "do", "device": "front door", "command": "self_destruct", "confirmed": True})
     assert reply["code"] == "refused"
@@ -534,6 +537,18 @@ def test_console_do_confirms_only_at_a_terminal(tmp_path: Path) -> None:
     done = run_console(tmp_path, body, stdin=Tty(), ask=lambda q: asked.append(q) or "yes", service_factory=factory)
     assert done["result"] == "done" and asked == ["Let Jarvis unlock the Front door? [y/N]: "]
 
+    # The yes goes back for the device the prompt named, by its id, even if the words now find another.
+    def renamed(question: str) -> str:
+        def swap(config: HomeConfig) -> None:
+            config.device(DOOR.id).name = "Back door"  # type: ignore[union-attr]
+            config.upsert(DeviceRecord("fake-new-front-door", "fake", "Front door", "lock"))
+
+        calls[-1].store.update(swap)
+        return "y"
+
+    done = run_console(tmp_path, body, stdin=Tty(), ask=renamed, service_factory=factory)
+    assert done["result"] == "done" and done["device"]["id"] == DOOR.id
+
 
 def test_the_wizard_wants_a_person_at_a_console(tmp_path: Path, monkeypatch: Any, capsys: Any) -> None:
     from jarvis_voice.home.wizard import run_wizard
@@ -541,6 +556,21 @@ def test_the_wizard_wants_a_person_at_a_console(tmp_path: Path, monkeypatch: Any
     monkeypatch.setattr(sys, "stdin", io.StringIO("1234\n"))
     assert run_wizard(tmp_path) == 2
     assert "terminal window of your own" in capsys.readouterr().err
+
+
+def test_a_saved_device_named_by_its_id_needs_no_hub_list(tmp_path: Path) -> None:
+    service, drivers = make_service(tmp_path, ALL, hubs={"fakehub": {}})
+    service.handle({"action": "info"})
+    hub = drivers["fakehub"]
+    hub.hub_error = TimeoutError("a hub that is off")
+    listed: list[int] = []
+    original = hub.hub_devices
+    hub.hub_devices = lambda: listed.append(1) or original()  # type: ignore[method-assign]
+    assert service.handle({"action": "status", "device": TV.id})["result"] == "done"
+    assert service.handle({"action": "do", "device": TV.id, "command": "turn_on"})["result"] == "done"
+    assert listed == []
+    # Words still read every hub's devices.
+    assert service.handle({"action": "status", "device": "sony tv"})["result"] == "done" and listed == [1]
 
 
 def test_home_call_runs_as_a_one_shot_process(tmp_path: Path) -> None:

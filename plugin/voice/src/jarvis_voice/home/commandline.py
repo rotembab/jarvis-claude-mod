@@ -61,6 +61,10 @@ def run_console(
         answer = ask(f"{response.get('prompt', 'Go ahead?')} [y/N]: ").strip().lower()
         if answer not in ("y", "yes"):
             return {**response, "result": "failed", "code": "refused", "text": "Not done."}
+        # The yes is for the device the prompt named: it goes again by that device's id, not the words typed.
+        device = response.get("device")
+        if isinstance(device, dict) and isinstance(device.get("id"), str) and device["id"]:
+            body = {**body, "device": device["id"]}
         return service.handle({**body, "confirmed": True})
     finally:
         service.close()

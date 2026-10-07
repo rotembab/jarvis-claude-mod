@@ -117,6 +117,16 @@ In the setup window, **Ask before Jarvis uses a device** sets any device you add
 
 In plan mode, Jarvis only looks at devices and doesn't change them.
 
+Your Claude Code permission rules apply too. Jarvis's device tool is `mcp__jarvis__home_control`, and you can add rules for it with `/permissions`:
+
+- **Deny rule**: Jarvis can't change any device. `/jarvis home` still works when you type it.
+- **Ask rule**: Jarvis asks on screen before every change, whatever the device's setting.
+- **dontAsk mode**: changes are refused unless you have an allow rule for the tool.
+
+Listing devices and reading their state are always allowed.
+
+These checks cover Jarvis's own device tool. Programs that run under your Windows account can still use the helper, and that includes shell commands Claude runs: DPAPI keeps your keys from other accounts, not from your own programs. Claude Code asks before it runs a shell command you haven't allowed, and that prompt is what stops Claude going around the tool. So don't allow commands that run Jarvis's Python (`.jarvis\venv`) without asking.
+
 ## Commands
 
 | Command | What it does |

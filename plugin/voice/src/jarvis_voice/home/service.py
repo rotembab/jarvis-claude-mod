@@ -194,9 +194,18 @@ class HomeService:
         footer = ["* asks the user to confirm on screen first."] if asks else []
         return _reply("done", "ok", "\n".join([header + ":", *rows, *footer, *notes]), count=len(shown))
 
-    def _status(self, wanted: str) -> dict[str, Any]:
+    def _find(self, wanted: str) -> DeviceRecord | dict[str, Any]:
+        """The device ``wanted`` names. A saved device named by its exact id (as list shows it, and as a
+        confirmation sends it) needs no hub listing, so a hub that is off or slow does not delay it."""
+        if wanted:
+            saved = self.store.load().device(wanted)
+            if saved is not None:
+                return saved
         devices, notes = self._devices()
-        found = self._resolve(devices, wanted, notes)
+        return self._resolve(devices, wanted, notes)
+
+    def _status(self, wanted: str) -> dict[str, Any]:
+        found = self._find(wanted)
         if isinstance(found, dict):
             return found
         driver = self._driver(found.driver)
@@ -210,10 +219,13 @@ class HomeService:
         name = canonical_command(command)
         if name == "status":
             return self._status(wanted)
-        devices, notes = self._devices()
-        found = self._resolve(devices, wanted, notes)
+        found = self._find(wanted)
         if isinstance(found, dict):
             return found
+        if confirmed and found.id != wanted:
+            # A yes is for the device its prompt named, and comes back with that device's id. A name may
+            # find another device by now (a hub's list changed or failed in between), so it is asked again.
+            confirmed = False
         device = found
         driver = self._driver(device.driver)
         if isinstance(driver, Outcome):

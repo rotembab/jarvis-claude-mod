@@ -1217,7 +1217,8 @@ def test_scenes_that_open_up_the_house_ask_on_screen_first(home: Home) -> None:
     try:
         answer = service.handle({"action": "do", "device": "open garage", "command": "run"})
         assert answer["result"] == "confirm" and home.cloud.triggered == []
-        answer = service.handle({"action": "do", "device": "open garage", "command": "run", "confirmed": True})
+        confirmed = {"action": "do", "device": answer["device"]["id"], "command": "run", "confirmed": True}
+        answer = service.handle(confirmed)
         assert answer["text"] == "Ran Open garage." and home.cloud.triggered == [("home-1", "scene-garage")]
     finally:
         service.close()
