@@ -8,6 +8,7 @@ import type { PaneSize } from './hud'
 
 import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
+import type { AppLinkStatus } from './companion'
 import { runHandsCommand, runHandsSetupCommand } from './hands'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
@@ -30,6 +31,7 @@ const HELP = [
   '/jarvis devices                  show the audio devices and models in use',
   '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
   '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
+  '/jarvis app [on|off]             show the HUD in the Jarvis desktop app while it runs (docs/APP.md)',
   '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
   '/jarvis setup hands              install hand control (about 500 MB)',
 ].join('\n')
@@ -80,6 +82,8 @@ export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi 
         return { text: await focus(app, rest[0], ui) }
       case 'hands':
         return { text: await runHandsCommand(app.hands, rest) }
+      case 'app':
+        return { text: await appLink(app, rest[0]) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }
@@ -313,6 +317,37 @@ async function focus(app: Jarvis, choice: string | undefined, ui: CommandUi): Pr
       return 'Focus mode off: the conversation is back beside the HUD.'
     default:
       return `Unknown choice "${choice}". Use /jarvis focus on or /jarvis focus off.`
+  }
+}
+
+async function appLink(app: Jarvis, choice: string | undefined): Promise<string> {
+  const companion = app.companion
+  if (!app.isLocal || companion === undefined) return NOT_LOCAL
+  switch (choice?.toLowerCase()) {
+    case undefined:
+    case 'status':
+      return appLinkLine(await companion.check())
+    case 'on':
+      await companion.setOn(true)
+      return appLinkLine(await companion.check())
+    case 'off':
+      await companion.setOn(false)
+      return 'The HUD is no longer sent to the Jarvis app. /jarvis app on sends it again.'
+    default:
+      return `Unknown choice "${choice}". Use /jarvis app, /jarvis app on or /jarvis app off.`
+  }
+}
+
+function appLinkLine(status: AppLinkStatus): string {
+  switch (status.state) {
+    case 'off':
+      return 'The Jarvis app link is off. /jarvis app on turns it on.'
+    case 'not_running':
+      return 'The Jarvis app is not running. Start it with npm start in the app folder (docs/APP.md); Jarvis finds it within a few seconds.'
+    case 'no_answer':
+      return `Found the Jarvis app's address, but it did not answer (${status.reason}). Start it again with npm start in the app folder.`
+    case 'connected':
+      return `The Jarvis app ${status.version} is connected and shows the HUD. /jarvis app off stops sending it.`
   }
 }
 
