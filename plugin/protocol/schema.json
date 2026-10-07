@@ -52,7 +52,9 @@
         "id": { "type": "string" }, "text": { "type": "string", "minLength": 1 },
         "source": { "$ref": "#/$defs/UtteranceSource" },
         "durationMs": { "type": "integer", "minimum": 0 },
-        "language": { "type": "string" }
+        "language": { "type": "string" },
+        "startedAtMs": { "type": "integer", "minimum": 0, "description": "when the user began speaking (the push-to-talk press, or where the listener heard the voice begin), on the helper's own millisecond clock" },
+        "overSpeech": { "type": "boolean", "description": "the clip began while Jarvis was audible: it cut him off" }
       }
     },
     "SpeechStartedEvent": {
@@ -65,7 +67,8 @@
       "required": ["v", "type", "replyId", "interrupted", "spokenText"],
       "properties": {
         "v": { "$ref": "#/$defs/v" }, "type": { "const": "speech_done" },
-        "replyId": { "type": "string" }, "interrupted": { "type": "boolean" }, "spokenText": { "type": "string" }
+        "replyId": { "type": "string" }, "interrupted": { "type": "boolean" }, "spokenText": { "type": "string" },
+        "endedAtMs": { "type": "integer", "minimum": 0, "description": "when the reply's speech ended (played out or stopped), on the helper's own millisecond clock" }
       }
     },
     "BargeInEvent": {

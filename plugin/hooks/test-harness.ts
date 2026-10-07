@@ -14,6 +14,8 @@ import type {
   ProcessSpawnRequest,
   PromptSubmitInput,
   SessionMessage,
+  Settings,
+  SettingsSource,
   ToolSpec,
   TurnCompleteInput,
   TurnStepChunk,
@@ -206,8 +208,40 @@ export type World = {
   runs: RunCall[]
   /** The administrator check's runs (whoami, reg, id), kept apart so other tests' runs stay their own. */
   probes: RunCall[]
-  /** Answers a `$.process.run` the world does not know; undefined: exit 127 (no such program). */
+  /**
+   * Answers a `$.process.run` the world does not know; undefined: exit 127 (no
+   * such program), but for the administrator check, which then finds a normal
+   * user (ADMIN_PROBE_ANSWERS).
+   */
   onRun: (call: RunCall) => RunAnswer | undefined
+  /** Each settings source as `$.settings.read({ source })` answers it (`merged` for no source); none: `{}`. */
+  settings: Partial<Record<SettingsSource | 'merged', Settings>>
+  /** When set, `$.settings.read` fails with it. */
+  settingsError: string | undefined
+  /** The sources the mod read (`merged` for none). */
+  settingsReads: string[]
+}
+
+/**
+ * What the administrator check finds when a test does not say: Windows'
+ * whoami (an administrator's token, not elevated) and its UAC policy (Always
+ * notify), or a normal user's uid elsewhere.
+ */
+export const ADMIN_PROBE_ANSWERS: Record<'whoami' | 'reg' | 'id', string> = {
+  whoami: [
+    '"Everyone","Well-known group","S-1-1-0","Mandatory group, Enabled by default, Enabled group"',
+    '"BUILTIN\\Administrators","Alias","S-1-5-32-544","Group used for deny only"',
+    '"Mandatory Label\\Medium Mandatory Level","Label","S-1-16-8192",""',
+  ].join('\r\n'),
+  reg: [
+    '',
+    'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System',
+    '    ConsentPromptBehaviorAdmin    REG_DWORD    0x2',
+    '    EnableLUA    REG_DWORD    0x1',
+    '    PromptOnSecureDesktop    REG_DWORD    0x1',
+    '',
+  ].join('\r\n'),
+  id: '1000\n',
 }
 
 export type WorldOptions = {
@@ -278,11 +312,15 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     runs: [],
     probes: [],
     onRun: () => undefined,
+    settings: {},
+    settingsError: undefined,
+    settingsReads: [],
   }
   const state = w.state
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => {
     if (w.toolRefusal !== undefined) return { deny: w.toolRefusal }
@@ -380,9 +418,11 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       ...(init.timeoutMs === undefined ? {} : { timeoutMs: init.timeoutMs }),
     }
     const program = (command ?? '').split(/[\\/]/).at(-1)?.toLowerCase().replace(/\.exe$/, '')
-    if (program === 'whoami' || program === 'reg' || program === 'id') w.probes.push(call)
+    const isProbe = program === 'whoami' || program === 'reg' || program === 'id'
+    if (isProbe) w.probes.push(call)
     else w.runs.push(call)
     const answer = w.onRun(call)
+    if (answer === undefined && isProbe) return { value: run(0, ADMIN_PROBE_ANSWERS[program]) }
     if (answer === undefined) return { value: run(127, '') }
     if ('deny' in answer) return { deny: answer.deny }
     if (answer.delayMs !== undefined) await clock.sleep(answer.delayMs)
@@ -449,6 +489,13 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     },
   }))
   on('session.messages', () => ({ value: w.messages }))
+  // The settings, never the real ones: each source as the test set it.
+  on('settings.read', ($, e) => {
+    const source = e.source ?? 'merged'
+    w.settingsReads.push(source)
+    if (w.settingsError !== undefined) throw new Error(w.settingsError)
+    return { value: w.settings[source] ?? {} }
+  })
   on('ui.open', ($, e) => {
     w.opens.push(e)
     return { value: { isPlaced: true as const } }

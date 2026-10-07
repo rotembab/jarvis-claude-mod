@@ -95,6 +95,9 @@ async function status(app: Jarvis): Promise<string> {
   if (isRetry) app.startHelper(true)
 
   const lines = [statusLine(app.view) ?? 'JARVIS']
+  // Why nothing of Jarvis's starts: elevated, the administrator check still running, or failed.
+  const held = app.pc.whyHeld()
+  if (held !== undefined) lines.push(held)
   const hello = app.helper?.hello
   if (hello !== undefined) {
     const ready = app.ready
@@ -350,8 +353,11 @@ async function testVoice(app: Jarvis): Promise<string> {
 function restart(app: Jarvis): string {
   if (!app.isLocal) return NOT_LOCAL
   if (app.isSetupRunning) return 'Setup is running; the helper starts when it is done.'
+  const isRecheck = app.pc.hasAdminCheckFailed
   void app.restartHelper()
-  return 'Restarting the voice helper.'
+  return isRecheck
+    ? 'Checking again whether Claude Code runs as administrator; the voice helper starts if it does not.'
+    : 'Restarting the voice helper.'
 }
 
 async function voice(app: Jarvis, id: string | undefined): Promise<string> {

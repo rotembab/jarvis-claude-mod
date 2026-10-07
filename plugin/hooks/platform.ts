@@ -235,26 +235,31 @@ export function system32(systemRoot: string | undefined): string {
   return `${root}\\System32`
 }
 
+/** The system's own `id` (a program of that name earlier on PATH cannot answer). */
+const ID_PROGRAM = '/usr/bin/id'
+
 /**
  * Whether Claude Code runs elevated and, on Windows, the UAC level: the
  * token's groups from `whoami`, the policy from `reg query`. macOS and
- * Linux check for root. Throws when it cannot tell.
+ * Linux check for root. Throws when it cannot tell, or when either Windows
+ * command fails or times out: the check fails closed.
  */
 export async function probeAdmin(engine: Engine, platform: Platform): Promise<AdminFacts> {
   const init = { timeoutMs: ADMIN_PROBE_TIMEOUT_MS }
   if (platform.os !== 'windows') {
-    const { exitCode, stdout } = await engine.run(['id', '-u'], init)
+    const { exitCode, stdout } = await engine.run([ID_PROGRAM, '-u'], init)
     if (exitCode !== 0 || !/^\d+$/.test(stdout.trim())) throw new Error(`id -u exited with ${exitCode}`)
     return { isElevated: stdout.trim() === '0' }
   }
   const folder = system32((await engine.env()).SystemRoot)
   const [groups, policy] = await Promise.all([
     engine.run([`${folder}\\whoami.exe`, '/groups', '/fo', 'csv', '/nh'], init),
-    engine.run([`${folder}\\reg.exe`, 'query', UAC_POLICY_KEY], init).catch(() => undefined),
+    engine.run([`${folder}\\reg.exe`, 'query', UAC_POLICY_KEY], init),
   ])
   const sids = parseWhoamiGroups(groups.stdout)
   if (groups.exitCode !== 0 || sids.size === 0) throw new Error(`whoami /groups exited with ${groups.exitCode}`)
+  if (policy.exitCode !== 0) throw new Error(`reg query of the UAC policy exited with ${policy.exitCode}`)
   const isAdminAccount = sids.has(ADMINISTRATORS_SID)
-  const uacLevel = !isAdminAccount ? 'standard-account' : policy?.exitCode === 0 ? parseUacPolicy(policy.stdout) : undefined
+  const uacLevel = !isAdminAccount ? 'standard-account' : parseUacPolicy(policy.stdout)
   return { isElevated: ELEVATED_SIDS.some(sid => sids.has(sid)), isAdminAccount, ...(uacLevel === undefined ? {} : { uacLevel }) }
 }

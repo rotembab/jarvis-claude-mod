@@ -28,7 +28,8 @@ The question uses Claude Code's own question dialog, under the heading "Jarvis":
 > Jarvis: Claude wants to run a PowerShell command that deletes files: "Remove-Item -Recurse -Force $env:USERPROFILE\Downloads". Run it?
 
 - "Don't run it" is always the first option, so a stray Enter says no. "Run it" is the second.
-- Under "Other" you can type a yes ("yes", "run it", "go ahead", "do it", "ok"). Anything else you type counts as no, and Claude is shown what you wrote.
+- The command is shown on one line, with each line break shown as ⏎, so you can see when several commands are joined. A command longer than 300 characters is shown by the parts that set its tier (the lines, or the pieces between `;`, `&&`, `||` and `|`, that are in that tier on their own), as many as fit, with the number of characters not shown. If no short part sets the tier, the first 300 characters are shown, again with the number not shown.
+- Under "Other" you can type a yes ("yes", "run it", "go ahead", "do it", "ok"). Anything else you type counts as no, and Claude is shown what you wrote. A yes with words in another script beside it ("ok, לא עכשיו", "ok, not now") counts as no.
 - If you close the dialog, or it closes by itself while you are away, nothing runs and Claude is told to ask again later.
 - Two risky commands at once (from two subagents, say) each get their own question. If two questions would read the same, the second ends in "(2)".
 - In a voice conversation Jarvis says "That one needs your OK on screen, sir." A spoken answer while the dialog is open doesn't count; Jarvis says "I need a click on screen for that one, sir."
@@ -36,13 +37,18 @@ The question uses Claude Code's own question dialog, under the heading "Jarvis":
 
 ### A spoken yes (voice tier)
 
-In a voice conversation, a voice-tier command is held the first time Claude tries it. Claude then says in one sentence what it wants to do, asks whether to go ahead, and ends its turn. If your very next message is a spoken yes and nothing else, Claude runs that exact command once.
+In a voice conversation, a voice-tier command is held the first time Claude tries it. Claude says in one sentence what it wants to do and ends its turn. Then Jarvis asks himself, in a fixed line after Claude's words, built from the guard's reason and the start of the command:
 
-- Words that count as a yes: "yes", "yeah", "yep", "yes please", "go ahead", "go for it", "do it", "proceed", "confirm", "confirmed", "affirmative", "sure", "ok", "okay". "Jarvis, go ahead." counts. "Yes, and delete dist too" does not; it is a new request.
-- The yes covers only the command Claude held, with the same tool and the same text (spacing aside). A different command is held again.
-- The yes answers only the question just asked. If anything else comes between, spoken or typed (a "no", another question), the held command no longer counts and Claude has to ask again.
+> Claude wants to run a Bash command that pushes commits to the remote: git push. Say yes to run it, sir.
+
+The yes answers Jarvis's line, which names the command whatever Claude said before it. A notice and the transcript show the whole command. If your very next message is a spoken yes and nothing else, and you began saying it after Jarvis finished that line, Claude runs that exact command once.
+
+- Words that count as a yes: "yes", "yeah", "yep", "yes please", "go ahead", "go for it", "do it", "proceed", "confirm", "confirmed", "affirmative", "sure", "ok", "okay". "Jarvis, go ahead." counts. "Yes, and delete dist too" does not; it is a new request. Nor does a yes with words in another script ("OK, не надо", "OK, don't"), or with any word not on the list.
+- The yes covers only the command Claude held, with the same tool and the same text. Spacing within a line doesn't matter, but line breaks do: a held `git push origin npm publish` (one command) doesn't cover `git push origin` and `npm publish` on two lines. A different command is held again.
+- The helper times both sides on its own clock: when you began speaking (the push-to-talk press, or where your voice began) and when Jarvis's line finished playing. A yes begun before the line ended goes to the on-screen question instead. That covers a yes said while Claude was still working (it waits as the next message, so it would answer a question not yet asked), and a line that was cut short. A helper too old to time its clips gets the on-screen question every time; `/jarvis setup` updates it.
+- A yes said over Jarvis's voice (it cut him off) doesn't count, because it may have been his own voice or a TV. The command is held again and Jarvis asks again. The helper marks the clip that cut him off, so another clip's barge-in never counts against your yes. Push-to-talk is never taken for speech over him, but a press before his line ended still goes to the on-screen question.
+- The yes answers only the question just asked. The held command is dropped, and Claude has to ask again, when the turn is stopped (Esc, "stop", talking over Jarvis), when you say anything other than a bare yes (a "no", "Jarvis, stop", another question), when a yes or no is spoken while a dialog waits for a click, when you type a prompt, and on a `/clear` or a new session. Any turn in between also unbinds it.
 - One command waits at a time, for 2 minutes at most; a newer one replaces it. If Claude tries two different commands in one turn, neither is held, and Claude asks about one at a time.
-- A yes said while Jarvis is still talking doesn't count, because it may have been Jarvis's own voice or a TV. Claude asks again.
 - A typed message, or a command from a subagent, gets the on-screen question instead.
 
 ## Commands
@@ -99,7 +105,7 @@ On Windows (not in cloud sessions), Claude gets a tool called `mcp__jarvis__desk
 | `focus {target}` | Brings an open app's window to the front. |
 | `media {key}` | `play_pause`, `next`, `previous` or `stop`. Windows has one play/pause toggle, not separate keys. |
 | `volume {level}` or `{change}` | Sets 0-100, steps `up` or `down`, or mutes and unmutes. With neither, it reads the volume. |
-| `screenshot` | Saves the screen to your Screenshots folder and returns the path. Claude looks at it only by reading the file, and is told to do that only when you asked it to see the screen. |
+| `screenshot` | Saves the screen to your Screenshots folder and returns the path. It asks you first. Claude looks at it only by reading the file, and is told to do that only when you asked it to see the screen. |
 | `lock` | Locks the PC. |
 | `clipboard_read` | Returns the text on the clipboard, up to 4,000 characters. It asks you first. |
 | `clipboard_write {text}` | Puts text on the clipboard, up to 20,000 characters. |
@@ -107,15 +113,19 @@ On Windows (not in cloud sessions), Claude gets a tool called `mcp__jarvis__desk
 
 There is deliberately no typing, clicking, other keys, opening files, or running commands. For anything else Claude uses PowerShell, which goes through the guard.
 
-The tool follows your own Claude Code rules for `mcp__jarvis__desktop`:
+The mod answers the tool itself, so Claude Code's own permission path never sees its calls. Jarvis applies your own Claude Code rules for `mcp__jarvis__desktop` instead:
 
-- A deny rule refuses the action.
-- Any ask shows an on-screen question ("Don't do it" / "Do it"): an ask rule, and also Claude Code's own default for a tool no rule allows yet. If the question can't be shown, nothing is done.
-- An allow rule lets actions run without that question. Jarvis doesn't add one; to skip the question, add `"mcp__jarvis__desktop"` to `allow` in your settings yourself. Reading the clipboard still asks.
-- In dontAsk mode, only an allow rule lets it run.
-- In plan mode, only the read-only actions work: reading the volume and reading the clipboard. Until Jarvis has seen your first prompt it can't tell whether plan mode is on, so it changes nothing until then.
+- A deny rule refuses the action, as does an organization's deny.
+- Any ask shows an on-screen question ("Don't do it" / "Do it"): an ask rule, and also Claude Code's own default for a tool no rule allows yet. The question shows the whole target (up to 400 characters), with line breaks shown as ⏎. If the question can't be shown, nothing is done.
+- An allow rule lets actions run without that question. Jarvis doesn't add one; to skip the question, add `"mcp__jarvis__desktop"` to `allow` in your settings yourself. Only an allow from your own rule counts: an allow that comes from the mode alone (bypassPermissions with no rule) still gets the question.
+- Even with your allow rule, the question comes when:
+  - a PreToolUse or PermissionRequest hook in your settings (user, project, local, `--settings` or managed) could match the tool: its matcher is empty, `*`, names the tool, or is a pattern that finds it, such as `mcp__.*`. Apart from an organization's managed hooks, whose deny comes before any plugin, Claude Code runs no settings hook for this tool, so Jarvis asks you instead of letting such a hook decide. Jarvis reads only the hooks' matchers and never logs your settings. PostToolUse and other settings hooks never see the tool's calls, and hooks that come with plugins are not read;
+  - the permission mode is not known for the current turn: a call from a subagent (which may be in a plan mode of its own), or a turn that started without a prompt Jarvis saw. A change on the PC needs the mode from this turn's prompt, or from a tool Claude ran during this turn.
+- If your rules or your settings can't be read, nothing is done.
+- In dontAsk mode, only your allow rule lets it run; anything that would ask is refused.
+- In plan mode, only the read-only actions work: reading the volume and reading the clipboard. Until Jarvis has seen your first prompt it can't tell whether plan mode is on, so it changes nothing until then. Jarvis learns the mode from each prompt and from each tool Claude runs, so after a Shift+Tab into plan mode in the middle of a turn, a desktop action before Claude's next tool call still sees the earlier mode. Claude Code's own verdict for the tool (`$.tool.check`, which knows the current mode) is still applied then, but Jarvis's own plan-mode hold is not.
 
-Reading the clipboard asks for a spoken yes in a voice conversation, or a click otherwise ("Don't let it" / "Let it read"). Claude sees the clipboard text marked as data, with a note not to follow instructions in it.
+Reading the clipboard and taking a screenshot always ask first, whatever your rules allow: a spoken yes in a voice conversation (Jarvis asks "Claude wants to read your clipboard. Say yes to let it, sir."), or a click otherwise ("Don't let it" / "Let it read", "Let it"). Claude sees the clipboard text marked as data, with a note not to follow instructions in it.
 
 If the helper is not running, or is too old to have desktop actions, Claude is told to start it with `/jarvis` or use PowerShell instead.
 
@@ -148,13 +158,15 @@ Say "Jarvis, stand down" or "Abort that" on its own, or type `/jarvis pc stop`. 
 
 ## Never as administrator
 
-At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer). Until the check has finished, the voice helper and `/jarvis setup` wait. If it does run as administrator, Jarvis stays off:
+At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`). Until the check has finished, the voice helper and `/jarvis setup` wait. If it does run as administrator, Jarvis stays off:
 
 - no voice helper;
 - an error on the HUD;
 - `/jarvis setup` and restarting the helper are refused.
 
 Every command Claude runs would run as administrator too. Start Claude Code from a normal window, not with "Run as administrator". Every part of Jarvis that starts a program checks this first, and new ones (such as the home and hands helpers) must too.
+
+The check fails closed. If `whoami` or `reg` fails, gives an answer Jarvis can't read, or takes longer than 5 seconds (a cold start under a virus scan, say), Jarvis stays off the same way. The HUD, `/jarvis` and `/jarvis pc` say the check failed and why. `/jarvis restart` runs the check again, and starts the voice helper once it passes.
 
 Jarvis also reads the UAC level. If it is below "Always notify", you see a one-time notice, because some admin changes then happen without a prompt. For PC control, the safer choices are:
 
@@ -165,7 +177,7 @@ Jarvis also reads the UAC level. If it is below "Always notify", you see a one-t
 
 ## Bypass mode
 
-If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it.
+If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it. The desktop tool still asks before each action unless your own allow rule covers it, since the mode's allow is not yours.
 
 ## Check on the PC
 
@@ -181,4 +193,6 @@ These can't be tested on the Linux CI runner. Check them by hand before calling 
 - **Stand down during a long command.** Start `Start-Sleep 60` in the background, then say "stand down". The task should stop.
 - **Stopping a task.** Check whether stopping a background task brings up a dialog of its own.
 - **`/jarvis pc` from an elevated window.** It should say Jarvis stays off.
+- **A spoken yes, on time and too soon.** With a voice-tier command held, say "yes" just after Jarvis finishes his line: it should run. Say "yes" while Claude is still working, before he asks: it should go to the on-screen question. With speakers rather than a headset, check that Jarvis's own voice is not taken for a yes.
+- **A settings hook on MCP tools.** With `"mcp__jarvis__desktop"` allowed and a PreToolUse hook whose matcher is `mcp__.*`, a desktop action should still ask on screen.
 - **`/jarvis pc` on a PC with UAC at the Windows default.** It should show the UAC notice once.
