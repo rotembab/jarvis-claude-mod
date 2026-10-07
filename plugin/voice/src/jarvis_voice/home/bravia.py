@@ -125,8 +125,9 @@ ERR_APP_UNDECIDED = 41402
 GONE = frozenset({"unreachable", "timeout", "refused", "tls"})
 # Failures worth one more try after a short wait (WebApiCore restarting).
 RETRYABLE = frozenset({"restarting", "refused"})
-# What plain http can answer a TV that takes only https: setup tries https after any of these.
-HTTPS_HINTS = frozenset({"refused", "auth", "http", "restarting", "bad_reply", "off"})
+# What plain http can answer a TV that takes only https: setup tries https after any of these, and
+# so does a call to a TV saved on http (after a JSON-RPC error too) while nothing in it has worked yet.
+HTTPS_HINTS = frozenset({"refused", "auth", "http", "restarting", "bad_reply", "off", "unverified"})
 
 # audio.getSoundSettings outputTerminal values for a soundbar or receiver over HDMI (eARC).
 # There setAudioVolume can do nothing without an error, so the remote's buttons are used.
@@ -142,7 +143,8 @@ class BraviaError(Exception):
     ``kind``: auth (key refused), unreachable / timeout / refused / tls (no
     HTTP answer), restarting (HTTP 404), http (another status), rpc (a
     JSON-RPC error, see ``code``), off ("not power-on"), bad_reply, budget
-    (no time left in this call), bad_key (the saved key cannot be sent).
+    (no time left in this call), bad_key (the saved key cannot be sent),
+    unverified (setup: only error codes, so nothing checked the key).
     ``late``: the TV had already answered an earlier request of this call, so
     a timeout means it is slow, not off.
     """
@@ -216,6 +218,7 @@ class BraviaClient:
         self.retry_wait = retry_wait
         self.retry_kinds = RETRYABLE
         self.answered = False  # any HTTP answer yet in this call
+        self.succeeded = False  # any request that worked yet in this call
         self._psk = psk
         self._id = 0
 
@@ -248,7 +251,9 @@ class BraviaClient:
 
         def send() -> list[Any]:
             response = self._post(f"/sony/{service}", headers=headers, json_body=payload, timeout=timeout)
-            return _rpc_result(response, method)
+            result = _rpc_result(response, method)
+            self.succeeded = True
+            return result
 
         return self.retrying(send) if retry else send()
 
@@ -257,6 +262,7 @@ class BraviaClient:
         body = _ENVELOPE.format(code=xml_escape(code)).encode("utf-8")
         headers = {"Content-Type": "text/xml; charset=UTF-8", "SOAPACTION": SOAP_ACTION}
         self._post(path, headers=headers, body=body, timeout=timeout)
+        self.succeeded = True
 
     def retrying(self, send: Callable[[], T]) -> T:
         """``send()``, once more after a short wait if the TV's service was restarting."""
@@ -761,16 +767,27 @@ class BraviaDriver(Driver):
         self, device: DeviceRecord, budget: float, work: Callable[[_Session], Outcome], *, action: bool = True
     ) -> Outcome:
         """``work`` on a new session, and once more over https when a TV saved on http
-        refuses the key: it may now take only https."""
+        refuses the key, or answers only with errors before anything in the call worked:
+        it may now take only https."""
         session = self._open(device, budget)
         if isinstance(session, Outcome):
             return session
         try:
             return work(session)
         except BraviaError as err:
-            if err.kind != "auth" or session.client.scheme != "http":
+            hint = err.kind == "auth" or (err.kind in HTTPS_HINTS | {"rpc"} and not session.client.succeeded)
+            if not hint or session.client.scheme != "http":
                 return self._failure(device, err, action=action)
+            failed = err
         secure = self._over_https(session)
+        if secure is None and failed.kind != "auth":
+            outcome = self._failure(device, failed, action=action)
+            if failed.kind == "rpc" and failed.code == ERR_ILLEGAL_STATE:
+                # How a TV that now takes only https answers plain http; setup tries https again.
+                return Outcome.fail(
+                    outcome.code, f"{outcome.text} If this keeps happening, add the {device.name} again in home setup."
+                )
+            return outcome
         if secure is None:
             return Outcome.fail(
                 "auth",
@@ -1042,11 +1059,18 @@ class BraviaDriver(Driver):
                 "unsupported", f"The {s.name}'s sound goes to another audio device, so I can only turn it up or down."
             )
         low, high = _range(other)
-        steps = low + round(percent * (high - low) / 100) - int(other["volume"])
-        if steps and not s.press(
-            ("VolumeUp",) if steps > 0 else ("VolumeDown",), times=min(abs(steps), MAX_KEY_PRESSES), gap=self.key_gap_s
-        ):
+        current = int(other["volume"])
+        steps = low + round(percent * (high - low) / 100) - current
+        presses = min(abs(steps), MAX_KEY_PRESSES)
+        if steps and not s.press(("VolumeUp",) if steps > 0 else ("VolumeDown",), times=presses, gap=self.key_gap_s):
             return Outcome.fail("unsupported", f"The {s.name} can't change its sound system's volume.")
+        if presses < abs(steps):
+            # The presses stop at MAX_KEY_PRESSES to keep the call within its time: say where they got to.
+            reached = _percent({**other, "volume": current + (presses if steps > 0 else -presses)})
+            direction = "up" if steps > 0 else "down"
+            return Outcome.done(
+                f"Turned the {s.name}'s sound system {direction} to about {reached}%; say it again to go further."
+            )
         return Outcome.done(f"Set the {s.name}'s sound system to about {percent}%.")
 
     def _mute(self, s: _Session, _value: Value = None, *, on: bool) -> Outcome:
@@ -1395,6 +1419,11 @@ def _probe_problem(err: BraviaError, address: str) -> str:
             "The TV answered, but its control service did not. Check that IP control and Control remotely "
             "are on. If they are, the TV may be restarting the service: wait half a minute and try again."
         )
+    if kind == "unverified":
+        return (
+            "The TV answered only with errors, so Jarvis could not check the key. Check that IP control and "
+            "Control remotely are on in the TV's network settings and that the TV is on, then try again."
+        )
     if kind == "tls":
         return f"Could not make a secure connection to {address}."
     if kind == "bad_reply":
@@ -1413,7 +1442,7 @@ _Contact = tuple[BraviaClient, dict[str, Any]] | BraviaError
 
 def _first_contact(address: str, psk: str, scheme: str, retry_wait: float) -> _Contact:
     """A client and the TV's system information over ``scheme`` (empty when it
-    answered with an error code), or why that failed."""
+    answered that with an error code but listed its apps), or why that failed."""
     try:
         client = BraviaClient(address, psk, scheme=scheme, budget=PROBE_BUDGET_S, retry_wait=retry_wait)
     except BraviaError as err:
@@ -1432,6 +1461,8 @@ def _first_contact(address: str, psk: str, scheme: str, retry_wait: float) -> _C
     except BraviaError as err:
         if err.kind == "auth":
             return err
+        if not info:  # only error codes: nothing showed that the key works
+            return BraviaError("unverified", f"nothing checked the key (getApplicationList: {err.kind})", code=err.code)
     return client, info
 
 
@@ -1443,7 +1474,7 @@ def _pick_scheme(plain: _Contact, secure: _Contact) -> _Contact:
     if secure.kind == "auth":
         return secure  # the key is wrong only when https refuses it too
     if not isinstance(plain, BraviaError):
-        return plain  # http answered as a Sony TV does, if with an error code: as before https was tried
+        return plain  # http took the key, if without the system information: as before https was tried
     # Both failed: https's own answer says more, unless it gave none.
     return secure if secure.kind not in GONE | {"budget"} else plain
 
@@ -1469,7 +1500,8 @@ def probe_tv(address: str, psk: str, *, retry_wait: float | None = None) -> TvPr
     http goes first. TVs made since August 2025 take only https and answer plain
     http with an error (often as if the key were wrong), so https is tried
     whenever http answered without the TV's system information. The key is
-    called wrong only when https refuses it too, or does not answer at all."""
+    called wrong only when https refuses it too, or does not answer at all, and
+    an answer of error codes alone is never taken as a key that works."""
     retry_wait = RETRY_WAIT_S if retry_wait is None else retry_wait
     probe = TvProbe()
     contact = _first_contact(address, psk, "http", retry_wait)

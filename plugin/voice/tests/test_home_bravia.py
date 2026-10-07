@@ -105,8 +105,8 @@ class FakeBravia:
         self.wake_after_drops: int | None = None  # asleep: wake up after dropping this many requests
         self.not_found = 0  # how many requests get a 404 (WebApiCore restarting)
         self.auth_shape = "http"  # how a wrong key is refused: "http" 403 or "json" error 403
-        # "403" or "error": a TV made since August 2025, whose plain http answers every request
-        # with HTTP 403 or a JSON-RPC error (its API is only on https; see the https_ports fixture).
+        # "403", "404" or "error": a TV made since August 2025, whose plain http answers every request
+        # with HTTP 403 or 404 or a JSON-RPC error (its API is only on https; see the https_ports fixture).
         self.plain_http = "api"
         self.sound_output: str | None = "speaker"  # getSoundSettings' outputTerminal (None: no such method)
         self.mac_in_info = True  # False: getSystemInformation leaves macAddr out
@@ -237,6 +237,8 @@ class FakeBravia:
         if plain_refused:
             if self.plain_http == "403":
                 return 403, b"Forbidden", "text/plain"
+            if self.plain_http == "404":
+                return 404, b"Not Found", "text/plain"
             return self._json({"error": [7, "Illegal State"], "id": ident})
         if not key_ok:
             if self.auth_shape == "http":
@@ -673,6 +675,24 @@ def test_volume_on_an_external_audio_system_uses_the_remote_buttons(tmp_path: Pa
     assert tv.external_volume == 15
 
 
+def test_a_long_way_on_a_sound_system_says_how_far_it_got(tmp_path: Path, tv: FakeBravia) -> None:
+    """One call presses a volume button at most MAX_KEY_PRESSES times, to stay within its time: a
+    longer way says the level it reached, not the one asked for."""
+    driver, store = add_tv(tmp_path, tv, ircc_codes=CODES)
+    tv.sound_output, tv.external_volume = "hdmi", 45  # of 50
+    assert run(driver, store, "set_volume", 20) == Outcome.done(
+        "Turned the Sony TV's sound system down to about 40%; say it again to go further."
+    )
+    assert tv.external_volume == 20 and tv.ircc.count(CODES["VolumeDown"]) == bravia.MAX_KEY_PRESSES
+    assert run(driver, store, "set_volume", 20) == Outcome.done("Set the Sony TV's sound system to about 20%.")
+    assert tv.external_volume == 10
+    tv.external_volume = 0
+    assert run(driver, store, "set_volume", 100) == Outcome.done(
+        "Turned the Sony TV's sound system up to about 50%; say it again to go further."
+    )
+    assert tv.external_volume == 25
+
+
 def test_mute_on_an_external_audio_system_presses_mute_only_when_needed(tmp_path: Path, tv: FakeBravia) -> None:
     """The remote's Mute button toggles, so it is pressed only when the audio system's own
     state is not the one asked for."""
@@ -885,6 +905,43 @@ def test_a_tv_that_now_takes_only_https_is_switched_over(tmp_path: Path, tv: Fak
     assert status(driver, store) == Outcome.done("The Sony TV is on, showing HDMI 2, volume 30%.")
     assert run(driver, store, "home") == Outcome.done("Pressed Home on the Sony TV.")
     assert set(tv.schemes) == {"https"}
+
+
+@pytest.mark.parametrize(
+    ("plain", "says"),
+    [
+        ("error", "The Sony TV can't do that right now. If this keeps happening, add the Sony TV again in home setup."),
+        ("404", "The Sony TV's control service is restarting; try again in half a minute."),
+    ],
+    ids=["error", "404"],
+)
+def test_a_tv_whose_plain_http_now_answers_only_errors_is_switched_over(
+    tmp_path: Path, tv: FakeBravia, https_ports: set[int], plain: str, says: str
+) -> None:
+    """Saved on http, the TV now answers plain http only with a JSON-RPC error or a 404, not a
+    refused key: an error before anything worked in the call gets the one try over https too."""
+    driver, store = add_tv(tmp_path, tv)
+    tv.plain_http = plain
+    # https does not answer either: the TV's own trouble is told, and it stays on http.
+    outcome = status(driver, store)
+    assert not outcome.ok and outcome.text == says
+    assert device_of(store).settings["scheme"] == "http"
+    https_ports.add(tv.port)
+    assert run(driver, store, "set_volume", 30) == Outcome.done("Set the Sony TV's volume to 30%.")
+    assert tv.volume == 30 and device_of(store).settings["scheme"] == "https"
+    assert status(driver, store) == Outcome.done("The Sony TV is on, showing HDMI 2, volume 30%.")
+
+
+def test_an_error_after_a_good_answer_keeps_http(
+    tmp_path: Path, tv: FakeBravia, https_ports: set[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The TV listed its apps over http, so its error for the next request is about that request."""
+    driver, store = add_tv(tmp_path, tv)
+    https_ports.add(tv.port)
+    original = tv._rpc
+    monkeypatch.setattr(tv, "_rpc", lambda *a: 7 if a[1] == "setActiveApp" else original(*a))
+    assert run(driver, store, "launch_app", "Netflix") == Outcome.fail("failed", "The Sony TV can't do that right now.")
+    assert "https" not in tv.schemes and device_of(store).settings["scheme"] == "http"
 
 
 def test_the_https_try_stays_within_the_call_budget(tmp_path: Path, tv: FakeBravia, https_ports: set[int]) -> None:
@@ -1219,10 +1276,27 @@ def test_wizard_calls_the_key_wrong_only_when_https_refuses_it_too(
     assert ctx.store.load().devices == []
 
 
+@pytest.mark.parametrize("psk", [PSK, WRONG_PSK], ids=["right key", "wrong key"])
+def test_wizard_saves_nothing_when_no_answer_checks_the_key(
+    tmp_path: Path, tv: FakeBravia, fast_setup: None, psk: str
+) -> None:
+    """Plain http answers only with error codes (as a TV made since August 2025 does) and https does
+    not answer: nothing showed that the key works, so nothing is saved, whichever key was typed."""
+    ctx = wizard_ctx(tmp_path)
+    tv.plain_http = "error"  # and https finds no open port
+    ui = ScriptedPrompter([False, tv.address, psk, False])
+    bravia.wizard(ui, ctx)
+    assert "The TV answered only with errors, so Jarvis could not check the key." in ui.text
+    assert "Connected" not in ui.text and ui.said[-1] == "Nothing was saved."
+    assert ctx.store.load().devices == [] and ctx.store.secret_keys() == []
+    assert set(tv.methods()) == {"getSystemInformation", "getApplicationList"}
+
+
 @pytest.mark.parametrize(
     ("plain", "secure", "shown"),
     [
         ("auth", "refused", "auth"),  # nothing on https: http's refusal stands
+        ("unverified", "refused", "unverified"),
         ("refused", "auth", "auth"),
         ("auth", "restarting", "restarting"),  # https answered, so its trouble is the one to tell
         ("refused", "tls", "refused"),
@@ -1239,7 +1313,7 @@ def test_setup_keeps_http_unless_https_says_more() -> None:
     def answer(scheme: str, info: dict[str, Any]) -> tuple[BraviaClient, dict[str, Any]]:
         return BraviaClient("192.0.2.20", PSK, scheme=scheme), info
 
-    plain, secure = answer("http", {}), answer("https", {})  # both answered with an error code
+    plain, secure = answer("http", {}), answer("https", {})  # both took the key, without the system information
     informed = answer("https", {"model": "K-55XR70"})
     assert bravia._pick_scheme(plain, secure) is plain
     assert bravia._pick_scheme(plain, bravia.BraviaError("refused")) is plain
