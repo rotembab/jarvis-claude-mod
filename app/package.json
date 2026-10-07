@@ -1,0 +1,23 @@
+{
+  "name": "jarvis-app",
+  "productName": "Jarvis",
+  "version": "0.8.0",
+  "description": "The Jarvis desktop app: shows the Jarvis HUD beside Claude Code.",
+  "private": true,
+  "license": "MIT",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/build.mjs && electron .",
+    "typecheck": "tsc -p .",
+    "test": "node scripts/build.mjs tests && node --test \"dist-test/**/*.test.js\"",
+    "e2e": "node scripts/build.mjs && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^24.9.0",
+    "electron": "^44.7.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

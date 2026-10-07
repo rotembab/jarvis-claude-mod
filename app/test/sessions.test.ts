@@ -1,0 +1,69 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+
+import { MAX_SESSIONS, SessionBoard, STALE_MS } from '../src/main/sessions'
+import type { AppSnapshot } from '../src/shared/snapshot'
+
+const snap = (sessionId: string, overrides: Partial<AppSnapshot> = {}): AppSnapshot => ({
+  v: 1,
+  sessionId,
+  mode: 'sleeping',
+  phase: 'sleeping',
+  mic: 0,
+  out: 0,
+  actions: [],
+  isOwner: false,
+  at: 1000,
+  ...overrides,
+})
+
+test('an empty board shows nothing', () => {
+  assert.equal(new SessionBoard().current(0), undefined)
+})
+
+test('a session shows until it misses three heartbeats', () => {
+  const board = new SessionBoard()
+  assert.equal(board.accept(snap('a'), 10_000), true)
+  assert.equal(board.current(10_000)?.sessionId, 'a')
+  assert.equal(board.current(10_000 + STALE_MS - 1)?.sessionId, 'a')
+  assert.equal(board.current(10_000 + STALE_MS), undefined)
+  assert.equal(board.liveCount(10_000 + STALE_MS), 0)
+})
+
+test('the window running the voice helper wins over a later one', () => {
+  const board = new SessionBoard()
+  board.accept(snap('owner', { isOwner: true }), 1000)
+  board.accept(snap('other'), 2000)
+  assert.equal(board.current(2000)?.sessionId, 'owner')
+  assert.equal(board.liveCount(2000), 2)
+})
+
+test('without an owner, the session heard from last wins', () => {
+  const board = new SessionBoard()
+  board.accept(snap('a'), 1000)
+  board.accept(snap('b'), 2000)
+  assert.equal(board.current(2000)?.sessionId, 'b')
+  board.accept(snap('a', { at: 1100 }), 3000)
+  assert.equal(board.current(3000)?.sessionId, 'a')
+})
+
+test('a snapshot older than the one held for its session is ignored', () => {
+  const board = new SessionBoard()
+  board.accept(snap('a', { at: 2000, mode: 'thinking' }), 1000)
+  assert.equal(board.accept(snap('a', { at: 1500, mode: 'listening' }), 1100), false)
+  assert.equal(board.current(1100)?.mode, 'thinking')
+})
+
+test('a stale owner loses to a live session', () => {
+  const board = new SessionBoard()
+  board.accept(snap('owner', { isOwner: true }), 1000)
+  board.accept(snap('other'), 5000)
+  assert.equal(board.current(1000 + STALE_MS)?.sessionId, 'other')
+})
+
+test('the board keeps at most MAX_SESSIONS sessions', () => {
+  const board = new SessionBoard()
+  for (let i = 0; i < 20; i += 1) board.accept(snap(`s${i}`), 1000 + i)
+  assert.equal(board.liveCount(1020), MAX_SESSIONS)
+  assert.equal(board.current(1020)?.sessionId, 's19')
+})

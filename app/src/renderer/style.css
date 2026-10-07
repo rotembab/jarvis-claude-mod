@@ -1,0 +1,161 @@
+/* Both pages: the overlay (the big ring over the main screen) and the orb.
+   Each mode's colour is the plugin's (HUD_COLORS in plugin/hooks/hud-ring.ts);
+   test/view.test.ts reads these six lines and checks them against it. */
+body[data-mode="offline"] { --mode: #6b757d; }
+body[data-mode="sleeping"] { --mode: #2f9bff; }
+body[data-mode="listening"] { --mode: #5cc8ff; }
+body[data-mode="thinking"] { --mode: #ff9a2a; }
+body[data-mode="speaking"] { --mode: #ffc04a; }
+body[data-mode="interrupted"] { --mode: #bfe6ff; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  color: #d6efff;
+}
+
+[hidden] { display: none !important; }
+
+/* The ring's square drawing, cut round with a soft edge. */
+.ring {
+  -webkit-mask-image: radial-gradient(circle closest-side, #000 88%, transparent 100%);
+  mask-image: radial-gradient(circle closest-side, #000 88%, transparent 100%);
+}
+
+.ring svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* ---------------------------------------------------------------- overlay */
+
+body.overlay {
+  display: grid;
+  place-items: center;
+}
+
+#hud {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  opacity: 0;
+  transition: opacity 300ms ease;
+}
+
+body[data-visible="true"] #hud { opacity: 1; }
+
+body.overlay .ring {
+  width: min(46vmin, 440px);
+  height: min(46vmin, 440px);
+}
+
+#label {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: .32em;
+  color: var(--mode);
+  text-shadow: 0 0 12px var(--mode);
+}
+
+#panel {
+  box-sizing: border-box;
+  max-width: min(680px, 80vw);
+  padding: 14px 18px;
+  background: rgba(3, 10, 18, .78);
+  color: #d6efff;
+  border: 1px solid rgba(92, 200, 255, .28);
+  border-radius: 14px;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+#panel p,
+#panel ul { margin: 0; }
+
+#panel > * + * { margin-top: 10px; }
+
+#utterance {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+#utterance::before { content: "\201C"; }
+#utterance::after { content: "\201D"; }
+
+#reply { color: #b4d3e8; }
+
+#actions {
+  list-style: none;
+  padding: 0;
+  font-size: 14px;
+}
+
+#actions li {
+  display: flex;
+  gap: 8px;
+}
+
+#actions .mark {
+  flex: none;
+  width: 1em;
+  text-align: center;
+}
+
+#actions .text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#actions li[data-status="running"] .mark { color: var(--mode); }
+#actions li[data-status="done"] .mark { color: #8fd6a8; }
+#actions li[data-status="failed"] .mark { color: #ff7a7a; }
+
+#note {
+  color: #9fb4c4;
+  font-size: 14px;
+}
+
+/* ---------------------------------------------------------------- orb */
+
+/* The orb's edge drags the window; its centre is the button. */
+#orb {
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  -webkit-app-region: drag;
+  display: grid;
+  place-items: center;
+}
+
+#orb .ring {
+  width: 168px;
+  height: 168px;
+  grid-area: 1 / 1;
+}
+
+/* Above the ring: its mask makes it a layer of its own, painted over plain boxes. */
+#hit {
+  position: relative;
+  z-index: 1;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  grid-area: 1 / 1;
+  padding: 0;
+  background: transparent;
+  border: none;
+  -webkit-app-region: no-drag;
+  cursor: pointer;
+}
+
+#hit:focus-visible { outline: 2px solid var(--mode); }
