@@ -109,7 +109,7 @@ Per hand, per frame, from the pose-space points `P` (see Coordinates), with per-
 
 The pose, in priority order: `pinch` (index pinch closed), `pinch_middle`, `fist` (all four fingers curled), `two` (index and middle extended, ring and pinky curled), `palm` (all four extended, index pinch open), else `hover`.
 
-The **anchor**, the one point that drives the cursor, is the mean of the index and middle knuckles (image landmarks 5 and 9). It barely moves when you pinch, curl into a fist or raise two fingers, which is what keeps clicks from drifting. Setting `anchor: index` uses the index fingertip instead.
+The **anchor**, the one point that drives the cursor, is the mean of the index and middle knuckles (image landmarks 5 and 9). It barely moves when you pinch, curl into a fist or raise two fingers, which is what keeps clicks from drifting. Setting `anchor: index` moves the cursor with the index fingertip instead; tracks, the drag slop and held presses still follow the knuckles, and a press lands where the fingertip pointed before the finger began to bend (looking back up to 0.8 s for where the index was straightest), plus the knuckles' motion since.
 
 ## Mapping (mapping.py)
 
@@ -126,13 +126,16 @@ Desk mode spans the displays as Windows arranges them, so a projector set up to 
 
 A raw pose must hold for 2 frames (`confirm_frames`) before the engine acts on it; this applies to entering and leaving every pose.
 
+A hand closing into a fist, or opening out of one, passes through `pinch` (the thumb crosses the index tip before the index curls), so a pinch presses only once the hand has **settled** into it: the least-squares slope of the other three fingers' mean reach over the last `SETTLE_WINDOW_S` = 0.1 s (frames from before the pinch included, never back past the pinching finger's last curl) is at most `SETTLE_RATE` = 0.3 reach units per second, over at least 0.05 s and three frames, and the pinch has lasted that long too. A held pinch therefore presses about 0.1 s after the fingers stop. A pinch let go before it pressed is a quick tap: it clicks at the press point as it ends, unless it ends in a fist or another action pose, or its finger was curled within 0.15 s before it began (a hand opening out of a fist); while the other fingers are still closing, its click waits up to 0.15 s for the fist that would drop it.
+
 ### Engagement
 
 - **Disengaged**: the camera runs, nothing moves. The overlay shows a faint ring under a visible hand.
 - **Engage**: an open `palm`, moving less than 0.3 frame widths per second, held for `engage_s` = 0.5 s. That hand becomes the pointer hand. Setting `engage: always` skips this (any hand engages at once), for a projector room.
 - **Pointer hand tracking**: the observation whose anchor is nearest the pointer's last anchor (within 0.25), else the one with the same handedness. The other hand, if any, is the helper hand.
 - **Hand lost**: for `hold_s` = 0.25 s nothing changes (a dropped frame must not end a drag). After that every held button is released and any window grab ends. After `lost_s` = 1.5 s without the pointer hand the engine disengages.
-- **Real mouse**: when the executor sees the cursor where it did not put it, the engine releases everything and disengages (`engine.on_user_input()`). Touching the mouse always wins.
+- **Real mouse**: when the executor sees the cursor where it did not put it, the engine releases everything and disengages (`engine.on_user_input()`). Touching the mouse always wins. After that, or after the `disengage` command, a palm still in view must drop it (or leave view for `hold_s`) before it engages again; another hand, a returning hand and the `engage` command are not held back.
+- **A break in tracking**: a camera reopen (resume) and the desktop coming back from the lock screen or a UAC prompt start every track over (`reset_tracks()`, applied on the next frame), so a palm already up needs the full `engage_s` hold again and the cursor re-anchors instead of jumping.
 - **Commands**: `engage` and `disengage` come from the mod's `hands` tool ("let my hand take the cursor", by voice or typed) and work from any state; `engage` still needs a hand to follow.
 
 ### While engaged
@@ -140,7 +143,7 @@ A raw pose must hold for 2 frames (`confirm_frames`) before the engine acts on i
 | Pose | Gesture | Actions |
 | --- | --- | --- |
 | `hover`, `palm` | point | `MoveCursor(p)` every frame |
-| `pinch` | left press | Freeze the cursor at its position 70 ms before the pinch began (the "rewind", undoing the pinch's own drift), then `Button(left, down)`. While the anchor stays within `slop` = 0.015 (camera units) of where the pinch started, the cursor stays frozen; past it, drag: the cursor follows again. Release: `Button(left, up)`. |
+| `pinch` | left press | Once the hand has settled into the pinch (above), freeze the cursor at its position 70 ms before the pinch began (the "rewind", undoing the pinch's own drift), then `Button(left, down)`; a pinch let go before that is a click at that point. While the anchor stays within `slop` = 0.015 (camera units) of where the pinch started, the cursor stays frozen; past it, drag: the cursor follows again. Release: `Button(left, up)`. |
 | `pinch` x2 | double-click | A press that starts within the system double-click time of the last click and within 3x the double-click rectangle of it is pressed at the last click's point, so Windows sees a double-click. |
 | `pinch_middle` | right press | Same as the left press, with the right button. |
 | `two` | scroll | The cursor freezes; the anchor's vertical motion in desktop pixels scrolls the content with the hand (`Scroll(dy=+k*Δy_px)` in wheel units, k = 2.4 per px times `scroll_speed`, sub-notch deltas allowed and accumulated), horizontal likewise. |
@@ -148,7 +151,7 @@ A raw pose must hold for 2 frames (`confirm_frames`) before the engine acts on i
 | `fist` + helper hand `fist` | two-hand resize | `ResizeWindow(a, b)`: the midpoint between the hands moves the window, the change in their horizontal and vertical separation (in desktop pixels) changes its width and height. Ends when either hand opens. |
 | `fist` released fast | throw | On release, the cursor's speed over the last 120 ms: above 1.5 display widths per second, mostly sideways, throws the window to the next display that way (or snaps it to that half of its display when there is none); up maximizes, down minimizes: `ThrowWindow(direction)`. Otherwise `ReleaseWindow()`. |
 
-Latches: after a grab ends, a new grab needs the fist opened first; after a pinch release, the next press needs the pinch opened first (hysteresis already gives this).
+Latches: after a grab ends, a new grab needs the fist opened first, and `pinch` and `pinch_middle` (what a fist passes through as it opens) stay latched until the hand shows a palm, another action pose, or a pose that is no action for 0.2 s; engaging with a fist latches them the same way. After a pinch release, the next press needs the pinch opened first (hysteresis already gives this).
 
 ### Calibration flow (calibration.py)
 
@@ -172,9 +175,12 @@ ReleaseAll()                             buttons up, grab ended (hand lost, dise
 
 - Runs on its own thread at 120 Hz. Cursor moves are interpolated linearly from the previous target to the new one over one camera frame interval, so a 30 fps camera still gives a smooth cursor (costs one frame of latency).
 - Every action carrying a point first moves the cursor exactly there.
+- Queued actions have a shelf life of two frame intervals (`SHELF_FRAMES`): when a desktop call stalls, the presses, scrolls and window steps queued meanwhile are dropped rather than replayed in one burst (which Windows would read as a double-click). Letting go (`ReleaseAll`, `ReleaseWindow`, the up of a held button) is never dropped. Of a batch only the newest `MoveCursor` is applied, and a run of drags or resizes keeps its first and last step. `flush()` empties the queue down to its releases, for a pause, the lock screen and the way out.
+- While Windows shows the lock screen or a UAC prompt (the runtime's input-desktop check, every 0.5 s), `set_desktop_blocked(True)` stops cursor reads, glides and new actions; releases still go out, best effort, and a refused call there is logged at debug level, not as a fault.
+- The first move after a takeover glides from where the user left the cursor.
 - Before each cursor move it reads the cursor; if it is more than 6 px from where the executor last put it, the user moved the real mouse: release everything and call `on_user_input`.
 - It never leaves a button down: `ReleaseAll` on disengage, on hand loss, on shutdown, on any exception in the loop, and from an atexit hook.
-- Windows: on grab it records the window and its visible rect (DWM extended frame bounds); a maximized window is restored first and placed so the grab point keeps its relative position across the title bar, as Windows does. Each drag sets the rect with SetWindowPos (no activation, no z-order change other than raising it once at grab). Minimum size 240 x 160; resize clamps to the union of the chosen displays' work areas. A window it cannot move (an administrator's window; UIPI) gives one non-fatal `input_blocked` error per window, and the grab becomes a no-op.
+- Windows: on grab it records the window and its visible rect (DWM extended frame bounds); a maximized window is restored first and placed so the grab point keeps its relative position across the title bar, as Windows does. Each drag sets the rect with SetWindowPos (no activation, no z-order change other than raising it once at grab), moving the window by the cursor's displacement and keeping the size the window has now, so the size an app picks when it crosses onto a monitor with another DPI is kept; only a two-hand resize sets the size. Minimum size 240 x 160; resize clamps to the union of the chosen displays' work areas. A window it cannot move (an administrator's window; UIPI) gives one non-fatal `input_blocked` error per window, and the grab becomes a no-op.
 
 ## Desktop backend (desktop/)
 
@@ -233,10 +239,10 @@ Commands (mod -> helper, `POST /v1/<name>`):
 | `heartbeat` | `{}` | keeps it alive |
 | `status` | `{}` | state, camera, fps, inference ms, engaged, displays, settings |
 | `config` | `{engage?, displays?, hand?, anchor?, overlay?, scrollSpeed?}` | live settings |
-| `pause` / `resume` | `{}` | release / reopen the camera; `{ok: true, pending: true}` while the camera is still opening |
+| `pause` / `resume` | `{}` | release / reopen the camera. `{ok: true, pending: true}` while the camera is still opening (a resume before `start()` reaches the camera too); a reopen that fails after that is an `error` event. A pause while `start()` opens the camera leaves hand control paused, not failed; a resume a later pause countermands answers `bad_request`. |
 | `engage` / `disengage` | `{}` | take or drop the cursor (the `hands` tool) |
 | `calibrate` | `{action: "start" \| "cancel"}` | calibration |
-| `shutdown` | `{}` | exit cleanly |
+| `shutdown` | `{}` | exit cleanly, once the answer is written |
 
 ## The mod side (plugin/hooks/hands.ts)
 
