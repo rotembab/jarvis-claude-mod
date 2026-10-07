@@ -9,7 +9,8 @@ import type { Engine } from './engine'
 import { describeError } from './engine'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
-import { Hud } from './hud'
+import { Hud, hudMode } from './hud'
+import type { PaneSize } from './hud'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
@@ -108,6 +109,7 @@ const BARGE_IN_OVERRIDE_KEY = 'bargeIn'
 const ROUTING_OVERRIDE_KEY = 'modelRouting'
 /** Whether the HUD pane opens by itself (/jarvis hud on|off). */
 const HUD_OVERRIDE_KEY = 'hud'
+const FOCUS_KEY = 'focus'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -139,6 +141,11 @@ export class Jarvis {
   private isEchoCancelBroken = false
   private lastLevelAt = 0
   private shownStatus: string | undefined
+  /** Focus mode: the person's setting, whether they typed since Jarvis last listened, whether it shows, and whether it folds the conversation. */
+  private isFocusOn = false
+  private hasTypedSinceVoice = false
+  private isFocusShown = false
+  private isFolded = false
 
   constructor(readonly settings: JarvisSettings) {}
 
@@ -175,6 +182,13 @@ export class Jarvis {
     this.hud?.dispose()
     this.hud = new Hud(engine)
     this.hud.setPhase(this.view.phase)
+    this.hud.save()
+    this.hud.onShownChange = () => this.updateFocus()
+    this.isFocusOn = await this.focusSetting()
+    // $.state outlives a reload: focus mode starts hidden until the new HUD draws.
+    this.isFocusShown = false
+    this.isFolded = false
+    void engine.writeFolded(false).catch(() => undefined)
     if (await this.isHudOn()) void this.openHud()
     // The desktop app starts its sessions with no surface, then attaches one
     // (perhaps while the awaits above ran).
@@ -254,16 +268,54 @@ export class Jarvis {
     await this.engine?.storeSet(HUD_OVERRIDE_KEY, isOn)
   }
 
+  /** Whether focus mode is on: /jarvis focus's choice, off by default. */
+  async focusSetting(): Promise<boolean> {
+    const stored = await this.engine?.storeGet(FOCUS_KEY).catch(() => undefined)
+    return stored === true
+  }
+
+  async setFocus(isOn: boolean): Promise<void> {
+    this.isFocusOn = isOn
+    this.hasTypedSinceVoice = false
+    await this.engine?.storeSet(FOCUS_KEY, isOn)
+    this.updateFocus()
+  }
+
+  /** Jarvis's helper is up (the ring is not the gray one). */
+  get isRunning(): boolean {
+    return hudMode(this.view.phase, false) !== 'offline'
+  }
+
+  /** The person typed a prompt: the conversation comes back until Jarvis next listens. */
+  onTyped(): void {
+    if (this.hasTypedSinceVoice) return
+    this.hasTypedSinceVoice = true
+    this.updateFocus()
+  }
+
+  /** A turn of the main conversation ended: in focus mode the HUD shows the reply. */
+  async onTurnComplete(): Promise<void> {
+    this.hud?.onTurnComplete()
+    if (!this.isFocusOn || this.engine === undefined) return
+    try {
+      const messages = await this.engine.messages()
+      const reply = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim() !== '')
+      this.hud?.setLastReply(reply?.text.trim())
+    } catch (error) {
+      this.engine.debug(`jarvis: could not read the last reply: ${describeError(error)}`)
+    }
+  }
+
   /**
    * Opens the HUD pane; false when the surface could not place it yet (a
    * narrow terminal). `open` is the person's own when they asked for it
    * (/jarvis hud), which the engine places at any width.
    */
-  async openHud(open?: () => Promise<UiOpenResult>): Promise<boolean> {
+  async openHud(open?: (size: PaneSize) => Promise<UiOpenResult>): Promise<boolean> {
     const engine = this.engine
     if (engine === undefined || this.hud === undefined) return false
     try {
-      const opened = await (open ?? engine.openPane)()
+      const opened = await (open ?? engine.openPane)(this.hud.size)
       if (!opened.isPlaced) engine.debug(`jarvis: HUD waits to be placed (${opened.reason})`)
       return opened.isPlaced
     } catch (error) {
@@ -539,11 +591,33 @@ export class Jarvis {
     this.patch({ phase: next, detail })
   }
 
+  /**
+   * Focus mode shows while it is on, the HUD is drawn in the terminal, Jarvis
+   * runs, and the person has not typed since he last listened. Docked beside
+   * the conversation (the fullscreen view) the conversation's rows fold away;
+   * above the prompt on the main screen they print as usual and the tall pane
+   * pushes them up into the scrollback, so none is lost.
+   */
+  private updateFocus(): void {
+    const isShown = this.isFocusOn && this.hud?.isShown === true && this.isRunning && !this.hasTypedSinceVoice
+    if (isShown !== this.isFocusShown) {
+      this.isFocusShown = isShown
+      this.hud?.setFocus(isShown)
+    }
+    const isFolded = isShown && this.hud?.isDocked === true
+    if (isFolded === this.isFolded) return
+    this.isFolded = isFolded
+    void this.engine?.writeFolded(isFolded).catch(() => undefined)
+  }
+
   private publish(view: JarvisView): void {
     // undefined fields are dropped: $.state holds JSON data.
     const clean = JSON.parse(JSON.stringify(view)) as JarvisView
+    // Talking to Jarvis again takes focus mode back from typing.
+    if ((clean.phase === 'listening' || clean.phase === 'awake') && clean.phase !== this.view.phase) this.hasTypedSinceVoice = false
     this.view = clean
     this.hud?.setPhase(clean.phase)
+    this.updateFocus()
     const engine = this.engine
     if (engine === undefined) return
     void engine.writeView(clean).catch(() => undefined)

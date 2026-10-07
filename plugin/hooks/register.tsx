@@ -7,16 +7,17 @@ import type { Register } from 'claude-code'
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
-import { actionLabel, HUD_PANE, hudMode, ringSize } from './hud'
-import { bandTree, HUD_TEXT_ROWS, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
+import { actionLabel, HUD_PANE, hudLayout, hudMode, PANE_START } from './hud'
+import { bandTree, foldedRow, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
 
 // The session state this mod owns (types/index.d.ts declares it).
 const viewAtom = atom({ plugin: 'jarvis', key: 'view' } as const, { phase: 'stopped' })
 const helperRefAtom = atom({ plugin: 'jarvis', key: 'helper' } as const, null)
 const hudAtom = atom({ plugin: 'jarvis', key: 'hud' } as const, { isThinking: false, actions: [] })
+const foldedAtom = atom({ plugin: 'jarvis', key: 'folded' } as const, false)
 
-/** The HUD pane: about as tall as the ring and its log, as wide when docked. */
-const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', rows: 24, columns: 52 }
+/** The HUD pane; its size follows the screen (hud.ts paneSize). */
+const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', ...PANE_START }
 
 export const register: Register = (on, options) => {
   const app = new Jarvis(readSettings(options))
@@ -56,16 +57,23 @@ export const register: Register = (on, options) => {
       writeHud: async hud => {
         await update($, hudAtom, () => hud)
       },
+      writeFolded: async isFolded => {
+        await update($, foldedAtom, () => isFolded)
+      },
       status: text => $.ui.status(text),
       toast: (text, toastOptions) => $.ui.toast(text, toastOptions),
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
-      openPane: () => $.ui.open(HUD_OPEN),
+      openPane: size => $.ui.open({ ...HUD_OPEN, ...size }),
       closePane: () => $.ui.close({ id: HUD_PANE }),
       blit: args => $.ui.blit(args),
       invalidate: () => $.ui.invalidate('ui.render'),
       submitPrompt: text => $.prompt.submit({ text, asUser: true }),
       complete: request => $.model.complete(request),
+      messages: async () => {
+        const messages = await $.session.messages()
+        return Array.isArray(messages) ? messages : []
+      },
       contextTokens: async () => (await $.session.usage()).context.tokens,
       abortTurn: turnId => $.turn.abort({ turnId }),
     }
@@ -86,7 +94,7 @@ export const register: Register = (on, options) => {
   })
 
   // The command opens the HUD through its own `$`: the person asked, so it is placed at any width.
-  on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: () => $.ui.open(HUD_OPEN) }))
+  on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: size => $.ui.open({ ...HUD_OPEN, ...size }) }))
 
   on('turn.start', ($, e, next) => {
     app.voice?.onTurnStart(e)
@@ -102,7 +110,7 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', ($, e, next) => {
     app.voice?.onTurnComplete(e)
-    if (e.agentId === undefined) app.hud?.onTurnComplete()
+    if (e.agentId === undefined) void app.onTurnComplete()
     return next(e)
   })
 
@@ -139,24 +147,53 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: HUD_PANE }, async ($, e) => {
     const view = await read($, viewAtom)
     const hud = await read($, hudAtom)
-    const data = { mode: hudMode(view.phase, hud.isThinking), view, hud }
+    const isFocus = hud.isFocus === true
+    const data = { mode: hudMode(view.phase, hud.isThinking), view, hud, isFocus }
     if (e.surface === 'terminal') {
+      // The pane asks for the room the screen spares (more in focus mode).
+      if (e.viewport !== undefined) {
+        const { placement, bodyColumns, scroll } = e.props
+        app.hud?.onLayout({ placement, bodyColumns, bodyRows: scroll.bodyRows, columns: e.viewport.columns, rows: e.viewport.rows })
+      }
       const { Box, Text, Raster } = $.ui.resolve(e)
-      const bodyRows = e.props.scroll.bodyRows
-      const ring = ringSize(e.props.bodyColumns, bodyRows, 1 + HUD_TEXT_ROWS)
-      const cells = app.hud?.mountTerminal(HUD_PANE, ring.columns, ring.rows) ?? ''
-      const actionRows = bodyRows - 1 - ring.rows - (view.lastUtterance ? 1 : 0)
-      return hudTerminalTree({ Box, Text, Raster }, data, { ...ring, cells }, actionRows)
+      const layout = hudLayout(e.props.bodyColumns, e.props.scroll.bodyRows, view.lastUtterance !== undefined, isFocus)
+      const cells = app.hud?.mountTerminal(HUD_PANE, layout.ring.columns, layout.ring.rows) ?? ''
+      return hudTerminalTree({ Box, Text, Raster }, data, layout, cells)
     }
     const { Box, Text, Svg } = $.ui.resolve(e)
     app.hud?.mountDesktop()
-    return hudSvgTree({ Box, Text, Svg }, data, app.hud?.levels() ?? { mic: 0, out: 0, t: 0 })
+    return hudSvgTree({ Box, Text, Svg }, data, app.hud?.levels() ?? { mic: 0, out: 0, t: 0 }, e.props.bodyColumns)
   })
 
   on('ui.close', ($, e, next) => {
     if (e.id === HUD_PANE) app.hud?.onClosed()
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  // Typing at the prompt brings the conversation back from focus mode.
+  on('prompt.submit', ($, e, next) => {
+    if (e.origin.kind === 'composer') app.onTyped()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // Focus mode folds the conversation away: its rows draw nothing while it
+  // shows. Questions for you and command output are left alone, and
+  // permission dialogs are Claude Code's own. ctrl+o's detailed transcript
+  // draws the prompts expanded (the first row of it is one): while it shows,
+  // nothing is folded, so the whole conversation is there.
+  let isDetailed = false
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    isDetailed = e.props.isExpanded
+    return !isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)
+  })
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'ToolProgress' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
+  on('ui.render', { component: 'InfoNotice' }, async ($, e, next) => (!isDetailed && (await read($, foldedAtom)) ? foldedRow($.ui.resolve(e)) : next(e)))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const view = await read($, viewAtom)

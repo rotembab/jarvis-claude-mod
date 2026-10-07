@@ -4,6 +4,8 @@
 
 import type { CommandRunResult, UiOpenResult } from 'claude-code'
 
+import type { PaneSize } from './hud'
+
 import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
 import { findUv, shellCommandLine } from './platform'
@@ -26,6 +28,7 @@ const HELP = [
   '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
   '/jarvis devices                  show the audio devices and models in use',
   '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
+  '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -34,7 +37,7 @@ const VOICE_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 /** Runs `/jarvis <args>`; never throws (a failure is the command's output). */
 /** What the command's own hook does for it: opens the HUD as the person asked. */
-export type CommandUi = { openHud?: () => Promise<UiOpenResult> }
+export type CommandUi = { openHud?: (size: PaneSize) => Promise<UiOpenResult> }
 
 export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi = {}): Promise<CommandRunResult> {
   const [sub = '', ...rest] = args.trim().split(/\s+/).filter(word => word !== '')
@@ -70,6 +73,8 @@ export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi 
         return { text: await devices(app) }
       case 'hud':
         return { text: await hud(app, rest[0], ui) }
+      case 'focus':
+        return { text: await focus(app, rest[0], ui) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }
@@ -277,6 +282,27 @@ async function hud(app: Jarvis, choice: string | undefined, ui: CommandUi): Prom
       return 'HUD closed. It stays closed in new sessions until /jarvis hud on.'
     default:
       return `Unknown choice "${choice}". Use /jarvis hud, /jarvis hud on or /jarvis hud off.`
+  }
+}
+
+async function focus(app: Jarvis, choice: string | undefined, ui: CommandUi): Promise<string> {
+  if (!app.isLocal) return NOT_LOCAL
+  switch (choice?.toLowerCase()) {
+    case undefined:
+    case 'on': {
+      await app.setFocus(true)
+      const isOpen = await app.openHud(ui.openHud)
+      const how = 'Typing a prompt brings the conversation back until you next talk to Jarvis; /jarvis focus off ends it.'
+      if (!isOpen) return `Focus mode is on; it takes over once the HUD has room to open. ${how}`
+      return app.isRunning
+        ? `Focus mode on: while Jarvis runs, the HUD fills the screen and the conversation folds away. ${how}`
+        : `Focus mode is on; it takes over once Jarvis is running (/jarvis setup if he is not set up). ${how}`
+    }
+    case 'off':
+      await app.setFocus(false)
+      return 'Focus mode off: the conversation is back beside the HUD.'
+    default:
+      return `Unknown choice "${choice}". Use /jarvis focus on or /jarvis focus off.`
   }
 }
 

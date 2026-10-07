@@ -27,6 +27,14 @@ export const ACTION_LIMIT = 6
 const SLEEPING_EVERY = 4
 /** The desktop redraws for a level change at most this often (it swells and shrinks with the voice). */
 const LEVEL_REDRAW_MS = 150
+/** The terminal ring's largest size in rows (twice as many columns). */
+export const RING_MAX_ROWS = 64
+/** Cells a repaint every frame may cost; a bigger ring repaints on every second or third frame. */
+const CELLS_PER_FRAME = 3000
+/** The pane's size before the surface has said how big the screen is. */
+export const PANE_START = { rows: 24, columns: 52 }
+/** Lines of Claude's reply shown under the ring in focus mode. */
+export const REPLY_ROWS = 3
 
 export const MODE_LABELS: Record<HudMode, string> = {
   offline: 'OFFLINE',
@@ -58,10 +66,35 @@ export function hudMode(phase: JarvisPhase, isThinking: boolean, isInterrupted =
   return 'sleeping'
 }
 
-/** The ring's size in cells for a pane body: twice as wide as tall draws it round. */
+/** The ring's size in cells for a pane body: twice as wide as tall draws it round, as big as the body allows. */
 export function ringSize(bodyColumns: number, bodyRows: number, textRows: number): { columns: number; rows: number } {
-  const rows = Math.max(6, Math.min(24, Math.floor(bodyColumns / 2), bodyRows - textRows))
+  const rows = Math.max(6, Math.min(RING_MAX_ROWS, Math.floor(bodyColumns / 2), bodyRows - textRows))
   return { columns: rows * 2, rows }
+}
+
+/**
+ * Where the surface seated the pane, the body it gave it, and the room beside
+ * it: a dock's `columns` are the conversation's beside it, `rows` the screen's.
+ */
+export type PaneLayout = { placement: 'dock' | 'inline'; bodyColumns: number; bodyRows: number; columns: number; rows: number }
+export type PaneSize = { rows: number; columns: number }
+
+/**
+ * The size the HUD asks for: as much room as the ring can use. Docked beside
+ * the conversation (floor to ceiling) it is as wide as the ring its height
+ * allows, up to half the screen; inline above the prompt, half the screen's
+ * height. In focus mode the conversation is folded away, so it asks for
+ * nearly the whole screen.
+ */
+export function paneSize(layout: PaneLayout, textRows: number, isFocus: boolean): PaneSize {
+  if (layout.placement === 'dock') {
+    const screen = layout.columns + layout.bodyColumns + 1
+    if (isFocus) return { rows: PANE_START.rows, columns: Math.max(PANE_START.columns, screen - 4) }
+    const ringRows = Math.min(RING_MAX_ROWS, layout.bodyRows - textRows)
+    return { rows: PANE_START.rows, columns: Math.max(PANE_START.columns, Math.min(2 * ringRows + 2, Math.floor(screen / 2))) }
+  }
+  const rows = isFocus ? layout.rows - 8 : Math.floor(layout.rows / 2)
+  return { rows: Math.max(PANE_START.rows, rows), columns: PANE_START.columns }
 }
 
 /** A tool call as one line of the action log ("Bash npm test"). */
@@ -100,12 +133,31 @@ export class Hud {
   private isDesktopShown = false
   private desktopKey = ''
   private lastDesktopRedraw = 0
+  private layout: PaneLayout | undefined
+  private asked: PaneSize = PANE_START
+  private isFocus = false
+  private lastReply: string | undefined
 
   constructor(private readonly engine: Engine) {}
 
   /** The ring's mode now. */
   mode(now = performance.now()): HudMode {
     return hudMode(this.phase, this.isThinking, now < this.interruptedUntil)
+  }
+
+  /** Whether the terminal pane is drawn (focus mode is the terminal's). */
+  get isShown(): boolean {
+    return this.terminal !== undefined
+  }
+
+  /** Whether the pane is docked beside the conversation (the fullscreen view) rather than above the prompt. */
+  get isDocked(): boolean {
+    return this.layout?.placement === 'dock'
+  }
+
+  /** The size to open the pane at: what the HUD asked for last. */
+  get size(): PaneSize {
+    return this.asked
   }
 
   /** The levels as they arrived, for the desktop ring (its own motion smooths them), and the time its motion has reached. */
@@ -166,6 +218,33 @@ export class Hud {
     this.save()
   }
 
+  /** Claude's last reply, for focus mode. */
+  setLastReply(text: string | undefined): void {
+    if (text === this.lastReply) return
+    this.lastReply = text
+    this.save()
+  }
+
+  /** Focus mode came or went: the pane asks for its new size. */
+  setFocus(isFocus: boolean): void {
+    if (isFocus === this.isFocus) return
+    this.isFocus = isFocus
+    this.save()
+    this.resize()
+  }
+
+  /**
+   * The pane drew with this screen: when the size it should have changed,
+   * it asks for it (the person's own drag or keys still win).
+   */
+  onLayout(layout: PaneLayout): void {
+    const last = this.layout
+    if (last !== undefined && (Object.keys(layout) as (keyof PaneLayout)[]).every(key => last[key] === layout[key])) return
+    this.layout = layout
+    this.resize()
+    if (last?.placement !== layout.placement) this.onShownChange?.(this.isShown)
+  }
+
   // -- drawing
 
   /**
@@ -173,9 +252,11 @@ export class Hud {
    * repaints start (they stop once the pane is gone).
    */
   mountTerminal(requestId: string, columns: number, rows: number): string {
+    const wasShown = this.isShown
     this.terminal = { requestId, columns, rows }
     this.lastStaticMode = undefined
     this.ensureTimer()
+    if (!wasShown) this.onShownChange?.(true)
     return this.frame(performance.now())
   }
 
@@ -199,6 +280,8 @@ export class Hud {
     const mode = this.mode(now)
     this.ticks += 1
     if (mode === 'sleeping' && this.ticks % SLEEPING_EVERY !== 0) return // slow motion: a few frames a second
+    // A big ring repaints less often, so the terminal keeps up.
+    if (this.ticks % Math.ceil((terminal.columns * terminal.rows) / CELLS_PER_FRAME) !== 0) return
     if (mode === 'offline') {
       // A still ring: paint it once.
       if (this.lastStaticMode === mode) return
@@ -230,10 +313,17 @@ export class Hud {
 
   /** The pane was closed. */
   onClosed(): void {
+    const wasShown = this.isShown
     this.terminal = undefined
     this.isDesktopShown = false
+    // Until it draws again there is nothing to resize (a resize would open it again).
+    this.layout = undefined
     this.stopTimer()
+    if (wasShown) this.onShownChange?.(false)
   }
+
+  /** Called when the terminal pane starts or stops being drawn, or moves between dock and inline (focus mode follows both). */
+  onShownChange: ((isShown: boolean) => void) | undefined
 
   dispose(): void {
     this.onClosed()
@@ -262,8 +352,28 @@ export class Hud {
     if (this.isDesktopShown) this.redrawDesktop(performance.now())
   }
 
-  private save(): void {
-    void this.engine.writeHud({ isThinking: this.isThinking, actions: this.actions }).catch(() => undefined)
+  /** Writes what the pane shows to the session state (a new module's HUD starts from its own). */
+  save(): void {
+    const hud = {
+      isThinking: this.isThinking,
+      actions: this.actions,
+      ...(this.lastReply === undefined ? {} : { lastReply: this.lastReply }),
+      ...(this.isFocus ? { isFocus: true } : {}),
+    }
+    void this.engine.writeHud(hud).catch(() => undefined)
+  }
+
+  /** Asks for the size the screen and focus mode call for, once it differs from the last ask. */
+  private resize(): void {
+    const layout = this.layout
+    if (layout === undefined) return
+    const size = paneSize(layout, hudTextRows(this.isFocus), this.isFocus)
+    if (size.rows === this.asked.rows && size.columns === this.asked.columns) return
+    this.asked = size
+    // Not from inside a drawing: the open goes out on the next tick.
+    this.engine.after(0, () => {
+      void this.engine.openPane(size).catch(error => this.engine.debug(`jarvis: HUD resize failed: ${describeError(error)}`))
+    })
   }
 
   private ensureTimer(): void {
@@ -276,6 +386,55 @@ export class Hud {
   private stopTimer(): void {
     this.timer?.cancel()
     this.timer = undefined
+  }
+}
+
+/** The rows the title and the texts under the ring take at most. */
+export function hudTextRows(isFocus: boolean): number {
+  return 1 + 2 + ACTION_LIMIT + (isFocus ? REPLY_ROWS : 0)
+}
+
+/** The narrowest the texts may be beside the ring. */
+const SIDE_TEXT_COLUMNS = 40
+/** Lines of the reply when the texts sit beside the ring. */
+const SIDE_REPLY_ROWS = 8
+
+/** How a terminal pane's body is shared between the ring and the texts. */
+export type HudLayout = {
+  ring: { columns: number; rows: number }
+  /** The texts sit beside the ring, else under it. */
+  isSide: boolean
+  /** Cells across the texts. */
+  textColumns: number
+  replyRows: number
+  actionRows: number
+}
+
+/**
+ * The ring as big as the body allows, the texts under it; or, in a body wide
+ * enough that a column of texts beside it lets the ring grow (focus mode), beside it.
+ */
+export function hudLayout(bodyColumns: number, bodyRows: number, hasUtterance: boolean, isFocus: boolean): HudLayout {
+  const stacked = ringSize(bodyColumns, bodyRows, hudTextRows(isFocus))
+  const sideRows = Math.min(RING_MAX_ROWS, bodyRows - 1, Math.floor((bodyColumns - SIDE_TEXT_COLUMNS - 2) / 2))
+  const utteranceRows = hasUtterance ? 1 : 0
+  if (sideRows > stacked.rows) {
+    const replyRows = isFocus ? SIDE_REPLY_ROWS : 0
+    return {
+      ring: { columns: sideRows * 2, rows: sideRows },
+      isSide: true,
+      textColumns: bodyColumns - sideRows * 2 - 2,
+      replyRows,
+      actionRows: Math.max(0, sideRows - utteranceRows - replyRows - 1),
+    }
+  }
+  const replyRows = isFocus ? REPLY_ROWS : 0
+  return {
+    ring: stacked,
+    isSide: false,
+    textColumns: bodyColumns,
+    replyRows,
+    actionRows: Math.max(0, bodyRows - 1 - stacked.rows - utteranceRows - replyRows),
   }
 }
 
