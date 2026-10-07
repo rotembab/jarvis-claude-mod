@@ -35,6 +35,7 @@ TV_ID = "bravia-sony-tv"
 SOAP = '"urn:schemas-sony-com:service:IRCC:1#X_SendIRCC"'
 # The fakes speak only plain http: an https request reaches them marked with this header.
 OVER_HTTPS = "X-Test-Over-Https"
+REAL_REQUEST = net.request  # before the https_ports fixture replaces it
 
 # Sony's published IRCC codes (not secrets: every TV of a model has the same ones).
 CODES = {
@@ -1276,17 +1277,22 @@ def test_wizard_calls_the_key_wrong_only_when_https_refuses_it_too(
     assert ctx.store.load().devices == []
 
 
+@pytest.mark.parametrize("https", ["closed", "plain port"])
 @pytest.mark.parametrize("psk", [PSK, WRONG_PSK], ids=["right key", "wrong key"])
 def test_wizard_saves_nothing_when_no_answer_checks_the_key(
-    tmp_path: Path, tv: FakeBravia, fast_setup: None, psk: str
+    tmp_path: Path, tv: FakeBravia, fast_setup: None, monkeypatch: pytest.MonkeyPatch, psk: str, https: str
 ) -> None:
     """Plain http answers only with error codes (as a TV made since August 2025 does) and https does
-    not answer: nothing showed that the key works, so nothing is saved, whichever key was typed."""
+    not answer: nothing showed that the key works, so nothing is saved, whichever key was typed.
+    The fake's address has a port, and https goes to that port too, so setup says to leave it out."""
     ctx = wizard_ctx(tmp_path)
-    tv.plain_http = "error"  # and https finds no open port
+    tv.plain_http = "error"  # "closed": https finds no open port there
+    if https == "plain port":  # https meets the http port, as at "192.168.1.20:80": the TLS handshake fails
+        monkeypatch.setattr(net, "request", REAL_REQUEST)
     ui = ScriptedPrompter([False, tv.address, psk, False])
     bravia.wizard(ui, ctx)
     assert "The TV answered only with errors, so Jarvis could not check the key." in ui.text
+    assert "If you typed a port after the address, leave it out." in ui.text
     assert "Connected" not in ui.text and ui.said[-1] == "Nothing was saved."
     assert ctx.store.load().devices == [] and ctx.store.secret_keys() == []
     assert set(tv.methods()) == {"getSystemInformation", "getApplicationList"}
@@ -1307,6 +1313,24 @@ def test_wizard_saves_nothing_when_no_answer_checks_the_key(
 def test_setup_tells_the_failure_that_says_more(plain: str, secure: str, shown: str) -> None:
     picked = bravia._pick_scheme(bravia.BraviaError(plain), bravia.BraviaError(secure))
     assert isinstance(picked, bravia.BraviaError) and picked.kind == shown
+
+
+@pytest.mark.parametrize(
+    ("address", "port"),
+    [
+        ("192.0.2.20", False),
+        ("tv.lan", False),
+        ("2001:db8::20", False),
+        ("192.0.2.20:80", True),
+        ("[2001:db8::20]:80", True),
+    ],
+)
+def test_only_errors_says_to_leave_out_a_typed_port(address: str, port: bool) -> None:
+    """https goes to the port typed for http, where a TV that takes only https does not serve it."""
+    problem = bravia._probe_problem(bravia.BraviaError("unverified"), address)
+    assert problem.startswith("The TV answered only with errors, so Jarvis could not check the key.")
+    assert ("If you typed a port after the address, leave it out." in problem) is port
+    assert address not in problem
 
 
 def test_setup_keeps_http_unless_https_says_more() -> None:

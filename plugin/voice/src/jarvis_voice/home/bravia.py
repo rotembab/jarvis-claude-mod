@@ -1420,10 +1420,14 @@ def _probe_problem(err: BraviaError, address: str) -> str:
             "are on. If they are, the TV may be restarting the service: wait half a minute and try again."
         )
     if kind == "unverified":
-        return (
+        problem = (
             "The TV answered only with errors, so Jarvis could not check the key. Check that IP control and "
             "Control remotely are on in the TV's network settings and that the TV is on, then try again."
         )
+        if urlsplit(f"//{_netloc(address)}").port is not None:
+            # Setup tried https on that port too, where a TV that takes only https does not serve it.
+            problem += " If you typed a port after the address, leave it out."
+        return problem
     if kind == "tls":
         return f"Could not make a secure connection to {address}."
     if kind == "bad_reply":
