@@ -51,8 +51,75 @@ sentence by sentence (`plugin/voice/scripts/voice_latency.py`).
 
 - Speech started long before the last chunk arrived, and Fish received one `text` + `flush` per
   chunk, so the helper streams.
-- Almost all of the 1.4 s is Fish's side (connection setup plus synthesis on the free model).
+- Almost all of the 1.4 s is Fish's side. It splits into two parts, measured directly
+  against `wss://api.fish.audio/v1/tts/live` with `s2.1-pro-free` (3 runs per mode):
+
+  | `latency` mode | Connect (TCP + TLS + upgrade) | Flush to first audio frame |
+  | --- | --- | --- |
+  | `balanced` (the helper's setting) | 654–716 ms | 635–757 ms |
+  | `low` | 648–715 ms | 646–720 ms |
+  | `normal` | 710–749 ms | 2,423–2,846 ms |
+
+  The new connection the helper opens for every reply costs about 0.7 s, half the wait. `low`
+  is no faster than `balanced` in these runs, and `normal` is much slower.
 - `level` events appear only while speaking: none while idle, 180 over about 10 s of speech.
+
+## Where the remaining waits come from (code audit)
+
+A read-only audit traced the path from Claude's text to the speaker. Every stage streams:
+text deltas are split into sentences as they arrive, each sentence is POSTed at once, sent to
+Fish with a flush, and audio frames play as they arrive with no prebuffer. The waits a
+listener notices come from these places, most important first. A reviewer re-checked each one
+against the code.
+
+1. **Nothing is heard before Claude's first text** (confirmed). Thinking and tool calls are never
+   spoken (`plugin/hooks/voice.ts:298`). `onTurnStart` sends nothing to the helper. The persona's
+   "answer first, no preamble" rule (`voice.ts:56`) discourages a heads-up before tool work.
+   The status line also reads "ready" during this time. Fixes:
+   - reword the persona so a turn that uses tools first says one short sentence about what it
+     is checking;
+   - optionally, play a local earcon when a voice turn starts. That needs a small new helper
+     command reusing the chime code at `daemon.py:255-264`.
+2. **The sentence before a tool call waits until the tool's whole input has streamed**
+   (confirmed). The splitter holds a sentence that ends at the end of its buffer
+   (`plugin/hooks/sentences.ts:247, 279`). The line is ended only after the step finishes
+   (`voice.ts:307`). Fix: in `Voice.step`, call `turn.reply.endLine()` when a non-text chunk
+   follows text. Add a test that checks the speak command right after the `tool` chunk.
+3. **Each reply opens a new Fish connection, only once the first sentence is ready**
+   (confirmed; it costs about 0.7 s, measured above). Fix: open a spare connection in the
+   background when the user's clip is queued for transcription (`daemon.py:338-341`), and claim
+   it for the first sentence. Drop it if the voice id changes or it sits idle too long.
+   `SpeechSynth`/`FishStream` need a settable `on_audio`. This would cut time to first audio
+   from about 1.4 s to about 0.7 s.
+4. **The output device closes after 30 s of silence** (partly confirmed; small cost). Its reopen
+   runs before the Fish connect (`sd_backend.py:222`, `speech.py:341`). A pause of more than
+   30 s inside one reply puts the reopen right in front of the audio. Fix: keep the output
+   open while a voice reply is expected or still open, with a cap.
+
+Smaller items:
+- There are no timing logs between the speak POST and the first audio frame. Add them first.
+- Speak POSTs are sent one after another.
+- There is no timer flush when Claude pauses mid-sentence.
+- Sentences sent while the helper restarts are dropped.
+- Socket closes other than 1000 end the reply instead of reconnecting.
+- The next reply's socket opens only after the previous reply has finished playing.
+
+## A local engine inside the helper
+
+- What it must implement: `SpeechSynth`/`SynthStream` (`tts/base.py:23-67`). It must output
+  16-bit mono PCM at exactly 24 kHz (the playback path assumes 24 kHz). `send_text` must not
+  block.
+- The plugin side needs no change.
+- Two ways to wire it:
+  - **No helper change:** run a local bridge that speaks Fish's `/v1/tts/live` protocol
+    (`tests/fish_fake.py` is the template). Point `JARVIS_FISH_BASE_URL` at it, with any
+    non-empty key.
+  - **Built in:** a new `tts/kokoro.py`, plus a `JARVIS_TTS_ENGINE` switch in `cli.py`, new
+    error codes, setup and doctor steps, and a `local-tts` extra (also passed from
+    `plugin/hooks/setup.ts`).
+- Avoid putting `onnxruntime-gpu` or a torch-CUDA voice inside the helper. It would clash with
+  the CPU `onnxruntime` that faster-whisper already pulls in and with the pinned cuDNN. A GPU
+  voice-cloning model is better run as a separate bridge process.
 
 ## Other observations
 
@@ -100,6 +167,7 @@ Run them with the helper's Python (`~/.jarvis/venv/Scripts/python.exe`). Neither
 
 ## Open items
 
+- Latency fixes 1–3 above, starting with timing logs.
 - Pick a voice: a Fish Voice Design voice now, then possibly a local engine.
 - Decide whether to make `s2.1-pro-free` the default model and add a fallback for when it ends.
 - Fix the microphone and test push-to-talk end to end.
