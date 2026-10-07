@@ -2,7 +2,7 @@
 
 Phase 4 lets Claude work the PC from a spoken request: open apps, press the media keys, set a timer, run PowerShell. This page covers what Jarvis lets through, what it asks about, what it blocks, and what to check on the PC.
 
-Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse.
+Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse. Jarvis's own two tools, the desktop tool and hand control's tool, are answered by Jarvis, so Claude Code's permission path never sees them. For those, Jarvis asks Claude Code for its verdict on your rules and applies it itself, asking you wherever that verdict isn't your own allow (see each tool below).
 
 ## The guard
 
@@ -81,7 +81,7 @@ The yes answers Jarvis's line, which names the command whatever Claude said befo
 Jarvis writes no settings. `/jarvis pc rules` prints a snippet built from the same table the guard uses, for you to merge into `permissions` (and `env`) in your user settings (`.claude\settings.json` in your user folder). Claude can't do it for you: the guard blocks edits to Claude Code's settings.
 
 - **deny rules** keep the never list blocked even when Jarvis is off or not installed.
-- There are **no allow rules**. Jarvis only makes Claude Code stricter, so it suggests nothing that would skip Claude Code's own dialog.
+- There are **no allow rules**. Jarvis only makes Claude Code stricter, so it suggests nothing that would skip Claude Code's own dialog. The text above the snippet says how to allow the desktop tool and hand control's tool yourself, if you want their actions to run without Jarvis's question.
 - There are **no ask rules**. Jarvis asks for itself, and an ask rule would add a second dialog.
 - The **env line** turns on the PowerShell tool.
 
@@ -167,7 +167,16 @@ Spotify may navigate to the playlist without starting it, and the play/pause key
 
 Hand control (see [SPEC-hands.md](SPEC-hands.md)) gives Claude a tool too, `mcp__jarvis__hands`. It turns the camera and hand tracking on or off, pauses and resumes them, starts calibration, chooses the displays your hand reaches, and gives the cursor to your hand or takes it away. It never moves the mouse, clicks or types itself; your hand does that.
 
-Jarvis answers this tool itself, as it does the desktop tool, so Claude Code's own permission path never sees its calls. Unlike the desktop tool, it does not apply your rules for it: a deny or ask rule for `mcp__jarvis__hands`, plan mode and dontAsk don't stop it, and it doesn't ask before turning the camera on. While Claude Code runs as administrator, or the administrator check hasn't passed, its `on` is refused like `/jarvis hands on` (see below).
+Jarvis answers this tool itself, as it does the desktop tool, so Claude Code's own permission path never sees its calls. Jarvis applies your own Claude Code rules for `mcp__jarvis__hands` instead, the same way it does for the desktop tool (see above):
+
+- A deny rule refuses it, as does an organization's deny.
+- Anything else asks first: a spoken yes in a voice conversation, held as for the guard's voice tier (Jarvis asks, for example, "Claude wants to turn hand control on, which opens the camera. Say yes to let it, sir."), or a click otherwise ("Don't do it" / "Do it"). That covers an ask rule, Claude Code's own default for a tool no rule allows yet, and an allow that comes from the mode alone (bypassPermissions with no rule).
+- Your own allow rule lets it run without that question. Jarvis doesn't add one; to skip the question, add `"mcp__jarvis__hands"` to `allow` in your settings yourself. Even then it asks, as the desktop tool does, when a PreToolUse or PermissionRequest hook in your settings could match the tool, and before a change when the permission mode isn't known for the turn, such as a subagent's call (a subagent's question is always a click, never a spoken yes).
+- In dontAsk mode, only your allow rule lets it run; anything that would ask is refused.
+- In plan mode, and until Jarvis has seen your first prompt, it only reads hand control's status. Everything else is refused: turning it on or off, pausing, resuming, calibrating, choosing displays, and giving your hand the cursor or taking it away. You can still do those yourself with `/jarvis hands`.
+- If your rules or your settings can't be read, nothing is done.
+
+While Claude Code runs as administrator, or the administrator check hasn't passed, its `on` is refused like `/jarvis hands on` (see below).
 
 ## Stand down
 
@@ -201,7 +210,7 @@ Jarvis also reads the UAC level. If it is below "Always notify", you see a one-t
 
 ## Bypass mode
 
-If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it. The desktop tool still asks before each action unless your own allow rule covers it, since the mode's allow is not yours.
+If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it. The desktop tool and hand control's tool still ask before each action unless your own allow rule covers them, since the mode's allow is not yours.
 
 ## Check on the PC
 

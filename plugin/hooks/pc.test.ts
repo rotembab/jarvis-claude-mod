@@ -5,7 +5,7 @@ import type { JarvisHud } from '../types'
 import { DESKTOP_TOOL, GUARD_FAILED } from './pc'
 import { parseUacPolicy, parseWhoamiGroups, system32 } from './platform'
 import type { FakeChild, RunAnswer, RunCall, World } from './test-harness'
-import { completeTurn, HANDS_PYTHON, jarvis, runStep, startHelper, startSession, textChunks, WINDOWS_ENV, WINGET_UV, world } from './test-harness'
+import { allowedTurn, completeTurn, HANDS_PYTHON, jarvis, runStep, startHelper, startSession, textChunks, WINDOWS_ENV, WINGET_UV, world } from './test-harness'
 import { isNoPhrase, isStandDownPhrase, isStopPhrase, isYesPhrase } from './voice'
 
 const CLOUD_ENV = { ...WINDOWS_ENV, CLAUDE_CODE_REMOTE: 'true' }
@@ -999,6 +999,8 @@ describe('never as administrator', () => {
       expect(await jarvis($, args), args).toMatch(/^Jarvis stays off: Claude Code runs as administrator/)
     }
     expect(await jarvis($, 'hands camera 1')).toBe('Camera set to "1"; it applies when hand control starts.')
+    // Even with the user's own allow rule for the tool.
+    await allowedTurn($, w, 'mcp__jarvis__hands')
     expect((await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })).result).toMatch(/^Jarvis stays off: Claude Code runs as administrator/)
     await w.clock.advance(5000)
     await w.settle()
@@ -1152,6 +1154,7 @@ describe('/jarvis pc', () => {
     await startSession($, w)
     const text = await jarvis($, 'pc rules')
     expect(text).toContain('Jarvis writes no settings')
+    expect(text).toContain('add "mcp__jarvis__hands" to "allow" yourself')
     const snippet = JSON.parse(text.slice(text.indexOf('{'))) as { permissions: Record<string, string[]>; env: Record<string, string> }
     expect(snippet.permissions.deny?.length).toBeGreaterThan(0)
     expect(snippet.permissions.allow).toBeUndefined()

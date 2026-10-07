@@ -3,8 +3,11 @@ import type { On } from 'claude-code'
 
 import { BACKOFF_MS, HEARTBEAT_MS, ORPHAN_RETRY_MS, STOP_WAIT_MS } from './helper'
 import { describeHandsError, HANDS_TOOL, parseDisplaySelection, parseHandsEvent } from './hands'
+// The tool's calls here run under the user's own allow rule (allowedTurn); hands-gate.test.ts has its permissions.
+import { HANDS_TOOL_ID } from './hands-gate'
 import type { Answer, FakeChild, World, WorldOptions } from './test-harness'
 import {
+  allowedTurn,
   DATA_DIR,
   HANDS_INSTALLED,
   HANDS_PORT,
@@ -208,6 +211,7 @@ describe('hand helper process', () => {
     w.existing.add(HANDS_PYTHON)
     await startSession($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect((await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })).result).toBe('Hand control is already on.')
     expect(w.store.has('handsEnabled')).toBe(false)
   })
@@ -977,6 +981,7 @@ describe('/jarvis hands', () => {
     first = await handsReady(w)
     expect(await jarvis($, 'hands restart')).toBe('Restarting the hand helper.')
     await w.settle()
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const toolOff = $.tool.call({ tool: 'mcp__jarvis__hands', action: 'off' })
     await w.settle()
     first.exit(0)
@@ -1295,6 +1300,7 @@ describe('the hands tool', () => {
     await startHelper($, w)
     exitOnShutdown(w)
     expect(w.tools.map(tool => tool.name)).toContain('hands')
+    await allowedTurn($, w, HANDS_TOOL_ID)
 
     const turnedOn = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })
     expect(turnedOn.result).toContain('Hand control is on. The camera starts in a moment')
@@ -1322,6 +1328,7 @@ describe('the hands tool', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const call = async (input: Record<string, unknown>): Promise<string> =>
       String((await $.tool.call({ tool: 'mcp__jarvis__hands', ...input })).result)
 
@@ -1343,6 +1350,7 @@ describe('the hands tool', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const call = async (action: string): Promise<string> =>
       String((await $.tool.call({ tool: 'mcp__jarvis__hands', action })).result)
 

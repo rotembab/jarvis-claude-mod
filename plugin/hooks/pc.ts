@@ -13,6 +13,7 @@ import { delay, describeError } from './engine'
 import type { Resolved, Verdict } from './guard'
 import { judge, rulesSnippet } from './guard'
 import { DESKTOP_TOOL, DesktopTool, textLines, visibleText } from './desktop'
+import { HANDS_TOOL_ID } from './hands-gate'
 import { actionLabel } from './hud'
 import type { AdminFacts, UacLevel } from './platform'
 import { probeAdmin } from './platform'
@@ -348,7 +349,7 @@ export class PcControl {
   /**
    * The main loop's permission mode, as the latest classic hook input said
    * (a prompt, a session start, a plan-mode tool). Undefined until one has:
-   * the desktop tool then changes nothing, as in plan mode.
+   * the desktop and hands tools then change nothing, as in plan mode.
    */
   permissionMode: string | undefined
   /** The main-loop turn running now, and the turn the mode was last noted in (a prompt's own turn, or a tool's). */
@@ -912,6 +913,7 @@ export class PcControl {
           'Permission rules from the same table the guard uses. Jarvis writes no settings: paste these into the "permissions" (and "env") of your user settings yourself (.claude\\settings.json in your user folder). Claude cannot do it for you: the guard blocks edits to Claude Code\'s settings.',
           'The deny rules keep the never list blocked even without Jarvis. There are no allow rules (Jarvis only makes Claude Code stricter) and no ask rules (Jarvis asks itself; an ask rule would add a second dialog). The env line turns on the PowerShell tool.',
           `The desktop tool asks on screen before each action unless your rules allow it. To let its actions run without that question, add "${DESKTOP_TOOL}" to "allow" yourself. Even then Jarvis asks before reading the clipboard or taking a screenshot (a spoken yes in a voice conversation, else a click), and asks on screen when: a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it, PostToolUse ones included), the permission mode is not known for the turn (a subagent's call, a turn Jarvis did not see a prompt start, or one whose prompt was typed while another turn ran), or the allow comes from the mode alone (bypassPermissions) rather than your rule. If your rules or settings cannot be read, nothing is done.`,
+          `The hands tool (hand control) follows your rules the same way: it asks before each action (a spoken yes in a voice conversation, else a click) unless you add "${HANDS_TOOL_ID}" to "allow" yourself, and in plan mode it only reads hand control's status.`,
           '',
           rulesSnippet(),
         ].join('\n')
@@ -961,7 +963,7 @@ export class PcControl {
     const mode = this.permissionMode
     lines.push(
       mode === undefined
-        ? 'Permission mode: not known yet (the desktop tool changes nothing until the next prompt).'
+        ? 'Permission mode: not known yet (the desktop and hands tools change nothing until the next prompt).'
         : `Permission mode: ${mode}.${mode === 'bypassPermissions' ? ' Claude Code\'s own rules are skipped; the guard still asks.' : ''}`,
     )
     const timers = this.desktopTool.timerLabels
