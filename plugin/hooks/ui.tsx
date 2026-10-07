@@ -1,10 +1,15 @@
-// Minimal UI: one status line entry ("JARVIS · <state>", with hand
-// control's part while it is on) and a band above the prompt while the user
-// is talking. Nothing is drawn when idle.
+// The UI: a status line entry ("JARVIS · <state>", with hand control's part
+// while it is on), a band above the prompt while the user is talking, and the
+// HUD pane (the ring, what you said and what Claude is doing).
 
 import type { Elements, RenderElement } from 'claude-code'
 
-import type { HandsPhase, JarvisHandsView, JarvisPhase, JarvisView } from '../types'
+import type { HandsPhase, HudAction, JarvisHandsView, JarvisHud, JarvisPhase, JarvisView } from '../types'
+import type { HudMode } from './hud'
+import type { HudLayout } from './hud'
+import { ACTION_LIMIT, MODE_LABELS, REPLY_ROWS, RING_KEY } from './hud'
+import { HUD_COLORS } from './hud-ring'
+import { ringSvg } from './hud-svg'
 
 /** The status line text for a view; undefined hides the entry. */
 export function statusLine(view: JarvisView): string | undefined {
@@ -82,6 +87,147 @@ export function bandTree({ Box, Text }: BandElements, view: JarvisView): RenderE
           last: {view.lastUtterance}
         </Text>
       ) : null}
+    </Box>
+  )
+}
+
+type HudTerminalElements = Pick<Elements['terminal'], 'Box' | 'Text' | 'Raster'>
+type HudSvgElements = Pick<Elements['desktop'], 'Box' | 'Text' | 'Svg'>
+
+export type HudPaneData = {
+  mode: HudMode
+  view: JarvisView
+  hud: JarvisHud
+  /** Focus mode shows: the reply goes under the ring, the conversation being folded away. */
+  isFocus?: boolean
+}
+
+const ACTION_MARKS: Record<HudAction['status'], string> = { running: '›', done: '✓', failed: '✗' }
+
+/**
+ * The start of a reply in at most `rows` lines of `width` cells, its markdown
+ * marks dropped; an ellipsis ends it when it goes on.
+ */
+export function replyLines(text: string, width: number, rows: number): string[] {
+  const words = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^\s{0,3}(#{1,6}|>)\s*/gm, '')
+    .replace(/\*\*|__|`/g, '')
+    .split(/\s+/)
+    .filter(word => word !== '')
+  const lines: string[] = []
+  let line = ''
+  for (const word of words) {
+    const next = line === '' ? word : `${line} ${word}`
+    if (next.length <= width || line === '') {
+      line = next.length > width ? next.slice(0, width) : next
+      continue
+    }
+    lines.push(line)
+    line = word.slice(0, width)
+    if (lines.length === rows) break
+  }
+  if (lines.length < rows && line !== '') lines.push(line)
+  const isCut = lines.join(' ').length < words.join(' ').length
+  if (isCut && lines.length > 0) {
+    const last = lines[lines.length - 1] as string
+    lines[lines.length - 1] = `${last.slice(0, Math.max(0, width - 1))}…`
+  }
+  return lines
+}
+
+/** The lines under the ring: what you said, Claude's reply in focus mode, then what Claude did, newest first. */
+function hudTexts<E extends Pick<Elements['terminal'], 'Box' | 'Text'>>(
+  { Box, Text }: E,
+  data: HudPaneData,
+  limit: number,
+  columns: number,
+  replyRows: number,
+): RenderElement {
+  const actions = data.hud.actions.slice(0, Math.max(0, limit))
+  const reply = data.isFocus && data.hud.lastReply ? replyLines(data.hud.lastReply, Math.max(10, columns - 7), replyRows) : []
+  return (
+    <Box flexDirection="column">
+      {data.view.lastUtterance ? (
+        <Text wrap="truncate-end">
+          <Text dimColor>you </Text>
+          {data.view.lastUtterance}
+        </Text>
+      ) : null}
+      {reply.map((line, index) => (
+        <Text wrap="truncate-end">
+          <Text dimColor>{index === 0 ? 'jarvis ' : '       '}</Text>
+          {line}
+        </Text>
+      ))}
+      {actions.map(action => (
+        <Text wrap="truncate-end" dimColor={action.status !== 'running'} color={action.status === 'failed' ? 'error' : undefined}>
+          {ACTION_MARKS[action.status]} {action.label}
+        </Text>
+      ))}
+    </Box>
+  )
+}
+
+/** The title bar: the mode in the ring's color. */
+function hudTitle<E extends Pick<Elements['terminal'], 'Text'>>({ Text }: E, mode: HudMode): RenderElement {
+  return (
+    <Text color={hudColor(mode)} bold>
+      {`⟨ JARVIS · ${MODE_LABELS[mode]} ⟩`}
+    </Text>
+  )
+}
+
+export const hudColor = (mode: HudMode): string => `#${HUD_COLORS[mode].toString(16).padStart(6, '0')}`
+
+/** A transcript row folded away by focus mode: it draws nothing. */
+export function foldedRow({ Box }: Pick<Elements['terminal'], 'Box'>): RenderElement {
+  return <Box />
+}
+
+/** The terminal pane: title, the ring (a Raster the HUD repaints), the texts. */
+export function hudTerminalTree({ Box, Text, Raster }: HudTerminalElements, data: HudPaneData, layout: HudLayout, cells: string): RenderElement {
+  const { ring } = layout
+  const raster = <Raster key={RING_KEY} columns={ring.columns} rows={ring.rows} cells={cells} />
+  const texts = hudTexts({ Box, Text }, data, layout.actionRows, layout.textColumns, layout.replyRows)
+  return (
+    <Box flexDirection="column">
+      <Box justifyContent="center">{hudTitle({ Text }, data.mode)}</Box>
+      {layout.isSide ? (
+        <Box flexDirection="row" justifyContent="center">
+          {raster}
+          <Box flexDirection="column" justifyContent="center" marginLeft={2} width={layout.textColumns}>
+            {texts}
+          </Box>
+        </Box>
+      ) : (
+        <Box justifyContent="center">{raster}</Box>
+      )}
+      {layout.isSide ? null : texts}
+    </Box>
+  )
+}
+
+/** The desktop pane: the same, the ring as an animated SVG. */
+export function hudSvgTree(
+  { Box, Text, Svg }: HudSvgElements,
+  data: HudPaneData,
+  levels: { mic: number; out: number; t: number },
+  columns: number,
+): RenderElement {
+  return (
+    <Box flexDirection="column">
+      <Box justifyContent="center">{hudTitle({ Text }, data.mode)}</Box>
+      <Box justifyContent="center">
+        <Svg
+          source={ringSvg(data.mode, levels.mic, levels.out, levels.t)}
+          alt={`Jarvis: ${MODE_LABELS[data.mode].toLowerCase()}`}
+          width={240}
+          height={240}
+          isInteractive
+        />
+      </Box>
+      {hudTexts({ Box, Text }, data, ACTION_LIMIT, columns, REPLY_ROWS)}
     </Box>
   )
 }

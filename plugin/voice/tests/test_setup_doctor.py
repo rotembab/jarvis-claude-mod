@@ -10,8 +10,9 @@ from typing import Any
 import pytest
 
 from jarvis_voice.doctor import run_doctor
+from jarvis_voice.listen import models as wake_models
 from jarvis_voice.logs import mask_secret
-from jarvis_voice.setup_cmd import run_setup
+from jarvis_voice.setup_cmd import download_wake, run_setup
 from jarvis_voice.stt import models
 from jarvis_voice.stt.base import SttError
 
@@ -51,7 +52,8 @@ def test_setup_progress_lines(tmp_path: Path) -> None:
     )
     assert code == 0
     assert wake_dirs == [tmp_path / "models"]
-    assert any(line["message"] == "Wake word model ready" for line in lines)
+    assert any(line["message"] == 'Downloading the "Hey Jarvis" and "Jarvis" wake word models' for line in lines)
+    assert any(line["message"] == "Wake word models ready" for line in lines)
     assert all(set(line) == {"v", "type", "step", "pct", "message"} and line["type"] == "progress" for line in lines)
     steps = [line["step"] for line in lines]
     assert steps[0] == "prepare" and "download" in steps and "verify" in steps
@@ -80,6 +82,87 @@ def test_a_wake_word_download_failure_does_not_fail_setup(tmp_path: Path) -> Non
     )
     assert code == 0 and lines[-1]["step"] == "done"
     assert any("github.com unreachable" in line["message"] and "push-to-talk" in line["message"] for line in lines)
+
+
+def test_setup_downloads_both_wake_words_and_names_the_one_that_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetched: list[tuple[str, ...]] = []
+
+    def download(folder: Path, on_progress: Any = None, files: tuple[wake_models.ModelFile, ...] = ()) -> Path:
+        fetched.append(tuple(f.name for f in files))
+        if wake_models.JARVIS_V2 in files:
+            raise OSError("raw.githubusercontent.com unreachable")
+        return folder
+
+    monkeypatch.setattr(wake_models, "download", download)
+    with pytest.raises(OSError, match='"Jarvis": raw.githubusercontent.com unreachable') as failed:
+        download_wake(tmp_path)
+    assert getattr(failed.value, "phrase", None) == "Jarvis"
+    assert fetched == [
+        ("melspectrogram.onnx", "embedding_model.onnx", "hey_jarvis_v0.1.onnx"),
+        ("melspectrogram.onnx", "embedding_model.onnx", "jarvis_v2.onnx"),
+    ]
+
+
+def test_setup_says_hey_jarvis_still_works_when_only_plain_jarvis_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def download(folder: Path, on_progress: Any = None, files: tuple[wake_models.ModelFile, ...] = ()) -> Path:
+        if wake_models.JARVIS_V2 in files:
+            raise OSError("raw.githubusercontent.com unreachable")
+        return folder
+
+    monkeypatch.setattr(wake_models, "download", download)
+    lines: list[dict[str, Any]] = []
+    code = run_setup(  # with the real download_wake
+        tmp_path,
+        "small.en",
+        lines.append,
+        detect=lambda: "cpu",
+        download=fake_download,
+        verifier=lambda req, cache, dev: ("small.en", "cpu"),
+    )
+    assert code == 0 and lines[-1]["step"] == "done"
+    [failed] = [line["message"] for line in lines if line["message"].startswith("Could not download")]
+    assert failed == (
+        'Could not download the plain "Jarvis" wake word model (raw.githubusercontent.com unreachable); '
+        '"Hey Jarvis" and push-to-talk still work'
+    )
+
+
+def serve(tmp_path: Path, payload: bytes) -> wake_models.ModelFile:
+    """A model file whose own download URL is a local file."""
+    import hashlib
+
+    source = tmp_path / "source" / "plain.onnx"
+    source.parent.mkdir()
+    source.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    return wake_models.ModelFile("plain.onnx", digest, len(payload), source=source.as_uri())
+
+
+def test_a_model_file_downloads_from_its_own_url_and_is_checked(tmp_path: Path) -> None:
+    model = serve(tmp_path, b"onnx bytes")
+    folder = tmp_path / "wake"
+    assert not wake_models.is_downloaded(folder, (model,))
+    wake_models.download(folder, files=(model,))
+    assert (folder / "plain.onnx").read_bytes() == b"onnx bytes" and wake_models.is_downloaded(folder, (model,))
+
+    tampered = wake_models.ModelFile("bad.onnx", "0" * 64, model.size, source=model.source)
+    with pytest.raises(ValueError, match="failed its checksum"):
+        wake_models.download(folder, files=(tampered,))
+    assert sorted(f.name for f in folder.iterdir()) == ["plain.onnx"]  # nothing half-written is left
+
+
+def test_the_wake_word_models_are_pinned() -> None:
+    assert wake_models.HEY_JARVIS.url == f"{wake_models.RELEASE_URL}/hey_jarvis_v0.1.onnx"
+    assert wake_models.JARVIS_V2.url == (
+        "https://raw.githubusercontent.com/fwartner/home-assistant-wakewords-collection/"
+        "1c6d6a82947ff1367d8e5e50cc999c00943ccb9c/en/jarvis/jarvis_v2.onnx"
+    )
+    assert wake_models.FILES == wake_models.HEY_JARVIS_FILES
+    assert wake_models.PLAIN_JARVIS_FILES == (wake_models.MELSPEC, wake_models.EMBEDDING, wake_models.JARVIS_V2)
 
 
 def test_setup_skips_present_model_and_falls_back_to_cpu(tmp_path: Path) -> None:
@@ -156,6 +239,9 @@ def test_doctor_report_masks_key(tmp_path: Path) -> None:
     assert set(report) >= {"version", "platform", "python", "audio", "cuda", "models", "fish", "ptt"}
     assert report["models"]["downloaded"]["small.en"] is False
     assert "deviceCount" in report["cuda"]
+    wake = report["wake"]
+    assert (wake["phrase"], wake["plainPhrase"]) == ("Hey Jarvis", "Jarvis")
+    assert wake["downloaded"] is False and wake["plainDownloaded"] is False
 
 
 def test_doctor_without_network(tmp_path: Path) -> None:

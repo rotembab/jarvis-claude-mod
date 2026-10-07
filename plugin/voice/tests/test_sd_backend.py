@@ -86,10 +86,19 @@ class FakeStream:
 
     def abort(self) -> None:
         self.aborts += 1
+        self._halt()
+        if self.sd.finish_on_abort:
+            self.kwargs["finished_callback"]()
+
+    def end_by_itself(self) -> None:
+        """The device went away: PortAudio ends the stream, and only its finished callback says so."""
+        self._halt()
+        self.kwargs["finished_callback"]()
+
+    def _halt(self) -> None:
         self.active = False
         if self._thread:
             self._thread.join()
-        self.kwargs["finished_callback"]()
 
     def close(self) -> None:
         self.closed_with_com = getattr(self.sd.com, "ready", False)
@@ -125,6 +134,7 @@ class FakeSD(types.ModuleType):
         self._lib = FakeLib()
         self.host_error_on_fail = 0  # what a failing open leaves in the host error slot
         self.mute_input = False
+        self.finish_on_abort = True  # PortAudio calls the finished callback on abort() too
         self.streams: list[FakeStream] = []
         self.rendered: list[np.ndarray] = []
         self.com = threading.local()  # .ready: ensure_com ran on that thread
@@ -374,6 +384,127 @@ def test_playback_resamples_when_device_refuses_24k(sd: FakeSD) -> None:
         assert 1800 <= pb.speech_frames_played <= 2600
     finally:
         pb.close()
+
+
+def test_the_echo_canceller_gets_exactly_what_the_device_plays(sd: FakeSD) -> None:
+    sd.fail_open[("output", 24_000)] = FakePortAudioError("Invalid sample rate", -9997)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    tapped: list[tuple[np.ndarray, int]] = []
+    pb.set_far_listener(lambda block, rate: tapped.append((block, rate)))
+    pb.open()
+    try:
+        pb.add_effect(np.full(2400, 0.1, np.float32))
+        wait_until(lambda: sum(bool(block.any()) for block, _ in tapped) >= 3)
+        pb.set_far_listener(None)
+        time.sleep(0.03)  # a callback already running may still deliver one
+        count = len(tapped)
+        time.sleep(0.05)
+        assert len(tapped) == count  # detached, while the stream plays on
+    finally:
+        pb.close()
+    assert {rate for _, rate in tapped} == {48_000}  # at the device's rate, after resampling
+    for (block, _), played in zip(tapped, sd.rendered, strict=False):
+        np.testing.assert_array_equal(block, played)
+
+
+def test_the_echo_canceller_hears_when_the_output_stops(sd: FakeSD) -> None:
+    """A stop aborts and restarts the stream, and the idle close ends it: either way the canceller hears None
+    after the stream's last block, and can stand silence in for it and start afresh."""
+    pb = SoundDevicePlayback(None, idle_close_s=0.2)
+    tapped: list[np.ndarray | None] = []
+    pb.set_far_listener(lambda block, rate: tapped.append(block))
+    pb.open()
+    try:
+        assert pb.device_rate == 24_000
+        stream = sd.outputs()[0]
+        pb.add_speech(np.full(24_000, 0.3, np.float32), pb.speech_generation)
+        wait_until(lambda: pb.speech_frames_played > 1000)
+        pb.stop_speech()  # aborted, then restarted for chimes
+        stop = next(i for i, block in enumerate(tapped) if block is None)
+        assert any(block is not None and block.any() for block in tapped[:stop])  # the speech it cut
+        wait_until(lambda: any(block is not None for block in tapped[stop:]))  # the restarted stream plays on
+        wait_until(lambda: stream.closed and tapped[-1] is None, 3.0)  # idle: the reaper closed it, and said so
+    finally:
+        pb.close()
+
+
+def stops(tapped: list[np.ndarray | None]) -> int:
+    return sum(block is None for block in tapped)
+
+
+def test_a_stop_tells_the_echo_canceller_itself(sd: FakeSD) -> None:
+    """Not only through the finished callback abort() fires: a stop says so whatever the stream does."""
+    sd.finish_on_abort = False
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    tapped: list[np.ndarray | None] = []
+    pb.set_far_listener(lambda block, rate: tapped.append(block))
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        pb.add_speech(np.full(24_000, 0.3, np.float32), pb.speech_generation)
+        wait_until(lambda: pb.speech_frames_played > 1000)
+        pb.stop_speech()
+        assert stream.aborts == 1 and stream.active
+        assert stops(tapped) == 1  # between the cut speech and the restarted stream
+        stop = next(i for i, block in enumerate(tapped) if block is None)
+        assert any(block is not None and block.any() for block in tapped[:stop])
+        wait_until(lambda: len(tapped) > stop + 1)  # the restarted stream plays on
+    finally:
+        pb.close()
+
+
+def test_a_close_tells_the_echo_canceller_itself(sd: FakeSD) -> None:
+    sd.finish_on_abort = False
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    tapped: list[np.ndarray | None] = []
+    pb.set_far_listener(lambda block, rate: tapped.append(block))
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        wait_until(lambda: len(tapped) >= 3)
+        pb.close()
+        assert stream.closed and tapped[-1] is None and stops(tapped) == 1
+    finally:
+        pb.close()
+
+
+def test_the_echo_canceller_hears_when_the_device_goes_away(sd: FakeSD) -> None:
+    """PortAudio ends the stream by itself, with no abort or close of ours: only the finished callback knows."""
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    tapped: list[np.ndarray | None] = []
+    pb.set_far_listener(lambda block, rate: tapped.append(block))
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        wait_until(lambda: len(tapped) >= 3)
+        stream.end_by_itself()
+        assert stream.aborts == 0 and tapped[-1] is None and stops(tapped) == 1
+        pb.add_effect(np.full(240, 0.1, np.float32))  # the next sound reopens the output
+        assert len(sd.outputs()) == 2 and sd.outputs()[1].active
+    finally:
+        pb.close()
+
+
+def test_the_device_rate_is_what_the_output_opened_at(sd: FakeSD) -> None:
+    sd.fail_open[("output", 24_000)] = FakePortAudioError("Invalid sample rate", -9997)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    assert pb.device_rate == 24_000  # until it opens: the rate it tries first
+    pb.open()
+    try:
+        assert pb.device_rate == 48_000
+    finally:
+        pb.close()
+
+
+def test_capture_reports_its_input_latency(sd: FakeSD) -> None:
+    capture = SoundDeviceCapture("PRO X")
+    assert capture.input_latency == 0.0
+    capture.open()
+    try:
+        sd.streams[-1].latency = 0.012
+        assert capture.input_latency == 0.012
+    finally:
+        capture.close()
 
 
 def test_playback_closes_when_idle_and_reopens_on_audio(sd: FakeSD) -> None:

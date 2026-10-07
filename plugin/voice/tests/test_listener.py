@@ -29,21 +29,28 @@ def hush(seconds: float) -> np.ndarray:
 
 
 class Rig:
-    def __init__(self, **kwargs: Any) -> None:
-        self.wake = ScriptedWake()
+    def __init__(self, *, plain: bool = False, **kwargs: Any) -> None:
+        self.wake = ScriptedWake(plain=plain)
         self.playing = True
         self.events: list[tuple[str, Any]] = []
+        self.clips: list[np.ndarray] = []
+        kwargs.setdefault("plain_wake", plain)
         self.listener = Listener(
             ListenerConfig(),
             vad=LoudnessVad(),
             wake=self.wake,
             on_start=lambda kind: self.events.append(("start", kind)),
-            on_end=lambda pcm, kind: self.events.append(("end", (None if pcm is None else pcm.size / RATE, kind))),
+            on_end=self._on_end,
             on_follow_up=lambda opened: self.events.append(("follow", opened)),
             on_digital_silence=lambda silent: self.events.append(("silence", silent)),
             audio_playing=lambda: self.playing,
             **kwargs,
         )
+
+    def _on_end(self, pcm: np.ndarray | None, kind: str) -> None:
+        self.events.append(("end", (None if pcm is None else pcm.size / RATE, kind)))
+        if pcm is not None:
+            self.clips.append(pcm)
 
     def play(self, audio: np.ndarray) -> None:
         for i in range(0, audio.size, 160):  # 10 ms blocks, like the sound card
@@ -173,6 +180,268 @@ def test_wake_word_switched_off() -> None:
     assert rig.kinds("start") == [] and not rig.listener.wake_ready
 
 
+# -- plain "Jarvis" ---------------------------------------------------------------------------------
+
+
+def speech_starts_at(clip: np.ndarray) -> float:
+    """Seconds into a clip where the (tone) speech begins."""
+    return float(np.flatnonzero(np.abs(clip) > 0.1)[0]) / RATE
+
+
+def say_plain_jarvis(rig: Rig, *, before: float = 1.0) -> None:
+    """Silence, "Jarvis" (half a second), then the plain model fires as the word ends."""
+    rig.play(hush(before))
+    rig.play(tone(0.5))
+    rig.wake.say_plain()
+
+
+def test_plain_jarvis_then_a_short_pause_starts_an_utterance_with_the_whole_word() -> None:
+    rig = Rig(plain=True)
+    assert rig.listener.plain_ready
+    say_plain_jarvis(rig)  # "Jarvis,"
+    rig.play(hush(0.2))  # <0.2 s pause>
+    assert rig.kinds("start") == ["jarvis"]
+    rig.play(tone(1.0))  # "open the browser"
+    rig.play(hush(0.8))
+    [(seconds, kind)] = rig.kinds("end")
+    assert kind == "jarvis" and seconds >= 0.5 + 0.2 + 1.0 + 0.7
+    # The pre-roll reaches back to where the speech began, and 0.2 s before it.
+    assert 0.15 <= speech_starts_at(rig.clips[0]) <= 0.25
+
+
+def test_plain_jarvis_after_okay_and_a_short_pause_wakes() -> None:
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(0.4))  # "Okay."
+    rig.play(hush(0.3))
+    rig.play(tone(0.5))  # "Jarvis"
+    rig.wake.say_plain()
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == ["jarvis"]
+
+
+def test_a_pause_starts_a_new_utterance_for_plain_jarvis() -> None:
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(1.4))  # "Right, let me think."
+    say_plain_jarvis(rig, before=0.5)  # ... "Jarvis,"
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == ["jarvis"]
+    rig.play(tone(0.6))
+    rig.play(hush(0.8))
+    # The clip starts at "Jarvis", not at the sentence before the pause.
+    [(seconds, _kind)] = rig.kinds("end")
+    assert seconds < 0.2 + 0.5 + 0.2 + 0.6 + 0.9 and 0.15 <= speech_starts_at(rig.clips[0]) <= 0.25
+
+
+def test_plain_jarvis_inside_a_sentence_is_ignored() -> None:
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(2.0))  # "... and then I asked Jarvis" two seconds into speech
+    rig.wake.say_plain()
+    rig.play(tone(0.3))
+    rig.play(hush(1.0))
+    assert rig.kinds("start") == []
+    say_plain_jarvis(rig)  # the next utterance starts with it
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == ["jarvis"]
+
+
+def test_a_short_dip_between_words_does_not_start_a_new_utterance() -> None:
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(1.0))  # "I was talking to"
+    rig.play(hush(0.15))  # a breath, not a pause
+    rig.play(tone(0.5))  # "Jarvis"
+    rig.wake.say_plain()
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == []
+
+
+FRAME = 512  # one speech-detection frame
+
+
+@pytest.mark.parametrize(("pause", "starts"), [(0.25, []), (0.3, ["jarvis"])])
+def test_plain_jarvis_needs_a_pause_of_three_tenths_of_a_second_before_it(pause: float, starts: list[str]) -> None:
+    # Whole frames, so the pause shows as whole silent frames: 0.25 s as 7 of
+    # them, 0.3 s as 9 (0.288 s), which still counts as 0.3 s.
+    rig = Rig(plain=True)
+    rig.play(hush(1.1)[: 32 * FRAME])
+    rig.play(tone(1.6)[: 47 * FRAME])  # a sentence long enough that its own start is past the window
+    rig.play(hush(pause))
+    rig.play(tone(0.5))  # "Jarvis"
+    rig.wake.say_plain()
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == starts
+
+
+def test_plain_jarvis_never_interrupts_jarvis_but_hey_jarvis_still_does() -> None:
+    rig = Rig(plain=True, barge_mode="wake")
+    rig.listener.set_speaking(True)
+    say_plain_jarvis(rig)
+    rig.play(hush(0.3))
+    assert rig.kinds("start") == []
+    rig.wake.say()
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["wake"]
+
+
+def test_plain_jarvis_waits_out_the_refractory_after_a_cancelled_start() -> None:
+    rig = Rig(plain=True)
+    say_plain_jarvis(rig)
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["jarvis"]
+    rig.listener.cancel()  # the daemon could not take it
+    rig.wake.say_plain()  # and the score is still high
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == ["jarvis"] and rig.listener.mode == "idle"
+
+
+def test_a_cancelled_plain_jarvis_does_not_hold_off_hey_jarvis() -> None:
+    # Plain "Jarvis" fired on a sound-alike just as a reply became audible, so the
+    # daemon cancelled it. "Hey Jarvis, stop" right after must still start.
+    rig = Rig(plain=True)
+    say_plain_jarvis(rig)
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["jarvis"]
+    rig.listener.cancel()
+    rig.listener.set_speaking(True)
+    rig.wake.say()  # well inside the 1.5 s that holds off plain "Jarvis"
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["jarvis", "wake"] and rig.listener.mode == "record"
+
+
+def test_a_cancelled_hey_jarvis_holds_off_plain_jarvis() -> None:
+    # The daemon cancelled a "Hey Jarvis" start (push-to-talk was busy, or the
+    # speech model is not loaded). The plain model firing late on the same
+    # "Jarvis" must not start a second utterance (and a second error chime).
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(0.5))  # "Hey Jarvis", at the start of an utterance
+    rig.wake.say()
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["wake"]
+    rig.listener.cancel()
+    rig.wake.say_plain()  # well inside the 1.5 s that holds off both phrases
+    rig.play(hush(0.2))
+    assert rig.kinds("start") == ["wake"] and rig.listener.mode == "idle"
+
+
+def test_hey_jarvis_wins_when_both_phrases_fire_on_the_same_chunk() -> None:
+    rig = Rig(plain=True)
+    rig.play(hush(1.0))
+    rig.play(tone(0.5))
+    rig.wake.say()
+    rig.wake.say_plain()
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == ["wake"]
+
+
+def test_plain_jarvis_is_off_unless_switched_on() -> None:
+    rig = Rig(plain=True, plain_wake=False)
+    assert not rig.listener.plain_ready
+    say_plain_jarvis(rig)
+    rig.play(hush(0.3))
+    assert rig.kinds("start") == []
+    rig.listener.set_plain_wake(True)
+    say_plain_jarvis(rig)
+    rig.play(hush(0.3))
+    assert rig.kinds("start") == ["jarvis"]
+    rig.listener.set_wake_enabled(False)  # the wake word off silences both
+    assert not rig.listener.plain_ready
+
+
+def test_without_its_model_plain_jarvis_cannot_be_ready() -> None:
+    rig = Rig(plain_wake=True)  # the scorer has no plain model
+    assert rig.listener.plain_enabled and not rig.listener.plain_ready
+    rig.play(hush(1.0))
+    rig.play(tone(0.5))
+    rig.play(hush(0.3))
+    assert rig.kinds("start") == []
+
+
+def test_hey_jarvis_keeps_its_short_pre_roll_unless_plain_jarvis_is_on() -> None:
+    starts = []
+    flags = []
+    # Off with no plain model; off with the plain model loaded (what /jarvis setup gives everyone); on.
+    for kwargs in ({"plain": False}, {"plain": True, "plain_wake": False}, {"plain": True}):
+        rig = Rig(**kwargs)
+        rig.play(hush(1.0))
+        rig.play(tone(0.5))  # "Jarvis": the "Hey Jarvis" model fires on it often enough
+        rig.wake.say()
+        rig.play(hush(0.2))
+        rig.play(tone(1.0))
+        rig.play(hush(0.8))
+        assert rig.kinds("start") == ["wake"]
+        starts.append(speech_starts_at(rig.clips[0]))
+        flags.append(rig.listener.long_preroll)  # what the daemon reads as the clip is handed over
+    assert flags == [False, False, True]
+    assert starts[0] < 0.1  # 0.3 s of pre-roll: the word is cut
+    assert starts[1] < 0.1  # a loaded plain model alone changes nothing
+    assert 0.15 <= starts[2] <= 0.25  # plain "Jarvis" on: the whole word
+
+
+def test_hey_jarvis_well_into_speech_keeps_its_short_pre_roll_with_plain_jarvis_on() -> None:
+    # Said four seconds into talking, "Hey Jarvis" is not at the start of an
+    # utterance: the earlier, unrelated speech must not be sent with the request.
+    lengths = []
+    for plain in (False, True):
+        rig = Rig(plain=plain)
+        rig.play(hush(1.0))
+        rig.play(tone(4.0))  # talking, then "... hey Jarvis"
+        rig.wake.say()
+        rig.play(hush(0.2))
+        rig.play(tone(1.0))
+        rig.play(hush(0.8))
+        assert rig.kinds("start") == ["wake"]
+        [(seconds, _kind)] = rig.kinds("end")
+        lengths.append(seconds)
+    assert lengths[0] == lengths[1]
+
+
+def test_hey_jarvis_keeps_its_short_pre_roll_while_the_plain_model_is_missing() -> None:
+    rig = Rig(plain_wake=True)  # switched on, but the scorer has no plain model
+    rig.play(hush(1.0))
+    rig.play(tone(0.5))
+    rig.wake.say()
+    rig.play(hush(0.2))
+    rig.play(tone(1.0))
+    rig.play(hush(0.8))
+    assert rig.kinds("start") == ["wake"]
+    assert speech_starts_at(rig.clips[0]) < 0.1
+
+
+def test_hey_jarvis_over_jarvis_keeps_its_short_pre_roll_with_plain_jarvis_on() -> None:
+    # Through speakers the listener hears Jarvis himself. A sentence of his that
+    # began after a pause must not be put in front of the user's words.
+    lengths = []
+    for plain in (False, True):
+        rig = Rig(plain=plain, barge_mode="wake")
+        rig.listener.set_speaking(True)
+        rig.play(hush(1.0))
+        rig.play(tone(1.0))  # his voice
+        rig.play(hush(0.4))  # between two of his sentences
+        rig.play(tone(0.5))  # his next sentence, and the user says "Hey Jarvis" over it
+        rig.wake.say()
+        rig.play(hush(0.1))
+        assert rig.kinds("start") == ["wake"]
+        rig.play(tone(1.0))
+        rig.play(hush(0.8))
+        [(seconds, _kind)] = rig.kinds("end")
+        lengths.append(seconds)
+    assert lengths[0] == lengths[1]
+
+
+def test_the_sensitivity_applies_to_both_phrases() -> None:
+    rig = Rig(plain=True)
+    rig.listener.set_wake_threshold(0.95)
+    say_plain_jarvis(rig)  # scores 0.9
+    rig.play(hush(0.3))
+    rig.wake.say()
+    rig.play(hush(0.1))
+    assert rig.kinds("start") == []
+
+
 def test_long_utterances_are_cut_at_thirty_seconds() -> None:
     rig = Rig()
     rig.wake.say()
@@ -201,6 +470,51 @@ def test_a_noise_gate_is_not_mistaken_for_a_muted_microphone() -> None:
         rig.play(hush(0.5))
         rig.play(np.zeros(int(40.0 * RATE), np.float32))
     assert rig.kinds("silence") == []
+
+
+class FaintEcho:
+    """An echo canceller stand-in that removes everything, and turns exact zeros into faint noise
+    the way AEC3 does while Jarvis speaks."""
+
+    def __init__(self) -> None:
+        self.blocks = 0
+        self._noise = np.random.default_rng(1)
+
+    def far(self, block: np.ndarray, rate: int) -> None:
+        pass
+
+    def near(self, audio: np.ndarray, stamp: float) -> np.ndarray:
+        self.blocks += 1
+        return (self._noise.standard_normal(audio.size) * 1e-4).astype(np.float32)
+
+    def set_on_failed(self, callback: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_listener_hears_the_microphone_through_the_echo_canceller() -> None:
+    echo = FaintEcho()
+    rig = Rig(echo=echo)
+    rig.listener.set_speaking(True)
+    loud = tone(1.0)
+    for i in range(0, loud.size, 160):
+        rig.listener.handle(loud[i : i + 160], RATE, i / RATE)
+    assert rig.kinds("start") == [] and echo.blocks == 100  # Jarvis's own voice, cancelled: no barge-in
+    rig.listener.set_echo(None)
+    for i in range(0, loud.size, 160):
+        rig.listener.handle(loud[i : i + 160], RATE, 1.0 + i / RATE)
+    assert rig.kinds("start") == ["barge"]
+
+
+def test_a_muted_microphone_is_reported_through_the_echo_canceller() -> None:
+    # The check reads the raw audio: the canceller's faint noise must not hide the exact zeros.
+    rig = Rig(echo=FaintEcho())
+    rig.listener.config.silence_alarm_s = 3.0
+    for i in range(int(3.5 * 100)):
+        rig.listener.handle(np.zeros(480, np.float32), 48_000, i / 100)
+    assert rig.kinds("silence") == [True] and not rig.listener.heard_sound
 
 
 def test_the_thread_resamples_sound_card_blocks() -> None:
@@ -282,3 +596,77 @@ def test_other_speech_does_not_wake(wake_models: Path) -> None:
     wake = OpenWakeWord(wake_models)
     audio = np.concatenate([hush(2.0), read_wav(DATA / "hello-there.wav"), hush(1.0)])
     assert max(wake.process(audio)) < 0.2
+
+
+@pytest.fixture(scope="module")
+def plain_wake_models(wake_models: Path) -> Path:
+    from jarvis_voice.listen.models import JARVIS_V2, PLAIN_JARVIS_FILES, is_downloaded
+
+    if not is_downloaded(wake_models, PLAIN_JARVIS_FILES):
+        pytest.skip(f"put {JARVIS_V2.name} into JARVIS_WAKE_MODELS_DIR to test plain Jarvis")
+    return wake_models
+
+
+def test_with_plain_jarvis_on_the_wake_phrase_is_kept_from_its_first_syllable(plain_wake_models: Path) -> None:
+    from jarvis_voice.listen.models import JARVIS_V2
+    from jarvis_voice.listen.vad import SileroVad
+    from jarvis_voice.listen.wakeword import OpenWakeWord
+
+    speech = read_wav(DATA / "hey-jarvis-weather.wav")
+    starts = []
+    for plain in (False, True):
+        clips: list[np.ndarray] = []
+        listener = Listener(
+            ListenerConfig(),
+            vad=SileroVad(),
+            wake=OpenWakeWord(plain_wake_models, plain=JARVIS_V2),
+            on_start=lambda kind: None,
+            on_end=lambda pcm, kind: clips.append(pcm),
+            plain_wake=plain,
+        )
+        audio = np.concatenate([hush(1.5), speech, hush(1.0)])
+        for i in range(0, audio.size, 160):
+            listener.process(audio[i : i + 160])
+        [clip] = clips
+        starts.append(float(np.flatnonzero(np.abs(clip) > 0.02)[0]) / RATE)
+    assert starts[0] == 0.0  # 0.3 s of pre-roll starts inside "Jarvis"
+    assert 0.05 <= starts[1] <= 0.25  # from Silero's onset, less 0.2 s
+
+
+def test_plain_jarvis_runs_on_the_same_features_without_changing_hey_jarvis(plain_wake_models: Path) -> None:
+    # No test clip says plain "Jarvis": the model misses some synthetic voices,
+    # espeak-ng's among them. This checks the pairing and the false alarms.
+    from jarvis_voice.listen.models import JARVIS_V2
+    from jarvis_voice.listen.wakeword import OpenWakeWord
+
+    paired = OpenWakeWord(plain_wake_models, plain=JARVIS_V2)
+    alone = OpenWakeWord(plain_wake_models)
+    assert (paired.name, paired.plain_name, alone.plain_name) == ("hey_jarvis_v0.1", "jarvis_v2", None)
+    for name in ("hey-jarvis-weather.wav", "hello-there.wav"):
+        paired.reset()
+        alone.reset()
+        audio = np.concatenate([hush(2.0), read_wav(DATA / name), hush(1.0)])
+        pairs = paired.process_pair(audio)
+        assert np.allclose([hey for hey, _ in pairs], alone.process(audio))
+        assert all(plain is not None and 0.0 <= plain <= 1.0 for _, plain in pairs)
+        if name == "hello-there.wav":
+            assert max(plain for _, plain in pairs if plain is not None) < 0.2
+
+
+def test_plain_jarvis_attached_to_a_running_wake_word_scores_like_one_loaded_with_it(plain_wake_models: Path) -> None:
+    from jarvis_voice.listen.models import JARVIS_V2
+    from jarvis_voice.listen.wakeword import OpenWakeWord
+
+    paired = OpenWakeWord(plain_wake_models, plain=JARVIS_V2)
+    later = OpenWakeWord(plain_wake_models)
+    audio = np.concatenate([hush(2.0), read_wav(DATA / "hey-jarvis-weather.wav"), hush(1.0)])
+    half = audio.size // 2
+    before = later.process_pair(audio[:half])
+    assert all(plain is None for _, plain in before)
+    later.attach_plain(plain_wake_models, JARVIS_V2)
+    assert later.plain_name == "jarvis_v2"
+    after = later.process_pair(audio[half:])
+    expected = paired.process_pair(audio[:half]) + paired.process_pair(audio[half:])
+    assert np.allclose([hey for hey, _ in before + after], [hey for hey, _ in expected])
+    tail = expected[len(before) :]
+    assert np.allclose([plain for _, plain in after], [plain for _, plain in tail])

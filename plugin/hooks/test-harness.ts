@@ -9,13 +9,16 @@ import type {
   ModelCompleteInput,
   ModelCompleteResult,
   On,
+  PaneOpenArgs,
   ProcessSpawnChunk,
   ProcessSpawnRequest,
   PromptSubmitInput,
+  SessionMessage,
   TurnCompleteInput,
   TurnStepChunk,
   TurnStepInput,
   TurnStepResult,
+  UiBlitArgs,
 } from 'claude-code'
 
 export const WINDOWS_ENV = {
@@ -76,8 +79,9 @@ export class FakeChild {
     this.stdout(`${JSON.stringify({ v: 1, ...event })}\n`)
   }
 
-  hello(port = PORT): void {
-    this.event({ type: 'hello', port, pid: 4242, platform: 'windows', version: '0.1.0', capabilities: ['ptt'] })
+  /** The default capabilities are an older helper's, without `wake.plain`. */
+  hello(port = PORT, capabilities: string[] = ['ptt']): void {
+    this.event({ type: 'hello', port, pid: 4242, platform: 'windows', version: '0.1.0', capabilities })
   }
 
   exit(code: number | null): void {
@@ -161,12 +165,22 @@ export type World = {
   failedSteps: Set<string>
   /** The conversation's size each step (`${turnId}:${index}`) reports in its usage; none: no usage. */
   stepTokens: Map<string, number>
+  /** The main conversation as `$.session.messages()` reads it. */
+  messages: SessionMessage[]
   /** What `$.session.usage()` says the conversation's size is (undefined: no response yet). */
   contextTokens: number | undefined
   /** Every `$.model.complete` call. */
   completions: ModelCompleteInput[]
   /** Answers `$.model.complete` (default: the judge says "simple"). */
   complete: (input: ModelCompleteInput) => ModelCompleteResult | Promise<ModelCompleteResult>
+  /** Every pane the mod opened, and the ids it closed. */
+  opens: PaneOpenArgs[]
+  closes: string[]
+  /** Every repaint of a Raster, and how many redraws the mod asked for. */
+  blits: UiBlitArgs[]
+  invalidations: number
+  /** When set, `$.ui.blit` answers `{ deny }` with it (the Raster is gone). */
+  blitDeny: string | undefined
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
 }
@@ -206,8 +220,14 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     failedSteps: new Set(),
     stepTokens: new Map(),
     contextTokens: undefined,
+    messages: [],
     completions: [],
     complete: () => answered('simple'),
+    opens: [],
+    closes: [],
+    blits: [],
+    invalidations: 0,
+    blitDeny: undefined,
     onSpawn: () => undefined,
     respond: () => ({ status: 200, body: { ok: true } }),
     helpers: () => w.children.filter(child => child.isHelperRun),
@@ -354,6 +374,24 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       rateLimits: [],
     },
   }))
+  on('session.messages', () => ({ value: w.messages }))
+  on('ui.open', ($, e) => {
+    w.opens.push(e)
+    return { value: { isPlaced: true as const } }
+  })
+  on('ui.close', ($, e) => {
+    w.closes.push(e.id)
+    return { value: undefined }
+  })
+  on('ui.blit', ($, e) => {
+    w.blits.push(e)
+    return { value: w.blitDeny === undefined ? {} : { deny: w.blitDeny } }
+  })
+  on('ui.invalidate', () => {
+    w.invalidations += 1
+    return { value: undefined }
+  })
+  on('tool.call', () => ({ result: 'ok' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
   return w
@@ -387,10 +425,10 @@ export async function startSession($: TestEngine, w: World): Promise<void> {
 }
 
 /** Starts the session and brings a helper up to `hello` and `ready`. */
-export async function startHelper($: TestEngine, w: World): Promise<FakeChild> {
+export async function startHelper($: TestEngine, w: World, capabilities?: string[]): Promise<FakeChild> {
   await startSession($, w)
   const helper = w.lastHelper()
-  helper.hello()
+  helper.hello(PORT, capabilities)
   helper.event({ type: 'state', state: 'sleeping' })
   helper.event({ type: 'ready', sttModel: 'large-v3-turbo', sttDevice: 'cuda', pttKey: 'right ctrl' })
   await w.settle()

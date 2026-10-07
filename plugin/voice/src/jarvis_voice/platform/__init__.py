@@ -38,7 +38,7 @@ def current() -> ModuleType:
     Each exposes: ``make_instance_lock(name, lock_dir)``, ``mic_blocked_hint()``,
     ``digital_silence_hint()`` (blocked or merely muted, where the OS can tell),
     ``mic_in_use_hint()``, ``no_input_device_hint()``, ``no_output_device_hint()``,
-    ``ptt_hint()``, ``open_mic_settings()``, ``suppress_crash_dialogs()``,
+    ``ptt_hint()``, ``echo_cancel_hint()``, ``open_mic_settings()``, ``suppress_crash_dialogs()``,
     ``ensure_com()`` (before a thread touches an audio stream) and ``PREFERRED_HOSTAPI``.
     """
     return importlib.import_module(f"{__name__}.{name()}")

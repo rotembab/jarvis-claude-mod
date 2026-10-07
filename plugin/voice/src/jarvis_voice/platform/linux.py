@@ -45,6 +45,13 @@ def ptt_hint() -> str:
     return "Global push-to-talk needs an X11 session (Wayland blocks global key hooks). Use /jarvis talk instead."
 
 
+def echo_cancel_hint() -> str:
+    return (
+        "Run /jarvis setup to reinstall the voice helper. "
+        "Meanwhile, with speakers, /jarvis bargein wake stops Jarvis interrupting himself."
+    )
+
+
 def open_mic_settings() -> bool:
     return False
 

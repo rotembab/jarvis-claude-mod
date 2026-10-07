@@ -3,7 +3,7 @@
 // supervisor, the voice controller, hand control and the view the status line
 // and band draw.
 
-import type { PluginOptions, RenderSurface } from 'claude-code'
+import type { PluginOptions, RenderSurface, UiOpenResult } from 'claude-code'
 
 import type { JarvisPhase, JarvisView } from '../types'
 import type { Engine } from './engine'
@@ -12,6 +12,8 @@ import type { HandsEngine, HandsSettings } from './hands'
 import { Hands, readHandsSettings } from './hands'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
+import { Hud, hudMode } from './hud'
+import type { PaneSize } from './hud'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
 import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
@@ -39,6 +41,12 @@ export type VoiceEngine = (typeof VOICE_ENGINES)[number]
 /** What interrupts Jarvis by voice: any speech (default), only the wake word, or nothing. */
 export const BARGE_IN_MODES = ['speech', 'wake', 'off'] as const satisfies readonly BargeInMode[]
 
+/** What wakes Jarvis: "Hey Jarvis" (default), plain "Jarvis" as well, or nothing (push-to-talk only). */
+export const WAKE_MODES = ['on', 'jarvis', 'off'] as const
+export type WakeMode = (typeof WAKE_MODES)[number]
+/** The hello capability of a helper whose config takes `plainWake` (older ones refuse the whole config). */
+export const PLAIN_WAKE_CAPABILITY = 'wake.plain'
+
 /** Wake word sensitivity, as the helper's score threshold: high wakes more easily, and falsely more often. */
 export const WAKE_SENSITIVITY = { low: 0.7, medium: 0.5, high: 0.3 } as const
 export type WakeSensitivity = keyof typeof WAKE_SENSITIVITY
@@ -52,9 +60,11 @@ export type JarvisSettings = {
   pttKey: string
   sttModel: SttModel
   language: string
-  wakeWord: boolean
+  wakeWord: WakeMode
   bargeIn: BargeInMode
   wakeSensitivity: WakeSensitivity
+  /** The helper removes Jarvis's own voice from what the microphone hears. */
+  echoCancelling: boolean
   modelRouting: RoutingMode
   hands: HandsSettings
 }
@@ -76,11 +86,12 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
     sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
     language: optionString(options, 'language') ?? 'en',
-    wakeWord: optionString(options, 'wakeWord') !== 'off',
+    wakeWord: WAKE_MODES.find(mode => mode === optionString(options, 'wakeWord')) ?? 'on',
     bargeIn: BARGE_IN_MODES.find(mode => mode === optionString(options, 'bargeIn')) ?? 'speech',
     wakeSensitivity:
       (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
       'medium',
+    echoCancelling: optionString(options, 'echoCancelling') !== 'off',
     modelRouting: ROUTING_MODES.find(mode => mode === optionString(options, 'modelRouting')) ?? 'auto',
     hands: readHandsSettings(options),
   }
@@ -101,6 +112,9 @@ const ENGINE_OVERRIDE_KEY = 'voiceEngine'
 const WAKE_OVERRIDE_KEY = 'wakeWord'
 const BARGE_IN_OVERRIDE_KEY = 'bargeIn'
 const ROUTING_OVERRIDE_KEY = 'modelRouting'
+/** Whether the HUD pane opens by itself (/jarvis hud on|off). */
+const HUD_OVERRIDE_KEY = 'hud'
+const FOCUS_KEY = 'focus'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -117,6 +131,8 @@ export class Jarvis {
   voice: Voice | undefined
   /** Hand control (hands.ts): its own helper, started only when the user turned it on. */
   hands: Hands | undefined
+  /** The HUD pane's ring and action log (local sessions). */
+  hud: Hud | undefined
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined
@@ -128,8 +144,15 @@ export class Jarvis {
   private hasLocalAttach = false
   private hasAnnouncedReady = false
   private hasAnnouncedWake = false
+  /** This helper's echo canceller could not load, or stopped working (aec_unavailable). */
+  private isEchoCancelBroken = false
   private lastLevelAt = 0
   private shownStatus: string | undefined
+  /** Focus mode: the person's setting, whether they typed since Jarvis last listened, whether it shows, and whether it folds the conversation. */
+  private isFocusOn = false
+  private hasTypedSinceVoice = false
+  private isFocusShown = false
+  private isFolded = false
 
   constructor(readonly settings: JarvisSettings) {}
 
@@ -143,6 +166,7 @@ export class Jarvis {
       platform,
       fishApiKey: this.settings.fishApiKey,
       fishModel: this.settings.fishModel,
+      echoCancel: this.settings.echoCancelling,
       noProxy: env.NO_PROXY,
       sttModel: () => this.sttModel(),
       tts: async () => ({ engine: await this.voiceEngine(), localVoiceClip: this.settings.localVoiceClip }),
@@ -170,6 +194,17 @@ export class Jarvis {
       this.publish({ phase: 'unavailable' })
       return
     }
+    this.hud?.dispose()
+    this.hud = new Hud(engine)
+    this.hud.setPhase(this.view.phase)
+    this.hud.save()
+    this.hud.onShownChange = () => this.updateFocus()
+    this.isFocusOn = await this.focusSetting()
+    // $.state outlives a reload: focus mode starts hidden until the new HUD draws.
+    this.isFocusShown = false
+    this.isFolded = false
+    void engine.writeFolded(false).catch(() => undefined)
+    if (await this.isHudOn()) void this.openHud()
     // The desktop app starts its sessions with no surface, then attaches one
     // (perhaps while the awaits above ran).
     if ((surface !== null && LOCAL_SURFACES.has(surface)) || this.hasLocalAttach) this.autoStart()
@@ -178,6 +213,8 @@ export class Jarvis {
   onAttach(surface: RenderSurface): void {
     if (!LOCAL_SURFACES.has(surface)) return
     this.hasLocalAttach = true
+    // The desktop app attaches its surface after session.start: show the HUD there too.
+    if (this.isLocal && this.hud !== undefined) void this.isHudOn().then(isOn => (isOn ? this.openHud() : false))
     // Before session.start has finished, it starts the helper itself.
     if (this.isLocal) this.autoStart()
   }
@@ -209,14 +246,21 @@ export class Jarvis {
     await this.engine?.storeSet(ENGINE_OVERRIDE_KEY, engine)
   }
 
-  /** Whether Jarvis listens for "Hey Jarvis": /jarvis wake's choice, else the wakeWord setting. */
-  async wakeWord(): Promise<boolean> {
+  /** What wakes Jarvis: /jarvis wake's choice, else the wakeWord setting. */
+  async wakeWord(): Promise<WakeMode> {
     const stored = await this.engine?.storeGet(WAKE_OVERRIDE_KEY).catch(() => undefined)
-    return typeof stored === 'boolean' ? stored : this.settings.wakeWord
+    // Before plain "Jarvis", /jarvis wake saved on and off as true and false.
+    if (typeof stored === 'boolean') return stored ? 'on' : 'off'
+    return WAKE_MODES.find(mode => mode === stored) ?? this.settings.wakeWord
   }
 
-  async setWakeWord(isOn: boolean): Promise<void> {
-    await this.engine?.storeSet(WAKE_OVERRIDE_KEY, isOn)
+  async setWakeWord(mode: WakeMode): Promise<void> {
+    await this.engine?.storeSet(WAKE_OVERRIDE_KEY, mode)
+  }
+
+  /** The running helper takes `plainWake` (a helper installed before it would refuse the whole config). */
+  get canPlainWake(): boolean {
+    return this.helper?.hello?.capabilities.includes(PLAIN_WAKE_CAPABILITY) === true
   }
 
   /** What interrupts Jarvis by voice: /jarvis bargein's choice, else the bargeIn setting. */
@@ -227,6 +271,83 @@ export class Jarvis {
 
   async setBargeIn(mode: BargeInMode): Promise<void> {
     await this.engine?.storeSet(BARGE_IN_OVERRIDE_KEY, mode)
+  }
+
+  /** Whether the HUD opens with the session: /jarvis hud's choice, on by default. */
+  async isHudOn(): Promise<boolean> {
+    const stored = await this.engine?.storeGet(HUD_OVERRIDE_KEY).catch(() => undefined)
+    return stored !== false
+  }
+
+  async setHudOn(isOn: boolean): Promise<void> {
+    await this.engine?.storeSet(HUD_OVERRIDE_KEY, isOn)
+  }
+
+  /** Whether focus mode is on: /jarvis focus's choice, off by default. */
+  async focusSetting(): Promise<boolean> {
+    const stored = await this.engine?.storeGet(FOCUS_KEY).catch(() => undefined)
+    return stored === true
+  }
+
+  async setFocus(isOn: boolean): Promise<void> {
+    this.isFocusOn = isOn
+    this.hasTypedSinceVoice = false
+    await this.engine?.storeSet(FOCUS_KEY, isOn)
+    this.updateFocus()
+  }
+
+  /** Jarvis's helper is up (the ring is not the gray one). */
+  get isRunning(): boolean {
+    return hudMode(this.view.phase, false) !== 'offline'
+  }
+
+  /** The person typed a prompt: the conversation comes back until Jarvis next listens. */
+  onTyped(): void {
+    if (this.hasTypedSinceVoice) return
+    this.hasTypedSinceVoice = true
+    this.updateFocus()
+  }
+
+  /** A turn of the main conversation ended: in focus mode the HUD shows the reply. */
+  async onTurnComplete(): Promise<void> {
+    this.hud?.onTurnComplete()
+    if (!this.isFocusOn || this.engine === undefined) return
+    try {
+      const messages = await this.engine.messages()
+      const reply = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim() !== '')
+      this.hud?.setLastReply(reply?.text.trim())
+    } catch (error) {
+      this.engine.debug(`jarvis: could not read the last reply: ${describeError(error)}`)
+    }
+  }
+
+  /**
+   * Opens the HUD pane; false when the surface could not place it yet (a
+   * narrow terminal). `open` is the person's own when they asked for it
+   * (/jarvis hud), which the engine places at any width.
+   */
+  async openHud(open?: (size: PaneSize) => Promise<UiOpenResult>): Promise<boolean> {
+    const engine = this.engine
+    if (engine === undefined || this.hud === undefined) return false
+    try {
+      const opened = await (open ?? engine.openPane)(this.hud.size)
+      if (!opened.isPlaced) engine.debug(`jarvis: HUD waits to be placed (${opened.reason})`)
+      return opened.isPlaced
+    } catch (error) {
+      engine.debug(`jarvis: HUD did not open: ${describeError(error)}`)
+      return false
+    }
+  }
+
+  async closeHud(): Promise<void> {
+    await this.engine?.closePane().catch(() => undefined)
+    this.hud?.onClosed()
+  }
+
+  /** Echo cancelling as set, or unavailable when the running helper could not load it. */
+  get echoCancel(): 'on' | 'off' | 'unavailable' {
+    if (!this.settings.echoCancelling) return 'off'
+    return this.isEchoCancelBroken ? 'unavailable' : 'on'
   }
 
   /** Whether voice requests are routed between Sonnet, Opus and Fable: /jarvis routing's choice, else the setting. */
@@ -408,11 +529,14 @@ export class Jarvis {
 
   private async initialConfig(): Promise<ConfigCommand> {
     const voiceId = await this.voiceId()
+    const wake = await this.wakeWord()
     // The speech model is not here: the helper loads it from its argv at start.
+    // plainWake is off in a fresh helper, so it is sent only to switch it on.
     return {
       pttKey: this.settings.pttKey,
       language: this.settings.language,
-      wakeWord: await this.wakeWord(),
+      wakeWord: wake !== 'off',
+      ...(wake === 'jarvis' && this.canPlainWake ? { plainWake: true } : {}),
       bargeIn: await this.bargeIn(),
       wakeThreshold: WAKE_SENSITIVITY[this.settings.wakeSensitivity],
       ...(voiceId === undefined ? {} : { voiceId }),
@@ -423,6 +547,7 @@ export class Jarvis {
     this.voice?.onHelperEvent(event)
     switch (event.type) {
       case 'hello':
+        this.isEchoCancelBroken = false // a new helper tries again
         this.patch({ phase: 'starting', detail: undefined })
         return
       case 'state':
@@ -448,6 +573,7 @@ export class Jarvis {
         return
       }
       case 'level': {
+        this.hud?.setLevels(event.mic, event.out)
         const now = performance.now()
         if (this.view.phase !== 'listening' || now - this.lastLevelAt < LEVEL_INTERVAL_MS) return
         this.lastLevelAt = now
@@ -457,7 +583,11 @@ export class Jarvis {
       case 'utterance':
         this.patch({ lastUtterance: event.text })
         return
+      case 'barge_in':
+        this.hud?.onBargeIn()
+        return
       case 'error': {
+        if (event.code === 'aec_unavailable') this.isEchoCancelBroken = true
         const detail = event.hint ? `${event.message} (${event.hint})` : event.message
         if (event.fatal) this.patch({ phase: 'error', detail })
         else {
@@ -490,10 +620,33 @@ export class Jarvis {
     this.patch({ phase: next, detail })
   }
 
+  /**
+   * Focus mode shows while it is on, the HUD is drawn in the terminal, Jarvis
+   * runs, and the person has not typed since he last listened. Docked beside
+   * the conversation (the fullscreen view) the conversation's rows fold away;
+   * above the prompt on the main screen they print as usual and the tall pane
+   * pushes them up into the scrollback, so none is lost.
+   */
+  private updateFocus(): void {
+    const isShown = this.isFocusOn && this.hud?.isShown === true && this.isRunning && !this.hasTypedSinceVoice
+    if (isShown !== this.isFocusShown) {
+      this.isFocusShown = isShown
+      this.hud?.setFocus(isShown)
+    }
+    const isFolded = isShown && this.hud?.isDocked === true
+    if (isFolded === this.isFolded) return
+    this.isFolded = isFolded
+    void this.engine?.writeFolded(isFolded).catch(() => undefined)
+  }
+
   private publish(view: JarvisView): void {
     // undefined fields are dropped: $.state holds JSON data.
     const clean = JSON.parse(JSON.stringify(view)) as JarvisView
+    // Talking to Jarvis again takes focus mode back from typing.
+    if ((clean.phase === 'listening' || clean.phase === 'awake') && clean.phase !== this.view.phase) this.hasTypedSinceVoice = false
     this.view = clean
+    this.hud?.setPhase(clean.phase)
+    this.updateFocus()
     const engine = this.engine
     if (engine === undefined) return
     void engine.writeView(clean).catch(() => undefined)

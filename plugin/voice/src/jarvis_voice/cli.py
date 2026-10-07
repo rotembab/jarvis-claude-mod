@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -57,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--language", default=_env("JARVIS_LANGUAGE") or "en")
     run.add_argument("--input-device", default=_env("JARVIS_INPUT_DEVICE"))
     run.add_argument("--output-device", default=_env("JARVIS_OUTPUT_DEVICE"))
+    run.add_argument(
+        "--aec",
+        choices=["on", "off"],
+        default=(_env("JARVIS_AEC") or "on").lower(),
+        help="echo cancelling: keep Jarvis's own voice out of what the microphone hears",
+    )
     run.add_argument("--instance-name", default=_env("JARVIS_INSTANCE_NAME") or DEFAULT_INSTANCE_NAME)
     run.add_argument("--heartbeat-timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     run.add_argument("--heartbeat-grace", type=float, default=60.0, help=argparse.SUPPRESS)
@@ -137,7 +144,9 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
         "barge_in.ptt",
         "barge_in.speech",
         "wake",
+        "wake.plain",  # config takes plainWake
         "follow_up",
+        *(["aec"] if args.aec != "off" and not args.fake_audio else []),  # fake audio has nothing to cancel
         "stt.faster-whisper",
         "tts.local" if args.tts_engine == "local" else "tts.fish-live",
     ]
@@ -206,18 +215,24 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         vad = SileroVad()
     except Exception as exc:  # noqa: BLE001 - hands-free is off, push-to-talk still works
         log.warning("voice activity detection unavailable, hands-free listening is off: %s", exc)
-    wake_loader = None
+    wake_loader = plain_loader = None
     if not args.fake_audio:  # fake audio never hears anything; don't download for it
+        from .listen.models import wake_dir
+        from .stt.models import models_dir as wake_models_dir
+
+        wake_folder = wake_dir(wake_models_dir(data_dir))
 
         def wake_loader() -> Any:
-            from .listen.models import download, is_downloaded, wake_dir
-            from .listen.wakeword import OpenWakeWord
-            from .stt.models import models_dir as wake_models_dir
+            return load_wake(wake_folder)
 
-            folder = wake_dir(wake_models_dir(data_dir))
-            if not is_downloaded(folder):
-                download(folder)  # about 3.7 MB, once
-            return OpenWakeWord(folder)
+        def plain_loader(scorer: Any) -> None:
+            attach_plain_wake(wake_folder, scorer)
+
+    echo_loader: Any = None
+    if not args.fake_audio and args.aec != "off":
+        from .audio.echo import loader  # numpy only; livekit itself loads in the background, when called
+
+        echo_loader = loader(playback, capture)
 
     config = DaemonConfig(
         stt_model=args.stt_model,
@@ -239,7 +254,50 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         rescan_audio=rescan,
         vad=vad,
         wake_loader=wake_loader,
+        plain_loader=plain_loader,
+        echo_loader=echo_loader,
     )
+
+
+def load_wake(folder: Path) -> Any:
+    """Load "Hey Jarvis" at once; plain "Jarvis" is paired in only when its model is on disk already.
+
+    A missing plain model is fetched later, by ``attach_plain_wake``, once
+    "Hey Jarvis" is live and plain "Jarvis" is switched on (``/jarvis setup``
+    downloads both), so a slow or blocked host never delays "Hey Jarvis".
+    """
+    from .listen.models import HEY_JARVIS_FILES, JARVIS_V2, PLAIN_JARVIS_FILES, download, is_downloaded
+    from .listen.wakeword import OpenWakeWord
+
+    if not is_downloaded(folder, HEY_JARVIS_FILES):
+        download(folder, files=HEY_JARVIS_FILES)  # about 3.7 MB, once
+    if is_downloaded(folder, PLAIN_JARVIS_FILES):
+        try:
+            return OpenWakeWord(folder, plain=JARVIS_V2)
+        except Exception as exc:  # noqa: BLE001 - "Hey Jarvis" alone still works
+            log.warning('plain "Jarvis" wake word could not be loaded: %s', exc)
+    return OpenWakeWord(folder)
+
+
+def attach_plain_wake(folder: Path, scorer: Any) -> None:
+    """Fetch the plain "Jarvis" model if it is missing (about 200 KB, short limits) and load it beside "Hey Jarvis"."""
+    from .listen.models import (
+        JARVIS_V2,
+        PLAIN_FETCH_DEADLINE_S,
+        PLAIN_FETCH_TIMEOUT_S,
+        PLAIN_JARVIS_FILES,
+        download,
+        is_downloaded,
+    )
+
+    if not is_downloaded(folder, PLAIN_JARVIS_FILES):
+        download(
+            folder,
+            files=PLAIN_JARVIS_FILES,
+            timeout=PLAIN_FETCH_TIMEOUT_S,
+            deadline=time.monotonic() + PLAIN_FETCH_DEADLINE_S,
+        )
+    scorer.attach_plain(folder, JARVIS_V2)
 
 
 def cmd_run(args: argparse.Namespace) -> int:

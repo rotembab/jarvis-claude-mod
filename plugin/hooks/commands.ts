@@ -2,10 +2,12 @@
 // `/jarvis stop` works while a reply is streaming; work that takes longer
 // than a moment (setup, restart) runs on after the command has answered.
 
-import type { CommandRunResult } from 'claude-code'
+import type { CommandRunResult, UiOpenResult } from 'claude-code'
 
-import type { Jarvis, SttModel, VoiceEngine } from './app'
-import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
+import type { PaneSize } from './hud'
+
+import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
+import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
 import { runHandsCommand, runHandsSetupCommand } from './hands'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
@@ -17,7 +19,7 @@ const HELP = [
   '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model (and update hand control)',
   '/jarvis setup local [cpu]        install the local voice (Chatterbox, about 6 GB)',
   '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
-  '/jarvis wake <on|off>            listen for "Hey Jarvis" (push-to-talk always works)',
+  '/jarvis wake <on|jarvis|off>     wake on "Hey Jarvis", also on plain "Jarvis", or push-to-talk only',
   '/jarvis bargein <speech|wake|off>  what interrupts Jarvis: any speech, "Hey Jarvis", or nothing',
   '/jarvis routing <auto|off>       Sonnet answers voice requests, Opus or Fable the hard ones; off: your model',
   '/jarvis stop                     stop speaking and cancel the spoken reply',
@@ -26,6 +28,8 @@ const HELP = [
   '/jarvis restart                  restart the voice helper',
   '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
   '/jarvis devices                  show the audio devices and models in use',
+  '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
+  '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
   '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
   '/jarvis setup hands              install hand control (about 500 MB)',
 ].join('\n')
@@ -35,7 +39,10 @@ const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cl
 const VOICE_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 /** Runs `/jarvis <args>`; never throws (a failure is the command's output). */
-export async function runJarvisCommand(app: Jarvis, args: string): Promise<CommandRunResult> {
+/** What the command's own hook does for it: opens the HUD as the person asked. */
+export type CommandUi = { openHud?: (size: PaneSize) => Promise<UiOpenResult> }
+
+export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi = {}): Promise<CommandRunResult> {
   const [sub = '', ...rest] = args.trim().split(/\s+/).filter(word => word !== '')
   try {
     switch (sub.toLowerCase()) {
@@ -67,6 +74,10 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: await routing(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
+      case 'hud':
+        return { text: await hud(app, rest[0], ui) }
+      case 'focus':
+        return { text: await focus(app, rest[0], ui) }
       case 'hands':
         return { text: await runHandsCommand(app.hands, rest) }
       default:
@@ -92,7 +103,7 @@ async function status(app: Jarvis): Promise<string> {
     const model = ready ? `speech model ${ready.sttModel} on ${ready.sttDevice}` : 'loading models'
     const voiceId = (await app.voiceEngine()) === 'local' ? 'local' : ((await app.voiceId()) ?? 'Fish Audio default')
     lines.push(`Helper ${hello.version} (pid ${hello.pid}) · ${model} · voice ${voiceId}`)
-    lines.push(await handsFreeLine(app))
+    lines.push(`${await handsFreeLine(app)} · echo cancelling ${app.echoCancel}`)
     lines.push(await routingLine(app))
   } else if (isRetry) {
     lines.push('Starting the voice helper…')
@@ -186,33 +197,54 @@ const BARGE_IN_LABELS: Record<BargeInMode, string> = {
   off: 'only push-to-talk or /jarvis stop interrupts him',
 }
 
+/** The helper's ready.wakePhrase while plain "Jarvis" works (it says "Hey Jarvis" otherwise). */
+const PLAIN_WAKE_PHRASE = 'Jarvis'
+// A helper that takes plain "Jarvis" fetches its model when it is switched on; an older one never will.
+const PLAIN_NOT_READY = 'plain "Jarvis" is not ready yet: its model is downloading; if it stays so, run /jarvis setup'
+const PLAIN_NEEDS_SETUP = 'plain "Jarvis" is not ready: run /jarvis setup'
+
 async function handsFreeLine(app: Jarvis): Promise<string> {
-  const isOn = await app.wakeWord()
+  const mode = await app.wakeWord()
   const phrase = app.ready?.wakePhrase
-  const wakeText = !isOn ? 'Wake word off' : phrase !== undefined ? `Say "${phrase}"` : 'Wake word loading'
+  let wakeText = mode === 'off' ? 'Wake word off' : phrase !== undefined ? `Say "${phrase}"` : 'Wake word loading'
+  if (mode === 'jarvis' && phrase !== undefined) {
+    const notReady = app.canPlainWake ? PLAIN_NOT_READY : PLAIN_NEEDS_SETUP
+    wakeText = phrase === PLAIN_WAKE_PHRASE ? 'Say "Jarvis" or "Hey Jarvis"' : `${wakeText} (${notReady})`
+  }
   return `${wakeText} · ${BARGE_IN_LABELS[await app.bargeIn()]}`
 }
 
+type HandsFreeConfig = { wakeWord?: boolean; plainWake?: boolean; bargeIn?: BargeInMode }
+
 /** Sends a hands-free change to a running helper; undefined when none runs (it applies at the next start). */
-async function sendConfig(app: Jarvis, body: { wakeWord?: boolean; bargeIn?: BargeInMode }): Promise<string | undefined> {
+async function sendConfig(app: Jarvis, body: HandsFreeConfig): Promise<string | undefined> {
   if (app.helper?.isRunning !== true) return undefined
   const outcome = await app.helper.send('config', body)
   return outcome.ok ? '' : outcome.message
 }
 
+const WAKE_SAVED: Record<WakeMode, string> = {
+  on: 'Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.',
+  jarvis:
+    'Jarvis listens for "Jarvis" at the start of what you say, and for "Hey Jarvis". Nothing is recorded or sent until he hears one; plain "Jarvis" never interrupts him.',
+  off: 'Wake word off: hold the push-to-talk key to talk.',
+}
+
 async function wake(app: Jarvis, choice: string | undefined): Promise<string> {
-  const word = choice?.toLowerCase()
-  if (word === undefined) {
-    return `${await handsFreeLine(app)}. Switch with /jarvis wake on or /jarvis wake off.`
+  if (choice === undefined) {
+    return `${await handsFreeLine(app)}. Switch with /jarvis wake on, jarvis or off.`
   }
-  if (word !== 'on' && word !== 'off') return `Unknown choice "${choice}". Use /jarvis wake on or /jarvis wake off.`
-  const isOn = word === 'on'
-  await app.setWakeWord(isOn)
-  const refused = await sendConfig(app, { wakeWord: isOn })
+  const mode = WAKE_MODES.find(one => one === choice.toLowerCase())
+  if (mode === undefined) return `Unknown choice "${choice}". Use /jarvis wake on, jarvis or off.`
+  await app.setWakeWord(mode)
+  // A helper installed before plain "Jarvis" would refuse plainWake, and with it the whole change.
+  const canPlain = app.canPlainWake
+  const refused = await sendConfig(app, { wakeWord: mode !== 'off', ...(canPlain ? { plainWake: mode === 'jarvis' } : {}) })
   if (refused) return `Saved, but the helper refused it: ${refused}`
-  return isOn
-    ? 'Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.'
-    : 'Wake word off: hold the push-to-talk key to talk.'
+  if (mode === 'jarvis' && app.helper?.isRunning === true && !canPlain) {
+    return 'Saved, but this voice helper is older than plain "Jarvis": run /jarvis setup to update it. Until then, say "Hey Jarvis".'
+  }
+  return WAKE_SAVED[mode]
 }
 
 async function bargeIn(app: Jarvis, choice: string | undefined): Promise<string> {
@@ -242,6 +274,46 @@ async function routing(app: Jarvis, choice: string | undefined): Promise<string>
   return mode === 'auto'
     ? 'Sonnet answers voice requests; a quick check sends complex ones to Opus and the hardest to Fable. Typed messages keep your model.'
     : "Your session's model answers voice requests."
+}
+
+async function hud(app: Jarvis, choice: string | undefined, ui: CommandUi): Promise<string> {
+  if (!app.isLocal) return NOT_LOCAL
+  switch (choice?.toLowerCase()) {
+    case undefined:
+    case 'show':
+      return (await app.openHud(ui.openHud)) ? 'HUD open.' : 'The HUD could not open here; it shows once there is room.'
+    case 'on':
+      await app.setHudOn(true)
+      await app.openHud(ui.openHud)
+      return 'The HUD opens with each session (it shows beside the conversation in wide windows).'
+    case 'off':
+      await app.setHudOn(false)
+      await app.closeHud()
+      return 'HUD closed. It stays closed in new sessions until /jarvis hud on.'
+    default:
+      return `Unknown choice "${choice}". Use /jarvis hud, /jarvis hud on or /jarvis hud off.`
+  }
+}
+
+async function focus(app: Jarvis, choice: string | undefined, ui: CommandUi): Promise<string> {
+  if (!app.isLocal) return NOT_LOCAL
+  switch (choice?.toLowerCase()) {
+    case undefined:
+    case 'on': {
+      await app.setFocus(true)
+      const isOpen = await app.openHud(ui.openHud)
+      const how = 'Typing a prompt brings the conversation back until you next talk to Jarvis; /jarvis focus off ends it.'
+      if (!isOpen) return `Focus mode is on; it takes over once the HUD has room to open. ${how}`
+      return app.isRunning
+        ? `Focus mode on: while Jarvis runs, the HUD fills the screen and the conversation folds away. ${how}`
+        : `Focus mode is on; it takes over once Jarvis is running (/jarvis setup if he is not set up). ${how}`
+    }
+    case 'off':
+      await app.setFocus(false)
+      return 'Focus mode off: the conversation is back beside the HUD.'
+    default:
+      return `Unknown choice "${choice}". Use /jarvis focus on or /jarvis focus off.`
+  }
 }
 
 async function stop(app: Jarvis): Promise<string> {
@@ -318,6 +390,6 @@ async function devices(app: Jarvis): Promise<string> {
     `Speech model: ${report.sttModel ?? 'unknown'}${report.sttDevice ? ` on ${report.sttDevice}` : ''}`,
     `Voice: ${report.voiceId ?? 'Fish Audio default'} · Fish Audio key ${report.fishKeySet === true ? 'set' : 'missing'}`,
     `Push-to-talk: ${report.pttKey ?? app.settings.pttKey} · helper ${report.version ?? '?'} on ${report.platform ?? '?'}`,
-    `Wake word: ${report.wakeWord ?? 'off'} · barge-in: ${report.bargeIn ?? 'push-to-talk only'}`,
+    `Wake word: ${report.wakeWord ?? 'off'} · barge-in: ${report.bargeIn ?? 'push-to-talk only'} · echo cancelling: ${report.echoCancel ?? 'off'}`,
   ].join('\n') + doctor
 }

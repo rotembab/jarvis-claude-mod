@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
@@ -12,6 +13,10 @@ from .errors import AudioError
 from .levels import meter
 
 TTS_SAMPLERATE = 24_000
+
+# Receives every block sent to the speaker, with the device's sample rate, on the audio thread; and None
+# (with the rate) when the stream stops: closed, aborted or restarted. Nothing is rendered until the next block.
+FarListener = Callable[[np.ndarray | None, int], None]
 
 
 class Playback(Protocol):
@@ -22,6 +27,11 @@ class Playback(Protocol):
     """
 
     samplerate: int  # rate expected by add_speech()/add_effect()
+
+    @property
+    def device_rate(self) -> int:
+        """The rate the device plays at, and the far listener hears (``samplerate`` unless the device refused it)."""
+        ...
 
     @property
     def device_name(self) -> str | None: ...
@@ -48,6 +58,11 @@ class Playback(Protocol):
         """Why the last attempt to open the device failed; None once it opened."""
         ...
 
+    @property
+    def output_latency(self) -> float:
+        """Seconds from rendering a block to the speaker playing it, as the device reports it (0 if unknown)."""
+        ...
+
     def open(self) -> None:
         """Open the device (idempotent). Raises AudioError."""
         ...
@@ -59,6 +74,13 @@ class Playback(Protocol):
 
         While held, silences (Claude running a tool between sentences) do not
         close the device, up to a cap; afterwards it may close when idle.
+        """
+        ...
+
+    def set_far_listener(self, listener: FarListener | None) -> None:
+        """Also hand every block sent to the device to ``listener`` (the echo canceller), which must return at once.
+
+        ``listener(None, rate)`` follows the last block whenever the stream stops (closed, aborted or restarted).
         """
         ...
 
