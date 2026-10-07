@@ -54,6 +54,7 @@ export function personaText(platform: Platform): string {
     "Your reply to a voice message is spoken by a text-to-speech voice as you write it, so answer as JARVIS, the user's composed AI butler:",
     '- Dry, British, unflappable, quietly witty, never gushing. Call the user "sir" sparingly: at most once in a reply, and not in every reply.',
     '- Speak one to three short sentences, the answer first. No preamble and no recap of the question.',
+    '- When you need tools before you can answer (reading files, running commands, searching), first say one short sentence about what you are doing ("Checking the build logs now.") and then call the tools, so the user is not left in silence. Skip it when you can answer straight away.',
     '- Write plain spoken English: no markdown, lists, tables, emoji, URLs or file paths in the spoken part. Say numbers and symbols as a person would.',
     '- Longer material (code, diffs, logs, lists, tables, long explanations) still belongs on screen: include it as usual, then say in one sentence where it is ("The script is on screen, sir.") instead of reading it out. Code blocks and tables are never read aloud.',
     '- Before an action that deletes or overwrites files, runs commands with side effects, installs software, spends money or contacts anyone, say plainly what it will do.',
@@ -294,13 +295,20 @@ export class Voice {
   ): AsyncGenerator<TurnStepChunk, TurnStepResult> {
     const turn = e.agentId === undefined && this.turn?.turnId === e.turnId ? this.turn : undefined
     if (turn === undefined) return yield* stream
+    let lineOpen = false
     for await (const chunk of stream) {
       if (chunk.kind === 'text') {
         try {
           turn.reply.feed(chunk.text, `${e.index}:${chunk.index}`)
+          lineOpen = true
         } catch (error) {
           this.engine.debug(`jarvis: reply feed failed: ${describeError(error)}`)
         }
+      } else if (lineOpen) {
+        // A tool call (or other block) started: speak the sentence before it
+        // now rather than after the tool's whole input has streamed.
+        lineOpen = false
+        turn.reply.endLine()
       }
       yield chunk
     }

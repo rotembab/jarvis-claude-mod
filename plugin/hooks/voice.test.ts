@@ -89,6 +89,26 @@ describe('voice turns', () => {
     expect(spoken(w).map(one => one.seq)).toEqual([0, 1, 2, 3, 4])
   })
 
+  test('the sentence before a tool call is spoken as the call starts, not after its input', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await speak(w, helper, 'Check the build')
+    await startTurn($, w, 'Check the build', 'turn-5')
+    w.steps.set('turn-5:0', [
+      ...textChunks('Checking the build now, sir.', 0),
+      { kind: 'tool', index: 1, id: 'toolu_1', name: 'PowerShell' },
+      { kind: 'input', index: 1, json: '{"command":"npm test"}' },
+      { kind: 'stop', stopReason: 'tool_use', usage: null },
+    ])
+    const heardBy: Partial<Record<TurnStepChunk['kind'], string[]>> = {}
+    for await (const chunk of $.turn.step({ turnId: 'turn-5', index: 0, model: 'claude-test', messageCount: 1 })) {
+      await w.settle()
+      heardBy[chunk.kind] ??= spoken(w).map(one => one.text)
+    }
+    expect(heardBy.text).toEqual([])
+    expect(heardBy.tool).toEqual(['Checking the build now, sir.'])
+  })
+
   test('typed turns are never spoken', async ($, on) => {
     const w = world(on)
     await startHelper($, w)

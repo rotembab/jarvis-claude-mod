@@ -26,15 +26,10 @@ and model cards as read that day, so re-check them before relying on them.
 - With API credit 0, the live WebSocket handshake is accepted for `s2.1-pro-free` and refused
   with 402 for `s2.1-pro`, `s2-pro` and `s1`. *measured*
 - Full replies played on the headset with `interrupted: false`. *measured*
-- To use it, set in the `env` block of the Claude Code user settings and restart Claude Code:
-
-  ```json
-  "JARVIS_TTS_MODEL": "s2.1-pro-free",
-  "JARVIS_VOICE_ID": "<a Fish voice-library id>"
-  ```
-
-  Spell the model exactly: per Fish's docs an unknown `model` value silently falls back to the
-  paid `s2.1-pro`, which brings the 402 back.
+- Since f08afa1 it is the default: the plugin's **Fish Audio model** option (`fishModel`) offers
+  `s2.1-pro-free` and `s2.1-pro` and passes the choice to the helper as `JARVIS_TTS_MODEL`.
+  The option is a fixed list because, per Fish's docs, an unknown `model` value silently falls
+  back to the paid `s2.1-pro`, which brings the 402 back. Pick a voice with `/jarvis voice <id>`.
 - After 2026-11-30: API credit costs $15 per million UTF-8 bytes for `s2.1-pro`, `s2-pro` and
   `s1`, about $0.003 for a 200-character English reply (Hebrew is 2 bytes a character).
   `speech-1.5` and `speech-1.6` were retired on 2026-02-28.
@@ -95,6 +90,11 @@ against the code.
    runs before the Fish connect (`sd_backend.py:222`, `speech.py:341`). A pause of more than
    30 s inside one reply puts the reopen right in front of the audio. Fix: keep the output
    open while a voice reply is expected or still open, with a cap.
+
+Status on main (2026-10-07): item 3 is done (f7b9870: the Fish stream opens while the clip is
+transcribed, and the first sentence reuses it). Item 2 is done (`Voice.step` ends the line when a
+tool call starts, with a test). Item 1 is half done: the persona now asks for one short sentence
+before tool work; the earcon is still open, as is item 4.
 
 Smaller items:
 - There are no timing logs between the speak POST and the first audio frame. Add them first.
@@ -169,5 +169,5 @@ Run them with the helper's Python (`~/.jarvis/venv/Scripts/python.exe`). Neither
 
 - Latency fixes 1–3 above, starting with timing logs.
 - Pick a voice: a Fish Voice Design voice now, then possibly a local engine.
-- Decide whether to make `s2.1-pro-free` the default model and add a fallback for when it ends.
+- Decide what happens when `s2.1-pro-free` ends on 2026-11-30 (API credit, or a local engine).
 - Fix the microphone and test push-to-talk end to end.
