@@ -15,7 +15,8 @@ plugin/                           the plugin, the only folder that ships
   tsconfig.json                   type-checks the mod (tsc -p plugin)
   protocol/schema.json            helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
-docs/                             the phase 1 spec and this file
+    src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard
+docs/                             the plan, the phase 1 spec, the home-control guide (HOME.md) and this file
 ```
 
 ## Prerequisites
@@ -88,6 +89,8 @@ uv run --locked --project plugin\voice pytest -q plugin\voice\tests
 ```
 
 This creates `plugin\voice\.venv` (ignored by git). The tests need no microphone, speakers, GPU or network: audio, push-to-talk, speech-to-text and Fish Audio are faked, the Fish fake being a local WebSocket server (`tests\fish_fake.py`). The hands-free tests drive the listener with fakes too, and Silero VAD (shipped inside faster-whisper) on synthetic speech in `tests\data`. Two tests run the real "Hey Jarvis" model and are skipped unless `JARVIS_WAKE_MODELS_DIR` names a folder for it (they download it there, about 3.7 MB, when it is missing); CI sets it. `tests\test_integration.py` starts `python -m jarvis_voice run` as a subprocess in fake mode and drives it over HTTP the way the mod does. The named-mutex test runs on Windows only.
+
+The home-control tests (`tests\test_home_*.py`) use fake drivers (`tests\home_fakes.py`) and fake devices served on 127.0.0.1, so they need no Apple TV, TV or Tuya device either. The DPAPI test runs on Windows only.
 
 `--locked` fails if `uv.lock` no longer matches `pyproject.toml`. After changing dependencies, run `uv lock --project plugin\voice` and commit the new `uv.lock`; `/jarvis setup` installs from it.
 
@@ -167,6 +170,40 @@ It uses `%USERPROFILE%\.jarvis` (models, logs) by default, and `FISH_AUDIO_API_K
 Prints a JSON report: audio devices, microphone access (a one-second test recording), CUDA, the installed speech models, the push-to-talk backend, and whether Fish Audio accepts your key (a handshake only: no text is sent, nothing is billed). `--no-mic` and `--no-network` skip those checks.
 
 The doctor reads `FISH_AUDIO_API_KEY` from its own environment, and a plain PowerShell window does not have the `env` block of Claude Code's settings. Set it for that window with `$env:FISH_AUDIO_API_KEY = Read-Host 'Fish Audio key'`, which keeps the key out of your command history. The key is masked in the report.
+
+## Home control
+
+The helper answers the `home` command (`list`, `status`, `do`, `info`, `reload`); the mod registers it as the model tool `home_control` and handles on-screen confirmations. User-facing steps are in [HOME.md](HOME.md).
+
+```text
+plugin/voice/src/jarvis_voice/home/
+  model.py         devices, commands (CommandSpec), tiers, value parsing, command synonyms
+  store.py         devices.json and credentials.dat (DPAPI on Windows), shared by the helper and the setup window
+  service.py       HomeService: finds the device, checks the tier, runs the driver with a lock and a time limit
+  base.py          the Driver interface and the registries (DRIVERS, WIZARD_STEPS)
+  runner.py        one asyncio loop thread for the async libraries (pyatv, the Smart Life SDK)
+  net.py           plain HTTP without a proxy, Wake-on-LAN
+  wizard.py        the setup console (`/jarvis home setup`), run in a window of its own
+  commandline.py   `jarvis_voice home ...` without the helper
+  appletv.py, bravia.py, tuya*.py, homeassistant.py   the drivers and their setup steps
+```
+
+**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command.
+
+**Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
+
+**Adding a driver.** Subclass `base.Driver` (`commands` reads saved data only, never the network; `run` and `status` finish within `DriverContext.call_timeout`), add it to `DRIVERS`, and add its setup step to `WIZARD_STEPS`. Use the canonical command names in `model.COMMAND_SYNONYMS` so "switch on" and "turn on" mean the same everywhere. Never poll a device in the background: a request to an Apple TV wakes it and, over HDMI-CEC, the TV.
+
+Try it from a PowerShell window, using your real data folder or a scratch one:
+
+```powershell
+$py = "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe"
+& $py -m jarvis_voice home setup                      # the setup console, in this window
+& $py -m jarvis_voice home --data-dir "$env:TEMP\jh" setup   # the same, on a scratch folder
+& $py -m jarvis_voice home list
+& $py -m jarvis_voice home status "Sony TV"
+& $py -m jarvis_voice home do "Sony TV" set_volume 20  # asks y/n first for a confirm-tier command
+```
 
 ## Logs
 

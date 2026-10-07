@@ -252,6 +252,8 @@ Five phases, each ending in something you can try on your PC.
 4. **PC control.** The Windows desktop actions, PowerShell and Bash permission rules, the guard with voice and on-screen confirmations, the UAC check, and the action log. Done when "Jarvis, open Spotify and play my focus playlist" works and "delete my Downloads folder" stops for a click.
 5. **Polish.** Sound design, voice audio treatment, wake word tuning for your room, a smoother one-command install, and the optional full-screen HUD. Optional extras: NVIDIA speed-up for transcription, and hardened mode.
 
+**Alongside the phases: home devices.** Jarvis controls the Apple TV, the Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant over the home network, through a `home_control` tool and a setup window that keeps keys out of the chat. Unlocking, disarming and opening a garage door ask on screen, like the Ask on screen tier above. Guide: [HOME.md](HOME.md).
+
 **Then the Mac port.** Most of it is new helper backend files plus Mac permission setup; the mod and the action list carry over (see Windows now, Mac later).
 
 ## What I need from you

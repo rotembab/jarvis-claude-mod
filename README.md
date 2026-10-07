@@ -5,6 +5,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - **Push-to-talk now.** Hold Right Ctrl, speak, release. Speech is transcribed on your own machine with faster-whisper (on an NVIDIA GPU when there is one).
 - **Fish Audio voice.** Replies are spoken sentence by sentence as Claude writes them, through Fish Audio's streaming text-to-speech, in the voice you pick.
 - **Wake word "Jarvis" and barge-in next.** Hands-free listening and interrupting Jarvis by voice are phase 2.
+- **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant, over your home network. See [docs/HOME.md](docs/HOME.md).
 - **Later:** a holographic HUD, and control of your PC with permission tiers.
 
 > **Status: phase 1 of 4 ("Talking Jarvis").** Push-to-talk, local speech-to-text and Fish Audio speech work on Windows. Expect rough edges; see the [roadmap](#roadmap).
@@ -16,6 +17,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - [Fish Audio key and voice](#fish-audio-key-and-voice)
 - [Local voice (optional)](#local-voice-optional)
 - [Using Jarvis](#using-jarvis)
+- [Home devices](#home-devices)
 - [Commands](#commands)
 - [Settings](#settings)
 - [How it works](#how-it-works)
@@ -140,6 +142,14 @@ Sonnet answers what you say, so replies start quickly. Before each voice request
 - `/jarvis routing off` makes your session's model answer voice requests too.
 - Moving between models costs some prompt caching: the first request on a model that has not answered for a while reads the conversation again.
 
+## Home devices
+
+Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Smart Life and Tuya devices, and anything Home Assistant controls, and talks to them directly on your home network.
+
+Run `/jarvis home setup`, or say "open home setup". A setup window opens where you add each device. PINs, keys and tokens are typed there, never into the chat, and are kept encrypted for your Windows account. Unlocking a lock, disarming an alarm and opening a garage door need your OK on screen first.
+
+[docs/HOME.md](docs/HOME.md) has the one-time steps for each kind of device, where everything is stored, and troubleshooting.
+
 ## Commands
 
 | Command | What it does |
@@ -156,6 +166,7 @@ Sonnet answers what you say, so replies start quickly. Before each voice request
 | `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
+| `/jarvis home [setup\|list\|status <device>]` | Home devices: what is set up, open the setup window, list devices, or show one device's state. See [docs/HOME.md](docs/HOME.md). |
 | `/jarvis restart` | Restart the voice helper. |
 
 ## Settings
@@ -215,6 +226,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 - **Your audio stays on your computer.** The wake word, speech detection and transcription all run locally. While Jarvis runs, the helper keeps the microphone open (Windows shows Python using the microphone) and listens for "Hey Jarvis", holding only the last 2 seconds in memory. Nothing is recorded, transcribed or kept until it hears the wake word, you hold push-to-talk, you speak in the few seconds after a reply, or you talk over Jarvis while he speaks. Audio is never written to disk. `/jarvis wake off` turns the wake word off.
 - **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message. With model routing on, each one also goes to Haiku, through the same Claude Code connection, to choose the model.
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
+- **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Smart Life scenes and the one-time Smart Life link. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log`. API keys and tokens are masked in it.
 - Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word model from openWakeWord's GitHub releases), Jarvis talks to nothing else.
 
@@ -249,6 +261,8 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 2 (now) | Always listening | Done: "Hey Jarvis", end-of-speech detection, the follow-up window, barge-in, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: echo cancelling for speakers, and a custom plain "Jarvis" wake word. |
 | 3 | HUD | A holographic heads-up display that shows Jarvis listening, thinking and speaking. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
+
+Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).
 
 Not scheduled yet: macOS support, a hardened mode, and signed releases.
 
