@@ -5,17 +5,22 @@
 - mDNS (python-zeroconf, IPv4 only): a fixed list of service types, each answer resolved for its TXT record;
 - SSDP: an M-SEARCH for a handful of search targets, then each device's own description, fetched over
   plain HTTP from the device that answered and from no other address;
-- Tuya: listening for the devices' UDP broadcasts (tinytuya's scanner without polling, so no connection);
+- Tuya: tinytuya's scanner without polling: it listens on UDP 6666, 6667 and 7000 and broadcasts Tuya's own
+  discovery request to UDP 7000 (about every 6 s), and never opens a TCP connection;
 - the UDP discovery messages of Kasa, LIFX, WiZ, Yeelight and Govee.
+
+Alongside them, a Home Assistant saved by name (the setup default is homeassistant.local) is looked up, to
+tell whether the one that answers is it.
 
 Everything here only asks "who is there". Nothing pairs, signs in, writes or changes a device: there is
 no HomeKit pair-setup, no Hue POST, no LG or Samsung websocket (both put a prompt on the TV), no Tuya TCP
 connection, no Cast connection and no Kasa ``set_*`` call, because the code for them does not exist.
 
 The answers are merged per address inside this module only. The report names devices and kinds and never
-carries an address, a MAC, a serial or an id (``clean_name`` strips them from the devices' own names), and
-nothing is written to devices.json. Raw TXT records and SSDP bodies are never logged. Each search fails
-soft: a port in use, a firewall or a missing library becomes a note in the report, not an exception.
+carries an address (``clean_name`` strips the MACs, UUIDs, hex ids and serials it recognizes from the
+devices' own names), and nothing is written to devices.json. Raw TXT records and SSDP bodies are never
+logged. Each search fails soft: a port in use, a firewall or a missing library becomes a note in the report,
+not an exception.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -117,7 +123,8 @@ FIREWALL_HINT = (
     "on Private networks, and check that this network is set to Private."
 )
 
-Status = Literal["set_up", "not_set_up", "could_add", "apple_home", "homekit_free", "matter", "ignored"]
+# "unconfirmed": Jarvis has one saved by a name that could not be looked up, so it may or may not be this one.
+Status = Literal["set_up", "unconfirmed", "not_set_up", "could_add", "apple_home", "homekit_free", "matter", "ignored"]
 
 # HomeKit's accessory categories (the ``ci`` TXT key), as plain words.
 HOMEKIT_KINDS = {
@@ -264,7 +271,8 @@ class ScanEntry:
     jarvis_name: str | None = None  # the name Jarvis knows it by, when set up
     # A short spoken hint: "needs the button on the bridge pressed once"; for "not_set_up", how to add it.
     detail: str = ""
-    count: int = 1  # Matter devices in one Matter home are one entry
+    count: int = 1  # Matter devices in the same Matter homes are one entry
+    homes: int = 1  # how many Matter homes those devices are in (a device can be shared between several)
 
     def label(self) -> str:
         """``Sony Bravia TV``, ``HomeKit light``, ``Apple TV``."""
@@ -280,7 +288,9 @@ class ScanEntry:
         return self.name
 
     def line(self) -> str:
-        if self.status == "matter" and not self.detail:  # the devices of one Matter home
+        if self.status == "matter" and not self.detail:  # the devices of one Matter home, or shared between some
+            if self.homes > 1:
+                return f"- {_count(self.count, 'Matter device')} shared between {self.homes} Matter homes."
             return f"- {_count(self.count, 'Matter device')} in one Matter home."
         text = self.label()
         if self.shown_name():
@@ -302,16 +312,25 @@ class ScanEntry:
             data["detail"] = self.detail
         if self.count != 1:
             data["count"] = self.count
+        if self.homes != 1:
+            data["homes"] = self.homes
         return data
 
 
 # The report's groups, in order: (heading, statuses).
 GROUPS: tuple[tuple[str, tuple[Status, ...]], ...] = (
-    ("Jarvis controls these:", ("set_up", "not_set_up")),
+    ("Jarvis controls these:", ("set_up", "unconfirmed", "not_set_up")),
     ("Jarvis could control these with a new driver:", ("could_add",)),
-    ("In Apple Home (Siri controls these; Jarvis can't share them):", ("apple_home",)),
+    # sf says only that some HomeKit controller paired with it: usually Apple Home, but Home Assistant can too.
+    (
+        "Already in a HomeKit home (usually Apple Home, where Siri controls them; Jarvis can't pair with them too):",
+        ("apple_home",),
+    ),
     ("HomeKit devices not in any home yet:", ("homekit_free",)),
-    ("Matter devices (Jarvis can't control Matter yet; the app that set them up can):", ("matter",)),
+    (
+        "Matter devices (Jarvis has no Matter driver of its own; the app that set them up can control them):",
+        ("matter",),
+    ),
 )
 
 
@@ -393,6 +412,17 @@ def _ignored_line(entries: list[ScanEntry]) -> str:
 # --------------------------------------------------------------------------- the scan
 
 
+@dataclass(slots=True)
+class _Heard:
+    """What one scan heard, before it is matched against the saved configuration."""
+
+    sightings: list[Sighting]
+    notes: list[str]  # spoken notes about the searches themselves
+    seconds: float
+    # A Home Assistant host name saved in home setup, and the IPv4 addresses it was looked up to.
+    looked_up: dict[str, frozenset[str]] = field(default_factory=dict, repr=False)
+
+
 class _History:
     """The last scan, for the once-a-minute limit (one per process: the helper keeps it)."""
 
@@ -400,7 +430,7 @@ class _History:
         self.lock = threading.Lock()
         self.running = False
         self.started: float | None = None
-        self.report: ScanReport | None = None
+        self.heard: _Heard | None = None
 
 
 _history = _History()
@@ -420,31 +450,41 @@ def scan(
     """Searches the home network for about ``seconds`` (all searches at once) and says what answered.
 
     ``config`` is the saved configuration, to say which devices Jarvis already has. Within a minute of
-    the last scan, that scan's report comes back with a note instead. Never raises for a network problem.
+    the last scan, what that scan heard comes back with a note instead, matched against ``config`` as it
+    is now (a device added since shows as set up). Never raises for a network problem.
     """
+    config = config or HomeConfig()
     with _history.lock:
         now = clock()
         if _history.running:
             return ScanReport(note="I'm already searching the network. Ask again in a few seconds.", ran=False)
-        last, started = _history.report, _history.started
+        last, started = _history.heard, _history.started
         if last is not None and started is not None and now - started < MIN_GAP_S:
             ago = max(1, round(now - started))
             note = f"I searched {_count(ago, 'second')} ago and search at most once a minute, so this is from then."
-            return replace(last, note=note)
+            return replace(_report(last, config), note=note)
         _history.running, _history.started = True, now
-    report: ScanReport | None = None
+    done: tuple[ScanReport, _Heard] | None = None
     try:
-        report = _run(config or HomeConfig(), seconds, dict(probes) if probes is not None else default_probes())
-        return report
+        done = _run(config, seconds, dict(probes) if probes is not None else default_probes())
+        return done[0]
     finally:
         with _history.lock:
             _history.running = False
-            if report is not None:
-                _history.report = report
+            if done is not None:
+                _history.heard = done[1]
 
 
-def _run(config: HomeConfig, seconds: float, probes: dict[str, Probe]) -> ScanReport:
+def _run(config: HomeConfig, seconds: float, probes: dict[str, Probe]) -> tuple[ScanReport, _Heard]:
     start = time.monotonic()
+    # A Home Assistant saved by name is looked up alongside the searches, to match the one that answers.
+    lookups: dict[str, tuple[threading.Thread, set[str]]] = {}
+    saved_host = _url_host(str((config.hubs.get("homeassistant") or {}).get("url") or ""))
+    if saved_host and not net.is_ip_address(saved_host):
+        addresses: set[str] = set()
+        lookup = threading.Thread(target=_look_up, args=(saved_host, addresses), name="home-scan-lookup", daemon=True)
+        lookup.start()
+        lookups[saved_host] = (lookup, addresses)
     results: dict[str, list[Sighting]] = {}
     notes: dict[str, list[str]] = {name: [] for name in probes}
     failed: set[str] = set()
@@ -463,7 +503,7 @@ def _run(config: HomeConfig, seconds: float, probes: dict[str, Probe]) -> ScanRe
     for thread in threads.values():
         thread.start()
     deadline = start + seconds + JOIN_MARGIN_S
-    for thread in threads.values():
+    for thread in [*threads.values(), *(lookup for lookup, _ in lookups.values())]:
         thread.join(max(0.0, deadline - time.monotonic()))
 
     sightings: list[Sighting] = []
@@ -484,26 +524,64 @@ def _run(config: HomeConfig, seconds: float, probes: dict[str, Probe]) -> ScanRe
     sightings = [s for s in sightings if s.host is None or s.host not in own]
     if sightings and heard.get("mdns") == 0 and "mdns" not in failed and not notes.get("mdns"):
         spoken.append(f"Nothing answered the mDNS search, which most smart devices use. {FIREWALL_HINT}")
-    entries = classify(sightings, config)
-    report = ScanReport(entries, spoken, time.monotonic() - start, answered=bool(sightings))
+    looked_up = {host: frozenset(found) for host, (lookup, found) in lookups.items() if not lookup.is_alive()}
+    done = _Heard(sightings, spoken, time.monotonic() - start, looked_up)
+    report = _report(done, config)
     log.info(
         "home scan: %d answers, %d devices, %d left out",
         len(sightings),
         len(report.devices()),
-        len(entries) - len(report.devices()),
+        len(report.entries) - len(report.devices()),
     )
-    return report
+    return report, done
+
+
+def _look_up(host: str, into: set[str]) -> None:
+    """Adds the IPv4 addresses of ``host`` (Windows resolves .local names over mDNS); none when that fails."""
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except (OSError, UnicodeError, ValueError):
+        return
+    into.update(str(info[4][0]) for info in infos)
+
+
+def _report(heard: _Heard, config: HomeConfig) -> ScanReport:
+    """What ``heard`` means with ``config``: which devices Jarvis has, and what it could reach another way."""
+    entries = classify(heard.sightings, config, heard.looked_up)
+    hint = _home_assistant_hint(entries, config)
+    notes = [hint, *heard.notes] if hint else list(heard.notes)
+    return ScanReport(entries, notes, heard.seconds, answered=bool(heard.sightings))
+
+
+def _home_assistant_hint(entries: list[ScanEntry], config: HomeConfig) -> str:
+    """Home Assistant controls brands Jarvis has no driver for, Matter and HomeKit devices included."""
+    if not any(e.status in ("could_add", "apple_home", "matter") for e in entries):
+        return ""
+    if config.hubs.get("homeassistant"):
+        return (
+            "Devices that are in your Home Assistant already work through it, whatever their brand, Matter and "
+            "HomeKit ones too; ask me to list your devices to see which."
+        )
+    if any(e.brand == "Home Assistant" for e in entries):
+        return (
+            "Jarvis could also control the devices in Home Assistant, Matter and HomeKit ones too, once you "
+            "connect it in home setup."
+        )
+    return ""
 
 
 # --------------------------------------------------------------------------- names
 
 _UUID = re.compile(r"(?:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
-_MAC_TEXT = re.compile(r"(?<![0-9a-z])[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}(?![0-9a-z])", re.IGNORECASE)
+# A MAC, or its last three to five bytes, written with colons or dashes ("Light Panels 53:A4:F1").
+_MAC_TEXT = re.compile(r"(?<![0-9a-z])[0-9a-f]{2}(?:[:-][0-9a-f]{2}){2,5}(?![0-9a-z])", re.IGNORECASE)
 _IPV4 = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 _RAOP_PREFIX = re.compile(r"^[0-9a-f]{12}@", re.IGNORECASE)
 _HEX_RUN = re.compile(r"(?<![0-9a-z])[0-9a-f]{8,}(?![0-9a-z])", re.IGNORECASE)
 # A MAC's last three bytes, as in "esp-kitchen-a1b2c3": six or more hex digits with a digit and a letter.
 _HEX_TAIL = re.compile(r"(?<![0-9a-z])(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{6,}(?![0-9a-z])", re.IGNORECASE)
+# The serial a Roku nobody renamed ends its name with, "Roku 3 - 1GU48T017973": upper case, letters and digits.
+_SERIAL_TAIL = re.compile(r"\s+-\s+(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{10,}$")
 _EDGE = re.compile(r"^[\s\-_:@.,#/|]+|[\s\-_:@.,#/|]+$")
 _EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]")
 NAME_MAX = 60
@@ -511,7 +589,7 @@ NAME_MAX = 60
 
 def clean_name(text: str) -> str:
     """A device's own name without addresses, MACs, UUIDs or hex ids (a serial, a HomeKit or Tuya id)."""
-    name = _RAOP_PREFIX.sub("", str(text or "").strip())
+    name = _SERIAL_TAIL.sub("", _RAOP_PREFIX.sub("", str(text or "").strip()))
     for pattern in (_UUID, _MAC_TEXT, _IPV4, _HEX_RUN, _HEX_TAIL):
         name = pattern.sub(" ", name)
     name = _EMPTY_BRACKETS.sub(" ", name.replace("_", " "))
@@ -557,49 +635,62 @@ class _Host:
         return any(_homekit_paired(s) for s in self.of("_hap._tcp", "_hap._udp"))
 
 
-def classify(sightings: Iterable[Sighting], config: HomeConfig) -> list[ScanEntry]:
-    """One entry per device (answers merged by address), in report order."""
+def classify(
+    sightings: Iterable[Sighting], config: HomeConfig, looked_up: Mapping[str, frozenset[str]] | None = None
+) -> list[ScanEntry]:
+    """One entry per device (answers merged by address), in report order.
+
+    ``looked_up`` holds the IPv4 addresses of a Home Assistant host name saved in home setup, when the scan
+    could look the name up."""
     groups: dict[str, list[Sighting]] = {}
     for s in sightings:
+        if s.service == "_googlecast._tcp" and "group" in s.props.get("md", "").lower():
+            continue  # a speaker group made in Google Home, announced from one of its speakers' addresses
+        if s.source == "mdns" and s.host is None and not s.server and s.service != "_matter._tcp":
+            continue  # a name that never resolved: nothing ties it to its device, so it would be a second entry
         key = s.host or (f"server:{s.server.lower()}" if s.server else f"name:{s.service}:{s.name}")
         groups.setdefault(key, []).append(s)
     entries: list[ScanEntry] = []
-    fabrics: dict[str, set[str]] = {}
+    shared: dict[frozenset[str], int] = {}  # Matter devices, by the Matter homes each one is in
     for group in groups.values():
-        host = _Host(group)
-        found, nodes = _classify_host(host, config)
+        found, fabrics = _classify_host(_Host(group), config, looked_up or {})
         entries.extend(found)
-        for fabric, node in nodes:
-            fabrics.setdefault(fabric, set()).add(node)
-    for nodes in sorted(fabrics.values(), key=len, reverse=True):
-        entries.append(ScanEntry("device", "", "Matter", "matter", count=len(nodes)))
+        if fabrics:
+            shared[fabrics] = shared.get(fabrics, 0) + 1
+    for fabrics, count in sorted(shared.items(), key=lambda item: item[1], reverse=True):
+        entries.append(ScanEntry("device", "", "Matter", "matter", count=count, homes=len(fabrics)))
     order = {status: i for i, (_, statuses) in enumerate(GROUPS) for status in statuses}
     return sorted(entries, key=lambda e: (order.get(e.status, len(GROUPS)), e.label().lower(), e.name.lower()))
 
 
-def _classify_host(h: _Host, config: HomeConfig) -> tuple[list[ScanEntry], list[tuple[str, str]]]:
-    """The host's entries, and the (fabric, node) pairs of Matter devices that only say they are in a home."""
+def _classify_host(
+    h: _Host, config: HomeConfig, looked_up: Mapping[str, frozenset[str]]
+) -> tuple[list[ScanEntry], frozenset[str]]:
+    """The host's entries, and the Matter homes (fabrics) of a Matter device that only says it is in some."""
     if h.has("tuya"):
-        return [_tuya_entry(h, config)], []
-    if h.has("_googlecast._tcp") and "group" in h.prop("md", "_googlecast._tcp").lower():
-        return [], []  # a speaker group made in Google Home, not a device
-    for rule in (_bravia, _home_assistant, _apple, _branded):
+        return [_tuya_entry(h, config)], frozenset()
+    rules: tuple[Callable[[_Host, HomeConfig], ScanEntry | None], ...] = (
+        _bravia,
+        partial(_home_assistant, looked_up=looked_up),
+        _apple,
+        _branded,
+    )
+    for rule in rules:
         entry = rule(h, config)
         if entry is not None:
             if entry.status != "ignored" and h.in_apple_home():
-                extra = "also in Apple Home"
+                extra = "also in a HomeKit home"
                 entry = replace(entry, detail=f"{entry.detail}; {extra}" if entry.detail else extra)
-            return [entry], []
-    if h.has("_hap._tcp", "_hap._udp"):
-        return [_homekit_entry(s) for s in h.of("_hap._tcp", "_hap._udp")], []
+            return [entry], frozenset()
+    # A record without its status flags (sf) can't say whether the accessory is in a home.
+    hap = [s for s in h.of("_hap._tcp", "_hap._udp") if _homekit_flags(s) is not None]
+    if hap:
+        return [_homekit_entry(s) for s in hap], frozenset()
     if h.has("_matter._tcp", "_matterc._udp"):
         entries = [_matter_waiting(s) for s in h.of("_matterc._udp")]
-        nodes = []
-        for s in h.of("_matter._tcp"):
-            fabric, _, node = s.name.partition("-")
-            nodes.append((fabric.upper(), (node or s.name).upper()))
-        return entries, nodes
-    return [_ignored(h)], []
+        # One operational name ("<fabric>-<node>") per Matter home the device is in.
+        return entries, frozenset(s.name.partition("-")[0].upper() for s in h.of("_matter._tcp"))
+    return [_ignored(h)], frozenset()
 
 
 def _saved(config: HomeConfig, driver: str) -> list[DeviceRecord]:
@@ -663,7 +754,9 @@ def _bravia(h: _Host, config: HomeConfig) -> ScanEntry | None:
     return _not_set_up("TV", name, "Sony Bravia")
 
 
-def _home_assistant(h: _Host, config: HomeConfig) -> ScanEntry | None:
+def _home_assistant(
+    h: _Host, config: HomeConfig, looked_up: Mapping[str, frozenset[str]] | None = None
+) -> ScanEntry | None:
     if not h.has("_home-assistant._tcp"):
         return None
     name = clean_name(h.prop("location_name", "_home-assistant._tcp"))
@@ -672,8 +765,13 @@ def _home_assistant(h: _Host, config: HomeConfig) -> ScanEntry | None:
     hosts = {h.address} | {
         _url_host(h.prop(key, "_home-assistant._tcp")) for key in ("base_url", "internal_url", "external_url")
     }
-    if saved_host and saved_host in hosts:
+    # A hub saved by name (homeassistant.local, the setup default) is matched by the addresses the name has.
+    addresses = (looked_up or {}).get(saved_host or "", frozenset())
+    if saved_host and (saved_host in hosts or addresses & hosts):
         return ScanEntry("hub", name, "Home Assistant", "set_up")
+    if saved_host and not addresses and not net.is_ip_address(saved_host):
+        detail = "Jarvis has a Home Assistant saved by name and couldn't check that it is this one"
+        return ScanEntry("hub", name, "Home Assistant", "unconfirmed", detail=detail)
     return _not_set_up("hub", name, "Home Assistant", "connect it in home setup")
 
 
@@ -954,7 +1052,8 @@ def _mdns_probe(seconds: float, notes: list[str]) -> list[Sighting]:
             sighting = None
             if future.done() and not future.cancelled() and future.exception() is None:
                 sighting = future.result()
-            # A name with no details still counts (a Thread device has no IPv4 address to resolve).
+            # A name with no details still goes to classify, which counts it only for Matter (its name says
+            # which Matter home it is in); a Thread device that resolved has its host name, not an IPv4 address.
             found.append(sighting or _mdns_sighting(service_type, name, None, zc_mod))
         return found
     finally:
@@ -1127,7 +1226,8 @@ def _xml_first(text: str, tag: str) -> str:
 
 
 def _tuya_probe(seconds: float, notes: list[str]) -> list[Sighting]:
-    """Listens for Tuya broadcasts (UDP 6666, 6667, 7000) with tinytuya's scanner; poll=False never connects."""
+    """Listens for Tuya broadcasts (UDP 6666, 6667, 7000) with tinytuya's scanner, which also broadcasts Tuya's
+    discovery request to UDP 7000 (some v3.5 devices announce themselves only then); poll=False never connects."""
     try:
         from . import tuya
 

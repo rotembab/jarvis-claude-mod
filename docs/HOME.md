@@ -138,21 +138,21 @@ Jarvis can search your home network and tell you which smart devices are there a
 - Type `/jarvis home scan` in Claude Code.
 - Ask Jarvis, for example "what smart devices are on my network?"
 
-A search takes about ten seconds. It only asks the network who is there, and reads the description a device offers about itself. It doesn't pair with anything, sign in or change anything, and it saves nothing. Jarvis searches at most once a minute; ask again sooner and you get the last answer.
+A search takes about ten seconds. It only asks the network who is there, and reads the description a device offers about itself. If you connected Home Assistant by its name, such as `homeassistant.local`, it also looks that name up. It doesn't pair with anything, sign in or change anything, and it saves nothing. While Jarvis is running, it searches at most once a minute; ask again sooner and you get what that search found, checked against your setup as it is now. The setup window's search, and any search while Jarvis isn't running, always start afresh.
 
 The answer puts what it found in groups:
 
 | Group | What it means |
 | --- | --- |
-| Jarvis controls these | Apple TVs, Sony Bravia TVs, Tuya devices and Home Assistant. Each says the name Jarvis knows it by, or that it isn't set up yet and how to add it in home setup. |
-| Jarvis could control these with a new driver | Brands Jarvis doesn't support yet, such as Philips Hue or Sonos, and what adding one would take. |
-| In Apple Home | HomeKit devices already in Apple's Home app. Siri controls them, and Jarvis can't share them; see [Siri and Apple Home](#siri-and-apple-home). |
-| HomeKit devices not in any home yet | HomeKit devices nothing has paired with yet. Jarvis doesn't control HomeKit devices. |
-| Matter devices | Jarvis can't control Matter devices yet; the app that set them up can. Ones already set up can only be counted, per Matter home. |
+| Jarvis controls these | Apple TVs, Sony Bravia TVs, Tuya devices and Home Assistant. Each says the name Jarvis knows it by, or that it isn't set up yet and how to add it in home setup. If Jarvis couldn't look up the name you connected Home Assistant by, it says it couldn't check. |
+| Jarvis could control these with a new driver | Brands Jarvis has no driver of its own for, such as Philips Hue or Sonos, and what adding one would take. If they are in your Home Assistant, Jarvis already controls them through it. |
+| Already in a HomeKit home | HomeKit devices something has already paired with, usually Apple's Home app, where Siri controls them. Jarvis can't pair with them too; if Home Assistant paired them, Jarvis controls them through it. See [Siri and Apple Home](#siri-and-apple-home). |
+| HomeKit devices not in any home yet | HomeKit devices nothing has paired with yet. Jarvis can't pair with HomeKit devices itself. |
+| Matter devices | Jarvis has no Matter driver of its own: the app that set them up can control them, and Matter devices in your Home Assistant work through it. Ones already set up can only be counted, per Matter home; a device shared between two homes counts once. |
 
 Printers, computers, phones and routers are only counted. Bluetooth and Zigbee devices never show up in a network search, only their hub or gateway does, so a Fingerbot paired only to your phone won't appear.
 
-Claude sees the devices' names and kinds, never their addresses or ids.
+Claude sees the devices' names and kinds, never their network addresses. A name is shown as the device announces it, minus the MACs, ids and serial numbers Jarvis recognizes in it.
 
 If nothing answers, Windows Firewall may be blocking Python, or your network may be set to Public. In **Windows Security > Firewall & network protection > Allow an app through firewall**, allow Python on Private networks, and check that your network is set to Private. Govee and Yeelight lights answer only when **LAN Control** is on in their own app.
 
