@@ -13,6 +13,7 @@ import type {
   ProcessSpawnChunk,
   ProcessSpawnRequest,
   PromptSubmitInput,
+  SessionMessage,
   TurnCompleteInput,
   TurnStepChunk,
   TurnStepInput,
@@ -144,6 +145,8 @@ export type World = {
   failedSteps: Set<string>
   /** The conversation's size each step (`${turnId}:${index}`) reports in its usage; none: no usage. */
   stepTokens: Map<string, number>
+  /** The main conversation as `$.session.messages()` reads it. */
+  messages: SessionMessage[]
   /** What `$.session.usage()` says the conversation's size is (undefined: no response yet). */
   contextTokens: number | undefined
   /** Every `$.model.complete` call. */
@@ -194,6 +197,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     failedSteps: new Set(),
     stepTokens: new Map(),
     contextTokens: undefined,
+    messages: [],
     completions: [],
     complete: () => answered('simple'),
     opens: [],
@@ -327,6 +331,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       rateLimits: [],
     },
   }))
+  on('session.messages', () => ({ value: w.messages }))
   on('ui.open', ($, e) => {
     w.opens.push(e)
     return { value: { isPlaced: true as const } }

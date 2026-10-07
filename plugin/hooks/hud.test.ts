@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { RenderPropsOf } from 'claude-code'
 
 import { completeTurn, jarvis, startHelper, startSession, world } from './test-harness'
-import { actionLabel, FRAME_MS, HUD_PANE, hudMode, RING_KEY, ringSize } from './hud'
+import { actionLabel, FRAME_MS, HUD_PANE, hudLayout, hudMode, paneSize, RING_KEY, ringSize } from './hud'
 import type { HudMode } from './hud'
 import { hudZoom, ringCells, ringPixels, toBase64 } from './hud-ring'
 import { ringSvg } from './hud-svg'
@@ -61,6 +61,11 @@ describe('HUD ring', () => {
         expect(bg).toBeLessThanOrEqual(0xffffff)
         pairs.add(`${fg}:${bg}`)
       }
+      expect(pairs.size).toBeLessThan(1024)
+    }
+    // The biggest ring too.
+    for (const mode of ['sleeping', 'speaking'] as HudMode[]) {
+      const pairs = new Set(decodeCells(ringCells({ mode, t: 1.7, mic: 0.6, out: 0.6 }, 128, 64)).map(([, fg, bg]) => `${fg}:${bg}`))
       expect(pairs.size).toBeLessThan(1024)
     }
   })
@@ -126,10 +131,30 @@ describe('HUD ring', () => {
     expect(toBase64(new Uint8Array([255, 254, 253, 0]))).toBe('//79AA==')
   })
 
-  test('the ring fits the pane, round, between 6 and 24 rows', () => {
-    expect(ringSize(52, 34, 9)).toEqual({ columns: 48, rows: 24 })
+  test('the ring fills the pane, round, between 6 and 64 rows', () => {
+    expect(ringSize(52, 34, 9)).toEqual({ columns: 50, rows: 25 })
     expect(ringSize(52, 30, 9)).toEqual({ columns: 42, rows: 21 })
     expect(ringSize(30, 10, 9)).toEqual({ columns: 12, rows: 6 })
+    expect(ringSize(300, 100, 9)).toEqual({ columns: 128, rows: 64 })
+  })
+
+  test('the pane asks for the room the ring can use', () => {
+    // Docked in a 160 x 45 screen: as wide as the ring its height allows.
+    const dock = { placement: 'dock', bodyColumns: 53, bodyRows: 38, columns: 106, rows: 45 } as const
+    expect(paneSize(dock, 9, false)).toEqual({ rows: 24, columns: 60 })
+    // Never more than half the screen beside the conversation.
+    expect(paneSize({ ...dock, bodyRows: 100, columns: 66 }, 9, false)).toEqual({ rows: 24, columns: 60 })
+    // Focus mode: nearly all of it.
+    expect(paneSize(dock, 12, true)).toEqual({ rows: 24, columns: 156 })
+    // Above the prompt: half the screen's height, nearly all of it in focus mode.
+    const inline = { placement: 'inline', bodyColumns: 100, bodyRows: 22, columns: 100, rows: 60 } as const
+    expect(paneSize(inline, 9, false)).toEqual({ rows: 30, columns: 52 })
+    expect(paneSize(inline, 12, true)).toEqual({ rows: 52, columns: 52 })
+  })
+
+  test('the texts go beside the ring when that lets it grow', () => {
+    expect(hudLayout(52, 34, false, false)).toMatchObject({ ring: { columns: 50, rows: 25 }, isSide: false, replyRows: 0, actionRows: 8 })
+    expect(hudLayout(135, 38, true, true)).toEqual({ ring: { columns: 74, rows: 37 }, isSide: true, textColumns: 59, replyRows: 8, actionRows: 27 })
   })
 
   test('the desktop ring is an SVG for every mode', () => {
@@ -158,12 +183,12 @@ describe('HUD pane', () => {
     const ui = await $.ui.mount({ plugin: 'jarvis', surface: 'terminal', component: 'Pane', requestId: HUD_PANE, props: PANE })
     expect(await ui.find({ type: 'Text', text: /JARVIS · STANDING BY/ })).toBeDefined()
     const ring = await ui.find({ type: 'Raster', key: RING_KEY })
-    expect(ring?.props).toMatchObject({ columns: 48, rows: 24 })
+    expect(ring?.props).toMatchObject({ columns: 50, rows: 25 })
     // It animates by repainting the Raster in place.
     await w.clock.advance(FRAME_MS * 8)
     await w.settle()
     expect(w.blits.length).toBeGreaterThan(0)
-    expect(w.blits.at(-1)).toMatchObject({ requestId: HUD_PANE, key: RING_KEY, columns: 48, rows: 24 })
+    expect(w.blits.at(-1)).toMatchObject({ requestId: HUD_PANE, key: RING_KEY, columns: 50, rows: 25 })
   })
 
   test('says what Jarvis is doing, what you said, and what Claude ran', async ($, on) => {

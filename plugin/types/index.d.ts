@@ -54,6 +54,10 @@ export type JarvisHud = {
   isThinking: boolean
   /** The latest tool calls, newest first. */
   actions: HudAction[]
+  /** The text of Claude's last reply, shown under the ring in focus mode. */
+  lastReply?: string
+  /** Focus mode shows: the pane asks for most of the screen and shows the reply. */
+  isFocus?: boolean
 }
 
 /**
@@ -73,6 +77,8 @@ declare module 'claude-code' {
       view: JarvisView
       helper: JarvisHelperRef | null
       hud: JarvisHud
+      /** Focus mode folds the conversation's rows away (the HUD docked beside them fills the screen). */
+      folded: boolean
     }
   }
 }

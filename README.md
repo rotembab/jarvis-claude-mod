@@ -155,9 +155,21 @@ A pane titled JARVIS opens beside the conversation when a session starts. Its ri
 
 Under the ring are the last thing you said and the last six things Claude ran (`›` running, `✓` done, `✗` failed).
 
-- In the terminal the ring is drawn in block characters. A pane opens by itself only in a window at least 144 columns wide; in a narrower one it waits for room, and `/jarvis hud` opens it at any width.
+- In the terminal the ring is drawn in block characters and grows to fill the room the pane has; the pane asks for up to half the window. A pane opens by itself only in a window at least 144 columns wide; in a narrower one it waits for room, and `/jarvis hud` opens it at any width.
 - In the desktop app's Code tab the ring is a vector drawing.
 - `/jarvis hud off` closes it and keeps it closed in new sessions; `/jarvis hud on` brings it back.
+
+#### Focus mode
+
+`/jarvis focus` shows only the HUD and the prompt while Jarvis is running. The HUD takes nearly the whole window, with what you said, the start of Claude's last reply and what Claude ran beside the ring, and the conversation folds away.
+
+- Typing a prompt brings the conversation back; it folds away again the next time you talk to Jarvis.
+- Ctrl+O shows the whole conversation at any time.
+- Questions for you, permission prompts and command output still show.
+- The reply Claude is writing streams in a narrow strip beside the HUD, and folds away once it is done.
+- In Claude Code's classic (non-fullscreen) view nothing is folded: the HUD grows tall above the prompt and the conversation scrolls up out of sight, where you can scroll back to it.
+- In the desktop app focus mode does nothing yet.
+- `/jarvis focus off` turns it off. The choice is kept for new sessions.
 
 ## Commands
 
@@ -175,6 +187,7 @@ Under the ring are the last thing you said and the last six things Claude ran (`
 | `/jarvis routing <auto\|off>` | Sonnet answers voice requests and Opus or Fable the hard ones (default), or your session's model answers. |
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis hud [on\|off]` | Open the HUD pane. `off` closes it and keeps it closed in new sessions; `on` opens it with each session again. |
+| `/jarvis focus [on\|off]` | Focus mode: while Jarvis runs, only the HUD and the prompt show. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis restart` | Restart the voice helper. |
 
