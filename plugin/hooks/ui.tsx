@@ -130,13 +130,13 @@ export function hudTerminalTree(
 }
 
 /** The desktop pane: the same, the ring as an animated SVG. */
-export function hudSvgTree({ Box, Text, Svg }: HudSvgElements, data: HudPaneData, levels: { mic: number; out: number }): RenderElement {
+export function hudSvgTree({ Box, Text, Svg }: HudSvgElements, data: HudPaneData, levels: { mic: number; out: number; t: number }): RenderElement {
   return (
     <Box flexDirection="column">
       <Box justifyContent="center">{hudTitle({ Text }, data.mode)}</Box>
       <Box justifyContent="center">
         <Svg
-          source={ringSvg(data.mode, levels.mic, levels.out)}
+          source={ringSvg(data.mode, levels.mic, levels.out, levels.t)}
           alt={`Jarvis: ${MODE_LABELS[data.mode].toLowerCase()}`}
           width={240}
           height={240}

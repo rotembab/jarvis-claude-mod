@@ -150,7 +150,7 @@ export const register: Register = (on, options) => {
     }
     const { Box, Text, Svg } = $.ui.resolve(e)
     app.hud?.mountDesktop()
-    return hudSvgTree({ Box, Text, Svg }, data, app.hud?.levels() ?? { mic: 0, out: 0 })
+    return hudSvgTree({ Box, Text, Svg }, data, app.hud?.levels() ?? { mic: 0, out: 0, t: 0 })
   })
 
   on('ui.close', ($, e, next) => {
