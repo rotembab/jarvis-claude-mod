@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -661,6 +662,10 @@ def test_an_unsupported_platform_is_fatal(make_rig: Callable[..., Rig]) -> None:
     rig.runtime.wait()
     error = rig.writer.wait_for("error")
     assert (error["code"], error["fatal"]) == ("unsupported_platform", True)
+    # The mod prints "<message> (<hint>)": a hint that repeats the message says the same thing twice, and
+    # nothing the user could do would change the platform anyway.
+    assert "hint" not in error
+    assert error["message"] == "no desktop backend here"
     assert rig.runtime.exit_code == EXIT_FATAL and rig.cameras == []
 
 
@@ -1018,3 +1023,312 @@ def test_camera_errors_carry_the_protocol_code() -> None:
     with pytest.raises(CameraError) as info:
         camera.open()
     assert info.value.code == "camera_blocked"
+
+
+# --------------------------------------------------------------------------- slow camera changes
+
+
+class SlowOpenCamera(FakeCamera):
+    """A camera whose open takes its time, like Windows' Media Foundation on a cold webcam (11 to 21 s).
+
+    An app holding the camera is slow in just this way: it lets the device
+    open and then sends no frame, so ``camera_in_use`` only comes after the
+    backend's first-frame timeout, always later than ``resume`` waits.
+    """
+
+    #: Seconds ``open`` takes; a class attribute, so the rig's own factory needs no arguments.
+    open_s = 0.0
+
+    def open(self) -> CameraInfo:
+        time.sleep(type(self).open_s)
+        return super().open()  # raises when the rig asked this camera to fail
+
+
+@pytest.fixture
+def slow_camera() -> Iterator[type[SlowOpenCamera]]:
+    yield SlowOpenCamera
+    SlowOpenCamera.open_s = 0.0
+
+
+def test_a_resume_the_camera_outlasts_answers_pending_not_ok(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rotem's webcam can take longer to open than the helper waits; the mod must not say it is on again."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.3)
+    rig = make_rig(camera_type=slow_camera).started()
+    assert rig.command("pause") == {"ok": True}
+    slow_camera.open_s = 1.0
+    assert rig.command("resume") == {"ok": True, "pending": True}
+    rig.writer.wait_for("ready", after=1)
+    eventually(lambda: rig.command("status")["state"] == "idle", what="the camera to be back")
+
+
+def test_a_camera_that_fails_after_the_resume_gave_up_waiting_is_reported_as_an_event(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pause for a Teams call, resume while Teams still holds the camera: the reason must reach the mod."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.3)
+    rig = make_rig(camera_type=slow_camera).started()
+    assert rig.command("pause") == {"ok": True}
+    slow_camera.open_s = 0.6
+    rig.next_camera_fails = "camera_in_use"
+    mark = len(rig.writer.snapshot())
+    assert rig.command("resume") == {"ok": True, "pending": True}
+    error = rig.writer.wait_for("error", after=mark)
+    assert (error["code"], error["fatal"]) == ("camera_in_use", False)
+    assert rig.command("status")["state"] == "paused"
+    assert rig.runtime.exit_code is None  # not fatal: the user can try again
+
+
+def test_each_camera_a_resume_could_not_reopen_is_reported_even_twice_in_a_row(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume, Teams still has the camera; resume again a few seconds later: the mod waits for each reason."""
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.2)
+    rig = make_rig(camera_type=slow_camera).started()
+    assert rig.command("pause") == {"ok": True}
+    slow_camera.open_s = 0.4
+    for _ in range(2):
+        rig.next_camera_fails = "camera_in_use"
+        mark = len(rig.writer.snapshot())
+        assert rig.command("resume") == {"ok": True, "pending": True}
+        error = rig.writer.wait_for("error", after=mark)
+        assert (error["code"], error["fatal"]) == ("camera_in_use", False)
+        eventually(lambda: rig.command("status")["state"] == "paused", what="hand control paused again")
+
+
+def test_a_resume_before_start_reaches_the_camera_answers_pending(make_rig: Callable[..., Rig]) -> None:
+    """Paused right after hello (the mod's remembered pause), resumed while start() is still loading."""
+    desktop = FakeDesktop()
+    loading = threading.Event()
+    go_on = threading.Event()
+
+    def slow_desktop() -> FakeDesktop:
+        loading.set()
+        go_on.wait(TIMEOUT)
+        return desktop
+
+    rig = make_rig(desktop=desktop, desktop_factory=slow_desktop)
+    assert rig.command("pause") == {"ok": True}
+    starter = threading.Thread(target=rig.start)
+    starter.start()
+    try:
+        assert loading.wait(TIMEOUT)
+        assert rig.command("resume") == {"ok": True, "pending": True}  # no camera yet: start() opens it next
+    finally:
+        go_on.set()
+        starter.join(TIMEOUT)
+    rig.writer.wait_for("ready")
+    eventually(lambda: rig.command("status")["state"] == "idle", what="the camera to be on")
+
+
+def test_a_failed_resume_within_the_wait_answers_with_the_error_and_no_event(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera]
+) -> None:
+    rig = make_rig(camera_type=slow_camera).started()
+    rig.command("pause")
+    rig.next_camera_fails = "camera_in_use"
+    mark = len(rig.writer.snapshot())
+    response = rig.command("resume")
+    assert response["ok"] is False and response["error"]["code"] == "camera_in_use"
+    assert [e for e in rig.writer.snapshot()[mark:] if e["type"] == "error"] == []
+
+
+def test_a_pause_while_the_camera_is_still_opening_answers_pending_and_keeps_it_off(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The camera that opens must not stream or announce itself ready once a pause has come."""
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.3)
+    monkeypatch.setattr(runtime_module, "RESUME_WAIT_S", 0.3)
+    rig = make_rig(camera_type=slow_camera).started()
+    assert rig.command("pause") == {"ok": True}
+    readies = len(rig.writer.of("ready"))
+    slow_camera.open_s = 1.0
+    resumed: list[dict[str, Any]] = []
+    resume = threading.Thread(target=lambda: resumed.append(rig.command("resume")))
+    resume.start()
+    try:
+        time.sleep(0.1)
+        assert rig.command("pause") == {"ok": True, "pending": True}
+    finally:
+        resume.join(TIMEOUT)
+    assert resumed and resumed[0]["ok"] is True and resumed[0].get("pending") is True
+    eventually(lambda: not any(camera.is_open for camera in rig.cameras), what="every camera closed again")
+    assert rig.command("status")["state"] == "paused"
+    assert len(rig.writer.of("ready")) == readies  # the camera that opened never announced itself
+
+
+def test_a_resume_countermanded_by_a_pause_is_answered_as_an_error(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera]
+) -> None:
+    rig = make_rig(camera_type=slow_camera).started()
+    assert rig.command("pause") == {"ok": True}
+    slow_camera.open_s = 0.4
+    resumed: list[dict[str, Any]] = []
+    resume = threading.Thread(target=lambda: resumed.append(rig.command("resume")))
+    resume.start()
+    try:
+        time.sleep(0.1)
+        rig.command("pause")
+    finally:
+        resume.join(TIMEOUT)
+    assert resumed and resumed[0]["ok"] is False
+    assert resumed[0]["error"]["code"] == "bad_request" and "paus" in resumed[0]["error"]["message"].lower()
+    assert rig.command("status")["state"] == "paused"
+
+
+def starting_on_a_slow_camera(rig: Rig) -> threading.Thread:
+    """Runs ``start()`` on its own thread (the command thread stays free) until the camera is opening."""
+    starter = threading.Thread(target=rig.start)
+    starter.start()
+    eventually(lambda: bool(rig.cameras), what="start() to open the camera")
+    time.sleep(0.1)  # well into the open
+    return starter
+
+
+def test_a_pause_while_start_is_opening_the_camera_leaves_hand_control_paused_not_failed(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera]
+) -> None:
+    """Saying "pause hands" right after turning hand control on: Rotem's webcam takes 11 to 21 s to open."""
+    slow_camera.open_s = 0.6
+    rig = make_rig(camera_type=slow_camera)
+    starter = starting_on_a_slow_camera(rig)
+    try:
+        assert rig.command("pause") == {"ok": True}  # answered once the camera that opened is off again
+    finally:
+        starter.join(TIMEOUT)
+    assert rig.writer.of("error") == []
+    assert rig.runtime.exit_code is None
+    assert rig.command("status")["state"] == "paused"
+    assert not any(camera.is_open for camera in rig.cameras)
+    assert rig.writer.of("ready") == []  # the camera that opened never announced itself
+    slow_camera.open_s = 0.0
+    assert rig.command("resume") == {"ok": True}
+    rig.writer.wait_for("ready")
+    eventually(lambda: rig.command("status")["state"] == "idle", what="the camera to be on")
+
+
+def test_a_pause_while_start_is_opening_the_camera_answers_pending_when_the_open_outlasts_it(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_module, "PAUSE_WAIT_S", 0.2)
+    slow_camera.open_s = 0.8
+    rig = make_rig(camera_type=slow_camera)
+    starter = starting_on_a_slow_camera(rig)
+    try:
+        assert rig.command("pause") == {"ok": True, "pending": True}  # the camera light is still on
+    finally:
+        starter.join(TIMEOUT)
+    eventually(lambda: not any(camera.is_open for camera in rig.cameras), what="the camera to be off again")
+    assert rig.command("status")["state"] == "paused"
+    assert rig.writer.of("error") == []
+
+
+def test_a_resume_while_start_is_opening_the_camera_after_a_pause_waits_for_that_open(
+    make_rig: Callable[..., Rig], slow_camera: type[SlowOpenCamera]
+) -> None:
+    slow_camera.open_s = 0.6
+    rig = make_rig(camera_type=slow_camera)
+    starter = starting_on_a_slow_camera(rig)
+    paused: list[dict[str, Any]] = []
+    pause = threading.Thread(target=lambda: paused.append(rig.command("pause")))
+    try:
+        pause.start()
+        time.sleep(0.1)
+        assert rig.command("resume") == {"ok": True}  # the same open serves it
+    finally:
+        pause.join(TIMEOUT)
+        starter.join(TIMEOUT)
+    assert paused == [{"ok": True}]
+    eventually(lambda: rig.command("status")["state"] == "idle", what="the camera to be on")
+    assert len(rig.cameras) == 1 and rig.cameras[0].is_open
+    assert rig.writer.of("error") == []
+
+
+# --------------------------------------------------------------------------- a break in tracking
+
+
+def test_a_palm_still_up_after_a_resume_must_hold_again_before_it_engages(make_rig: Callable[..., Rig]) -> None:
+    """The pause outlasts ``engage_s``: without a break in tracking, the hold would count the pause itself."""
+    rig = make_rig().started().engaged()
+    assert rig.command("pause") == {"ok": True}
+    time.sleep(1.5)
+    mark = len(rig.writer.snapshot())
+    rig.puppet.set({"pose": "palm", "at": [0.55, 0.5]})  # the hand is up again (or never went down)
+    assert rig.command("resume") == {"ok": True}
+    rig.writer.wait_for("state", state="idle", after=mark)
+    back = time.monotonic()
+    rig.writer.wait_for("gesture", name="engage", after=mark)
+    assert time.monotonic() - back >= 0.4  # the spec's 0.5 s hold, less the clock's slack
+
+
+def test_a_palm_still_up_after_the_lock_screen_must_hold_again_before_it_engages(
+    make_rig: Callable[..., Rig],
+) -> None:
+    desktop = LockableDesktop()
+    rig = make_rig(desktop=desktop).started().engaged()
+    mark = len(rig.writer.snapshot())
+    desktop.locked = True
+    rig.writer.wait_for("gesture", name="disengage", after=mark)
+    rig.puppet.set({"pose": "palm", "at": [0.55, 0.5]})
+    time.sleep(0.5)
+    mark = len(rig.writer.snapshot())
+    unlocked = time.monotonic()
+    desktop.locked = False
+    rig.writer.wait_for("gesture", name="engage", after=mark)
+    assert time.monotonic() - unlocked >= 0.4
+
+
+class SecureDesktop(LockableDesktop):
+    """Windows refuses to even say where the cursor is while another desktop has the input."""
+
+    def cursor(self) -> tuple[int, int]:
+        if self.locked:
+            raise OSError(5, "Access is denied")
+        return super().cursor()
+
+
+def test_while_the_desktop_is_locked_the_executor_logs_no_failures(
+    make_rig: Callable[..., Rig], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock screen or a UAC prompt is an expected state, not a stream of failing ticks with tracebacks."""
+    desktop = SecureDesktop()
+    rig = make_rig(desktop=desktop).started().engaged((0.35, 0.35))
+    eventually(lambda: desktop.calls_named("move_cursor"), what="hand control moving the cursor")
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.executor"):
+        desktop.locked = True
+        rig.writer.wait_for("gesture", name="disengage")
+        time.sleep(1.0)  # 120 ticks of the executor, every one of which would have read the cursor
+        faults = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert faults == []  # not even in the half second before the runtime notices
+    mark = len(rig.writer.snapshot())
+    desktop.locked = False
+    rig.puppet.set({"pose": "palm", "at": [0.4, 0.4]})
+    rig.writer.wait_for("gesture", name="engage", after=mark)  # and hand control works again afterwards
+
+
+def test_the_cursor_is_not_yanked_back_while_the_user_keeps_mousing(make_rig: Callable[..., Rig]) -> None:
+    """'Touching the mouse always wins' (SPEC-hands.md): a hand left open in view must not take it back."""
+    rig = make_rig().started().engaged((0.35, 0.35))  # e.g. the free hand resting open in view
+    eventually(lambda: rig.desktop.calls_named("move_cursor"), what="hand control moving the cursor")
+    mark = len(rig.writer.snapshot())
+    rig.desktop.move_mouse(1500, 800)
+    rig.writer.wait_for("gesture", name="user_input", after=mark)
+    stop = threading.Event()
+
+    def user() -> None:
+        x = 1500
+        while not stop.is_set():
+            x = 1500 + (x + 20 - 1500) % 300  # the user keeps moving the real mouse
+            rig.desktop.move_mouse(x, 800)
+            time.sleep(0.02)
+
+    thread = threading.Thread(target=user, daemon=True)
+    thread.start()
+    try:
+        time.sleep(2.0)  # four times the engage hold, with the palm still up
+    finally:
+        stop.set()
+        thread.join()
+    assert rig.writer.gestures().count("engage") == 1
+    assert rig.command("status")["engaged"] is False

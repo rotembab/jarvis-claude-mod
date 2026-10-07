@@ -13,6 +13,17 @@ Safety rules, in order of importance:
   A failing tick also drops what was queued (replaying it later, say after
   the PC is unlocked, would be worse), and a streak of failures is logged
   once with its traceback and then once a minute, not 120 times a second.
+- **Nothing is done late.** A queued action keeps for ``SHELF_FRAMES`` frame
+  intervals. Windows' ``set_window_rect`` is synchronous whenever the size
+  changes, so a busy app can hold a tick for seconds while the engine keeps
+  queueing; everything that would act on a point the hand has long left
+  (a press, the wheel, a window operation) is then dropped instead of fired
+  in one burst, which Windows would read as a double-click. Only the newest
+  ``MoveCursor`` of a batch is applied, consecutive drags and resizes
+  collapse to the last one, and letting go (``ReleaseAll``,
+  ``ReleaseWindow``, the up of a held button) is never dropped. ``flush()``
+  empties the queue down to those releases, for a pause, the lock screen and
+  the way out.
 - **The real mouse wins.** Each tick, while the executor owns the cursor, it
   reads the cursor and compares it with where it last put it (read back
   after each move, so the OS clamping a point into a monitor is not mistaken
@@ -36,8 +47,10 @@ maximized window is restored on the first real drag (not on the grab, so a
 fist that lets go without moving changes nothing) and placed the way Windows
 does it: the cursor keeps its relative x across the window and sits at most
 ``TITLE_GRAB_PX`` below its top edge. Drags move the grab-time rect by the
-cursor's displacement; a two-hand resize keeps the hands' first positions
-and scales the rect by the change in their separation. Throws move the
+cursor's displacement, keeping whatever size the window has at the time (an
+app resizes itself when it crosses to a monitor with another DPI, and that
+must not be undone); a two-hand resize keeps the hands' first positions and
+scales the rect by the change in their separation. Throws move the
 window to the next display that way (same relative place, size scaled to
 the work area, maximized again if it was), snap it to that half of its
 display when there is none, maximize (up) or minimize (down).
@@ -86,6 +99,8 @@ SUSPEND_S = 0.25
 USER_INPUT_WINDOW_S = 0.1
 #: While ticks keep failing, at most one log record this often.
 FAILURE_LOG_INTERVAL_S = 60.0
+#: Frame intervals a queued action keeps: past them the hand has moved on and acting would be wrong.
+SHELF_FRAMES = 2.0
 
 _ORIGIN = Point(0, 0)
 _NO_RECT = Rect(0, 0, 0, 0)
@@ -152,6 +167,8 @@ class Executor:
         self._grab: _Grab | None = None
         self._blocked_reported: set[int] = set()
         self._suspended_until = -math.inf
+        #: The lock screen or a UAC prompt has the input (the runtime says so): act on nothing.
+        self._desktop_blocked = False
         self._scroll_rest = [0.0, 0.0]
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -181,10 +198,12 @@ class Executor:
         now = self._clock() if now is None else now
         with self._lock:
             try:
-                if not self._user_moved(now):
+                if self._desktop_blocked:
+                    self._blocked_tick()
+                elif not self._user_moved(now):
                     with self._queue_lock:
                         batch, self._queue = self._queue, []
-                    for submitted, action in batch:
+                    for submitted, action in self._due(batch, now):
                         self._apply(action, submitted, now)
                     self._glide(now)
             except Exception as exc:  # noqa: BLE001 - whatever failed, let go of the buttons; _failed logs it
@@ -197,8 +216,32 @@ class Executor:
                     log.info("executor works again after %d failed steps", self._failures)
                     self._failures = 0
 
+    def flush(self) -> None:
+        """Drop what is queued, down to the actions that let go of something. Any thread; never raises."""
+        with self._queue_lock:
+            self._queue = [entry for entry in self._queue if _releases(entry[1])]
+
+    def set_desktop_blocked(self, blocked: bool) -> None:
+        """The lock screen or a UAC prompt has the input (the runtime's check), or it is ours again.
+
+        While it is not ours, Windows refuses to even say where the cursor is,
+        so a tick that read it would fail every time and log it as a fault.
+        Ticks then only let go of what is held; everything else is dropped.
+        """
+        with self._lock:
+            if blocked == self._desktop_blocked:
+                return
+            self._desktop_blocked = blocked
+            log.info("the desktop is %s to the executor", "blocked" if blocked else "ours again")
+            if blocked:
+                self._segment = None
+                self._last_set = self._seen_at = None
+                self._foreign = (0.0, 0.0)
+        self.flush()
+
     def release_all(self) -> None:
-        """Every held button up and any grab ended. Never raises."""
+        """Every held button up, any grab ended and the queue dropped. Never raises."""
+        self.flush()
         if self._lock.acquire(timeout=1.0):
             try:
                 self._release_all()
@@ -252,12 +295,28 @@ class Executor:
 
     def _failed(self, exc: Exception, now: float) -> None:
         self._failures += 1
+        if self._expected_failure():
+            # The lock screen, a UAC prompt or Ctrl+Alt+Del took the input desktop since the last check (the
+            # runtime notices within half a second and stops the ticks): expected, so not a fault.
+            log.debug("executor step failed while another desktop has the input: %r", exc)
+            return
         if self._failures == 1:
             log.exception("executor step failed; releasing everything")
             self._failure_logged = now
         elif now - self._failure_logged >= FAILURE_LOG_INTERVAL_S:
             log.error("executor steps still failing (%d in a row): %r", self._failures, exc)
             self._failure_logged = now
+
+    def _expected_failure(self) -> bool:
+        """Whether the desktop says the input desktop is not ours (so nothing we send can work anyway)."""
+        check = getattr(self._desktop, "input_desktop_ok", None)
+        if check is None:
+            return False
+        try:
+            return not check()
+        except Exception as exc:  # noqa: BLE001 - a check that cannot answer says nothing about the failure
+            log.debug("input_desktop_ok failed: %r", exc)
+            return False
 
     def _user_moved(self, now: float) -> bool:
         if self._last_set is None:
@@ -285,11 +344,44 @@ class Executor:
                 log.exception("on_user_input callback failed")
         return True
 
+    def _due(self, batch: list[tuple[float, Action]], now: float) -> list[tuple[float, Action]]:
+        """What of ``batch`` is still worth doing (see the shelf-life rule in the module docstring)."""
+        shelf = SHELF_FRAMES * self.frame_interval
+        due: list[tuple[float, Action]] = []
+        for submitted, action in batch:
+            fresh = shelf <= 0.0 or now - submitted <= shelf
+            if _releases(action):
+                # Letting go always goes out; a button nobody holds any more only needs its move while fresh.
+                if fresh or not isinstance(action, Button) or action.button in self._held:
+                    due.append((submitted, action))
+            elif not fresh:
+                continue
+            elif _window_step(action) and len(due) >= 2 and _same_step(due[-1][1], due[-2][1], action):
+                # A stalled tick holds a whole gesture: its steps in between changed nothing, because every
+                # one of them is computed from the grab. The first one still anchors a resize and restores a
+                # maximized window, so a run keeps its first and its last step.
+                due[-1] = (submitted, action)
+            else:
+                due.append((submitted, action))
+        newest_move = max((i for i, (_, a) in enumerate(due) if isinstance(a, MoveCursor)), default=-1)
+        return [e for i, e in enumerate(due) if i == newest_move or not isinstance(e[1], MoveCursor)]
+
+    def _blocked_tick(self) -> None:
+        """While the input desktop is not ours: let go of what is held, best effort, and drop the rest."""
+        with self._queue_lock:
+            batch, self._queue = self._queue, []
+        if self._held or self._grab is not None or any(_releases(action) for _, action in batch):
+            try:
+                self._release_all()
+            except Exception as exc:  # noqa: BLE001 - expected while another desktop has the input
+                log.debug("could not let go while the desktop is blocked: %r", exc)
+
     def _apply(self, action: Action, submitted: float, now: float) -> None:
         if now < self._suspended_until and not isinstance(action, ReleaseAll):
             return
         if isinstance(action, MoveCursor):
-            start = self._pos if self._pos is not None else Point(*self._desktop.cursor())
+            # After the real mouse took over, the glide starts from the live cursor, never from a stale point.
+            start = self._pos if self._pos is not None and self._last_set is not None else self._live()
             self._segment = (start, Point(action.x, action.y), submitted)
         elif isinstance(action, Button):
             self._move_exact(Point(action.x, action.y))
@@ -330,6 +422,9 @@ class Executor:
         if alpha >= 1.0:
             self._segment = None
 
+    def _live(self) -> Point:
+        return Point(*self._desktop.cursor())
+
     def _move_exact(self, p: Point) -> None:
         self._segment = None
         self._move_to(p, exact=True)
@@ -364,8 +459,13 @@ class Executor:
         for button in sorted(self._held):
             try:
                 self._desktop.button(button, False)
-            except Exception:
-                log.exception("could not release the %s button", button)
+            except Exception as exc:
+                if self._desktop_blocked:
+                    # Expected: Windows refuses our input while the lock screen or a UAC prompt has it, and
+                    # the backend sends the release again as soon as our desktop is back.
+                    log.debug("the %s button's release waits for our desktop: %r", button, exc)
+                else:
+                    log.exception("could not release the %s button", button)
         self._held = frozenset()
         self._grab = None
         self._segment = None
@@ -416,11 +516,17 @@ class Executor:
         grab.rect0, grab.ref, grab.maximized = rect, p, False
 
     def _drag(self, grab: _Grab, p: Point) -> None:
+        assert grab.window is not None
         if grab.maximized:
             if p.distance(grab.grab_point) >= RESTORE_DRAG_PX:
                 self._restore_at(grab, p)
             return
-        self._set_rect(grab, grab.rect0.moved_to(grab.rect0.x + p.x - grab.ref.x, grab.rect0.y + p.y - grab.ref.y))
+        moved = grab.rect0.moved_to(grab.rect0.x + p.x - grab.ref.x, grab.rect0.y + p.y - grab.ref.y)
+        # The size is read back, not carried from the grab: dragged onto a monitor with another DPI, the app
+        # resizes itself for that monitor, and sending the grab-time size back would undo it. A two-hand
+        # resize still sets the size, from the rect it last set.
+        size = self._desktop.window_rect(grab.window)
+        self._set_rect(grab, Rect(moved.x, moved.y, size.width, size.height))
 
     def _resize(self, grab: _Grab, a: Point, b: Point) -> None:
         if grab.maximized:
@@ -508,6 +614,19 @@ class Executor:
     def _work_bounds(self) -> Rect | None:
         displays = self._used_displays()
         return bounding_rect([d.work for d in displays]) if displays else None
+
+
+def _window_step(action: Action) -> bool:
+    return isinstance(action, DragWindow | ResizeWindow)
+
+
+def _same_step(*actions: Action) -> bool:
+    return len({type(a) for a in actions}) == 1
+
+
+def _releases(action: Action) -> bool:
+    """Whether the action lets go of something (never dropped, whatever else is)."""
+    return isinstance(action, ReleaseAll | ReleaseWindow) or (isinstance(action, Button) and not action.down)
 
 
 def _display_of(rect: Rect, displays: list[Display]) -> Display:

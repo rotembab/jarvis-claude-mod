@@ -351,10 +351,25 @@ def test_run_exits_3_when_another_helper_holds_the_lock(tmp_path: Path) -> None:
 # A stand-in for jarvis_hands.runtime (another module's job), so the wiring of
 # ``run`` is tested on its own: hello, the token, heartbeats, shutdown, signals.
 STUB_RUNTIME = """
-import json, os, sys, threading, types
+import json, os, sys, threading, time, types
 
 mode = os.environ.get("STUB_RUNTIME_MODE", "ok")
 stub = types.ModuleType("jarvis_hands.runtime")
+
+# A handler thread that is descheduled while it writes: the control server's threads are daemon threads
+# that nothing joins, so the answer must be written before anything asks the process to wind down.
+delay = float(os.environ.get("STUB_SHUTDOWN_WRITE_DELAY_S", "0"))
+if delay:
+    from jarvis_hands import control
+
+    write = control._Handler._send_encoded
+
+    def slow_write(self, status, body, *, close=False):
+        if self.path.startswith("/v1/shutdown"):
+            time.sleep(delay)
+        return write(self, status, body, close=close)
+
+    control._Handler._send_encoded = slow_write
 
 
 class RuntimeOptions:
@@ -666,3 +681,21 @@ def test_mask_secret() -> None:
     assert mask_secret(None) is None and mask_secret("") is None
     assert mask_secret("short") == "****"
     assert mask_secret("abcdefghijklmnop") == "****mnop"
+
+
+def test_the_shutdown_answer_arrives_even_when_its_write_is_slow(tmp_path: Path) -> None:
+    """The mod waits for this answer before it starts the next helper, so it must not be cut off."""
+    token = "slow-shutdown-token-0123456789"
+    proc = start_stub(
+        tmp_path,
+        env=helper_env(JARVIS_TOKEN=token, STUB_SHUTDOWN_WRITE_DELAY_S="0.3"),
+    )
+    try:
+        port = read_hello(proc)["port"]
+        assert read_event(proc) == {"v": 1, "type": "state", "state": "idle"}
+        assert command(port, "shutdown", token=token) == (200, {"ok": True})
+        out, err = proc.communicate(timeout=TIMEOUT)
+    finally:
+        proc.kill()
+    assert proc.returncode == 0, err
+    assert json_lines(out) == []

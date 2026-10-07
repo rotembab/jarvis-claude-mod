@@ -171,8 +171,15 @@ def display_dict(display: Display, used: bool) -> dict[str, Any]:
 # --------------------------------------------------------------------------- responses
 
 
-def ok_response() -> dict[str, Any]:
-    return {"ok": True}
+def ok_response(*, pending: bool = False) -> dict[str, Any]:
+    """``pending``: the camera change the command asked for was still going on when it answered.
+
+    ``pause`` and ``resume`` wait for the loop thread to close or reopen the
+    camera, and a camera can take longer to open than they wait. The mod then
+    says the camera is still starting or still stopping, instead of claiming
+    it is already off (whose light would still be on) or already back.
+    """
+    return {"ok": True, "pending": True} if pending else {"ok": True}
 
 
 def error_response(code: ErrorCode, message: str) -> dict[str, Any]:

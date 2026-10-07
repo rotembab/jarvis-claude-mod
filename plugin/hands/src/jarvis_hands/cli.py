@@ -238,12 +238,16 @@ def cmd_run(args: argparse.Namespace) -> int:
                 return protocol.ok_response()
             if name == "shutdown":
                 log.info("shutdown requested by the mod")
-                request_stop()
-                return protocol.ok_response()
+                return protocol.ok_response()  # ``sent`` asks for the stop once this answer is written
             response: dict[str, Any] = rt.handle_command(name, body)
             return response
 
-        control = ControlServer(token, handle).start()
+        def sent(name: str) -> None:
+            """A command that has been answered. The process may now wind down (and close this socket)."""
+            if name == "shutdown":
+                request_stop()
+
+        control = ControlServer(token, handle, on_sent=sent).start()
         writer.emit(protocol.hello(control.port, os.getpid(), plat.name(), __version__, capabilities(args.fake)))
         for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGBREAK", None)):
             if sig is not None:

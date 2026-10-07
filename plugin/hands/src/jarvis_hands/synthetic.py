@@ -15,6 +15,10 @@ knuckles, lands exactly on ``at``: a pinch at ``at`` does not move the cursor
 unless the script moves it. Like the tracker's output, the hands are already
 in the mirrored frame, so ``handedness`` is the user's own hand.
 
+``between`` blends two poses part way (every joint angle and the thumb tip
+interpolated), for the frames a real hand passes through while it changes
+pose: closing an open hand into a fist goes past a thumb on the index tip.
+
 It lives in the package rather than the tests so that ``run --fake`` can
 replay a script of poses through the whole runtime without a camera or model.
 """
@@ -93,25 +97,32 @@ def _thumb(tip: np.ndarray) -> list[np.ndarray]:
     return [cmc, cmc + 0.42 * span + bow, cmc + 0.74 * span + 0.6 * bow, tip]
 
 
-def world_landmarks(pose: SyntheticPose, handedness: Literal["left", "right"] = "right") -> np.ndarray:
-    """(21, 3) metric landmarks for ``pose``, centred on the palm."""
+def _thumb_tip(pose: SyntheticPose, fingers: dict[str, list[np.ndarray]]) -> np.ndarray:
+    """Where ``pose`` puts the thumb tip, given its fingers."""
+    if pose == "palm" or pose == "hover":
+        return np.array([-0.072, -0.085, -0.005])
+    if pose == "pinch":
+        return fingers["index"][3] + np.array([-0.004, 0.003, 0.002])
+    if pose == "pinch_middle":
+        return fingers["middle"][3] + np.array([-0.004, 0.003, 0.002])
+    if pose == "two":
+        return fingers["ring"][2] + np.array([-0.006, 0.0, -0.012])
+    if pose == "point":
+        return fingers["middle"][2] + np.array([-0.006, 0.0, -0.012])
+    if pose == "thumb_up":
+        return np.array([-0.045, -0.125, -0.020])
+    # fist: the thumb lies across the curled index and middle fingers
+    return (fingers["index"][2] + fingers["middle"][2]) / 2 + np.array([0.0, 0.004, -0.014])
+
+
+def _check(pose: str) -> None:
     if pose not in _FINGER_ANGLES:
         raise ValueError(f"unknown synthetic pose {pose!r}; expected one of {', '.join(POSES)}")
-    fingers = {name: _finger(name, angles) for name, angles in _FINGER_ANGLES[pose].items()}
-    if pose == "palm" or pose == "hover":
-        thumb_tip = np.array([-0.072, -0.085, -0.005])
-    elif pose == "pinch":
-        thumb_tip = fingers["index"][3] + np.array([-0.004, 0.003, 0.002])
-    elif pose == "pinch_middle":
-        thumb_tip = fingers["middle"][3] + np.array([-0.004, 0.003, 0.002])
-    elif pose == "two":
-        thumb_tip = fingers["ring"][2] + np.array([-0.006, 0.0, -0.012])
-    elif pose == "point":
-        thumb_tip = fingers["middle"][2] + np.array([-0.006, 0.0, -0.012])
-    elif pose == "thumb_up":
-        thumb_tip = np.array([-0.045, -0.125, -0.020])
-    else:  # fist: the thumb lies across the curled index and middle fingers
-        thumb_tip = (fingers["index"][2] + fingers["middle"][2]) / 2 + np.array([0.0, 0.004, -0.014])
+
+
+def _assemble(
+    fingers: dict[str, list[np.ndarray]], thumb_tip: np.ndarray, handedness: Literal["left", "right"]
+) -> np.ndarray:
     points = np.zeros((21, 3))
     points[0] = _WRIST
     points[1:5] = _thumb(thumb_tip)
@@ -120,6 +131,39 @@ def world_landmarks(pose: SyntheticPose, handedness: Literal["left", "right"] = 
     if handedness == "left":
         points[:, 0] *= -1
     return points - points[[0, 5, 9, 13, 17]].mean(axis=0)
+
+
+def world_landmarks(pose: SyntheticPose, handedness: Literal["left", "right"] = "right") -> np.ndarray:
+    """(21, 3) metric landmarks for ``pose``, centred on the palm."""
+    _check(pose)
+    fingers = {name: _finger(name, angles) for name, angles in _FINGER_ANGLES[pose].items()}
+    return _assemble(fingers, _thumb_tip(pose, fingers), handedness)
+
+
+def between(
+    start: SyntheticPose,
+    end: SyntheticPose,
+    k: float,
+    handedness: Literal["left", "right"] = "right",
+    *,
+    thumb_k: float | None = None,
+) -> np.ndarray:
+    """(21, 3) metric landmarks ``k`` of the way from ``start`` to ``end`` (0 is ``start``, 1 is ``end``).
+
+    Every finger's joint angles are interpolated, and the thumb tip moves on
+    the straight line between the two poses' thumb tips, ``thumb_k`` of the
+    way (default ``k``): a thumb that leads or lags the fingers.
+    """
+    _check(start)
+    _check(end)
+    tk = k if thumb_k is None else thumb_k
+    fingers = {}
+    for name in _MCP:
+        a, b = _FINGER_ANGLES[start][name], _FINGER_ANGLES[end][name]
+        fingers[name] = _finger(name, (a[0] + k * (b[0] - a[0]), a[1] + k * (b[1] - a[1]), a[2] + k * (b[2] - a[2])))
+    tip_a = _thumb_tip(start, {n: _finger(n, _FINGER_ANGLES[start][n]) for n in _MCP})
+    tip_b = _thumb_tip(end, {n: _finger(n, _FINGER_ANGLES[end][n]) for n in _MCP})
+    return _assemble(fingers, tip_a + tk * (tip_b - tip_a), handedness)
 
 
 def hand(
@@ -133,14 +177,18 @@ def hand(
     roll: float = 0.0,
     jitter: float = 0.0,
     rng: np.random.Generator | None = None,
+    world: np.ndarray | None = None,
 ) -> HandObservation:
     """A hand in ``pose`` whose anchor (mean of image landmarks 5 and 9) is at ``at``.
 
     ``size`` is the camera frame (width, height) the hand is projected into;
     ``roll`` tilts the hand in the image plane (degrees); ``jitter`` adds
     Gaussian noise of that many frame widths to the image landmarks.
+    ``world`` projects those metric landmarks instead of ``pose``'s (say, a
+    hand ``between`` two poses, built with the same ``handedness``).
     """
-    world = world_landmarks(pose, handedness)
+    if world is None:
+        world = world_landmarks(pose, handedness)
     ax, ay = (at.x, at.y) if isinstance(at, Point) else at
     c, s = math.cos(math.radians(roll)), math.sin(math.radians(roll))
     rotation = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])

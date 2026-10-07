@@ -3,10 +3,19 @@
 One 1920 x 1080 display unless a test says otherwise; the default box maps
 the camera point (0.5, 0.45) to the centre of the screen (960, 540), and
 0.01 of the frame's width is 32 px sideways (0.01 of its height 21.6 px).
+
+A scripted hand jumps from one pose to the next, so the other fingers jump
+too: a pinch straight after a palm presses once the settle window holds only
+pinch frames (``SETTLE_WINDOW_S``, the fourth frame at 30 fps), and one let go
+before that clicks as it ends (a tap). Hence ``PRESS`` frames for a press.
 """
 
 from __future__ import annotations
 
+import itertools
+import math
+
+import numpy as np
 import pytest
 
 from jarvis_hands.actions import (
@@ -34,6 +43,8 @@ CENTRE = Point(960, 540)
 PRIMARY = display(1, 0, 0, 1920, 1080, primary=True)
 PROJECTOR = display(2, 1920, 0, 1280, 720)
 VIRTUAL = display(3, 3200, 0, 1920, 1080, virtual=True)
+#: Frames of a pinch after a palm until its button is down (see the module docstring).
+PRESS = 4
 
 
 def of(actions: list[Action], kind: type) -> list:
@@ -117,7 +128,7 @@ def test_a_hand_that_arrives_pinching_does_not_click(
     settings.engage = "always"
     actions = run(engine, script.hold(H("pinch", A), frames=10))
     assert engine.engaged and of(actions, Button) == []
-    actions = run(engine, script.hold(H("palm", A), frames=3) + script.hold(H("pinch", A), frames=3))
+    actions = run(engine, script.hold(H("palm", A), frames=3) + script.hold(H("pinch", A), frames=PRESS))
     assert [b.down for b in of(actions, Button)] == [True]
 
 
@@ -190,9 +201,12 @@ def test_a_disengage_that_races_a_press_still_lets_go() -> None:
     rig = Rig()
     rig.feed(Script().hold(H("palm", A), seconds=1.0))
     script = Script(t0=rig.now + 1 / 30)
-    rig.feed([script.frame(H("pinch", A))])
-    f = script.frame(H("pinch", A))
-    batch = rig.engine.update(f)  # the engine thread confirms the press...
+    for _ in range(PRESS):
+        f = script.frame(H("pinch", A))
+        batch = rig.engine.update(f)  # the engine thread presses...
+        if of(batch, Button):
+            break
+        rig.executor.submit(batch, now=f.t)
     assert [b.down for b in of(batch, Button)] == [True]
     rig.executor.submit(rig.engine.disengage(), now=f.t)  # ...a spoken "disengage" is submitted first...
     rig.executor.submit(batch, now=f.t)  # ...and the press lands after it
@@ -251,7 +265,7 @@ def test_a_click_lands_where_the_cursor_was_before_the_pinch(engine: GestureEngi
 
 def test_pinch_and_move_drags(engine: GestureEngine, script: Script) -> None:
     engage(engine, script)
-    actions = run(engine, script.hold(H("pinch", A), frames=3))
+    actions = run(engine, script.hold(H("pinch", A), frames=PRESS))
     assert of(actions, Button) == [btn("left", True)]
     actions = run(engine, script.move("pinch", A, (0.55, 0.45), frames=10))
     assert gestures(engine.take_events()) == ["drag_start"]
@@ -326,9 +340,12 @@ def test_a_one_frame_flicker_is_not_a_pose(engine: GestureEngine, script: Script
 
 
 def test_confirm_frames_one_acts_at_once(settings: HandsSettings, engine: GestureEngine, script: Script) -> None:
+    """A fist grabs on its first frame. (A pinch's button also waits for the hand to settle into it.)"""
     settings.confirm_frames = 1
     engage(engine, script)
-    assert of(run(engine, [script.frame(H("pinch", A))]), Button) == [btn("left", True)]
+    assert of(run(engine, [script.frame(H("fist", A))]), GrabWindow) == [
+        GrabWindow(pytest.approx(960), pytest.approx(540))
+    ]
 
 
 # -- scrolling ----------------------------------------------------------------------------
@@ -538,7 +555,7 @@ def test_hand_lost_during_a_drag(engine: GestureEngine, script: Script) -> None:
     actions = run(engine, script.hold(H("pinch", (0.54, 0.45)), frames=4))
     assert of(actions, Button) == [] and of(actions, MoveCursor)
     actions = run(
-        engine, script.hold(H("palm", (0.54, 0.45)), frames=3) + script.hold(H("pinch", (0.54, 0.45)), frames=3)
+        engine, script.hold(H("palm", (0.54, 0.45)), frames=3) + script.hold(H("pinch", (0.54, 0.45)), frames=PRESS)
     )
     assert [b.down for b in of(actions, Button)] == [True]
 
@@ -764,6 +781,8 @@ def test_every_event_value_is_in_the_protocol() -> None:
     rig.engine.cancel_calibration()
     rig.desktop.move_mouse(5, 5)
     rig.feed(script.hold(H("palm", A), frames=2))
+    # The palm that was up when the mouse took over must let go first (see the re-engage tests below).
+    rig.feed(script.gap(seconds=0.4))
     rig.feed(script.hold(H("palm", A), seconds=1.0))
     rig.feed(script.gap(seconds=2.0))
     seen = {e.value for e in rig.events if e.kind == "gesture"}
@@ -771,3 +790,276 @@ def test_every_event_value_is_in_the_protocol() -> None:
     assert seen >= {"grab", "resize_start", "release", "throw_right", "user_input", "disengage"}
     for event in rig.events:
         assert event.value in allowed[event.kind], event
+
+
+# -- a break in tracking, and the real mouse ---------------------------------------------
+
+
+def test_a_palm_up_across_a_break_in_tracking_must_hold_again(engine: GestureEngine, script: Script) -> None:
+    """No frames come while the camera is closed or another desktop has the input (runtime.reset_tracks)."""
+    engage(engine, script)
+    engine.disengage("command")
+    engine.take_events()
+    engine.reset_tracks()
+    # The hand never left: on the frame clock the gap did not happen at all.
+    run(engine, script.hold(H("palm", (0.55, 0.5)), frames=1))
+    assert not engine.engaged and engine.view().engage_progress == 0.0
+    run(engine, script.hold(H("palm", (0.55, 0.5)), seconds=0.4))
+    assert not engine.engaged
+    run(engine, script.hold(H("palm", (0.55, 0.5)), seconds=0.3))
+    assert engine.engaged  # the full hold, and no sooner
+    assert gestures(engine.take_events()) == ["engage"]
+
+
+def test_a_moving_palm_after_a_break_in_tracking_does_not_engage(engine: GestureEngine, script: Script) -> None:
+    """The stillness check comes back too: a palm waving past the camera must not take the cursor."""
+    engine.reset_tracks()
+    t0 = script.t
+    frames = [script.frame(H("palm", (0.5 + 0.12 * math.sin((script.t - t0) * 6.0), 0.45))) for _ in range(90)]
+    run(engine, frames)  # about 0.7 frame widths a second, over three seconds
+    assert not engine.engaged
+
+
+def test_a_break_in_tracking_does_not_keep_an_engaged_hand_from_working(engine: GestureEngine, script: Script) -> None:
+    """reset_tracks only ever comes with a disengage, but a stray one must not strand the pointer."""
+    engage(engine, script)
+    engine.reset_tracks()
+    run(engine, script.hold(H("palm", A), frames=2))
+    assert engine.engaged
+
+
+def test_a_palm_left_in_view_does_not_re_engage_after_the_mouse_took_over(
+    engine: GestureEngine, script: Script
+) -> None:
+    """'Touching the mouse always wins': the free hand resting open in view must not take the cursor back."""
+    engage(engine, script)
+    engine.on_user_input()
+    assert gestures(engine.take_events()) == ["user_input"]
+    for _ in range(6):  # six times the engage hold
+        run(engine, script.hold(H("palm", A), seconds=0.5))
+        assert not engine.engaged, "re-engaged while the user was using the mouse"
+    assert engine.view().engage_progress == 0.0
+
+
+def test_a_palm_that_lets_go_after_a_takeover_engages_again(engine: GestureEngine, script: Script) -> None:
+    engage(engine, script)
+    engine.on_user_input()
+    engine.take_events()
+    run(engine, script.hold(H("palm", A), seconds=0.8))
+    assert not engine.engaged
+    run(engine, script.hold(H("hover", A), seconds=0.2))  # the hand relaxes: it let go
+    run(engine, script.hold(H("palm", A), seconds=0.8))
+    assert engine.engaged
+
+
+def test_a_hand_that_leaves_view_after_a_takeover_engages_again(engine: GestureEngine, script: Script) -> None:
+    engage(engine, script)
+    engine.on_user_input()
+    engine.take_events()
+    run(engine, script.gap(seconds=0.4))  # the hand drops out of view for longer than hold_s
+    run(engine, script.hold(H("palm", A), seconds=0.8))
+    assert engine.engaged
+
+
+def test_the_other_hand_may_still_engage_after_a_takeover(engine: GestureEngine, script: Script) -> None:
+    """Only the hand that was up is held back; the user's other hand is a deliberate new palm."""
+    engage(engine, script)
+    engine.on_user_input()
+    engine.take_events()
+    run(engine, script.hold(H("palm", A), H("palm", (0.25, 0.5), "left"), seconds=0.8))
+    assert engine.engaged
+
+
+def test_a_palm_left_in_view_does_not_re_engage_after_the_disengage_command(
+    engine: GestureEngine, script: Script
+) -> None:
+    engage(engine, script)
+    engine.disengage("command")
+    engine.take_events()
+    run(engine, script.hold(H("palm", A), seconds=1.5))
+    assert not engine.engaged
+
+
+def test_a_hand_lost_mid_gesture_may_engage_again_without_letting_go(engine: GestureEngine, script: Script) -> None:
+    """Only a command or the real mouse holds a palm back; losing the hand is not the user's doing."""
+    engage(engine, script)
+    run(engine, script.gap(seconds=2.0))
+    assert not engine.engaged
+    engine.take_events()
+    run(engine, script.hold(H("palm", A), seconds=0.8))
+    assert engine.engaged
+
+
+def test_the_voice_engage_command_works_right_after_a_takeover(engine: GestureEngine, script: Script) -> None:
+    engage(engine, script)
+    engine.on_user_input()
+    engine.take_events()
+    engine.engage()
+    run(engine, script.hold(H("palm", A), frames=1))
+    assert engine.engaged
+
+
+# -- the cursor anchor ------------------------------------------------------------------
+
+
+def test_with_the_index_anchor_the_cursor_follows_the_fingertip(
+    settings: HandsSettings, engine: GestureEngine, script: Script
+) -> None:
+    settings.anchor = "index"
+    knuckles = GestureEngine(HandsSettings(), engine.mapper)
+    run(knuckles, script.hold(H("palm", A), seconds=1.0))
+    engine_script = Script()
+    actions = run(engine, engine_script.hold(H("palm", A), seconds=1.0))
+    assert engine.engaged
+    index_cursor = of(actions, MoveCursor)[-1]
+    knuckle_cursor = of(run(knuckles, script.hold(H("palm", A), frames=1)), MoveCursor)[-1]
+    assert not near(Point(index_cursor.x, index_cursor.y), Point(knuckle_cursor.x, knuckle_cursor.y), 20)
+
+
+def test_with_the_index_anchor_a_pinch_is_still_a_click_not_a_drag(
+    settings: HandsSettings, engine: GestureEngine, script: Script
+) -> None:
+    """The fingertip is what travels as the pinch closes; the slop is measured on the knuckles."""
+    settings.anchor = "index"
+    engage(engine, script)
+    before = engine.view().cursor
+    assert before is not None
+    actions = run(engine, script.transition("palm", "pinch", A, seconds=0.2))
+    actions += run(engine, script.hold(H("pinch", A), seconds=0.3))
+    actions += run(engine, script.transition("pinch", "palm", A, seconds=0.2))
+    actions += run(engine, script.hold(H("palm", A), seconds=0.2))
+    assert gestures(engine.take_events()) == ["click"]
+    presses = of(actions, Button)
+    assert [(b.button, b.down) for b in presses] == [("left", True), ("left", False)]
+    assert (presses[0].x, presses[0].y) == (presses[1].x, presses[1].y)
+    # The press lands where the cursor was before the pinch began (the rewind), not where the tip ended up.
+    assert near(Point(presses[0].x, presses[0].y), before, 6)
+
+
+def test_with_the_index_anchor_a_deliberate_drag_still_drags(
+    settings: HandsSettings, engine: GestureEngine, script: Script
+) -> None:
+    settings.anchor = "index"
+    engage(engine, script)
+    run(engine, script.transition("palm", "pinch", A, seconds=0.2))
+    run(engine, script.hold(H("pinch", A), seconds=0.2))
+    run(engine, script.move("pinch", A, (0.62, 0.45), seconds=0.3))
+    run(engine, script.hold(H("palm", (0.62, 0.45)), seconds=0.3))
+    assert gestures(engine.take_events()) == ["drag_start", "drag_end"]
+
+
+def test_with_the_index_anchor_a_hand_keeps_its_track_through_a_pinch(
+    settings: HandsSettings, engine: GestureEngine, script: Script
+) -> None:
+    """Association is on the knuckles, so a closing pinch cannot look like a new hand."""
+    settings.anchor = "index"
+    engage(engine, script)
+    pointer = engine._pointer
+    run(engine, script.transition("palm", "pinch", A, seconds=0.3))
+    run(engine, script.hold(H("pinch", A), seconds=0.2))
+    assert engine._pointer is pointer and len([t for t in engine._tracks if t.seen]) == 1
+
+
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+def test_with_the_index_anchor_a_quick_pinch_is_a_click_not_a_drag(fps: float) -> None:
+    """Five frames in, four held, five out (at 30 fps): the fingertip travels most of the slop on its own."""
+    settings = HandsSettings()
+    settings.anchor = "index"
+    rig = Rig(settings=settings)
+    script = Script(fps=fps)
+    rig.feed(script.hold(H("palm", A), seconds=1.5))
+    frames = round(5 * fps / 30)
+    rig.feed(script.transition("palm", "pinch", A, frames=frames))
+    rig.feed(script.hold(H("pinch", A), frames=round(4 * fps / 30)))
+    rig.feed(script.transition("pinch", "palm", A, frames=frames))
+    rig.feed(script.hold(H("palm", A), frames=round(10 * fps / 30)))
+    assert rig.gestures[1:] == ["click"]
+    down, up = of(rig.actions, Button)
+    assert (down.x, down.y) == (up.x, up.y)
+
+
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+@pytest.mark.parametrize("seconds", [0.1, 0.2, 0.3, 0.4, 0.6])
+def test_with_the_index_anchor_the_click_lands_where_the_fingertip_pointed_before_the_pinch(
+    fps: float, seconds: float
+) -> None:
+    """The rewind is on the knuckles: the fingertip's own travel as the finger bends into the pinch is undone,
+    however long the pinch takes to close (``rewind_s`` alone covers only its last 70 ms)."""
+    settings = HandsSettings()
+    settings.anchor = "index"
+    rig = Rig(settings=settings)
+    script = Script(fps=fps)
+    rig.feed(script.hold(H("palm", A), seconds=1.0))
+    before = rig.engine.view().cursor
+    assert before is not None
+    rig.feed(script.transition("palm", "pinch", A, seconds=seconds))
+    rig.feed(script.hold(H("pinch", A), seconds=0.3))
+    rig.feed(script.transition("pinch", "palm", A, seconds=seconds))
+    rig.feed(script.hold(H("palm", A), seconds=0.3))
+    assert rig.gestures[1:] == ["click"]
+    down = next(b for b in of(rig.actions, Button) if b.down)
+    assert near(Point(down.x, down.y), before, 6)
+
+
+def test_with_the_index_anchor_a_drag_carries_on_from_the_press_point() -> None:
+    """While pinched, the fingertip sits where the bent finger put it: the drag follows the hand from the press
+    point, just as far as it would with the knuckles anchor, and never jumps by that offset."""
+    paths = {}
+    for anchor in ("knuckles", "index"):
+        settings = HandsSettings()
+        settings.anchor = anchor  # type: ignore[assignment]
+        rig = Rig(settings=settings)
+        script = Script()
+        rig.feed(script.hold(H("palm", A), seconds=1.0))
+        rig.feed(script.transition("palm", "pinch", A, seconds=0.4))
+        rig.feed(script.hold(H("pinch", A), seconds=0.3))
+        down = next(b for b in of(rig.actions, Button) if b.down)
+        mark = len(rig.actions)
+        rig.feed(script.move("pinch", A, (0.53, 0.45), seconds=0.3))
+        assert "drag_start" in rig.gestures
+        paths[anchor] = [Point(down.x, down.y)] + [Point(m.x, m.y) for m in of(rig.actions[mark:], MoveCursor)]
+    index, knuckles = paths["index"], paths["knuckles"]
+    assert max(a.distance(b) for a, b in itertools.pairwise(index)) < 40
+    assert near(index[-1] - index[0], knuckles[-1] - knuckles[0], 3)
+
+
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+def test_with_the_index_anchor_a_noisy_pinch_still_lands_where_the_fingertip_pointed(fps: float) -> None:
+    """Landmark noise must not end the look back for where the finger began to bend (``BEND_TOLERANCE``)."""
+    misses = []
+    for seed in range(10):
+        noise = {"jitter": 0.0015, "rng": np.random.default_rng(seed)}
+        settings = HandsSettings()
+        settings.anchor = "index"
+        rig = Rig(settings=settings)
+        script = Script(fps=fps)
+        rig.feed(script.hold(H("palm", A, options=noise), seconds=1.0))
+        before = rig.engine.view().cursor
+        assert before is not None
+        rig.feed(script.transition("palm", "pinch", A, seconds=0.3, options=noise))
+        rig.feed(script.hold(H("pinch", A, options=noise), seconds=0.3))
+        rig.feed(script.transition("pinch", "palm", A, seconds=0.3, options=noise))
+        rig.feed(script.hold(H("palm", A, options=noise), seconds=0.3))
+        down = next((b for b in of(rig.actions, Button) if b.down), None)
+        if rig.gestures[1:] != ["click"] or down is None or not near(Point(down.x, down.y), before, 12):
+            misses.append((seed, rig.gestures, down))
+    assert misses == []
+
+
+def test_with_the_index_anchor_a_grab_takes_the_window_the_fingertip_pointed_at() -> None:
+    """A fist curls the index all the way: the grab is where it pointed before, and the window does not jump."""
+    settings = HandsSettings()
+    settings.anchor = "index"
+    rig = Rig(settings=settings, windows=[FakeWindow(1, "Notes", Rect(300, 100, 1300, 900))])
+    script = Script()
+    rig.feed(script.hold(H("palm", A), seconds=1.0))
+    before = rig.engine.view().cursor
+    assert before is not None
+    rig.feed(script.transition("palm", "fist", A, seconds=0.4))
+    rig.feed(script.hold(H("fist", A), seconds=0.2))
+    (grab,) = of(rig.actions, GrabWindow)
+    assert near(Point(grab.x, grab.y), before, 6)
+    start = rig.desktop.window(1).rect
+    rig.feed(script.hold(H("fist", A), seconds=0.3))
+    held = rig.desktop.window(1).rect
+    assert abs(held.x - start.x) < 6 and abs(held.y - start.y) < 6  # a still fist leaves the window where it was

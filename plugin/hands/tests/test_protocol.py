@@ -172,11 +172,23 @@ def test_display_dict_has_whole_pixels(reference_validator: Validate) -> None:
 
 @pytest.mark.parametrize(
     "response",
-    [protocol.ok_response(), protocol.error_response("bad_request", "nope"), protocol.error_response("internal", "")],
+    [
+        protocol.ok_response(),
+        protocol.ok_response(pending=True),
+        protocol.error_response("bad_request", "nope"),
+        protocol.error_response("internal", ""),
+    ],
 )
 def test_responses_match_schema(response: dict[str, Any], reference_validator: Validate) -> None:
     reference_validator(response, "CommandResponse")
     reference_validator(response, "OkResponse" if response["ok"] else "ErrorResponse")
+
+
+def test_an_ok_response_only_carries_pending_when_something_is_pending() -> None:
+    """``pause`` and ``resume`` say ``pending`` while the camera change is still going on; nothing else does."""
+    assert protocol.ok_response() == {"ok": True}
+    assert protocol.ok_response(pending=False) == {"ok": True}
+    assert protocol.ok_response(pending=True) == {"ok": True, "pending": True}
 
 
 # --------------------------------------------------------------------------- commands

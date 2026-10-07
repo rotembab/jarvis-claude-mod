@@ -7,7 +7,7 @@ importing everything from ``scripted``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -30,6 +30,7 @@ from jarvis_hands.synthetic import (
     STRAIGHT,
     WIDTH,
     SyntheticPose,
+    between,
     hand,
     world_landmarks,
 )
@@ -43,10 +44,12 @@ __all__ = [
     "SCALE",
     "STRAIGHT",
     "WIDTH",
+    "Blend",
     "H",
     "Rig",
     "Script",
     "SyntheticPose",
+    "between",
     "camera_point",
     "display",
     "gestures",
@@ -69,6 +72,24 @@ class H:
         return hand(self.pose, self.at, handedness=self.handedness, size=size, **self.options)
 
 
+@dataclass(frozen=True)
+class Blend:
+    """A hand part way between two poses (``k`` of the way from ``start`` to ``end``; see ``between``)."""
+
+    start: SyntheticPose
+    end: SyntheticPose
+    k: float
+    at: tuple[float, float] = (0.5, 0.45)
+    handedness: Literal["left", "right"] = "right"
+    thumb_k: float | None = None
+    #: More ``hand`` keywords (say ``jitter`` and ``rng``), as for ``H``.
+    options: dict[str, Any] = field(default_factory=dict)
+
+    def observe(self, size: tuple[int, int]) -> HandObservation:
+        world = between(self.start, self.end, self.k, self.handedness, thumb_k=self.thumb_k)
+        return hand(self.end, self.at, handedness=self.handedness, size=size, world=world, **self.options)
+
+
 class Script:
     """Frames at a fixed rate: each call returns the next frames and advances the clock."""
 
@@ -82,7 +103,7 @@ class Script:
     def dt(self) -> float:
         return 1.0 / self.fps
 
-    def frame(self, *hands: H) -> Frame:
+    def frame(self, *hands: H | Blend) -> Frame:
         f = Frame(self.t, tuple(h.observe((self.width, self.height)) for h in hands), self.width, self.height)
         self.t += self.dt
         return f
@@ -116,6 +137,29 @@ class Script:
             k = i / n
             at = (start[0] + (end[0] - start[0]) * k, start[1] + (end[1] - start[1]) * k)
             out.append(self.frame(H(pose, at, handedness), *also))
+        return out
+
+    def transition(
+        self,
+        start: SyntheticPose,
+        end: SyntheticPose,
+        at: tuple[float, float] = (0.5, 0.45),
+        *,
+        seconds: float | None = None,
+        frames: int | None = None,
+        thumb: Callable[[float], float] | None = None,
+        handedness: Literal["left", "right"] = "right",
+        options: dict[str, Any] | None = None,
+    ) -> list[Frame]:
+        """One hand changing from ``start`` (exclusive) to ``end`` (inclusive) in place, as a real hand does:
+        every joint moves at once. ``thumb`` maps the fingers' progress to the thumb's (it may lead or lag);
+        ``options`` are more ``hand`` keywords for every frame (say ``jitter`` and ``rng``)."""
+        n = frames if frames is not None else self.count(seconds or 0.0)
+        out = []
+        for i in range(1, n + 1):
+            k = i / n
+            thumb_k = None if thumb is None else thumb(k)
+            out.append(self.frame(Blend(start, end, k, at, handedness, thumb_k, dict(options or {}))))
         return out
 
 

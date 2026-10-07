@@ -7,8 +7,13 @@ executor, drains ``take_events()`` into protocol events and draws ``view()``.
 
 How a frame flows:
 
-1. **Tracks.** Each observed hand is matched to a track (nearest anchor within
-   ``ASSOCIATE_RADIUS`` frame widths, else the same handedness). Nearest is
+1. **Tracks.** Each observed hand is matched to a track (nearest knuckle point
+   within ``ASSOCIATE_RADIUS`` frame widths, else the same handedness). Every
+   distance (that match, the engagement stillness, a press's slop) is measured
+   on the knuckles, which barely move when the fingers do; only the cursor
+   target follows ``anchor``, which may be the index fingertip instead (then a
+   press is rewound on the knuckles, and what is held follows them: the tip
+   travels as the finger bends into the pose, see ``_aimed``). Nearest is
    decided over all tracks at once, not track by track: when the pointer hand
    is missed for a frame, the other hand stays on its own track instead of
    being taken over by the pointer's. Each track keeps its own pose hysteresis
@@ -28,6 +33,12 @@ How a frame flows:
    two-hand resize. A frame whose RAW pose already left the active pose
    neither moves nor drags, so the opening hand's own drift never lands in a
    drop, a drag or a window.
+4. **Pinches.** A hand closing into a fist, or opening out of one, passes
+   through a pinch, which must not click. So a pinch's button goes down only
+   once the other fingers have settled (``SETTLE_RATE``); a pinch let go
+   before that is a quick tap and clicks whole as it ends, unless its finger
+   curled on the way in or out (``_tap_verdict``). After a grab the pinches
+   stay latched until the hand is open (``_let_go``).
 
 A pose that ends an interaction abnormally (hand lost, calibration) is
 latched: it must be let go before it can start the same interaction again,
@@ -42,7 +53,7 @@ import threading
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Literal, TypeVar
 
 import numpy as np
 
@@ -83,12 +94,43 @@ STALE_FW_PER_S = 1.0
 HISTORY_S = 1.0
 #: Seconds over which a track's anchor speed is measured (engagement stillness).
 SPEED_WINDOW_S = 0.1
+#: A pinch presses only once the fingers that take no part in it have settled: their mean reach moves less
+#: than ``SETTLE_RATE`` (reach units per second; the least-squares slope over the last ``SETTLE_WINDOW_S``,
+#: frames from before the pinch included). A hand closing into a fist, or opening out of one, passes through
+#: a pinch (the thumb crosses the index tip while the index is not curled yet) with those fingers on the
+#: move, while a hand that means to pinch holds them.
+#: The numbers: through the real tracker, on still photos with webcam sensor noise (4 to 12 grey levels),
+#: that slope has a median of 0.05 to 0.10 and a p90 of 0.12 to 0.26, so a held pinch presses within a frame
+#: of the window clearing; a palm closing into a fist within 4.5 s, or a relaxed hand within 1.5 s,
+#: moves faster than the rate for the whole of the pinch it passes through, so the press is never sent.
+#: The window is what a held pinch's press costs: about ``SETTLE_WINDOW_S`` after the fingers stop.
+#: A pinch let go before that is a quick tap, which clicks as it ends (see ``_tap_verdict``).
+SETTLE_WINDOW_S = 0.1
+SETTLE_RATE = 0.3
+#: The slope is only taken over at least this long and three frames (two frame intervals), and the pinch
+#: itself must have lasted as long: over one interval, landmark noise alone can make a closing hand look still.
+SETTLE_MIN_S = 0.05
+#: A pinch whose own finger was curled this shortly before it began, or curled while it lasted, is a hand
+#: opening out of a fist or closing into one, never a tap (a pinch needs that finger not curled).
+TRANSIT_LOOKBACK_S = 0.15
+#: A tap that ends while the other fingers are still closing may be on its way into a fist: its click waits
+#: this long for the fist (which drops it) before it goes out.
+TAP_WAIT_S = 0.15
+#: After a grab ends, the pinch a fist passes through as it opens stays latched until the hand shows a palm,
+#: or another pose that is no action for this long: the hover between the fist and that pinch is shorter.
+OPENING_LATCH_S = 0.2
+#: With ``anchor: index``, how far back a press looks for where the finger began to bend into it, and how
+#: much (reach units) the index must have straightened again, going back, to mark that start.
+BEND_LOOKBACK_S = 0.8
+BEND_TOLERANCE = 0.03
 #: Wheel units per desktop pixel of hand motion, before ``scroll_speed``.
 SCROLL_UNITS_PER_PX = 2.4
 #: A throw (and a scroll axis) must be this much more along one axis than the other.
 AXIS_DOMINANCE = 1.5
 MAX_TRACKS = 4
 ACTION_POSES: frozenset[str] = frozenset({"pinch", "pinch_middle", "fist", "two"})
+#: Latched when a grab ends, until the hand shows it is open (``_let_go``): what a fist opening passes through.
+_OPENING_FIST: frozenset[PoseName] = frozenset({"pinch", "pinch_middle"})
 
 
 @dataclass(frozen=True)
@@ -116,6 +158,14 @@ class EngineView:
     calibration_progress: float
 
 
+_S = TypeVar("_S")
+
+
+def _finger(pose: PoseName) -> int:
+    """The finger (index 0, middle 1) the thumb pinches in ``pose``."""
+    return 1 if pose == "pinch_middle" else 0
+
+
 class _Track:
     """One hand followed across frames: hysteresis, debounce and recent anchors."""
 
@@ -125,9 +175,13 @@ class _Track:
         self.handedness = "right"
         self.seen = False
         self.last_seen = now
-        #: Image coordinates (what the mapper takes) and frame-width units (distances).
+        #: The cursor anchor in image coordinates (what the mapper takes): the knuckles, or the index
+        #: fingertip with ``anchor: index``.
         self.anchor = Point(0.5, 0.5)
+        #: The knuckles in frame-width units, which is what every distance is measured on (see ``_associate``).
         self.anchor_fw = Point(0.5, 0.5)
+        #: The knuckles in image coordinates (the cursor anchor itself, unless ``anchor: index``).
+        self.knuckles = Point(0.5, 0.5)
         self.hand_pose: HandPose | None = None
         self.raw: PoseName | None = None
         self.run = 0
@@ -138,6 +192,10 @@ class _Track:
         self.confirmed_t = now
         self.confirmed_anchor = Point(0.5, 0.5)
         self.history: deque[tuple[float, Point]] = deque()
+        #: Each frame's finger reach (index, middle, ring, pinky), over the same span as ``history``.
+        self.reach: deque[tuple[float, tuple[float, float, float, float]]] = deque()
+        #: When each finger (index, middle, ring, pinky) was last seen curled.
+        self.curled_t = [-math.inf] * 4
         self.palm_since: float | None = None
 
     def restart(self, now: float) -> None:
@@ -146,15 +204,23 @@ class _Track:
         self.raw, self.run, self.confirmed = None, 0, None
         self.run_start_t = self.confirmed_t = now
         self.history.clear()
+        self.reach.clear()
+        self.curled_t = [-math.inf] * 4
         self.palm_since = None
 
-    def observe(self, pose: HandPose, now: float, anchor_fw: Point, confirm_frames: int) -> None:
+    def observe(self, pose: HandPose, now: float, knuckles: Point, anchor_fw: Point, confirm_frames: int) -> None:
         self.hand_pose = pose
         self.anchor = pose.anchor
+        self.knuckles = knuckles
         self.anchor_fw = anchor_fw
         self.history.append((now, anchor_fw))
-        while self.history and now - self.history[0][0] > HISTORY_S:
-            self.history.popleft()
+        self.reach.append((now, pose.reach))
+        for hist in (self.history, self.reach):
+            while hist and now - hist[0][0] > HISTORY_S:
+                hist.popleft()
+        for i, curled in enumerate(pose.curled):
+            if curled:
+                self.curled_t[i] = now
         if pose.pose != self.raw:
             self.raw, self.run, self.run_start_t, self.run_start_anchor = pose.pose, 1, now, anchor_fw
         else:
@@ -171,10 +237,63 @@ class _Track:
         t0, p0 = _window_start(self.history, t1, SPEED_WINDOW_S)
         return p1.distance(p0) / (t1 - t0) if t1 - t0 > 1e-6 else 0.0
 
+    def settled(self, pose: PoseName, began: float, since: float = -math.inf) -> bool:
+        """Whether the fingers that take no part in ``pose`` (a pinch that ``began`` then) are holding still.
 
-def _window_start(history: Iterable[tuple[float, Point]], end: float, window: float) -> tuple[float, Point]:
+        The slope over the last ``SETTLE_WINDOW_S``, frames from before the
+        pinch included: a hand that closed into the pinch has to stop before
+        it counts, and a frame of noise inside the pinch does not start the
+        measure over. The pinch itself must have lasted three frames (two
+        frame intervals) and ``SETTLE_MIN_S``, so a slow closing whose noise
+        happens to average out does not press on the frame its pinch is
+        confirmed. Never back past
+        ``since`` (the last frame the pinching finger was curled): the way down
+        into a fist and back out of it could average out to no slope at all.
+        """
+        pinch = [t for t, _ in self.reach if t >= began]
+        if len(pinch) < 3 or pinch[-1] - pinch[0] < SETTLE_MIN_S - 1e-6:
+            return False
+        slope = self._reach_slope(pose, since)
+        return slope is not None and abs(slope) <= SETTLE_RATE
+
+    def closing(self, pose: PoseName) -> bool:
+        """Whether the fingers that take no part in ``pose`` are curling faster than ``SETTLE_RATE``."""
+        slope = self._reach_slope(pose, -math.inf)
+        return slope is not None and slope < -SETTLE_RATE
+
+    def _reach_slope(self, pose: PoseName, since: float) -> float | None:
+        """Least-squares slope (reach units per second) of those fingers' mean reach; None without enough frames."""
+        if not self.reach:
+            return None
+        end = self.reach[-1][0]
+        others = (0, 2, 3) if pose == "pinch_middle" else (1, 2, 3)
+        window = [(t, _mean(r, others)) for t, r in self.reach if t >= since and end - t <= SETTLE_WINDOW_S + 1e-6]
+        if len(window) < 3 or end - window[0][0] < SETTLE_MIN_S - 1e-6:
+            return None
+        t_mean = sum(t for t, _ in window) / len(window)
+        v_mean = sum(v for _, v in window) / len(window)
+        spread = sum((t - t_mean) ** 2 for t, _ in window)
+        return sum((t - t_mean) * (v - v_mean) for t, v in window) / spread
+
+
+def _at(history: Iterable[tuple[float, Point]], t: float) -> Point:
+    """The latest sample of ``history`` not after ``t`` (else its oldest)."""
+    point: Point | None = None
+    for when, p in history:
+        if point is not None and when > t:
+            break
+        point = p
+    assert point is not None
+    return point
+
+
+def _mean(reach: tuple[float, float, float, float], fingers: tuple[int, ...]) -> float:
+    return sum(reach[i] for i in fingers) / len(fingers)
+
+
+def _window_start(history: Iterable[tuple[float, _S]], end: float, window: float) -> tuple[float, _S]:
     """The newest sample at least ``window`` seconds before ``end``, else the oldest one."""
-    start: tuple[float, Point] | None = None
+    start: tuple[float, _S] | None = None
     for sample in reversed(list(history)):
         start = sample
         if end - sample[0] >= window:
@@ -191,6 +310,13 @@ class _Press:
     anchor: Point
     t: float
     double: bool
+    #: Where the pinch began (the first frame of the run it was confirmed on): its settling is measured from here.
+    since: float
+    #: Whether the button went down: a pinch waits for the hand to settle into it (see ``SETTLE_RATE``), and
+    #: one that ends before it does is either a quick tap or a hand passing through a pinch (``_tap_verdict``).
+    down: bool = False
+    #: When a pinch that never went down ended in a pose that is no action, while its tap waits (``TAP_WAIT_S``).
+    ended: float | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +351,10 @@ class GestureEngine:
         self._engage_requested = False
         #: After a command or real-mouse disengage, ``engage: always`` waits for the hands to leave first.
         self._always_blocked = False
+        #: Set by ``reset_tracks``; the next frame starts the tracks over on its own clock.
+        self._tracks_broken = False
+        #: Tracks whose palm hold does not count until they let go (a real-mouse or command disengage).
+        self._palm_blocked: set[int] = set()
         self._engage_floor = -math.inf
         self._last_hand_t = -math.inf
         self._hand_visible = False
@@ -235,6 +365,13 @@ class GestureEngine:
         self._cursor_hist: deque[tuple[float, Point]] = deque()
         self._motion: Point | None = None
         self._motion_hist: deque[tuple[float, Point]] = deque()
+        #: With ``anchor: index``, the knuckles' filtered desktop point too: what a press is rewound on, and
+        #: what a held press, drag or grab follows (at ``_held_offset`` from it), since the fingertip itself
+        #: travels as the finger bends into the pose.
+        self._knuckle_filter = self._new_filter()
+        self._knuckle: Point | None = None
+        self._knuckle_hist: deque[tuple[float, Point]] = deque()
+        self._held_offset: Point | None = None
         self._reset_cursor = False
         self._mode: Mode = "point"
         #: Action poses that must be let go (confirmed as some other pose) before they act again.
@@ -321,6 +458,21 @@ class GestureEngine:
                 self._engage_requested = True
                 self._always_blocked = False
 
+    def reset_tracks(self) -> None:
+        """Tracking broke: the next frame starts over, so engaging takes the full hold again.
+
+        The camera was closed and reopened (a pause and a resume), or another
+        desktop had the input (the lock screen, a UAC prompt). Either way no
+        frames came for a while, which the engine cannot tell from a hand that
+        never moved: without this, a palm still up when the gap began would
+        engage on the first frame after it, with no hold and no stillness
+        check. Called from another thread than ``update``, and the engine only
+        ever keeps time with the frames, so the next frame's own capture time
+        is the new floor.
+        """
+        with self._lock:
+            self._tracks_broken = True
+
     def disengage(self, reason: str = "command") -> list[Action]:
         """Let go of everything and stop following the hand.
 
@@ -367,11 +519,16 @@ class GestureEngine:
     # -- tracks -------------------------------------------------------------------------
 
     def _associate(self, frame: Frame, now: float, previous: float) -> None:
+        if self._tracks_broken:
+            self._break_tracks(now)
         aspect = frame.height / frame.width if frame.width else 1.0
         observed: list[tuple[HandObservation, Point, Point]] = []
         for hand in frame.hands:
-            anchor = anchor_point(hand.image, self.settings.anchor)
-            observed.append((hand, anchor, Point(anchor.x, anchor.y * aspect)))
+            # Distances are always measured on the knuckles, even where the cursor follows the index
+            # fingertip (``anchor: index``): the fingertip is the point that travels as a pinch closes, so a
+            # press measured on it would cross the slop and turn every click into a drag.
+            knuckles = anchor_point(hand.image)
+            observed.append((hand, Point(knuckles.x, knuckles.y * aspect), knuckles))
         for track in self._tracks:
             track.seen = False
 
@@ -387,7 +544,7 @@ class GestureEngine:
         pairs: list[tuple[float, int, int, _Track]] = []
         for rank, track in enumerate(order):
             stale = STALE_FW_PER_S * max(0.0, now - track.last_seen)
-            for i, (_, _, anchor_fw) in enumerate(observed):
+            for i, (_, anchor_fw, _) in enumerate(observed):
                 distance = anchor_fw.distance(track.anchor_fw)
                 if distance <= ASSOCIATE_RADIUS:
                     pairs.append((distance + stale, rank, i, track))
@@ -398,7 +555,7 @@ class GestureEngine:
         for track in order:
             options = [i for i in sorted(free) if observed[i][0].handedness == track.handedness]
             if track.id not in matches and options:
-                best = min(options, key=lambda i: observed[i][2].distance(track.anchor_fw))
+                best = min(options, key=lambda i: observed[i][1].distance(track.anchor_fw))
                 matches[track.id] = best
                 free.discard(best)
         for i in sorted(free):
@@ -416,13 +573,14 @@ class GestureEngine:
             missed = previous - track.last_seen
             if missed > self.settings.hold_s:
                 track.restart(now)
+                self._palm_blocked.discard(track.id)
             elif missed > 0 and track.palm_since is not None:
                 # The hold counts the time the palm was in view, not the frames it was missed in.
                 track.palm_since += missed
-            hand, _, anchor_fw = observed[i]
+            hand, anchor_fw, knuckles = observed[i]
             track.seen, track.last_seen, track.handedness = True, now, hand.handedness
             pose = track.poses.classify(hand, self.settings.anchor, aspect)
-            track.observe(pose, now, anchor_fw, confirm)
+            track.observe(pose, now, knuckles, anchor_fw, confirm)
 
         keep = [t for t in self._tracks if t.seen or t is self._pointer or now - t.last_seen <= self.settings.lost_s]
         keep.sort(key=lambda t: (t is not self._pointer, not t.seen, -t.last_seen))
@@ -437,6 +595,21 @@ class GestureEngine:
             if self._always_blocked and now - self._last_hand_t >= self.settings.hold_s:
                 self._always_blocked = False
             self._last_hand_t = now
+
+    def _break_tracks(self, now: float) -> None:
+        """The first frame after a break in tracking (see ``reset_tracks``), on the frame clock."""
+        self._tracks_broken = False
+        for track in self._tracks:
+            track.restart(now)
+            track.last_seen = now
+        self._candidate = None
+        self._palm_blocked = set()
+        self._engage_floor = self._last_hand_t = now
+        self._cursor = None
+        self._cursor_hist.clear()
+        self._motion_hist.clear()
+        self._knuckle_hist.clear()
+        self._reset_cursor = True
 
     def _seen(self) -> list[_Track]:
         return [t for t in self._tracks if t.seen]
@@ -455,6 +628,10 @@ class GestureEngine:
 
         for track in seen:
             if track.confirmed != "palm":
+                track.palm_since = None
+                self._palm_blocked.discard(track.id)  # it let go: the next palm hold counts again
+                continue
+            if track.id in self._palm_blocked:
                 track.palm_since = None
                 continue
             if track.palm_since is None:
@@ -493,6 +670,8 @@ class GestureEngine:
         # A pose already held when engaging must be let go first; a one-frame flicker of the raw pose
         # must not hide a confirmed fist, so both count.
         self._latched = frozenset(p for p in (track.raw, track.confirmed) if p is not None and p in ACTION_POSES)
+        if "fist" in self._latched:
+            self._latched |= _OPENING_FIST  # the fist opens through a pinch
         for t in self._tracks:
             t.palm_since = None
         self._restart_cursor(track, now)
@@ -505,10 +684,15 @@ class GestureEngine:
         """Start the filters at the hand's current point, so nothing glides in from a stale position."""
         self._cursor_filter = self._new_filter()
         self._motion_filter = self._new_filter()
+        self._knuckle_filter = self._new_filter()
         self._cursor = self._cursor_filter.filter(self.mapper.to_desktop(track.anchor), now)
         self._motion = self._motion_filter.filter(self.mapper.to_region(track.anchor), now)
+        self._knuckle = None
+        if self.settings.anchor != "knuckles":
+            self._knuckle = self._knuckle_filter.filter(self.mapper.to_desktop(track.knuckles), now)
         self._cursor_hist.clear()
         self._motion_hist.clear()
+        self._knuckle_hist.clear()
         self._record(now)
         self._reset_cursor = False
 
@@ -526,6 +710,10 @@ class GestureEngine:
             t.palm_since = None
         if reason in ("command", "user_input"):
             self._always_blocked = True
+            # "Touching the mouse always wins": the hand that was up must stop being a confirmed palm (or
+            # leave view for hold_s, which restarts its track) before a palm hold counts again. Otherwise a
+            # hand left open in view re-engages every engage_s and yanks the cursor away from the real mouse.
+            self._palm_blocked = {t.id for t in self._tracks if "palm" in (t.raw, t.confirmed)}
         self._emit("gesture", "user_input" if reason == "user_input" else "disengage")
         log.info("disengaged (%s)", reason)
         return actions
@@ -549,28 +737,62 @@ class GestureEngine:
             self._restart_cursor(ptr, now)
         filtered = self._cursor_filter.filter(self.mapper.to_desktop(ptr.anchor), now)
         self._motion = self._motion_filter.filter(self.mapper.to_region(ptr.anchor), now)
+        if self.settings.anchor != "knuckles":
+            self._knuckle = self._knuckle_filter.filter(self.mapper.to_desktop(ptr.knuckles), now)
+            if self._holding() and self._held_offset is not None:
+                filtered = self._knuckle + self._held_offset
         target = self._cursor if filtered.distance(self._cursor) <= self.settings.dead_zone_px else filtered
 
-        if self._latched and ptr.confirmed is not None and ptr.confirmed not in self._latched:
+        if (
+            self._latched
+            and ptr.confirmed is not None
+            and ptr.confirmed not in self._latched
+            and self._let_go(ptr, now)
+        ):
             self._latched = frozenset()
         pose: PoseName = ptr.confirmed or "hover"
         self._step(ptr, pose, target, now, actions)
         self._record(now)
+
+    def _let_go(self, ptr: _Track, now: float) -> bool:
+        """Whether the confirmed pose, outside the latched ones, lets go of them.
+
+        Any such pose does, except after a fist (``_OPENING_FIST``): opening
+        passes through a hover on its way to the pinch, so only a palm, another
+        action or a pose held for ``OPENING_LATCH_S`` tells the hand is open.
+        """
+        pose = ptr.confirmed
+        if not self._latched >= _OPENING_FIST or pose == "palm" or pose in ACTION_POSES:
+            return True
+        return now - ptr.confirmed_t >= OPENING_LATCH_S
 
     def _step(self, ptr: _Track, pose: PoseName, target: Point, now: float, actions: list[Action]) -> None:
         mode = self._mode
         if mode in ("press", "drag"):
             press = self._press
             assert press is not None
-            if pose == press.pose:
-                if ptr.raw == press.pose:
+            if pose == press.pose and press.ended is None:
+                if ptr.raw == press.pose and (press.down or self._press_down(ptr, actions)):
                     if mode == "press" and ptr.anchor_fw.distance(press.anchor) > self.settings.slop:
                         self._mode = "drag"
                         self._emit("gesture", "drag_start")
                     if self._mode == "drag":
                         self._move(target, actions)
                 return
-            self._release_press(actions)
+            if press.down:
+                self._release_press(actions)
+            else:
+                verdict = self._tap_verdict(ptr, press, pose, now)
+                if verdict == "wait":
+                    if press.ended is None:
+                        self._press = replace(press, ended=now)
+                    return  # the cursor stays on the pinch's point until the tap is decided
+                if verdict == "click":
+                    self._press_down(ptr, actions, settled=True)
+                    self._release_press(actions)
+                else:  # the hand passed through a pinch on its way into or out of a fist: nothing was pressed
+                    self._press = None
+                    self._mode = "point"
         elif mode == "scroll":
             if pose == "two":
                 if ptr.raw == "two":
@@ -590,7 +812,8 @@ class GestureEngine:
             self._move(target, actions)
 
     def _start(self, ptr: _Track, pose: PoseName, now: float, actions: list[Action]) -> None:
-        point = self._rewound(ptr.confirmed_t - self.settings.rewind_s)
+        rewind_to = ptr.confirmed_t - self.settings.rewind_s
+        point = self._aimed(ptr, rewind_to)
         if pose in ("pinch", "pinch_middle"):
             button: MouseButton = "left" if pose == "pinch" else "right"
             double = False
@@ -604,10 +827,11 @@ class GestureEngine:
                 and abs(point.y - last.point.y) <= 1.5 * height
             ):
                 point, double = last.point, True
-            self._press = _Press(button, pose, point, ptr.confirmed_anchor, now, double)
+            self._press = _Press(button, pose, point, ptr.confirmed_anchor, now, double, ptr.confirmed_t)
             self._mode = "press"
             self._cursor = point
-            actions.append(Button(button, True, point.x, point.y))
+            self._hold_from(point, rewind_to)
+            self._press_down(ptr, actions)
         elif pose == "two":
             self._mode = "scroll"
             self._cursor = point
@@ -617,9 +841,51 @@ class GestureEngine:
         elif pose == "fist":
             self._mode = "grab"
             self._cursor = point
+            self._hold_from(point, rewind_to)
             self._helper = None
             actions.append(GrabWindow(point.x, point.y))
             self._emit("gesture", "grab")
+
+    def _press_down(self, ptr: _Track, actions: list[Action], *, settled: bool = False) -> bool:
+        """The button goes down once the hand has settled into the pinch (see ``SETTLE_RATE``).
+
+        The settling is never measured back past the last frame the pinching
+        finger was curled: a fist opening into the pinch has only just let go
+        of it. ``settled`` presses regardless (a tap).
+        """
+        press = self._press
+        assert press is not None
+        if press.down:
+            return True
+        if not settled and (
+            ptr.raw != press.pose or not ptr.settled(press.pose, press.since, ptr.curled_t[_finger(press.pose)] + 1e-6)
+        ):
+            return False
+        self._press = replace(press, down=True)
+        actions.append(Button(press.button, True, press.point.x, press.point.y))
+        return True
+
+    def _tap_verdict(self, ptr: _Track, press: _Press, pose: PoseName, now: float) -> Literal["click", "drop", "wait"]:
+        """A pinch that ended before its button went down: a quick tap, or a hand passing through a pinch.
+
+        A hand closing into a fist leaves the pinch when the index curls (or
+        straight into the fist); one opening out of a fist enters it as the
+        index uncurls. Either way the pinching finger was curled just before or
+        during the pinch, which a tap never shows. A tap whose thumb lets go
+        while the other fingers still close may yet end in a fist: its click
+        waits up to ``TAP_WAIT_S`` for one. Pinching again in the meantime is
+        the next tap, so this one clicks first.
+        """
+        if ptr.curled_t[_finger(press.pose)] >= press.since - TRANSIT_LOOKBACK_S:
+            return "drop"
+        if pose == press.pose:
+            return "click"
+        if pose in ACTION_POSES:
+            return "drop"
+        if pose == "palm" or not ptr.closing(press.pose):
+            return "click"
+        ended = now if press.ended is None else press.ended
+        return "wait" if now - ended < TAP_WAIT_S else "click"
 
     def _release_press(self, actions: list[Action]) -> None:
         press, point = self._press, self._cursor
@@ -696,7 +962,7 @@ class GestureEngine:
         self._mode = "point"
         self._helper = None
         self._helper_point = None
-        self._latched = frozenset({"fist"})
+        self._latched = frozenset({"fist"}) | _OPENING_FIST
 
     def _release_grab(self, ptr: _Track, actions: list[Action]) -> None:
         direction = None if self._mode == "resize" else self._throw_direction(ptr.confirmed_t)
@@ -709,6 +975,8 @@ class GestureEngine:
         self._mode = "point"
         self._helper = None
         self._helper_point = None
+        # The fist is opening: the thumb crosses the index on the way, which must not click what is under it.
+        self._latched = _OPENING_FIST
 
     def _throw_direction(self, end: float) -> Literal["left", "right", "up", "down"] | None:
         """From the motion over ``throw_window_s`` before the hand began to open."""
@@ -751,12 +1019,41 @@ class GestureEngine:
         elif mode in ("grab", "resize"):
             self._emit("gesture", "release")
             if latch:
-                self._latched = frozenset({"fist"})
+                self._latched = frozenset({"fist"}) | _OPENING_FIST
         self._mode = "point"
         self._press = None
         self._helper = None
         self._helper_point = None
         self._scroll_prev = None
+
+    def _aimed(self, ptr: _Track, t: float) -> Point:
+        """Where the cursor pointed before the pose began: the rewind to ``t`` (``rewind_s`` before it).
+
+        With ``anchor: index`` the rewind is on the knuckles: the fingertip
+        travels for as long as the finger bends into the pose, far longer than
+        ``rewind_s``. So the fingertip's aim is taken from the last frame the
+        index was as straight as it got (back to ``BEND_LOOKBACK_S``, within
+        ``BEND_TOLERANCE``), and only the knuckles' own motion since then counts.
+        """
+        if self._knuckle is None or not self._knuckle_hist:
+            return self._rewound(t)
+        index = [(when, reach[0]) for when, reach in ptr.reach if t - BEND_LOOKBACK_S <= when <= t]
+        began, straightest = t, -math.inf
+        for i in range(len(index) - 1, -1, -1):
+            # Over three frames, so one frame of landmark noise does not pass for the finger straightening.
+            around = index[max(0, i - 1) : i + 2]
+            when, reach = index[i][0], sum(r for _, r in around) / len(around)
+            if reach < straightest - BEND_TOLERANCE:
+                break
+            if reach > straightest:
+                began, straightest = when, reach
+        return self._rewound(began) + (_at(self._knuckle_hist, t) - _at(self._knuckle_hist, began))
+
+    def _hold_from(self, point: Point, t: float) -> None:
+        """With ``anchor: index``: what is held at ``point`` follows the knuckles from where they were at ``t``."""
+        self._held_offset = None
+        if self._knuckle is not None and self._knuckle_hist:
+            self._held_offset = point - _at(self._knuckle_hist, t)
 
     def _rewound(self, t: float) -> Point:
         """The cursor as it was at time ``t`` (the latest recorded point not after it)."""
@@ -773,7 +1070,9 @@ class GestureEngine:
             self._cursor_hist.append((now, self._cursor))
         if self._motion is not None:
             self._motion_hist.append((now, self._motion))
-        for hist in (self._cursor_hist, self._motion_hist):
+        if self._knuckle is not None:
+            self._knuckle_hist.append((now, self._knuckle))
+        for hist in (self._cursor_hist, self._motion_hist, self._knuckle_hist):
             while hist and now - hist[0][0] > HISTORY_S:
                 hist.popleft()
 

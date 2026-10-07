@@ -1,6 +1,10 @@
 """Token-protected HTTP control server on 127.0.0.1 (mod -> helper commands).
 
 ``POST /v1/<command>`` with ``Authorization: Bearer <token>`` and a JSON body.
+A command whose answer must be on the wire before it takes effect (``shutdown``
+tears this server down) is handled through ``on_sent``, which runs once the
+response has been written: the handler threads are daemon threads that nothing
+joins, so a stop requested before the write can cut the answer off.
 This helper moves the real mouse, so the guard is the voice helper's, unchanged:
 browsers are shut out twice over (any ``Origin`` header is rejected against
 CSRF, and ``Host`` must be ``127.0.0.1:<port>`` or ``localhost:<port>`` against
@@ -161,8 +165,22 @@ class _Handler(BaseHTTPRequestHandler):
             log.exception("command %s failed", name)
             self._fail(500, "internal", f"{type(exc).__name__}: {exc}")
             return
-        # Domain-level failures are still HTTP 200 with ok:false.
-        self._send_encoded(200, encoded)
+        try:
+            # Domain-level failures are still HTTP 200 with ok:false.
+            self._send_encoded(200, encoded)
+        finally:
+            # Also when the write failed: a shutdown must happen either way, or the helper would stay up.
+            self._sent(name)
+
+    def _sent(self, name: str) -> None:
+        """What the command does once its answer is written (see the module docstring)."""
+        on_sent = self.server.control.on_sent
+        if on_sent is None:
+            return
+        try:
+            on_sent(name)
+        except Exception:
+            log.exception("acting on %s after its answer failed", name)
 
     def _method_not_allowed(self) -> None:
         if self._guard():
@@ -174,11 +192,20 @@ class _Handler(BaseHTTPRequestHandler):
 class ControlServer:
     """Owns the listening socket and the serving thread."""
 
-    def __init__(self, token: str, handler: CommandHandler, *, host: str = "127.0.0.1") -> None:
+    def __init__(
+        self,
+        token: str,
+        handler: CommandHandler,
+        *,
+        host: str = "127.0.0.1",
+        on_sent: Callable[[str], None] | None = None,
+    ) -> None:
         if not token:
             raise ValueError("a non-empty token is required")
         self.token = token
         self.handler = handler
+        #: Called with the command's name once its answer has been written (``shutdown`` stops the helper).
+        self.on_sent = on_sent
         self._httpd = _Server(self, (host, 0))
         self.port: int = self._httpd.server_port
         self._thread = threading.Thread(

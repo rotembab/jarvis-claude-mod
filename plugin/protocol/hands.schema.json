@@ -166,7 +166,13 @@
     "OkResponse": {
       "type": "object", "additionalProperties": false,
       "required": ["ok"],
-      "properties": { "ok": { "const": true } }
+      "properties": {
+        "ok": { "const": true },
+        "pending": {
+          "const": true,
+          "description": "pause / resume only: the camera change is still going on (the camera takes longer to open or close than the helper waits), so the state the command asks for is not reached yet."
+        }
+      }
     },
     "ErrorResponse": {
       "type": "object", "additionalProperties": false,

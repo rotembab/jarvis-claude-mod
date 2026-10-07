@@ -63,6 +63,9 @@ class HandPose:
     #: Index, middle, ring, pinky.
     extended: tuple[bool, bool, bool, bool]
     curled: tuple[bool, bool, bool, bool]
+    #: Each finger's reach ratio (index, middle, ring, pinky): how the engine tells a hand that
+    #: holds a pinch from one passing through it on its way into or out of a fist.
+    reach: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
 
 
 #: Height over width of the camera frame when the caller does not say (1280 x 720).
@@ -162,6 +165,7 @@ class PoseTracker:
             pinch=self._pinch_display(index_ratio, curled[0]),
             extended=extended,
             curled=curled,
+            reach=reach,
         )
 
     def _closed(self, was_closed: bool, ratio: float) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
 import socket
@@ -9,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from jarvis_hands import control as control_module
 from jarvis_hands import protocol
 from jarvis_hands.control import MAX_BODY_BYTES, ControlServer
 
@@ -306,3 +308,66 @@ def test_stop_frees_the_port() -> None:
     srv.stop()
     with pytest.raises(OSError):
         socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+
+# -- what happens after the answer is written -------------------------------------------
+
+
+def test_on_sent_runs_after_the_answer_is_on_the_wire() -> None:
+    """``shutdown`` tears this server down: the answer must be written before the helper winds down."""
+    order: list[str] = []
+    recorder = Recorder()
+
+    def handler(name: str, body: dict[str, Any]) -> dict[str, Any]:
+        order.append(f"handled {name}")
+        return recorder(name, body)
+
+    written: list[float] = []
+    original = control_module._Handler._send_encoded
+
+    def record_write(self: Any, status: int, body: bytes, *, close: bool = False) -> None:
+        order.append("answered")
+        written.append(status)
+        original(self, status, body, close=close)
+
+    srv = ControlServer(TOKEN, handler, on_sent=lambda name: order.append(f"sent {name}"))
+    srv._httpd.RequestHandlerClass._send_encoded = record_write  # type: ignore[attr-defined]
+    srv.start()
+    try:
+        assert post(srv.port, "shutdown", {}) == (200, {"ok": True, "echo": "shutdown"})
+    finally:
+        srv._httpd.RequestHandlerClass._send_encoded = original  # type: ignore[attr-defined]
+        srv.stop()
+    assert order == ["handled shutdown", "answered", "sent shutdown"]
+    assert written == [200]
+
+
+def test_on_sent_runs_even_when_the_answer_could_not_be_written() -> None:
+    """Otherwise a lost answer would leave the helper running with nobody to stop it."""
+    sent: list[str] = []
+    original = control_module._Handler._send_encoded
+
+    def refuse(self: Any, status: int, body: bytes, *, close: bool = False) -> None:
+        raise OSError("the client went away")
+
+    srv = ControlServer(TOKEN, Recorder(), on_sent=sent.append)
+    srv._httpd.RequestHandlerClass._send_encoded = refuse  # type: ignore[attr-defined]
+    srv.start()
+    try:
+        with contextlib.suppress(Exception):
+            post(srv.port, "shutdown", {})
+    finally:
+        srv._httpd.RequestHandlerClass._send_encoded = original  # type: ignore[attr-defined]
+        srv.stop()
+    assert sent == ["shutdown"]
+
+
+def test_a_failing_on_sent_hook_does_not_break_the_answer() -> None:
+    def boom(name: str) -> None:
+        raise RuntimeError("nope")
+
+    srv = ControlServer(TOKEN, Recorder(), on_sent=boom).start()
+    try:
+        assert post(srv.port, "heartbeat", {}) == (200, {"ok": True, "echo": "heartbeat"})
+    finally:
+        srv.stop()

@@ -21,7 +21,7 @@ from jarvis_hands.actions import (
     Scroll,
     ThrowWindow,
 )
-from jarvis_hands.desktop.base import Display
+from jarvis_hands.desktop.base import Display, Window
 from jarvis_hands.desktop.fake import FakeDesktop, FakeWindow
 from jarvis_hands.executor import Executor
 from jarvis_hands.geometry import Rect
@@ -527,3 +527,247 @@ def test_a_blocked_window_reports_once_and_the_grab_becomes_a_no_op() -> None:
     h.do(ReleaseWindow(), GrabWindow(300, 300), DragWindow(350, 350), ThrowWindow("down"))
     assert len(h.errors) == 1
     assert admin.state == "normal"
+
+
+# -- a stalled tick --------------------------------------------------------------------
+#
+# Windows' set_window_rect is synchronous whenever the size changes, so a busy app can hold a tick for
+# seconds while the engine keeps queueing frames. What was queued is then stale: the hand has moved on.
+
+
+def test_actions_the_hand_has_moved_on_from_are_dropped_not_fired_late() -> None:
+    h = Harness()
+    h.ex.submit([MoveCursor(300, 300), Button("left", True, 300, 300), Button("left", False, 300, 300)], now=0.0)
+    h.ex.submit([Scroll(-240, 0, 300, 300), MoveCursor(400, 400)], now=0.05)
+    h.ex.tick(3.0)  # the tick was held in a desktop call for 3 s
+    assert h.desktop.calls_named("button") == []
+    assert h.desktop.calls_named("scroll") == []
+    assert h.desktop.calls_named("move_cursor") == []
+
+
+def test_two_clicks_queued_during_a_stall_never_arrive_as_a_double_click() -> None:
+    h = Harness()
+    for t in (0.5, 1.2):  # the user, seeing the cursor frozen, pinches twice
+        h.ex.submit([Button("left", True, 600, 500), Button("left", False, 600, 500)], now=t)
+    h.ex.tick(3.0)
+    assert h.desktop.calls_named("button") == []
+    assert h.ex.held == frozenset()
+
+
+def test_a_fresh_action_within_two_frame_intervals_still_goes_out() -> None:
+    h = Harness()
+    h.ex.submit([Button("left", True, 300, 300)], now=0.0)
+    h.ex.tick(2 / 30)
+    assert h.desktop.calls_named("button") == [("button", "left", True)]
+
+
+def test_letting_go_is_never_dropped_however_late_it_is() -> None:
+    h = Harness(windows=[FakeWindow(1, rect=Rect(0, 0, 800, 600))])
+    h.do(Button("left", True, 10, 10), GrabWindow(20, 20))
+    assert h.ex.held == {"left"} and h.ex.grabbing
+    h.ex.submit([Button("left", False, 30, 30)], now=0.1)
+    h.ex.submit([ReleaseWindow()], now=0.1)
+    h.ex.tick(5.0)
+    assert h.ex.held == frozenset() and not h.ex.grabbing
+    assert h.desktop.calls_named("button")[-1] == ("button", "left", False)
+
+
+def test_an_up_for_a_button_nobody_holds_any_more_is_dropped_with_its_move() -> None:
+    h = Harness()
+    h.do(MoveCursor(500, 500), at=0.0)
+    h.ex.tick(1 / 30)
+    h.ex.submit([Button("left", False, 10, 10)], now=0.1)
+    h.ex.tick(5.0)
+    assert h.desktop.cursor() == (500, 500)
+
+
+def test_only_the_newest_cursor_target_of_a_batch_is_followed() -> None:
+    h = Harness()
+    for i in range(10):  # ten frames queued while a desktop call held the tick
+        h.ex.submit([MoveCursor(100 + 10 * i, 200)], now=0.9 + i / 30)
+    h.ex.tick(0.9 + 9 / 30)
+    h.ex.tick(1.0 + 9 / 30)
+    assert h.desktop.cursor() == (190, 200)
+    assert len(h.desktop.calls_named("move_cursor")) <= 2  # not one call per queued frame
+
+
+def test_a_run_of_drags_in_one_batch_moves_the_window_to_where_the_hand_ended() -> None:
+    w = FakeWindow(1, "Notes", Rect(100, 100, 800, 600))
+    h = Harness(windows=[w])
+    h.do(GrabWindow(600, 500), at=0.0)
+    for i in range(1, 6):
+        h.ex.submit([DragWindow(600 + 20 * i, 500)], now=0.01 * i)
+    h.ex.tick(0.06)
+    assert w.rect == Rect(200, 100, 800, 600)
+    # Five queued steps collapse to the first (which restores a maximized window) and the last.
+    assert len(h.desktop.calls_named("set_window_rect")) == 2
+
+
+def test_a_run_of_resizes_in_one_batch_keeps_its_first_step_as_the_anchor() -> None:
+    w = FakeWindow(1, rect=Rect(500, 300, 800, 500))
+    h = Harness([PRIMARY], [w])
+    h.do(GrabWindow(800, 500), at=0.0)
+    for i, (ax, bx) in enumerate([(800, 1000), (780, 1060), (750, 1150)]):
+        h.ex.submit([ResizeWindow(ax, 500, bx, 500)], now=0.01 * i)
+    h.ex.tick(0.03)
+    assert w.rect.width == 1000  # as if every step had been applied: 200 px more apart
+    assert len(h.desktop.calls_named("set_window_rect")) <= 2
+
+
+def test_flush_empties_the_queue_down_to_its_releases() -> None:
+    h = Harness(windows=[FakeWindow(1, rect=Rect(0, 0, 800, 600))])
+    h.do(Button("left", True, 10, 10), at=0.0)
+    h.ex.submit([MoveCursor(900, 900), Button("left", False, 10, 10), GrabWindow(20, 20)], now=0.0)
+    h.ex.flush()
+    h.ex.tick(0.01)
+    assert h.desktop.calls_named("button") == [("button", "left", True), ("button", "left", False)]
+    assert not h.ex.grabbing and h.desktop.cursor() == (10, 10)
+
+
+def test_release_all_drops_what_was_queued() -> None:
+    """A pause or the lock screen goes through release_all: nothing queued may act afterwards."""
+    h = Harness(windows=[FakeWindow(1, rect=Rect(0, 0, 800, 600))])
+    h.ex.submit([Button("left", True, 10, 10), GrabWindow(20, 20), Scroll(-240, 0, 10, 10)], now=0.0)
+    h.ex.release_all()
+    h.ex.tick(0.01)
+    assert h.desktop.calls_named("button") == [] and h.desktop.calls_named("scroll") == []
+    assert not h.ex.grabbing
+
+
+# -- the desktop blocked (the lock screen, a UAC prompt) -------------------------------
+
+
+class CountingLockedDesktop(LockedDesktop):
+    """Counts the cursor reads, which is what fails while another desktop has the input."""
+
+    def __init__(self) -> None:
+        super().__init__(cursor=(0, 0))
+        self.polls = 0
+
+    def cursor(self) -> tuple[int, int]:
+        self.polls += 1
+        return super().cursor()
+
+
+def test_while_the_desktop_is_blocked_no_tick_reads_the_cursor_or_logs_a_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    desktop = CountingLockedDesktop()
+    ex = Executor(desktop, displays=desktop.displays)
+    ex.submit([MoveCursor(300, 300)], now=0.0)
+    for k in range(10):
+        ex.tick(k / 120)
+    assert desktop.cursor_pos == (300, 300)
+    desktop.locked = True
+    ex.set_desktop_blocked(True)
+    polls = desktop.polls
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.executor"):
+        ex.submit([MoveCursor(400, 400), Button("left", True, 400, 400)], now=1.0)
+        for k in range(120 * 60):  # a minute on the lock screen
+            ex.tick(1.0 + k / 120)
+    assert desktop.polls == polls  # not one read while another desktop has the input
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    assert ex.held == frozenset()
+    # Back on our own desktop, hand control works again.
+    desktop.locked = False
+    ex.set_desktop_blocked(False)
+    ex.submit([MoveCursor(500, 500)], now=100.0)
+    ex.tick(100.0)
+    ex.tick(100.0 + 1 / 30)
+    assert desktop.cursor_pos == (500, 500)
+
+
+def test_a_blocked_tick_still_lets_go_of_a_held_button_best_effort(caplog: pytest.LogCaptureFixture) -> None:
+    desktop = LockedDesktop(cursor=(0, 0))
+    ex = Executor(desktop, displays=desktop.displays)
+    ex.submit([Button("left", True, 10, 10)], now=0.0)
+    ex.tick(0.0)
+    assert ex.held == {"left"}
+    desktop.locked = True
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.executor"):
+        ex.set_desktop_blocked(True)
+        ex.tick(0.1)
+    assert ex.held == frozenset() and desktop.buttons_down == set()
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_a_release_that_windows_refuses_while_locked_is_not_logged_as_a_fault(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RefusingDesktop(LockedDesktop):
+        def button(self, button: str, down: bool) -> None:  # type: ignore[override]
+            if self.locked:
+                raise OSError(5, "Access is denied")
+            super().button(button, down)  # type: ignore[arg-type]
+
+    desktop = RefusingDesktop(cursor=(0, 0))
+    ex = Executor(desktop, displays=desktop.displays)
+    ex.submit([Button("left", True, 10, 10)], now=0.0)
+    ex.tick(0.0)
+    desktop.locked = True
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.executor"):
+        ex.set_desktop_blocked(True)
+        for k in range(240):
+            ex.tick(0.1 + k / 120)
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+# -- after the real mouse took over ----------------------------------------------------
+
+
+def test_the_first_move_after_a_takeover_glides_from_the_live_cursor() -> None:
+    h = Harness()
+    h.do(MoveCursor(200, 200), at=0.0)
+    h.ex.tick(1 / 30)
+    assert h.desktop.cursor() == (200, 200)
+    h.desktop.move_mouse(1500, 800)
+    h.ex.tick(0.05)
+    assert h.user_inputs == 1
+    h.desktop.move_mouse(1700, 820)  # the user keeps working, unwatched
+    # A deliberate re-engagement: the glide starts where the cursor is now, not where we last left it.
+    h.do(MoveCursor(1710, 830), at=1.0)
+    x, y = h.desktop.cursor()
+    assert x >= 1700 and y >= 820
+    h.ex.tick(1.0 + 1 / 30)
+    assert h.desktop.cursor() == (1710, 830)
+
+
+# -- a window that resizes itself mid-drag (another monitor's DPI) ----------------------
+
+
+class DpiDesktop(FakeDesktop):
+    """A window the app resizes itself once it is dragged onto the second display, as a DPI change does."""
+
+    def __init__(self, window: FakeWindow) -> None:
+        super().__init__([PRIMARY, PROJECTOR], [window], cursor=(0, 0))
+        self.scaled = False
+
+    def set_window_rect(self, window: Window, rect: Rect) -> None:
+        super().set_window_rect(window, rect)
+        if not self.scaled and rect.center.x >= PROJECTOR.rect.left:
+            self.scaled = True
+            w = self.window(window.handle)
+            w.rect = Rect(w.rect.x, w.rect.y, w.rect.width / 2, w.rect.height / 2)
+
+
+def test_a_drag_keeps_the_size_the_app_chose_for_the_new_monitor() -> None:
+    w = FakeWindow(1, "Notes", Rect(1000, 400, 800, 600))
+    h = Harness()
+    h.desktop = DpiDesktop(w)
+    h.ex = Executor(h.desktop, displays=h.desktop.displays)
+    h.do(GrabWindow(1400, 700), at=0.0)
+    for i, x in enumerate([1900, 2100, 2300], start=1):
+        h.do(DragWindow(x, 700), at=0.1 * i)
+    assert h.desktop.scaled
+    assert (w.rect.width, w.rect.height) == (400, 300)  # not back to the grab-time 800 x 600
+    assert w.rect.x == 1000 + 2300 - 1400
+
+
+def test_a_two_hand_resize_still_sets_the_size() -> None:
+    w = FakeWindow(1, rect=Rect(500, 300, 800, 500))
+    h = Harness([PRIMARY], [w])
+    h.do(GrabWindow(800, 500), at=0.0)
+    h.do(DragWindow(820, 500), at=0.1)
+    h.do(ResizeWindow(800, 500, 1000, 500), at=0.2)
+    h.do(ResizeWindow(750, 500, 1150, 500), at=0.3)
+    assert w.rect.width == 1000
