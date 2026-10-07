@@ -138,13 +138,13 @@ Jarvis can search your home network and tell you which smart devices are there a
 - Type `/jarvis home scan` in Claude Code.
 - Ask Jarvis, for example "what smart devices are on my network?"
 
-A search takes about ten seconds. It only asks the network who is there, and reads the description a device offers about itself. If you connected Home Assistant by its name, such as `homeassistant.local`, it also looks that name up. It doesn't pair with anything, sign in or change anything, and it saves nothing. While Jarvis is running, it searches at most once a minute; ask again sooner and you get what that search found, checked against your setup as it is now. The setup window's search, and any search while Jarvis isn't running, always start afresh.
+A search takes about ten seconds. It only asks the network who is there, and reads the description a device offers about itself. If you connected Home Assistant by its name, such as `homeassistant.local`, it also looks that name up. It doesn't pair with anything, sign in or change anything, and it saves nothing. While Jarvis is running, it searches at most once a minute; ask again sooner and you get what that search found, checked against your setup as it is now. The setup window keeps its own minute, so its first search always starts afresh, and so does any search while Jarvis isn't running.
 
 The answer puts what it found in groups:
 
 | Group | What it means |
 | --- | --- |
-| Jarvis controls these | Apple TVs, Sony Bravia TVs, Tuya devices and Home Assistant. Each says the name Jarvis knows it by, or that it isn't set up yet and how to add it in home setup. If Jarvis couldn't look up the name you connected Home Assistant by, it says it couldn't check. |
+| Jarvis controls these | Apple TVs, Sony Bravia TVs, Tuya devices and Home Assistant. Each says the name Jarvis knows it by, or that it isn't set up yet and how to add it in home setup. If Jarvis couldn't look up the name you connected Home Assistant by, it says it couldn't check. If it finds a Home Assistant at another address than the one you connected, it says so rather than offer to connect it, since Jarvis connects to only one. |
 | Jarvis could control these with a new driver | Brands Jarvis has no driver of its own for, such as Philips Hue or Sonos, and what adding one would take. If they are in your Home Assistant, Jarvis already controls them through it. |
 | Already in a HomeKit home | HomeKit devices something has already paired with, usually Apple's Home app, where Siri controls them. Jarvis can't pair with them too; if Home Assistant paired them, Jarvis controls them through it. See [Siri and Apple Home](#siri-and-apple-home). |
 | HomeKit devices not in any home yet | HomeKit devices nothing has paired with yet. Jarvis can't pair with HomeKit devices itself. |

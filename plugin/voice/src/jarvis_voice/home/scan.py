@@ -123,7 +123,8 @@ FIREWALL_HINT = (
     "on Private networks, and check that this network is set to Private."
 )
 
-# "unconfirmed": Jarvis has one saved by a name that could not be looked up, so it may or may not be this one.
+# "unconfirmed": a Home Assistant Jarvis couldn't match to the one it is connected to (saved by a name that
+# could not be looked up, or at another address), so it may or may not be that one.
 Status = Literal["set_up", "unconfirmed", "not_set_up", "could_add", "apple_home", "homekit_free", "matter", "ignored"]
 
 # HomeKit's accessory categories (the ``ci`` TXT key), as plain words.
@@ -771,6 +772,11 @@ def _home_assistant(
         return ScanEntry("hub", name, "Home Assistant", "set_up")
     if saved_host and not addresses and not net.is_ip_address(saved_host):
         detail = "Jarvis has a Home Assistant saved by name and couldn't check that it is this one"
+        return ScanEntry("hub", name, "Home Assistant", "unconfirmed", detail=detail)
+    if saved_host:
+        # Jarvis keeps one Home Assistant, so connecting this one would replace it; and a name such as a
+        # Tailscale one reaches the same hub at an address it doesn't announce.
+        detail = "Jarvis is connected to a Home Assistant at another address; if it's this one, there's nothing to do"
         return ScanEntry("hub", name, "Home Assistant", "unconfirmed", detail=detail)
     return _not_set_up("hub", name, "Home Assistant", "connect it in home setup")
 

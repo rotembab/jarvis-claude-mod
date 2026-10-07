@@ -259,9 +259,22 @@ def test_home_assistant_saved_by_its_default_name(monkeypatch: pytest.MonkeyPatc
     config = HomeConfig(hubs={"homeassistant": {"url": homeassistant.DEFAULT_URL}})
     by_name = {"homeassistant.local": frozenset({"192.168.1.70"})}
     assert classify([ha], config, by_name) == [ScanEntry("hub", "Home", "Home Assistant", "set_up")]
-    # The name is another machine's: this is a second Home Assistant.
+    # The name has another address (a Tailscale name, or a second Home Assistant). Jarvis keeps one Home
+    # Assistant, so it never says to connect this one: that would replace the one that works.
     elsewhere = {"homeassistant.local": frozenset({"192.168.1.71"})}
-    assert classify([ha], config, elsewhere)[0].status == "not_set_up"
+    another = "Jarvis is connected to a Home Assistant at another address; if it's this one, there's nothing to do."
+    hue = mdns("_hue._tcp", "Hue Bridge", "192.168.1.90", bridgeid=HUE_BRIDGE_ID)
+    by_ip = HomeConfig(hubs={"homeassistant": {"url": "http://192.168.1.71:8123"}})
+    for heard, saved in (
+        (scan._Heard([ha, hue], [], 7.0, elsewhere), config),
+        (scan._Heard([ha, hue], [], 7.0), by_ip),
+    ):
+        assert classify(heard.sightings, saved, heard.looked_up)[0].status == "unconfirmed"
+        text = scan._report(heard, saved).text()
+        assert f'- Home Assistant hub "Home": {another}' in text
+        assert "Devices that are in your Home Assistant already work through it" in text
+        assert "not set up" not in text and "connect it" not in text
+        no_ids(text)
     # The name could not be looked up: Jarvis can't tell, so it never says the hub isn't set up.
     text = report_of([ha], config).text()
     assert '- Home Assistant hub "Home": Jarvis has a Home Assistant saved by name and couldn\'t check' in text
