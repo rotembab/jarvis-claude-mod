@@ -29,7 +29,7 @@ class TrackerError(RuntimeError):
 
 class Tracker(Protocol):
     def process(self, image: np.ndarray, t: float) -> Frame:
-        """The hands in one (H, W, 3) uint8 BGR frame captured at ``t`` (``time.monotonic()``).
+        """The hands in one (H, W, 3) uint8 BGR frame captured at ``t`` (``clock.now()``).
 
         Never raises for a bad frame: it returns an empty Frame and recovers.
         Raises TrackerError only when the model cannot run at all.

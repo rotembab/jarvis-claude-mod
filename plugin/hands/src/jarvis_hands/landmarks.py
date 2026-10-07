@@ -47,7 +47,7 @@ class HandObservation:
 
 @dataclass(frozen=True, eq=False)
 class Frame:
-    #: Capture time, monotonic seconds.
+    #: Capture time, ``clock.now()`` seconds.
     t: float
     hands: tuple[HandObservation, ...]
     #: Camera frame size in pixels.

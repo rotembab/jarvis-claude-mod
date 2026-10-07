@@ -424,6 +424,18 @@ def read_hello(proc: subprocess.Popen[str]) -> dict[str, Any]:
     return hello
 
 
+def read_event(proc: subprocess.Popen[str]) -> dict[str, Any]:
+    """The next event line. Tests read the runtime's first event before shutting down: a shutdown that
+    arrives while cmd_run is still on its way to ``runtime.start()`` rightly means start never runs."""
+    assert proc.stdout is not None
+    line = proc.stdout.readline()
+    if not line:
+        _, err = proc.communicate(timeout=TIMEOUT)
+        raise AssertionError(f"no event; stderr:\n{err}")
+    event: dict[str, Any] = json.loads(line)
+    return event
+
+
 def command(port: int, name: str, body: Any = None, *, token: str | None) -> tuple[int, dict[str, Any]]:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
@@ -450,12 +462,13 @@ def test_run_wiring_with_a_stand_in_runtime(tmp_path: Path) -> None:
         status, payload = command(port, "config", {"engage": "always"}, token=token)
         assert status == 200 and payload["error"]["message"] == "stub says no"
         assert command(port, "config", {"engage": "never"}, token=token)[0] == 400  # validated before the runtime
+        assert read_event(proc) == {"v": 1, "type": "state", "state": "idle"}
         assert command(port, "shutdown", token=token) == (200, {"ok": True})
         out, err = proc.communicate(timeout=TIMEOUT)
     finally:
         proc.kill()
     assert proc.returncode == 0, err
-    assert json_lines(out) == [{"v": 1, "type": "state", "state": "idle"}]
+    assert json_lines(out) == []
     options = json.loads(err.split("STUB stopped ", 1)[1].splitlines()[0])
     assert options == {
         "data_dir": str(tmp_path),
@@ -478,13 +491,14 @@ def test_run_forwards_commands_while_the_runtime_is_still_starting(tmp_path: Pat
         port = read_hello(proc)["port"]
         status, payload = command(port, "config", {"engage": "always"}, token=token)
         assert status == 200 and payload["error"]["message"] == "stub says no"  # the runtime's own answer
+        assert read_event(proc) == {"v": 1, "type": "state", "state": "idle"}
         assert command(port, "shutdown", token=token) == (200, {"ok": True})
         out, err = proc.communicate(timeout=TIMEOUT)
     finally:
         proc.kill()
     assert proc.returncode == 0, err
     assert "STUB command config started=False" in err
-    assert json_lines(out) == [{"v": 1, "type": "state", "state": "idle"}]
+    assert json_lines(out) == []
     assert "STUB stop after start=True" in err
 
 

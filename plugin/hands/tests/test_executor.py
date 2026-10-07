@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from jarvis_hands import clock
 from jarvis_hands import executor as executor_module
 from jarvis_hands.actions import (
     Button,
@@ -287,7 +288,7 @@ def test_the_loop_keeps_its_rate_when_timed_waits_are_coarse(monkeypatch: pytest
     real_tick = h.ex.tick
 
     def counting_tick(now: float | None = None) -> None:
-        ticks.append(time.monotonic())
+        ticks.append(time.perf_counter())
         real_tick(now)
 
     monkeypatch.setattr(h.ex, "tick", counting_tick)
@@ -296,11 +297,20 @@ def test_the_loop_keeps_its_rate_when_timed_waits_are_coarse(monkeypatch: pytest
         time.sleep(0.5)
     finally:
         h.ex.stop()
-    # 120 Hz asked: 8.3 ms apart. With the coarse wait the deadline catch-up keeps the count up, but in pairs
-    # (15.6 ms, then 0 ms), so the cursor only gets 64 distinct steps a second.
+    # 120 Hz asked: 8.3 ms apart. A coarse wait or a coarse clock keeps the count up through the deadline
+    # catch-up, but in pairs (15.6 ms, then 0 ms), so the cursor only gets 64 distinct steps a second. A busy
+    # machine stretches some gaps (and the catch-up then sends a few back to back), which is not pairing.
     gaps = sorted(b - a for a, b in itertools.pairwise(ticks))
     assert len(gaps) > 40
-    assert gaps[len(gaps) // 4] > 0.004 and gaps[3 * len(gaps) // 4] < 0.012
+    assert 0.004 < gaps[len(gaps) // 2] < 0.014
+    assert sum(gap < 0.001 for gap in gaps) < len(gaps) // 4
+
+
+def test_the_clock_is_fine_grained() -> None:
+    """Python 3.12's time.monotonic moves in 15.6 ms steps on Windows; everything times itself with clock.now."""
+    assert clock.now is time.perf_counter
+    assert time.get_clock_info("perf_counter").resolution < 1e-4
+    assert Executor(FakeDesktop(), displays=list)._clock is clock.now
 
 
 def test_os_clamping_between_monitors_is_not_the_user() -> None:

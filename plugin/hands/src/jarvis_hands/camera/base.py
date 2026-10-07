@@ -43,7 +43,7 @@ class CameraInfo:
 class CameraFrame:
     #: 1, 2, 3 ... per open; a gap means frames were dropped.
     seq: int
-    #: ``time.monotonic()`` when the frame came off the device.
+    #: ``clock.now()`` (time.perf_counter) when the frame came off the device.
     t: float
     #: (height, width, 3) uint8 BGR, C-contiguous. The caller owns it.
     image: np.ndarray

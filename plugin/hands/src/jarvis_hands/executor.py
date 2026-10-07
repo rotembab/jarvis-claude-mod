@@ -69,6 +69,7 @@ from .actions import (
     Scroll,
     ThrowWindow,
 )
+from .clock import now as clock_now
 from .desktop.base import Desktop, Display, InputBlocked, Window
 from .geometry import Point, Rect, bounding_rect
 from .mapping import display_in_direction
@@ -117,7 +118,7 @@ class Executor:
         tick_hz: float = 120.0,
         user_input_px: int = 6,
         min_size: tuple[int, int] = (240, 160),
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = clock_now,
         suspend_s: float = SUSPEND_S,
     ) -> None:
         self._desktop = desktop
@@ -233,17 +234,19 @@ class Executor:
 
     def _run(self) -> None:
         period = 1.0 / self.tick_hz
-        deadline = time.monotonic()
+        deadline = clock_now()
         while not self._stop_event.is_set():
             self.tick()
             deadline += period
-            delay = deadline - time.monotonic()
-            if delay < -period:
-                deadline = time.monotonic()
-            elif delay > 0:
+            delay = deadline - clock_now()
+            if delay > 0:
                 # Not Event.wait: on Windows its timeout rounds up to the 15.6 ms timer tick (about 64 Hz),
                 # while time.sleep uses a high-resolution timer since Python 3.11.
                 time.sleep(delay)
+            else:
+                # Late (a slow tick, or a sleep that overshot, as macOS's often do): the next period starts
+                # now. Catching up with a tick straight away would only repeat the same cursor position.
+                deadline = clock_now()
 
     def _failed(self, exc: Exception, now: float) -> None:
         self._failures += 1
