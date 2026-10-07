@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -1499,6 +1500,41 @@ def test_the_link_asks_once_and_the_menu_changes_the_choice(home: Home) -> None:
     assert saved_link(home)[tuya.FALLBACK] is True
 
 
+def test_a_refresh_keeps_tokens_the_helper_renewed_meanwhile(home: Home) -> None:
+    link(home)
+    run(home, "AC off", "activate")  # the helper's cloud session holds the first tokens
+
+    class RenewsBeforeSaving(ScriptedPrompter):
+        def confirm(self, question: str, default: bool = True) -> bool:
+            if question.startswith("Save "):  # the helper renews while the setup window waits for the user
+                home.cloud.renew_on_trigger = dict(RENEWED)
+                run(home, "AC off", "activate")
+                home.cloud.renew_on_trigger = None
+            return super().confirm(question, default)
+
+    tuya.wizard(RenewsBeforeSaving(["Refresh", True, False]), home.ctx)
+    assert saved_link(home)["token_info"]["refresh_token"] == "REFRESH-TOKEN-2"
+    managers = len(home.cloud.managers)
+    run(home, "AC off", "activate")
+    assert len(home.cloud.managers) == managers
+
+
+def test_the_helper_keeps_its_session_when_older_tokens_are_saved_over_it(home: Home) -> None:
+    link(home)
+    run(home, "AC off", "activate")
+    first = saved_link(home)
+    # The setup window renews: the helper takes up the newer tokens.
+    home.store.set_secret(CLOUD_SECRET, {**first, "token_info": dict(RENEWED)})
+    run(home, "AC off", "activate")
+    assert home.cloud.managers[-1]["token"]["refresh_token"] == "REFRESH-TOKEN-2"
+    # Older tokens saved over them (a renewal that could not be saved): the session and its tokens are kept.
+    managers = len(home.cloud.managers)
+    home.store.set_secret(CLOUD_SECRET, first)
+    assert run(home, "AC off", "activate").ok
+    assert len(home.cloud.managers) == managers
+    assert saved_link(home)["token_info"]["refresh_token"] == "REFRESH-TOKEN-2"
+
+
 def test_a_device_not_found_goes_through_the_cloud_and_is_looked_for_meanwhile(home: Home) -> None:
     link_with_cloud(home)
     managers = len(home.cloud.managers)
@@ -1547,6 +1583,18 @@ def test_a_press_is_never_sent_twice(home: Home) -> None:
     assert run(home, "Bedroom Fingerbot", "press").ok
     assert home.cloud.commands[-1] == ("finger-id", [{"code": "switch", "value": True}])
     assert [method for method, _ in home.cloud.requests] == ["POST", "POST"]
+
+
+def test_through_the_cloud_follows_a_name_with_a_full_stop_in_it(home: Home) -> None:
+    add_fingerbots(home)
+    tuya.wizard(ScriptedPrompter(["UC-TEST-0001", True, "Kitchen light", "", "Mr. Lamp", True, False]), home.ctx)
+    porch = home.device("Porch light")
+    home.store.update(lambda c: setattr(c.device(porch.id), "name", "St. Mary lamp"))
+    assert run(home, "St. Mary lamp", "turn_on") == Outcome.done("The St. Mary lamp is on, through Tuya's cloud.")
+    home.net.devices["hub-id"].write_errors = ["902"]
+    assert run(home, "Bedroom Fingerbot", "press").text.startswith(
+        "The Bedroom Fingerbot pressed the Mr. Lamp switch, through Tuya's cloud. Jarvis cannot see"
+    )
 
 
 def test_a_refused_value_or_command_does_not_go_to_the_cloud(home: Home) -> None:
@@ -1620,6 +1668,29 @@ def test_a_device_without_a_key_goes_through_the_cloud(home: Home, monkeypatch: 
     finally:
         home.cloud.hang.set()
     assert outcome == Outcome.fail("timeout", "Tuya's cloud did not answer in time; the Heater plug may still change.")
+
+
+def test_a_command_that_waited_too_long_for_another_cloud_call_is_never_sent(
+    home: Home, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    link_with_cloud(home)
+    home.store.set_secret(home.device("Heater plug").secret_key, None)  # only the cloud reaches it
+    monkeypatch.setattr(tuya, "CLOUD_MIN_S", 0.1)
+    monkeypatch.setattr(tuya, "CLOUD_SLICE_S", 0.5)
+    home.ctx.call_timeout = tuya.CALL_MARGIN_S + 1.0
+    # Another cloud call (a slow token renewal, say) holds the session longer than these may wait for it.
+    commands = [("Heater plug", "turn_on"), ("Porch light", "turn_on"), ("AC off", "activate")]
+    with tuya._CLOUD.lock, ThreadPoolExecutor(len(commands)) as pool:
+        plug, porch, scene = pool.map(lambda command: run(home, *command), commands)
+    for thread in threading.enumerate():
+        if thread.name == "tuya-cloud":
+            thread.join(5)
+    assert home.cloud.commands == [] and home.cloud.triggered == []
+    # Nothing left, so nothing is said to be on its way; a local failure keeps its own words.
+    assert plug == Outcome.fail("timeout", "Tuya's cloud did not answer in time about the Heater plug.")
+    assert porch.code == "unreachable" and porch.text.startswith("The Porch light has not been found")
+    assert porch.text.endswith(" Tuya's cloud could not reach it either.")
+    assert scene == Outcome.fail("timeout", "Tuya did not answer in time, so Jarvis did not run AC off.")
 
 
 def test_colours_and_states_through_the_cloud(home: Home) -> None:

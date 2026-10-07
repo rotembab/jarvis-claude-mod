@@ -423,7 +423,12 @@ class _TokenKeeper:
 
 
 class _Late(Exception):
-    """A cloud call that did not finish within its time."""
+    """A cloud call that did not finish within its time. ``started``: it was sent, so it may still take effect
+    (not when it only waited for another call to finish)."""
+
+    def __init__(self, started: bool = False) -> None:
+        super().__init__()
+        self.started = started
 
 
 def _within(seconds: float, call: Callable[[], Any]) -> Any:
@@ -455,6 +460,13 @@ def _usable_link(link: Any) -> dict[str, Any] | None:
     if not all(isinstance(link.get(name), str) and link.get(name) for name in fields) or not isinstance(token, dict):
         return None
     return link if token.get("access_token") and token.get("refresh_token") else None
+
+
+def _issued(link: Mapping[str, Any]) -> float:
+    """When Tuya issued a link's tokens (its own clock, in ms), to tell the newer of two; 0 when not known."""
+    token = link.get("token_info")
+    t = token.get("t") if isinstance(token, Mapping) else None
+    return t if isinstance(t, (int, float)) and not isinstance(t, bool) else 0
 
 
 def _manager(sharing: Any, link: dict[str, Any], keeper: _TokenKeeper) -> Any:
@@ -540,15 +552,21 @@ class _CloudSession:
         if self.paused():
             raise _Paused()
         deadline = time.monotonic() + seconds
+        # Whether the action started and whether the caller gave up are settled under one lock, so a late call
+        # either never starts or is known to have started.
+        guard = threading.Lock()
+        state = {"started": False, "gave_up": False}
 
         def locked() -> Any:
             if not self.lock.acquire(timeout=max(0.0, seconds)):
                 raise _Late()
             try:
-                if time.monotonic() >= deadline:
-                    raise _Late()  # the caller has given up: do not send it now
-                if self.paused():
-                    raise _Paused()
+                with guard:
+                    if state["gave_up"] or time.monotonic() >= deadline:
+                        raise _Late()  # the caller has given up: do not send it now
+                    if self.paused():
+                        raise _Paused()
+                    state["started"] = True
                 try:
                     return action(self._manager_for(store, link))
                 except Exception as exc:
@@ -559,20 +577,35 @@ class _CloudSession:
             finally:
                 self.lock.release()
 
-        return _within(seconds, locked)
+        try:
+            return _within(seconds, locked)
+        except _Late:
+            with guard:
+                state["gave_up"] = True
+                raise _Late(state["started"]) from None
 
     def _manager_for(self, store: HomeStore, link: dict[str, Any]) -> Any:
         def identity(item: Mapping[str, Any]) -> tuple[Any, ...]:
-            token = item.get("token_info") if isinstance(item.get("token_info"), Mapping) else {}
-            fields = (item.get("user_code"), item.get("terminal_id"), item.get("endpoint"))
-            return (*fields, token.get("refresh_token"))
+            return (item.get("user_code"), item.get("terminal_id"), item.get("endpoint"))
+
+        def refresh_token(item: Mapping[str, Any]) -> Any:
+            token = item.get("token_info")
+            return token.get("refresh_token") if isinstance(token, Mapping) else None
 
         # The keeper's copy follows the session's own renewals, so only a new link (or a renewal by the setup
         # window) builds a new Manager.
-        if self._keeper is None or self._keeper.store is not store or identity(link) != identity(self._keeper.link):
-            keeper = _TokenKeeper(store, dict(link))
-            self._manager = _manager(_sharing(), keeper.link, keeper)
-            self._keeper = keeper
+        keeper = self._keeper
+        if keeper is not None and keeper.store is store and identity(link) == identity(keeper.link):
+            if refresh_token(link) == refresh_token(keeper.link):
+                return self._manager
+            if _issued(link) < _issued(keeper.link):
+                # Older tokens than the session's own: its renewal could not be saved, or was saved over. The old
+                # refresh token may no longer work, so the session stays and its tokens are saved again.
+                keeper.update_token(keeper.link["token_info"])
+                return self._manager
+        keeper = _TokenKeeper(store, dict(link))
+        self._manager = _manager(_sharing(), keeper.link, keeper)
+        self._keeper = keeper
         return self._manager
 
 
@@ -668,10 +701,10 @@ class _CloudLink:
         seconds = self.budget.left() - reserve * CLOUD_MIN_S
         if seconds < CLOUD_MIN_S:
             raise _CloudFailure("budget")
-        self.sent = self.sent or sending
         try:
-            return _CLOUD.call(self.store, self.link, seconds, action)
-        except _Late:
+            result = _CLOUD.call(self.store, self.link, seconds, action)
+        except _Late as late:
+            self.sent = self.sent or (sending and late.started)  # not a write that waited for another call in vain
             log.warning("Tuya's cloud did not answer in time for device %s", self.tuya_id)
             raise _CloudFailure("late") from None
         except _Paused:
@@ -685,6 +718,8 @@ class _CloudLink:
             code = getattr(exc, "error_code", None)
             log.warning("Tuya's cloud failed for device %s (%s)", self.tuya_id, code or type(exc).__name__)
             raise _CloudFailure(kind) from None
+        self.sent = self.sent or sending
+        return result
 
 
 # --------------------------------------------------------------------------- the driver
@@ -930,8 +965,14 @@ class TuyaDriver(Driver):
             return self._cloud_outcome(device, failure, local, link.sent)
         if not outcome.ok or local is None:
             return outcome
-        first, stop, rest = outcome.text.partition(". ")
-        return Outcome.done(f"{first.rstrip('.')}, through Tuya's cloud.{' ' + rest if stop else ''}")
+        # After the first sentence, which holds the user's own words: past them, as a name may have a full stop
+        # in it ("St. Mary lamp").
+        text = outcome.text
+        start = max((text.find(w) + len(w) for w in (device.name, *device.aliases) if w and w in text), default=0)
+        cut = text.find(". ", start)
+        if cut < 0:
+            return Outcome.done(f"{text.rstrip('.')}, through Tuya's cloud.")
+        return Outcome.done(f"{text[:cut]}, through Tuya's cloud.{text[cut + 1 :]}")
 
     def _cloud_outcome(self, device: DeviceRecord, failure: _Failure, local: Outcome | None, sent: bool) -> Outcome:
         the, err = f"the {device.name}", failure.err
@@ -1258,8 +1299,10 @@ class TuyaDriver(Driver):
                 self._budget_s(),
                 lambda manager: manager.trigger_scene(str(home_id), str(scene_id)),
             )
-        except _Late:
+        except _Late as late:
             log.warning("Tuya did not answer a scene request in time")
+            if not late.started:  # it waited for another cloud call and was never sent
+                return Outcome.fail("timeout", f"Tuya did not answer in time, so Jarvis did not run {device.name}.")
             return Outcome.fail("timeout", f"Tuya did not answer in time; {device.name} may still run.")
         except _Paused:
             return Outcome.fail("busy", CLOUD_BUSY)
@@ -1741,6 +1784,12 @@ def _import(ui: Prompter, ctx: DriverContext, sharing: Any, link: dict[str, Any]
     if not ui.confirm(f"Save {_count(device_count, 'device')} and {_count(scene_count, 'scene')}?", default=True):
         ui.say("Nothing was saved.")
         return
+    if keeper.store is not None:
+        # Read again just before saving: the helper may have renewed the sign-in meanwhile, and the refresh token
+        # read at the start may no longer work.
+        saved = _saved_link(ctx)
+        if saved is not None and saved.get("terminal_id") == link.get("terminal_id") and _issued(saved) > _issued(link):
+            link["token_info"] = saved["token_info"]
     _save_all(ctx, records, removed, link)
     ui.say(
         "Saved. Names and rooms come from the Tuya Smart or Smart Life app; to change them, choose Rename a device "
