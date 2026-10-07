@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--language", default=_env("JARVIS_LANGUAGE") or "en")
     run.add_argument("--input-device", default=_env("JARVIS_INPUT_DEVICE"))
     run.add_argument("--output-device", default=_env("JARVIS_OUTPUT_DEVICE"))
+    run.add_argument(
+        "--aec",
+        choices=["on", "off"],
+        default=(_env("JARVIS_AEC") or "on").lower(),
+        help="echo cancelling: keep Jarvis's own voice out of what the microphone hears",
+    )
     run.add_argument("--instance-name", default=_env("JARVIS_INSTANCE_NAME") or DEFAULT_INSTANCE_NAME)
     run.add_argument("--heartbeat-timeout", type=float, default=15.0, help=argparse.SUPPRESS)
     run.add_argument("--heartbeat-grace", type=float, default=60.0, help=argparse.SUPPRESS)
@@ -140,6 +146,7 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
         "wake",
         "wake.plain",  # config takes plainWake
         "follow_up",
+        *(["aec"] if args.aec != "off" and not args.fake_audio else []),  # fake audio has nothing to cancel
         "stt.faster-whisper",
         "tts.local" if args.tts_engine == "local" else "tts.fish-live",
     ]
@@ -221,6 +228,12 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         def plain_loader(scorer: Any) -> None:
             attach_plain_wake(wake_folder, scorer)
 
+    echo_loader: Any = None
+    if not args.fake_audio and args.aec != "off":
+        from .audio.echo import loader  # numpy only; livekit itself loads in the background, when called
+
+        echo_loader = loader(playback, capture)
+
     config = DaemonConfig(
         stt_model=args.stt_model,
         language=args.language,
@@ -242,6 +255,7 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         vad=vad,
         wake_loader=wake_loader,
         plain_loader=plain_loader,
+        echo_loader=echo_loader,
     )
 
 

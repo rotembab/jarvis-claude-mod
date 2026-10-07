@@ -16,6 +16,7 @@ export type HelperPlatform = 'windows' | 'macos' | 'linux'
 export type UtteranceSource = 'ptt' | 'command' | 'wake'
 /** What interrupts Jarvis by voice: any speech, only the wake word, or nothing. */
 export type BargeInMode = 'speech' | 'wake' | 'off'
+export type EchoCancelState = 'on' | 'off' | 'loading' | 'unavailable'
 
 export type ErrorCode =
   | 'already_running'
@@ -31,6 +32,7 @@ export type ErrorCode =
   | 'stt_failed'
   | 'ptt_unavailable'
   | 'wake_unavailable'
+  | 'aec_unavailable'
   | 'bad_request'
   | 'unauthorized'
   | 'internal'
@@ -154,6 +156,8 @@ export type StatusResponse = {
   /** The wake phrase, while it is loaded and switched on. */
   wakeWord?: string
   bargeIn?: BargeInMode
+  /** Echo cancelling of what the listener hears: loading at start; unavailable if it failed to load or broke. */
+  echoCancel?: EchoCancelState
 }
 
 /** schema.json's maxLength on SpeakCommand.text. */

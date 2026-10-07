@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 import numpy as np
 
 from jarvis_voice.tts.base import AudioCallback, SynthError
 
 
-def tone_bytes(text: str, ms_per_char: float, sample_rate: int = 24_000) -> bytes:
+def tone_bytes(
+    text: str, ms_per_char: float, sample_rate: int = 24_000, voice: Callable[[int], np.ndarray] | None = None
+) -> bytes:
+    """PCM for ``text``: a 300 Hz tone, or ``voice(samples)`` (float, -1..1)."""
     n = int(len(text) * ms_per_char / 1000 * sample_rate)
+    if voice is not None:
+        return (np.clip(voice(n), -1.0, 1.0) * 32767).astype("<i2").tobytes()
     t = np.arange(n) / sample_rate
     return (np.sin(2 * np.pi * 300 * t) * 0.3 * 32767).astype("<i2").tobytes()
 
@@ -50,7 +56,7 @@ class FakeStream:
             return
         if not self.cancelled:
             # Deliver in two odd-sized pieces, as a network would.
-            data = tone_bytes(text, self._synth.ms_per_char)
+            data = tone_bytes(text, self._synth.ms_per_char, voice=self._synth.voice)
             cut = len(data) // 3 + 1
             self._on_audio(data[:cut])
             self._on_audio(data[cut:])
@@ -68,9 +74,15 @@ class FakeSynth:
     sample_rate = 24_000
 
     def __init__(
-        self, *, ms_per_char: float = 5.0, fail_open: SynthError | None = None, fail_after: int | None = None
+        self,
+        *,
+        ms_per_char: float = 5.0,
+        fail_open: SynthError | None = None,
+        fail_after: int | None = None,
+        voice: Callable[[int], np.ndarray] | None = None,
     ) -> None:
         self.ms_per_char = ms_per_char
+        self.voice = voice
         self.fail_open = fail_open
         self.fail_after = fail_after
         self.streams: list[FakeStream] = []

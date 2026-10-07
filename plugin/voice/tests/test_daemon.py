@@ -58,6 +58,7 @@ def build(
     vad: Any = None,
     wake_loader: Callable[[], Any] | None = None,
     plain_loader: Callable[[Any], None] | None = None,
+    echo_loader: Callable[[], Any] | None = None,
 ) -> Rig:
     rig = Rig(
         daemon=None,  # type: ignore[arg-type]
@@ -85,6 +86,7 @@ def build(
         vad=vad,
         wake_loader=wake_loader,
         plain_loader=plain_loader,
+        echo_loader=echo_loader,
     )
     return rig
 

@@ -30,6 +30,11 @@ is reported once, after 30 s. Some headsets (a noise gate in the headset or
 its software) send exact zeros whenever the user is quiet, so once any sound
 has arrived, zeros mean quiet, not muted, and are never reported.
 
+With an echo canceller (``set_echo``), everything after that check hears the
+microphone without Jarvis's own voice: the voice detector, the wake word, the
+pre-roll and the utterance itself. The check itself reads the raw audio,
+since the canceller turns exact zeros into faint noise while Jarvis speaks.
+
 Utterances start with some audio from before their start (pre-roll), so the
 first syllable is kept; a plain "Jarvis" utterance keeps everything from
 where the speech began, so the transcript holds the whole word (and so does
@@ -45,6 +50,7 @@ import logging
 import math
 import queue
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -52,6 +58,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ..audio.echo import EchoCanceller
 from .vad import VoiceDetector
 from .wakeword import WakeScorer
 
@@ -106,6 +113,7 @@ class Listener:
         wake_enabled: bool = True,
         barge_mode: BargeMode = "speech",
         plain_wake: bool = False,
+        echo: EchoCanceller | None = None,
     ) -> None:
         self.config = config
         self._vad = vad
@@ -118,6 +126,7 @@ class Listener:
         self._wake_enabled = wake_enabled
         self._barge_mode: BargeMode = barge_mode
         self._plain_enabled = plain_wake
+        self._echo = echo
 
         self._lock = threading.Lock()
         self._mode: Mode = "idle"
@@ -147,7 +156,7 @@ class Listener:
         self._rec_voiced = 0.0
         self._min_speech = 0.0
 
-        self._queue: queue.Queue[tuple[np.ndarray, int] | None] = queue.Queue(maxsize=1000)
+        self._queue: queue.Queue[tuple[np.ndarray, int, float] | None] = queue.Queue(maxsize=1000)
         self._thread: threading.Thread | None = None
         self._resampler: Any = None
         self._resampler_rate = RATE
@@ -213,6 +222,9 @@ class Listener:
     def set_plain_wake(self, enabled: bool) -> None:
         with self._lock:
             self._plain_enabled = enabled
+    def set_echo(self, echo: EchoCanceller | None) -> None:
+        """Clean the microphone with ``echo`` from the next block on (None: raw again)."""
+        self._echo = echo
 
     def set_barge_mode(self, mode: BargeMode) -> None:
         with self._lock:
@@ -277,9 +289,11 @@ class Listener:
             self._thread.join(2.0)
 
     def feed(self, block: np.ndarray, rate: int) -> None:
-        """Audio thread: queue the block and return."""
+        """Audio thread: queue the block, stamped with its arrival, and return."""
         try:
-            self._queue.put_nowait((block, rate))
+            # perf_counter: on Windows, monotonic() only advances every 15.6 ms. The
+            # echo canceller orders these stamps against the speaker's.
+            self._queue.put_nowait((block, rate, time.perf_counter()))
         except queue.Full:
             self._dropped += 1  # the listener fell behind; losing audio beats blocking the sound card
 
@@ -288,9 +302,8 @@ class Listener:
             item = self._queue.get()
             if item is None:
                 return
-            block, rate = item
             try:
-                self.process(self._to_16k(block, rate))
+                self.handle(*item)
             except Exception:
                 log.exception("listener failed on a block")
             if self._dropped:
@@ -310,12 +323,21 @@ class Listener:
 
     # ------------------------------------------------------------------ audio
 
-    def process(self, audio: np.ndarray) -> None:
+    def handle(self, block: np.ndarray, rate: int, stamp: float) -> None:
+        """One block from the sound card (listener thread): resample, watch for a muted mic, cancel echo, process."""
+        raw = self._to_16k(block, rate)
+        self._watch_digital_silence(raw, raw.size / RATE)
+        echo = self._echo
+        # The canceller runs while paused too, so it stays converged and in step with the speaker.
+        self.process(echo.near(raw, stamp) if echo is not None else raw, watch_silence=False)
+
+    def process(self, audio: np.ndarray, *, watch_silence: bool = True) -> None:
         """Handle 16 kHz mono float audio (called on the listener thread, or directly by tests)."""
         if audio.size == 0:
             return
         seconds = audio.size / RATE
-        self._watch_digital_silence(audio, seconds)
+        if watch_silence:
+            self._watch_digital_silence(audio, seconds)
         with self._lock:
             self._t += seconds
             mode = self._mode

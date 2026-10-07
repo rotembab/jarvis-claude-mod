@@ -20,7 +20,7 @@ from ..protocol import ErrorCode
 from .capture import STT_SAMPLERATE, BlockListener, CaptureBuffer, to_stt_rate
 from .devices import DeviceInfo, select_device
 from .errors import AudioError, classify_audio_error
-from .playback import TTS_SAMPLERATE, PlaybackMixer
+from .playback import TTS_SAMPLERATE, FarListener, PlaybackMixer
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +180,13 @@ class SoundDeviceCapture:
     def level(self) -> float:
         return self._buffer.level
 
+    @property
+    def input_latency(self) -> float:
+        try:
+            return float(self._stream.latency) if self._stream is not None else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         # Real-time thread: copy channel 0 and hand it over; nothing else.
         block = indata[:, 0].copy()
@@ -297,6 +304,7 @@ class SoundDevicePlayback:
         self._open_error: AudioError | None = None
         self._open_failures = 0
         self._retry_at = 0.0
+        self._far_listener: FarListener | None = None
 
     # -- properties
 
@@ -326,6 +334,10 @@ class SoundDevicePlayback:
         return self._mixer.paused
 
     @property
+    def device_rate(self) -> int:
+        return self._device_rate
+
+    @property
     def output_latency(self) -> float:
         try:
             return float(self._stream.latency) if self._stream is not None else 0.0
@@ -339,12 +351,23 @@ class SoundDevicePlayback:
     # -- device
 
     def _callback(self, outdata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
-        outdata[:] = self._mixer.render(frames)[:, None]
+        out = self._mixer.render(frames)  # a new array every call
+        outdata[:] = out[:, None]
         if self._mixer.level > 0.0:
             self._last_active = time.monotonic()
+        tap = self._far_listener
+        if tap is not None:
+            tap(out, self._device_rate)  # the echo canceller's reference: exactly what the device got
 
     def _finished(self) -> None:
         self._dead = True
+        self._far_stopped()  # also a stream that ended by itself (the device went away)
+
+    def _far_stopped(self) -> None:
+        """Tell the echo canceller the stream stopped: nothing is rendered until its next block."""
+        tap = self._far_listener
+        if tap is not None:
+            tap(None, self._device_rate)
 
     def _reap_idle(self) -> None:
         assert self._idle_close_s is not None
@@ -365,6 +388,9 @@ class SoundDevicePlayback:
         # holds ours while a slow device opens.
         self._held = held
         self._last_active = time.monotonic()
+
+    def set_far_listener(self, listener: FarListener | None) -> None:
+        self._far_listener = listener
 
     def open(self) -> None:
         with self._lock:  # ours only: a rescan or the mic's slow open may hold the PortAudio lock
@@ -442,6 +468,7 @@ class SoundDevicePlayback:
             except Exception:
                 log.debug("error closing output stream", exc_info=True)
             self._stream = None
+            self._far_stopped()  # after its last callback: abort() waits for it
 
     def close(self) -> None:
         with self._lock:
@@ -506,6 +533,7 @@ class SoundDevicePlayback:
                 # abort() discards what the device already buffered; restart for chimes.
                 _ensure_com()  # stop() runs on whichever thread the user's barge-in or command came from
                 stream.abort()
+                self._far_stopped()  # the restarted stream plays in a new phase
                 stream.start()
                 self._dead = False  # abort() fired finished_callback; the stream is alive again
             except Exception:

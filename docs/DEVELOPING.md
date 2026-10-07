@@ -9,7 +9,7 @@ Commands below are for PowerShell (Windows Terminal). Git Bash is not needed.
 ```text
 .claude-plugin/marketplace.json   makes the repo a plugin marketplace listing "jarvis" at ./plugin
 plugin/                           the plugin, the only folder that ships
-  .claude-plugin/plugin.json      manifest and userConfig (Fish Audio, voice engine, wake word, barge-in, model routing, push-to-talk, speech model)
+  .claude-plugin/plugin.json      manifest and userConfig (Fish Audio, voice engine, wake word, barge-in, echo cancelling, model routing, push-to-talk, speech model)
   hooks/                          the mod: TypeScript hooks module (register.tsx) and its *.test.ts
   types/index.d.ts                the mod's $.state contract
   tsconfig.json                   type-checks the mod (tsc -p plugin)
@@ -164,7 +164,7 @@ It uses `%USERPROFILE%\.jarvis` (models, logs) by default, and `FISH_AUDIO_API_K
 & "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice doctor
 ```
 
-Prints a JSON report: audio devices, microphone access (a one-second test recording), CUDA, the installed speech models, the push-to-talk backend, and whether Fish Audio accepts your key (a handshake only: no text is sent, nothing is billed). `--no-mic` and `--no-network` skip those checks.
+Prints a JSON report: audio devices, microphone access (a one-second test recording), CUDA, the installed speech models, the wake word models, an echo-cancelling self-test (a synthetic 24 kHz echo 30 ms late, fed the way the speaker's audio is; nothing is played or recorded), the push-to-talk backend, and whether Fish Audio accepts your key (a handshake only: no text is sent, nothing is billed). `--no-mic` and `--no-network` skip those checks.
 
 The doctor reads `FISH_AUDIO_API_KEY` from its own environment, and a plain PowerShell window does not have the `env` block of Claude Code's settings. Set it for that window with `$env:FISH_AUDIO_API_KEY = Read-Host 'Fish Audio key'`, which keeps the key out of your command history. The key is masked in the report.
 
@@ -185,6 +185,7 @@ The helper reports `mic_blocked` when Windows denies microphone access. Open Set
 
 - Check the headset's own mute button and that its microphone boom is plugged in.
 - `mic_blocked` with "pure digital silence" means Windows gets exact zeros from the device: it is muted before Windows (a mute button or light, a flipped-up or loose boom, or the headset's own software such as Logitech G HUB), not by Windows. The listener reports it once, after 30 seconds of nothing but exact zeros since it started. Some headsets (the Logitech PRO X with its noise gate, for one) send exact zeros whenever the user is quiet, so once any sound has arrived, zeros are never reported, and a push-to-talk clip of exact zeros is then ignored as silent.
+- `aec_unavailable` means the echo canceller (livekit's `livekit_ffi.dll`, about 25 MB and not Authenticode-signed) could not be loaded ("could not be started": Windows Smart App Control can block it; `/jarvis setup` reinstalls it), or loaded and then stopped working mid-session ("stopped working": `/jarvis restart` tries again). Hands-free listening goes on without it, hearing the raw microphone, and `doctor` has an `aec` section that runs it on a synthetic echo. `JARVIS_AEC=off` (the `echoCancelling` setting) skips it.
 - `wake_unavailable` means the "Hey Jarvis" model could not be downloaded or loaded (it comes from openWakeWord's GitHub releases into `%USERPROFILE%\.jarvis\models\wake`). Push-to-talk still works; `/jarvis setup`, or the next helper start, tries again. When it names plain "Jarvis", only `jarvis_v2.onnx` is missing (it comes from the fwartner/home-assistant-wakewords-collection repository on GitHub, pinned to one commit), and "Hey Jarvis" still works. The helper never waits for that model before "Hey Jarvis" is live: it loads it from disk if it is there, and otherwise fetches it only when plain "Jarvis" is switched on (giving up after 10 seconds with no data, or 60 seconds in all), reporting a failure once; `/jarvis setup` downloads it too.
 - `mic_in_use` means another app holds the microphone in exclusive mode: close it, or untick **Allow applications to take exclusive control of this device** in the microphone's Properties > Advanced.
 - The helper picks the Windows default input and output devices (WASAPI first). To pick another, set `JARVIS_INPUT_DEVICE` or `JARVIS_OUTPUT_DEVICE` in the `env` block of your user settings to part of the device name, such as `PRO X`, and restart Claude Code. `/jarvis devices` shows what is in use.

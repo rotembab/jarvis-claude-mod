@@ -19,6 +19,7 @@ describe('helper process', () => {
     expect(env.JARVIS_TOKEN).toMatch(/^[0-9a-f]{64}$/)
     expect(env.FISH_AUDIO_API_KEY).toBe('fk-test')
     expect(env.JARVIS_TTS_MODEL).toBe('s2.1-pro-free')
+    expect(env.JARVIS_AEC).toBeUndefined() // echo cancelling is the helper's default
     expect(env.NO_PROXY).toBe('corp.example,127.0.0.1,localhost')
     expect(w.status()).toBe('JARVIS · starting')
   })
@@ -33,6 +34,12 @@ describe('helper process', () => {
     const w = world(on)
     await startSession($, w)
     expect(w.lastHelper().request.env?.JARVIS_TTS_MODEL).toBe('s2.1-pro-free')
+  })
+
+  test('echo cancelling switched off reaches the helper', { options: { echoCancelling: 'off' } }, async ($, on) => {
+    const w = world(on)
+    await startSession($, w)
+    expect(w.lastHelper().request.env?.JARVIS_AEC).toBe('off')
   })
 
   test('loads the configured speech model from the start', { options: { sttModel: 'small.en' } }, async ($, on) => {

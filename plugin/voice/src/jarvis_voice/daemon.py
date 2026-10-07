@@ -11,8 +11,8 @@ Threads: push-to-talk callbacks, the ``listen`` command and the listener's
 decisions are funnelled into one action queue served by ``run()`` (the main
 thread), so listening transitions never race and the keyboard hook returns
 immediately (Windows silently unhooks slow low-level hooks). Transcription
-runs on its own worker; speech on the pipeline's worker; the wake word and
-voice activity on the listener's thread.
+runs on its own worker; speech on the pipeline's worker; the wake word, voice
+activity and echo cancelling on the listener's thread.
 """
 
 from __future__ import annotations
@@ -25,13 +25,15 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
 from . import __version__, protocol
+from . import platform as plat
 from .audio import chimes
 from .audio.capture import STT_SAMPLERATE, Capture
+from .audio.echo import EchoCanceller
 from .audio.errors import AudioError, digital_silence_error
 from .audio.levels import is_digital_silence, is_silent
 from .audio.playback import Playback
@@ -50,10 +52,16 @@ from .tts.base import SpeechSynth
 
 log = logging.getLogger(__name__)
 
+EchoState = Literal["on", "off", "loading", "unavailable"]
 DEFAULT_TEST_LINE = "Good evening, sir. Voice systems are online and at your service."
 KEY_HINT = "Use a key name like 'right ctrl', 'f13' or 'alt+space' in the Jarvis plugin settings."
 WAKE_HINT = "Run /jarvis setup to download it. Push-to-talk still works."
 PLAIN_WAKE_HINT = f'Run /jarvis setup to download it (voice.log says what went wrong). "{WAKE_PHRASE}" still works.'
+# The canceller loaded and ran, then failed: reinstalling (the load-failure hint) would not help.
+ECHO_STOPPED_HINT = (
+    "Jarvis now hears the microphone as it is. /jarvis restart tries again; meanwhile, with speakers, "
+    "/jarvis bargein wake stops Jarvis interrupting himself."
+)
 _EXIT = object()
 # "Hey Jarvis," at the start of a hands-free transcript is the wake word itself, not the request.
 _WAKE_PREFIX = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|a)\W+)?jarvis\b\W*", re.IGNORECASE)
@@ -159,6 +167,7 @@ class Daemon:
         vad: VoiceDetector | None = None,
         wake_loader: Callable[[], WakeScorer] | None = None,
         plain_loader: Callable[[WakeScorer], None] | None = None,
+        echo_loader: Callable[[], EchoCanceller] | None = None,
     ) -> None:
         self.config = config
         self._events = events
@@ -190,6 +199,10 @@ class Daemon:
         self._wake_scorer: WakeScorer | None = None
         self._plain_loading = False
         self._plain_reported: WakeScorer | None = None  # the scorer whose missing plain model was reported
+        # Echo cancelling only cleans what the listener hears: without one there is nothing to load.
+        self._echo_loader = echo_loader if vad is not None else None
+        self._echo: EchoCanceller | None = None
+        self._echo_state: EchoState = "loading" if self._echo_loader is not None else "off"
 
         self._transcriber: Transcriber | None = None
         self._stt_error: SttError | None = None
@@ -268,6 +281,9 @@ class Daemon:
             if self._wake_loader is not None:
                 thread = threading.Thread(target=self._load_wake, name="wake-load", daemon=True)
                 thread.start()
+            if self._echo_loader is not None:
+                thread = threading.Thread(target=self._load_echo, name="aec-load", daemon=True)
+                thread.start()
         try:
             self._capture.open()  # kept open: the pre-roll, and the listener, need it
         except AudioError as exc:
@@ -306,14 +322,21 @@ class Daemon:
         return self._exit_code or 0
 
     def _shutdown_components(self) -> None:
-        self._stopping.set()
+        with self._lock:  # with the echo canceller's loader, which checks it before wiring one in
+            self._stopping.set()
+            echo, self._echo = self._echo, None
         self.watchdog.stop()
-        steps = [self._ptt.stop, self.pipeline.close, self._capture.close, self._playback.close]
+        steps: list[Callable[[], None]] = [self._ptt.stop]
+        if echo is not None:
+            steps.append(lambda: self._playback.set_far_listener(None))  # the output stops feeding it
         if self.listener is not None:
-            steps.insert(1, self.listener.close)
+            steps.append(self.listener.close)
+        if echo is not None:
+            steps.append(echo.close)  # once the listener's thread, its other user, is done
         close_synth = getattr(self._synth, "close", None)  # the local voice owns a child process
         if callable(close_synth):
-            steps.insert(2, close_synth)
+            steps.append(close_synth)
+        steps += [self.pipeline.close, self._capture.close, self._playback.close]
         for step in steps:
             try:
                 step()
@@ -555,6 +578,44 @@ class Daemon:
             f'so only "{WAKE_PHRASE}" wakes Jarvis.'
         )
         self._emit_error("wake_unavailable", message, PLAIN_WAKE_HINT)
+
+    def _load_echo(self) -> None:
+        """Until this has loaded (or if it cannot), the listener hears the microphone as it is."""
+        assert self._echo_loader is not None and self.listener is not None
+        try:
+            echo = self._echo_loader()
+        except Exception as exc:
+            log.warning("echo cancelling unavailable: %s", exc, exc_info=True)
+            with self._lock:
+                self._echo_state = "unavailable"
+            message = f"Echo cancelling could not be started: {exc}"
+            self._emit_error("aec_unavailable", message, plat.current().echo_cancel_hint())
+            return
+        with self._lock:  # the lock shutdown takes: a canceller that arrives as the helper stops is freed
+            stopping = self._stopping.is_set()
+            if not stopping:
+                self._echo, self._echo_state = echo, "on"
+                # Called on the listener's thread: enqueue only.
+                echo.set_on_failed(lambda exc: self._actions.put(lambda: self._echo_failed(echo, exc)))
+                self._playback.set_far_listener(echo.far)
+                self.listener.set_echo(echo)
+        if stopping:
+            echo.close()
+            return
+        log.info("echo cancelling ready")
+
+    def _echo_failed(self, echo: EchoCanceller, exc: Exception) -> None:
+        """The canceller stopped working mid-session and passes the microphone through: unhook it and say so."""
+        with self._lock:
+            if self._echo is not echo or self._stopping.is_set():
+                return
+            self._echo, self._echo_state = None, "unavailable"
+            self._playback.set_far_listener(None)
+            if self.listener is not None:
+                self.listener.set_echo(None)
+        echo.close()
+        message = f"Echo cancelling stopped working: {exc}"
+        self._emit_error("aec_unavailable", message, ECHO_STOPPED_HINT)
 
     def _on_listener_start(self, kind: Kind) -> None:  # listener thread: enqueue only
         self._actions.put(lambda: self._begin_hands_free(kind))
@@ -856,6 +917,7 @@ class Daemon:
                 "pttArmed": self._ptt_armed,
                 "wakeWord": self._wake_phrase(),
                 "bargeIn": self.listener.barge_mode if self.listener is not None else None,
+                "echoCancel": self._echo_state,
                 "sttRequested": self._stt_requested,
                 "language": self._language,
                 "speakingReplyId": reply_id,

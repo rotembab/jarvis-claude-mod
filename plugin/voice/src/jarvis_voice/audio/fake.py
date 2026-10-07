@@ -9,7 +9,7 @@ import numpy as np
 
 from .capture import STT_SAMPLERATE, BlockListener
 from .errors import AudioError
-from .playback import TTS_SAMPLERATE, PlaybackMixer
+from .playback import TTS_SAMPLERATE, FarListener, PlaybackMixer
 
 
 class FakeCapture:
@@ -18,6 +18,8 @@ class FakeCapture:
     ``signal`` = "tone" (speech-like 220 Hz at -10 dBFS), "silence" (exact
     zeros) or "quiet" (very low noise). ``next_clip`` overrides one clip.
     """
+
+    input_latency = 0.0
 
     def __init__(self, signal: str = "tone", *, preroll_s: float = 0.3, fail_with: Exception | None = None) -> None:
         self.signal = signal
@@ -86,6 +88,7 @@ class FakePlayback:
     """Consumes the real mixer from a thread at ``speed`` x real time."""
 
     samplerate = TTS_SAMPLERATE
+    device_rate = TTS_SAMPLERATE
     output_latency = 0.0
 
     def __init__(self, *, speed: float = 1.0, block_ms: int = 10, fail_with: Exception | None = None) -> None:
@@ -100,6 +103,7 @@ class FakePlayback:
         self.ends = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._far_listener: FarListener | None = None
 
     @property
     def device_name(self) -> str | None:
@@ -144,6 +148,9 @@ class FakePlayback:
     def hold_open(self, held: bool) -> None:
         self.held = held
 
+    def set_far_listener(self, listener: FarListener | None) -> None:
+        self._far_listener = listener
+
     def _run(self) -> None:
         # Pace by the clock, not by wait() timeouts, the way a sound card does:
         # Windows rounds Event.wait to its ~15.6 ms timer tick and busy macOS
@@ -157,9 +164,16 @@ class FakePlayback:
             while rendered < due and not self._stop.is_set():
                 self._render_block()
                 rendered += 1
+        tap = self._far_listener
+        if tap is not None:
+            tap(None, TTS_SAMPLERATE)  # closed: the echo canceller hears that nothing plays until it reopens
 
-    def _render_block(self) -> None:
-        self.mixer.render(self.block)
+    def _render_block(self) -> np.ndarray:
+        out = self.mixer.render(self.block)
+        tap = self._far_listener
+        if tap is not None:
+            tap(out, TTS_SAMPLERATE)
+        return out
 
     def add_speech(self, pcm: np.ndarray, generation: int | None = None) -> None:
         self.mixer.add_speech(pcm, generation)

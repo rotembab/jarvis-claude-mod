@@ -48,7 +48,7 @@ describe('/jarvis', () => {
     expect(text).toContain('Helper 0.1.0 (pid 4242) · speech model large-v3-turbo on cuda · voice Fish Audio default')
     expect(text).toContain(`Data folder: ${DATA_DIR}`)
     expect(text).toContain('/jarvis stop                     stop speaking and cancel the spoken reply')
-    expect(text).toContain('Wake word loading · talking over Jarvis interrupts him')
+    expect(text).toContain('Wake word loading · talking over Jarvis interrupts him · echo cancelling on')
     expect(w.helpers()).toHaveLength(1) // a running helper is left alone
     expect(await jarvis($, 'frobnicate')).toContain('Unknown subcommand "frobnicate"')
   })
@@ -142,10 +142,14 @@ describe('/jarvis', () => {
               outputDevice: 'Speakers (Realtek)',
               pttKey: 'right ctrl',
               fishKeySet: true,
+              wakeWord: 'Hey Jarvis',
+              bargeIn: 'speech',
+              echoCancel: 'loading',
             },
           }
         : { status: 200, body: { ok: true } }
     const text = await jarvis($, 'devices')
+    expect(text).toContain('Wake word: Hey Jarvis · barge-in: speech · echo cancelling: loading')
     expect(text).toContain('Microphone: Headset Microphone')
     expect(text).toContain('Speakers: Speakers (Realtek)')
     expect(text).toContain('Speech model: large-v3-turbo on cuda')
@@ -518,6 +522,30 @@ describe('hands-free', () => {
       bargeIn: 'speech',
       wakeThreshold: 0.5,
     })
+  })
+
+  test('status says when echo cancelling could not start, until a new helper tries again', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    helper.event({
+      type: 'error',
+      code: 'aec_unavailable',
+      message: 'Echo cancelling could not be started: blocked',
+      hint: 'Run /jarvis setup to reinstall the voice helper.',
+      fatal: false,
+    })
+    await w.settle()
+    expect(w.toasts.at(-1)).toBe('Jarvis: Echo cancelling could not be started: blocked (Run /jarvis setup to reinstall the voice helper.)')
+    expect(await jarvis($, '')).toContain('talking over Jarvis interrupts him · echo cancelling unavailable')
+    helper.hello()
+    await w.settle()
+    expect(await jarvis($, '')).toContain('talking over Jarvis interrupts him · echo cancelling on')
+  })
+
+  test('status shows echo cancelling switched off', { options: { echoCancelling: 'off' } }, async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(await jarvis($, '')).toContain('talking over Jarvis interrupts him · echo cancelling off')
   })
 
   test('the settings shape the first config', { options: { wakeWord: 'off', bargeIn: 'wake', wakeSensitivity: 'high' } }, async ($, on) => {

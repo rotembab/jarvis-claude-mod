@@ -472,6 +472,51 @@ def test_a_noise_gate_is_not_mistaken_for_a_muted_microphone() -> None:
     assert rig.kinds("silence") == []
 
 
+class FaintEcho:
+    """An echo canceller stand-in that removes everything, and turns exact zeros into faint noise
+    the way AEC3 does while Jarvis speaks."""
+
+    def __init__(self) -> None:
+        self.blocks = 0
+        self._noise = np.random.default_rng(1)
+
+    def far(self, block: np.ndarray, rate: int) -> None:
+        pass
+
+    def near(self, audio: np.ndarray, stamp: float) -> np.ndarray:
+        self.blocks += 1
+        return (self._noise.standard_normal(audio.size) * 1e-4).astype(np.float32)
+
+    def set_on_failed(self, callback: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_listener_hears_the_microphone_through_the_echo_canceller() -> None:
+    echo = FaintEcho()
+    rig = Rig(echo=echo)
+    rig.listener.set_speaking(True)
+    loud = tone(1.0)
+    for i in range(0, loud.size, 160):
+        rig.listener.handle(loud[i : i + 160], RATE, i / RATE)
+    assert rig.kinds("start") == [] and echo.blocks == 100  # Jarvis's own voice, cancelled: no barge-in
+    rig.listener.set_echo(None)
+    for i in range(0, loud.size, 160):
+        rig.listener.handle(loud[i : i + 160], RATE, 1.0 + i / RATE)
+    assert rig.kinds("start") == ["barge"]
+
+
+def test_a_muted_microphone_is_reported_through_the_echo_canceller() -> None:
+    # The check reads the raw audio: the canceller's faint noise must not hide the exact zeros.
+    rig = Rig(echo=FaintEcho())
+    rig.listener.config.silence_alarm_s = 3.0
+    for i in range(int(3.5 * 100)):
+        rig.listener.handle(np.zeros(480, np.float32), 48_000, i / 100)
+    assert rig.kinds("silence") == [True] and not rig.listener.heard_sound
+
+
 def test_the_thread_resamples_sound_card_blocks() -> None:
     rig = Rig()
     rig.listener.start()

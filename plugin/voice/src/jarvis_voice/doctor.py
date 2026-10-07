@@ -1,4 +1,4 @@
-"""``doctor``: a JSON health report (devices, mic access, CUDA, models, Fish, PTT).
+"""``doctor``: a JSON health report (devices, mic access, CUDA, models, Fish, wake word, echo cancelling, PTT).
 
 Every section is independent and catches its own failures, so the report is
 always produced. The Fish key is masked; the control token never appears.
@@ -163,6 +163,26 @@ def _wake_section(data_dir: Path) -> dict[str, Any]:
     return section
 
 
+def _aec_section(env: Mapping[str, str]) -> dict[str, Any]:
+    """Echo cancelling against a synthetic echo: whether livekit loads and how much it removes.
+
+    It plays and records nothing, so it says nothing about the room itself.
+    """
+    section: dict[str, Any] = {"enabled": (env.get("JARVIS_AEC", "").strip().lower() or "on") != "off"}
+    try:
+        from livekit.rtc.version import __version__ as livekit_version
+
+        from .audio.echo import self_test
+
+        section["version"] = livekit_version
+        section.update(self_test())
+    except (ImportError, OSError) as exc:  # not installed, or Windows refused to load its DLL
+        hint = plat.current().echo_cancel_hint()
+        return {**section, "ok": False, "error": f"{type(exc).__name__}: {exc}", "hint": hint}
+    section["ok"] = section["attenuationDb"] >= 20.0
+    return section
+
+
 def _ptt_section() -> dict[str, Any]:
     try:
         from pynput import keyboard  # noqa: F401
@@ -193,6 +213,7 @@ def run_doctor(
         ("fish", lambda: _fish_section(env, network)),
         ("localVoice", lambda: _local_voice_section(data_dir, env)),
         ("wake", lambda: _wake_section(data_dir)),
+        ("aec", lambda: _aec_section(env)),
         ("ptt", _ptt_section),
     ):
         try:

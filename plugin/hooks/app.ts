@@ -59,6 +59,8 @@ export type JarvisSettings = {
   wakeWord: WakeMode
   bargeIn: BargeInMode
   wakeSensitivity: WakeSensitivity
+  /** The helper removes Jarvis's own voice from what the microphone hears. */
+  echoCancelling: boolean
   modelRouting: RoutingMode
 }
 
@@ -84,6 +86,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     wakeSensitivity:
       (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
       'medium',
+    echoCancelling: optionString(options, 'echoCancelling') !== 'off',
     modelRouting: ROUTING_MODES.find(mode => mode === optionString(options, 'modelRouting')) ?? 'auto',
   }
 }
@@ -132,6 +135,8 @@ export class Jarvis {
   private hasLocalAttach = false
   private hasAnnouncedReady = false
   private hasAnnouncedWake = false
+  /** This helper's echo canceller could not load, or stopped working (aec_unavailable). */
+  private isEchoCancelBroken = false
   private lastLevelAt = 0
   private shownStatus: string | undefined
 
@@ -147,6 +152,7 @@ export class Jarvis {
       platform,
       fishApiKey: this.settings.fishApiKey,
       fishModel: this.settings.fishModel,
+      echoCancel: this.settings.echoCancelling,
       noProxy: env.NO_PROXY,
       sttModel: () => this.sttModel(),
       tts: async () => ({ engine: await this.voiceEngine(), localVoiceClip: this.settings.localVoiceClip }),
@@ -269,6 +275,12 @@ export class Jarvis {
   async closeHud(): Promise<void> {
     await this.engine?.closePane().catch(() => undefined)
     this.hud?.onClosed()
+  }
+
+  /** Echo cancelling as set, or unavailable when the running helper could not load it. */
+  get echoCancel(): 'on' | 'off' | 'unavailable' {
+    if (!this.settings.echoCancelling) return 'off'
+    return this.isEchoCancelBroken ? 'unavailable' : 'on'
   }
 
   /** Whether voice requests are routed between Sonnet, Opus and Fable: /jarvis routing's choice, else the setting. */
@@ -454,6 +466,7 @@ export class Jarvis {
     this.voice?.onHelperEvent(event)
     switch (event.type) {
       case 'hello':
+        this.isEchoCancelBroken = false // a new helper tries again
         this.patch({ phase: 'starting', detail: undefined })
         return
       case 'state':
@@ -493,6 +506,7 @@ export class Jarvis {
         this.hud?.onBargeIn()
         return
       case 'error': {
+        if (event.code === 'aec_unavailable') this.isEchoCancelBroken = true
         const detail = event.hint ? `${event.message} (${event.hint})` : event.message
         if (event.fatal) this.patch({ phase: 'error', detail })
         else {

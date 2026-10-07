@@ -93,7 +93,7 @@ async function status(app: Jarvis): Promise<string> {
     const model = ready ? `speech model ${ready.sttModel} on ${ready.sttDevice}` : 'loading models'
     const voiceId = (await app.voiceEngine()) === 'local' ? 'local' : ((await app.voiceId()) ?? 'Fish Audio default')
     lines.push(`Helper ${hello.version} (pid ${hello.pid}) · ${model} · voice ${voiceId}`)
-    lines.push(await handsFreeLine(app))
+    lines.push(`${await handsFreeLine(app)} · echo cancelling ${app.echoCancel}`)
     lines.push(await routingLine(app))
   } else if (isRetry) {
     lines.push('Starting the voice helper…')
@@ -354,6 +354,6 @@ async function devices(app: Jarvis): Promise<string> {
     `Speech model: ${report.sttModel ?? 'unknown'}${report.sttDevice ? ` on ${report.sttDevice}` : ''}`,
     `Voice: ${report.voiceId ?? 'Fish Audio default'} · Fish Audio key ${report.fishKeySet === true ? 'set' : 'missing'}`,
     `Push-to-talk: ${report.pttKey ?? app.settings.pttKey} · helper ${report.version ?? '?'} on ${report.platform ?? '?'}`,
-    `Wake word: ${report.wakeWord ?? 'off'} · barge-in: ${report.bargeIn ?? 'push-to-talk only'}`,
+    `Wake word: ${report.wakeWord ?? 'off'} · barge-in: ${report.bargeIn ?? 'push-to-talk only'} · echo cancelling: ${report.echoCancel ?? 'off'}`,
   ].join('\n') + doctor
 }

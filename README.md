@@ -8,7 +8,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
 - **Later:** control of your PC with permission tiers.
 
-> **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in and the HUD work on Windows; echo cancelling is in progress. Expect rough edges; see the [roadmap](#roadmap).
+> **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. Expect rough edges; see the [roadmap](#roadmap).
 
 ## Contents
 
@@ -126,7 +126,7 @@ The local voice loads onto the GPU when the helper starts (a few seconds) and st
 
 Push-to-talk still works the whole time: hold the key (Right Ctrl by default), speak, release. It works while another window has focus, and pressing it while Jarvis speaks also cuts him off.
 
-**Speakers instead of a headset?** Jarvis has no echo cancelling yet, so with speakers he can hear himself and stop mid-sentence. Run `/jarvis bargein wake` so only "Hey Jarvis" interrupts him. If the TV or other people wake him by mistake, set **Wake word sensitivity** to `low`.
+**Speakers instead of a headset?** Echo cancelling takes Jarvis's own voice out of what the microphone hears, so you can talk over him with speakers too. It learns your room during the first second or two he speaks. If he still stops himself mid-sentence (very loud speakers, or Windows sound effects such as loudness equalization), run `/jarvis bargein wake` so only "Hey Jarvis" interrupts him. If the TV or other people wake him by mistake, set **Wake word sensitivity** to `low`.
 
 Messages you type are answered in Claude's normal style and are not read aloud; the Jarvis persona applies to voice messages only.
 
@@ -190,7 +190,8 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `voiceEngine` | `fish` | Who speaks: `fish` (Fish Audio) or `local` (Chatterbox-Turbo on your PC, after `/jarvis setup local`). `/jarvis engine` changes it too. |
 | `localVoiceClip` | empty | A 10 to 20 second recording for the local voice to copy. Empty means its built-in voice. Run `/jarvis restart` after changing it. |
 | `wakeWord` | `on` | `on` listens for "Hey Jarvis"; `jarvis` also for plain "Jarvis" at the start of what you say (needs English transcription; its model is downloaded when you switch it on); `off` is push-to-talk only. `/jarvis wake` changes it too. |
-| `bargeIn` | `speech` | What interrupts Jarvis: `speech` (talking over him, best with a headset), `wake` (only "Hey Jarvis", for speakers or a noisy room) or `off`. `/jarvis bargein` changes it too. |
+| `bargeIn` | `speech` | What interrupts Jarvis: `speech` (talking over him), `wake` (only "Hey Jarvis", for a noisy room, or speakers he still hears himself through) or `off`. `/jarvis bargein` changes it too. |
+| `echoCancelling` | `on` | `on` takes Jarvis's own voice out of what the microphone hears, so with speakers he doesn't interrupt or wake himself. `off` uses the microphone as it is. Run `/jarvis restart` after changing it. |
 | `modelRouting` | `auto` | `auto`: Sonnet answers voice requests, Opus complex ones and Fable the hardest ([Which model answers](#which-model-answers)). `off`: your session's model. `/jarvis routing` changes it too. |
 | `wakeSensitivity` | `medium` | `high` wakes more easily and more often by mistake; `low` needs a clearer "Hey Jarvis" (or "Jarvis"). Run `/jarvis restart` after changing it. |
 | `pttKey` | `right ctrl` | The push-to-talk key, for example `right ctrl`, `right alt`, `f13` or `caps lock`. |
@@ -247,7 +248,9 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | "The microphone delivered pure digital silence" | Something mutes the microphone completely: Windows' microphone privacy settings (above), or the headset itself (a mute button or light, a flipped-up or unplugged boom mic, or its own software, such as Logitech G HUB). Jarvis says this only when the microphone has sent nothing at all since it started, or for a push-to-talk clip before it has heard any sound. Headsets with a noise gate send exact silence between words, which is fine. |
 | Jarvis wakes by mistake, or misses "Hey Jarvis" | Change **Wake word sensitivity** (`low` wakes less often, `high` more easily). Say it clearly, like "hey JAR-vis". |
 | Plain "Jarvis" does not wake him | Say it first, after a moment's quiet: "Jarvis, ..." In the middle of a sentence it is ignored, and once Jarvis has started speaking a reply, until it ends (even while Claude runs a tool), only "Hey Jarvis" (or talking over him) works. It needs English transcription: with another `language`, Whisper may write the name differently and the request is dropped. A chime with no request means plain "Jarvis" woke on a sound-alike ("Travis, ...") and the transcript did not start with "Jarvis", so nothing was sent. If `/jarvis wake` says plain "Jarvis" is not ready, give it a moment (its model downloads when you switch it on); if it stays so, run `/jarvis setup`. |
-| Jarvis stops himself mid-sentence | With speakers he can hear his own voice. Use a headset, or run `/jarvis bargein wake`. |
+| Jarvis stops himself mid-sentence | With speakers he can hear his own voice. `/jarvis` shows whether echo cancelling is on; if it is and he still does, turn the speakers down, turn off Windows sound effects (loudness equalization, spatial sound), use a headset, or run `/jarvis bargein wake`. |
+| "Echo cancelling could not be started" | Run `/jarvis setup` to reinstall the voice helper. On Windows, Smart App Control can block the echo canceller's library (`livekit_ffi.dll`); everything else keeps working, and `/jarvis bargein wake` stops Jarvis interrupting himself through speakers. |
+| "Echo cancelling stopped working" | It loaded and ran, then failed; Jarvis now hears the microphone as it is. `/jarvis restart` tries again. Meanwhile, with speakers, `/jarvis bargein wake` stops Jarvis interrupting himself. |
 | Jarvis does not speak | Check the Fish Audio key (see above) and run `/jarvis test`. |
 | `JARVIS · active in another window` | Another Claude Code window has the helper. Close that window, then run `/jarvis` here. |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
@@ -267,7 +270,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | Phase | Name | What it adds |
 | --- | --- | --- |
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
-| 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: echo cancelling for speakers, and a plain "Jarvis" model trained for Jarvis. |
+| 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
 

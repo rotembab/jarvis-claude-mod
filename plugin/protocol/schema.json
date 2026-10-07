@@ -11,7 +11,8 @@
       "enum": [
         "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable", "local_voice_failed",
         "mic_blocked", "mic_in_use", "no_input_device", "no_output_device",
-        "stt_model_missing", "stt_failed", "ptt_unavailable", "wake_unavailable", "bad_request", "unauthorized", "internal"
+        "stt_model_missing", "stt_failed", "ptt_unavailable", "wake_unavailable", "aec_unavailable",
+        "bad_request", "unauthorized", "internal"
       ]
     },
     "UtteranceSource": { "enum": ["ptt", "command", "wake"] },
@@ -162,7 +163,8 @@
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
         "fishKeySet": { "type": "boolean" }, "ttsEngine": { "enum": ["fish", "local"] },
         "wakeWord": { "type": "string", "description": "the wake phrase, while it is loaded and switched on" },
-        "bargeIn": { "$ref": "#/$defs/BargeInMode" }
+        "bargeIn": { "$ref": "#/$defs/BargeInMode" },
+        "echoCancel": { "enum": ["on", "off", "loading", "unavailable"], "description": "echo cancelling of what the listener hears" }
       }
     }
   },
