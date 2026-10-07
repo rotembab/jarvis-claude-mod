@@ -43,6 +43,18 @@ models/
 logs/
 *.log
 
+# ---------------------------------------------------------------- Voice audio
+# Reference clips and generated speech stay on your own machine (the helper keeps
+# them under %USERPROFILE%\.jarvis). Voices cloned from real people must never be
+# published, and this repository is public.
+voice-ref/
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+*.opus
+
 # ---------------------------------------------------------------- Secrets
 .env
 .env.*
