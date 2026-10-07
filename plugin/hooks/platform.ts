@@ -2,7 +2,10 @@
 // python, where uv is, how to install it, and the persona's OS paragraph.
 // Windows is the phase 1 target; macOS and Linux get working defaults.
 
+import type { ProcessRunResult } from 'claude-code'
+
 import type { Engine, EnvSnapshot } from './engine'
+import { describeError } from './engine'
 
 export type OsKind = 'windows' | 'macos' | 'linux'
 
@@ -235,8 +238,30 @@ export function system32(systemRoot: string | undefined): string {
   return `${root}\\System32`
 }
 
-/** The system's own `id` (a program of that name earlier on PATH cannot answer). */
-const ID_PROGRAM = '/usr/bin/id'
+/**
+ * The system's own `id`, by full path (a program of that name earlier on PATH
+ * cannot answer): /usr/bin/id, else /bin/id on a system without it.
+ */
+const ID_PROGRAMS = ['/usr/bin/id', '/bin/id']
+
+/**
+ * `id -u` by the first of ID_PROGRAMS that runs, all of them within the one
+ * time limit; throws when none does in time.
+ */
+async function runId(engine: Engine): Promise<ProcessRunResult> {
+  const deadline = (await engine.now()) + ADMIN_PROBE_TIMEOUT_MS
+  const failures: string[] = []
+  for (const program of ID_PROGRAMS) {
+    const timeoutMs = Math.floor(deadline - (await engine.now()))
+    if (timeoutMs <= 0) break
+    try {
+      return await engine.run([program, '-u'], { timeoutMs })
+    } catch (error) {
+      failures.push(`${program}: ${describeError(error)}`)
+    }
+  }
+  throw new Error(`id -u could not run (${failures.join('; ')})`)
+}
 
 /**
  * Whether Claude Code runs elevated and, on Windows, the UAC level: the
@@ -245,12 +270,12 @@ const ID_PROGRAM = '/usr/bin/id'
  * command fails or times out: the check fails closed.
  */
 export async function probeAdmin(engine: Engine, platform: Platform): Promise<AdminFacts> {
-  const init = { timeoutMs: ADMIN_PROBE_TIMEOUT_MS }
   if (platform.os !== 'windows') {
-    const { exitCode, stdout } = await engine.run([ID_PROGRAM, '-u'], init)
+    const { exitCode, stdout } = await runId(engine)
     if (exitCode !== 0 || !/^\d+$/.test(stdout.trim())) throw new Error(`id -u exited with ${exitCode}`)
     return { isElevated: stdout.trim() === '0' }
   }
+  const init = { timeoutMs: ADMIN_PROBE_TIMEOUT_MS }
   const folder = system32((await engine.env()).SystemRoot)
   const [groups, policy] = await Promise.all([
     engine.run([`${folder}\\whoami.exe`, '/groups', '/fo', 'csv', '/nh'], init),

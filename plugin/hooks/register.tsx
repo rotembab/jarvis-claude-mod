@@ -146,7 +146,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: size => $.ui.open({ ...HUD_OPEN, ...size }) }))
 
   on('turn.start', ($, e, next) => {
-    app.pc.onTurnStart(e.turnId)
+    app.pc.onTurnStart(e)
     app.voice?.onTurnStart(e)
     app.hud?.onTurnStart()
     return next(e)
@@ -243,7 +243,7 @@ export const register: Register = (on, options) => {
   // mid-turn (Shift+Tab, EnterPlanMode, ExitPlanMode) that the next tool's PostToolUse reports.
   // Matched (on a field every input has) so another hook of the same event may stand beside them.
   on('classic.UserPromptSubmit', { hook_event_name: 'UserPromptSubmit' }, ($, e, next) => {
-    app.pc.notePermissionMode(e.permission_mode, e.agent_id)
+    app.pc.notePermissionMode(e.permission_mode, e.prompt, e.agent_id)
     return next(e)
   }).catch(($, e, next) => next(e))
   on('classic.PostToolUse', { hook_event_name: 'PostToolUse' }, ($, e, next) => {

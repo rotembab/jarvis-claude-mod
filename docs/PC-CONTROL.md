@@ -59,7 +59,7 @@ In a voice conversation, a voice-tier command is held the first time Claude trie
 
 > Claude wants to run a Bash command that pushes commits to the remote: git push. Say yes to run it, sir.
 
-The yes answers Jarvis's line, which names the command whatever Claude said before it. A notice and the transcript show the whole command. If your very next message is a spoken yes and nothing else, and you began saying it after Jarvis finished that line, Claude runs that exact command once.
+The yes answers Jarvis's line, which names the command whatever Claude said before it. A notice and the transcript quote the command as the on-screen question does: a command longer than 300 characters by the parts that set its tier (or its first 300 characters), with the number of characters not shown. The yes is for the whole command, the characters not shown included. If your very next message is a spoken yes and nothing else, and you began saying it after Jarvis finished that line, Claude runs that exact command once.
 
 - Words that count as a yes: "yes", "yeah", "yep", "yes please", "go ahead", "go for it", "do it", "proceed", "confirm", "confirmed", "affirmative", "sure", "ok", "okay". "Jarvis, go ahead." counts. "Yes, and delete dist too" does not; it is a new request. Nor does a yes with words in another script ("OK, не надо", "OK, don't"), or with any word not on the list.
 - The yes covers only the command Claude held, with the same tool and the same text. Spacing within a line doesn't matter, but line breaks do: a held `git push origin npm publish` (one command) doesn't cover `git push origin` and `npm publish` on two lines. A different command is held again. When the command runs a script file, the yes is also for that file as Jarvis read it when he asked: if the file has changed by the time the command runs again, the yes doesn't cover it, and the changed file is judged and asked about afresh.
@@ -138,7 +138,7 @@ The mod answers the tool itself, so Claude Code's own permission path never sees
 - An allow rule lets actions run without that question. Jarvis doesn't add one; to skip the question, add `"mcp__jarvis__desktop"` to `allow` in your settings yourself. Only an allow from your own rule counts: an allow that comes from the mode alone (bypassPermissions with no rule) still gets the question.
 - Even with your allow rule, the question comes when:
   - a PreToolUse or PermissionRequest hook in your settings (user, project, local, `--settings` or managed) could match the tool: its matcher is empty, `*`, names the tool, or is a pattern that finds it, such as `mcp__.*`. Apart from an organization's managed hooks, whose deny comes before any plugin, Claude Code runs no settings hook for this tool, so Jarvis asks you instead of letting such a hook decide. Jarvis reads only the hooks' matchers and never logs your settings. PostToolUse and other settings hooks never see the tool's calls, and hooks that come with plugins are not read;
-  - the permission mode is not known for the current turn: a call from a subagent (which may be in a plan mode of its own), or a turn that started without a prompt Jarvis saw. A change on the PC needs the mode from this turn's prompt, or from a tool Claude ran during this turn.
+  - the permission mode is not known for the current turn: a call from a subagent (which may be in a plan mode of its own), or a turn that did not start from a prompt Jarvis saw just before it (a turn Claude Code started on its own, one after a prompt a hook blocked, or one for a prompt you typed while another turn ran, since the mode may change while it waits). A change on the PC needs the mode from this turn's prompt, or from a tool Claude ran during this turn.
 - If your rules or your settings can't be read, nothing is done.
 - In dontAsk mode, only your allow rule lets it run; anything that would ask is refused.
 - In plan mode, only the read-only actions work: reading the volume and reading the clipboard. Until Jarvis has seen your first prompt it can't tell whether plan mode is on, so it changes nothing until then. Jarvis learns the mode from each prompt and from each tool Claude runs, so after a Shift+Tab into plan mode in the middle of a turn, a desktop action before Claude's next tool call still sees the earlier mode. Claude Code's own verdict for the tool (`$.tool.check`, which knows the current mode) is still applied then, but Jarvis's own plan-mode hold is not.
@@ -176,7 +176,7 @@ Say "Jarvis, stand down" or "Abort that" on its own, or type `/jarvis pc stop`. 
 
 ## Never as administrator
 
-At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`). Until the check has finished, the voice helper and `/jarvis setup` wait. If it does run as administrator, Jarvis stays off:
+At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`, or `/bin/id` where there is none). Until the check has finished, the voice helper and `/jarvis setup` wait. If it does run as administrator, Jarvis stays off:
 
 - no voice helper;
 - an error on the HUD;
@@ -184,7 +184,7 @@ At the start of each session, Jarvis checks whether Claude Code runs as administ
 
 Every command Claude runs would run as administrator too. Start Claude Code from a normal window, not with "Run as administrator". Every part of Jarvis that starts a program checks this first, and new ones (such as the home and hands helpers) must too.
 
-The check fails closed. If `whoami` or `reg` fails, gives an answer Jarvis can't read, or takes longer than 5 seconds (a cold start under a virus scan, say), Jarvis stays off the same way. The HUD, `/jarvis` and `/jarvis pc` say the check failed and why. `/jarvis restart` runs the check again, and starts the voice helper once it passes.
+The check fails closed. If `whoami`, `reg` or `id` fails (or neither `/usr/bin/id` nor `/bin/id` can run), gives an answer Jarvis can't read, or takes longer than 5 seconds (a cold start under a virus scan, say), Jarvis stays off the same way. The HUD, `/jarvis` and `/jarvis pc` say the check failed and why. `/jarvis restart` runs the check again, and starts the voice helper once it passes.
 
 Jarvis also reads the UAC level. If it is below "Always notify", you see a one-time notice, because some admin changes then happen without a prompt. For PC control, the safer choices are:
 
