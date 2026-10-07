@@ -3,7 +3,7 @@ import type { Engine as TestEngine } from 'claude-code/testing'
 
 import type { JarvisHud } from '../types'
 import type { DesktopAnswer } from './desktop'
-import { DESKTOP_TOOL, DESKTOP_TOOL_SPEC, duration, parseDesktopInput } from './desktop'
+import { DESKTOP_TOOL, DESKTOP_TOOL_SPEC, duration, parseDesktopInput, settingsHooksMatch } from './desktop'
 import type { RuleVerdict } from './pc'
 import type { FakeChild, SentCommand, World } from './test-harness'
 import { completeTurn, startHelper, startSession, WINDOWS_ENV, world } from './test-harness'
@@ -37,9 +37,16 @@ function desktopReplies(w: World, reply: (body: Record<string, unknown>) => Desk
 
 const bodies = (w: World) => w.named('desktop').map(command => command.body)
 
-/** A prompt in the main loop: how the mod learns the turn's permission mode. */
+let turns = 0
+/** The turn `prompted` started last. */
+let promptedTurn = ''
+
+/** A prompt in the main loop and the turn it starts: how the mod learns the turn's permission mode. */
 async function prompted($: TestEngine, mode = 'default'): Promise<void> {
   await $.classic.UserPromptSubmit({ prompt: 'Jarvis, the PC', permission_mode: mode })
+  turns += 1
+  promptedTurn = `typed-${turns}`
+  await $.turn.start({ text: 'Jarvis, the PC', turnId: promptedTurn })
 }
 
 /** The user's own allow rule for the tool: its actions then run with no question of the rules' own. */
@@ -203,6 +210,97 @@ describe('desktop tool: permissions', () => {
     expect(bodies(w)).toEqual([{ action: 'open', target: 'Spotify' }])
   })
 
+  test('an allow decided by the mode alone (bypassPermissions, no rule) asks on screen', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Opened.' }))
+    await startDesktop($, w)
+    await prompted($, 'bypassPermissions')
+    w.toolCheck = () => ({ decision: 'allow' })
+    w.askAnswer = "Don't do it"
+    expect(await desktop($, { action: 'open', target: 'https://example.com/?q=secret' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't do it"/) })
+    expect(w.asked).toEqual(['Jarvis: Claude wants to use the desktop tool to open "https://example.com/?q=secret". Do it?'])
+    expect(bodies(w)).toEqual([])
+  })
+
+  test('rules that cannot be read refuse: no click can override a deny no one saw', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Locked.' }))
+    await startDesktop($, w)
+    w.toolCheck = () => {
+      throw new Error('settings unreadable')
+    }
+    w.askAnswer = 'Do it'
+    expect(await desktop($, { action: 'lock' })).toEqual({ deny: 'Jarvis could not read your permission rules, so nothing was done.' })
+    expect(w.asked).toEqual([])
+    expect(bodies(w)).toEqual([])
+  })
+
+  test('a PreToolUse or PermissionRequest hook in the settings that could match the tool makes it ask; a read that fails refuses', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Locked.' }))
+    await startDesktop($, w)
+    const hook = (matcher?: string) => ({ ...(matcher === undefined ? {} : { matcher }), hooks: [{ type: 'command', command: 'audit.sh' }] })
+    w.settings = { user: { env: { ANTHROPIC_API_KEY: 'sk-not-real' }, hooks: { PreToolUse: [hook('Bash')], PostToolUse: [hook()] } } }
+    expect(await desktop($, { action: 'lock' })).toMatchObject({ result: 'Locked.' })
+    expect(w.settingsReads).toEqual(['user', 'project', 'local', 'flag', 'policy'])
+    w.settings = { project: { hooks: { PreToolUse: [hook('Bash'), hook('mcp__.*')] } } }
+    w.askAnswer = "Don't do it"
+    expect(await desktop($, { action: 'lock' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't do it"/) })
+    w.settings = { local: { hooks: { PermissionRequest: [hook()] } } }
+    expect(await desktop($, { action: 'lock' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't do it"/) })
+    expect(w.asked).toHaveLength(2)
+    w.settings = {}
+    w.settingsError = 'unreadable'
+    expect(await desktop($, { action: 'lock' })).toEqual({ deny: 'Jarvis could not read the hooks in your settings, so nothing was done.' })
+    expect(bodies(w)).toEqual([{ action: 'lock' }])
+    // The settings' values are never logged.
+    expect(w.logs.some(line => line.includes('sk-not-real') || line.includes('audit.sh'))).toBe(false)
+  })
+
+  test('which settings hook matchers could match the tool', () => {
+    const at = (event: string, matcher: unknown) => [{ hooks: { [event]: [{ matcher, hooks: [] }] } }]
+    for (const matcher of [undefined, '', '*', 'mcp__jarvis__desktop', 'Bash|mcp__jarvis__desktop', 'mcp__.*', 'mcp__jarvis', 'desktop', '(', 5]) {
+      expect(settingsHooksMatch(at('PreToolUse', matcher), DESKTOP_TOOL), String(matcher)).toBe(true)
+    }
+    for (const matcher of ['Bash', 'Write|Edit', '^Bash$', 'mcp__github__.*']) expect(settingsHooksMatch(at('PreToolUse', matcher), DESKTOP_TOOL), matcher).toBe(false)
+    expect(settingsHooksMatch(at('PermissionRequest', '*'), DESKTOP_TOOL)).toBe(true)
+    expect(settingsHooksMatch(at('PostToolUse', '*'), DESKTOP_TOOL)).toBe(false)
+    expect(settingsHooksMatch([{ hooks: 'odd' }], DESKTOP_TOOL)).toBe(true)
+    expect(settingsHooksMatch([{ hooks: { PreToolUse: {} } }], DESKTOP_TOOL)).toBe(true)
+    expect(settingsHooksMatch([{}, { permissions: { allow: [DESKTOP_TOOL] } }], DESKTOP_TOOL)).toBe(false)
+  })
+
+  test('a change on the PC needs the mode known for this turn: a turn begun with no prompt, or a subagent, asks', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Locked.' }))
+    await startDesktop($, w)
+    await completeTurn($, promptedTurn)
+    // A turn the engine started with no prompt Jarvis saw: a Shift+Tab into plan mode may have come since.
+    await $.turn.start({ text: '', turnId: 't-continue' })
+    w.askAnswer = "Don't do it"
+    expect(await desktop($, { action: 'lock' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't do it"/) })
+    // Reading changes nothing: no question.
+    expect(await desktop($, { action: 'volume' })).toMatchObject({ result: 'Locked.' })
+    await completeTurn($, 't-continue')
+    await prompted($)
+    expect(await desktop($, { action: 'lock', agentId: 'agent-1' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't do it"/) })
+    expect(await desktop($, { action: 'lock' })).toMatchObject({ result: 'Locked.' })
+    expect(w.asked).toHaveLength(2)
+    expect(bodies(w)).toEqual([{ action: 'volume' }, { action: 'lock' }])
+  })
+
+  test('the question shows a long target whole, its line breaks visible', async ($, on) => {
+    const w = world(on)
+    await startDesktop($, w)
+    w.toolCheck = () => ({ decision: 'ask' })
+    w.askAnswer = "Don't do it"
+    const link = `https://learn.microsoft.com/en-us/windows/release-health/status-windows-11-24h2?ref=${'A'.repeat(200)}&d=SECRET_FROM_DOTENV`
+    await desktop($, { action: 'open', target: link })
+    expect(w.asked.at(-1)).toBe(`Jarvis: Claude wants to use the desktop tool to open "${link}". Do it?`)
+    await desktop($, { action: 'focus', target: 'Notepad\nrm' })
+    expect(w.asked.at(-1)).toBe('Jarvis: Claude wants to use the desktop tool to bring "Notepad ⏎ rm" to the front. Do it?')
+  })
+
   test("an allow rule runs it with no question; dontAsk refuses the engine's plain ask", async ($, on) => {
     const w = world(on)
     desktopReplies(w, () => ({ result: 'done', text: 'Done.' }))
@@ -251,10 +349,11 @@ describe('desktop tool: clipboard', () => {
     expect(w.dialogs.at(-1)?.options).toEqual(["Don't let it", 'Let it read'])
   })
 
-  test('in a voice turn it needs a spoken yes', async ($, on) => {
+  test('in a voice turn it needs a spoken yes to the question Jarvis asks', async ($, on) => {
     const w = world(on)
     desktopReplies(w, () => ({ result: 'done', text: 'The clipboard holds 5 characters of text.', clipboard: 'hello' }))
     const helper = await startDesktop($, w)
+    await completeTurn($, promptedTurn)
     helper.event({ type: 'utterance', id: 'u1', text: "What's on my clipboard?", source: 'wake', durationMs: 900, language: 'en' })
     await w.settle()
     await $.classic.UserPromptSubmit({ prompt: "What's on my clipboard?", permission_mode: 'default' })
@@ -263,11 +362,48 @@ describe('desktop tool: clipboard', () => {
       result: expect.stringMatching(/^Jarvis held this: it shows the clipboard to Claude and needs the user's spoken OK\./),
     })
     await completeTurn($, 't1')
-    helper.event({ type: 'utterance', id: 'u2', text: 'Go ahead.', source: 'wake', durationMs: 600, language: 'en' })
+    await w.settle()
+    expect(w.named('speak').map(command => command.body.text).join(' ')).toContain('Claude wants to read your clipboard. Say yes to let it, sir.')
+    helper.event({ type: 'speech_done', replyId: 't1', interrupted: false, spokenText: '', endedAtMs: 40_000 })
+    helper.event({ type: 'utterance', id: 'u2', text: 'Go ahead.', source: 'wake', durationMs: 600, language: 'en', startedAtMs: 40_500, overSpeech: false })
     await w.settle()
     await $.classic.UserPromptSubmit({ prompt: 'Go ahead.', permission_mode: 'default' })
     await $.turn.start({ text: 'Go ahead.', turnId: 't2' })
     expect(await desktop($, { action: 'clipboard_read' })).toMatchObject({ result: expect.stringContaining('<clipboard>\nhello\n</clipboard>') })
+    expect(w.asked).toEqual([])
+  })
+})
+
+describe('desktop tool: screenshot', () => {
+  test('a screenshot asks first even when the tool is allowed: a click in a typed turn', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Saved the screenshot.', path: 'C:\\Users\\Rotem\\Pictures\\Screenshots\\jarvis.png' }))
+    await startDesktop($, w)
+    w.askAnswer = "Don't let it"
+    expect(await desktop($, { action: 'screenshot' })).toMatchObject({ result: expect.stringMatching(/^The user chose "Don't let it"/) })
+    expect(bodies(w)).toEqual([])
+    expect(w.asked).toEqual(['Jarvis: Claude wants to take a screenshot of your whole screen (it could then look at it). Let it?'])
+    w.askAnswer = 'Let it'
+    expect(await desktop($, { action: 'screenshot' })).toMatchObject({ result: 'Saved the screenshot.' })
+    expect(bodies(w)).toEqual([{ action: 'screenshot' }])
+  })
+
+  test('in a voice turn a screenshot is held for a spoken yes', async ($, on) => {
+    const w = world(on)
+    desktopReplies(w, () => ({ result: 'done', text: 'Saved the screenshot.' }))
+    const helper = await startDesktop($, w)
+    await completeTurn($, promptedTurn)
+    helper.event({ type: 'utterance', id: 'u1', text: 'Look at my screen', source: 'wake', durationMs: 900, language: 'en' })
+    await w.settle()
+    await $.classic.UserPromptSubmit({ prompt: 'Look at my screen', permission_mode: 'default' })
+    await $.turn.start({ text: 'Look at my screen', turnId: 't1' })
+    expect(await desktop($, { action: 'screenshot' })).toMatchObject({
+      result: expect.stringMatching(/^Jarvis held this: it shows your screen to Claude and needs the user's spoken OK\./),
+    })
+    await completeTurn($, 't1')
+    await w.settle()
+    expect(w.named('speak').map(command => command.body.text).join(' ')).toContain('Claude wants to take a screenshot of your screen. Say yes to let it, sir.')
+    expect(bodies(w)).toEqual([])
     expect(w.asked).toEqual([])
   })
 })

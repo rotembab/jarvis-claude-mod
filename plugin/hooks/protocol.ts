@@ -59,6 +59,10 @@ export type UtteranceEvent = Envelope<'utterance'> & {
   source: UtteranceSource
   durationMs: number
   language?: string
+  /** When the user began speaking (the push-to-talk press, or where the voice began), on the helper's own millisecond clock. */
+  startedAtMs?: number
+  /** The clip began while Jarvis was audible: it cut him off. */
+  overSpeech?: boolean
 }
 
 export type SpeechStartedEvent = Envelope<'speech_started'> & { replyId: string }
@@ -67,6 +71,8 @@ export type SpeechDoneEvent = Envelope<'speech_done'> & {
   replyId: string
   interrupted: boolean
   spokenText: string
+  /** When the reply's speech ended (played out or stopped), on the helper's own millisecond clock. */
+  endedAtMs?: number
 }
 
 export type BargeInEvent = Envelope<'barge_in'> & { replyId?: string; spokenText: string }

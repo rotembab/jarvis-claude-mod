@@ -101,10 +101,17 @@ export const register: Register = (on, options) => {
     return attached
   })
 
+  // A /clear (no session.start follows) or any other end: no command stays held for a spoken yes.
+  on('session.end', ($, e, next) => {
+    app.pc.clearHold()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
   // The command opens the HUD through its own `$`: the person asked, so it is placed at any width.
   on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args, { openHud: size => $.ui.open({ ...HUD_OPEN, ...size }) }))
 
   on('turn.start', ($, e, next) => {
+    app.pc.onTurnStart(e.turnId)
     app.voice?.onTurnStart(e)
     app.hud?.onTurnStart()
     return next(e)
@@ -123,15 +130,23 @@ export const register: Register = (on, options) => {
     return result
   }).catch(($, e, next) => (next.called ? next(e) : { deny: GUARD_FAILED }))
 
-  // The desktop tool: answered here, so the engine's permission path never sees it; desktop.ts
-  // applies the user's own rules for it ($.tool.check), plan mode and the tiers. Outer to the HUD's
-  // hook too, so it logs its own actions there.
+  // The desktop tool: answered here, so the engine's permission path and its settings hooks never
+  // see it; desktop.ts applies the user's own rules for it ($.tool.check), asks when a settings hook
+  // could match it (each source read on its own: only the hooks' matchers are looked at, and nothing
+  // of it is logged), plan mode and the tiers. Outer to the HUD's hook too, so it logs its own actions there.
   on('tool.call', { tool: 'mcp__jarvis__desktop' }, ($, e, next) =>
     app.pc.desktop(
       e as unknown as Record<string, unknown>,
       {
         ask: (question, options) => $.ui.ask(question, options),
         check: input => $.tool.check({ tool: 'mcp__jarvis__desktop', input }),
+        settings: async () => [
+          await $.settings.read({ source: 'user' }),
+          await $.settings.read({ source: 'project' }),
+          await $.settings.read({ source: 'local' }),
+          await $.settings.read({ source: 'flag' }),
+          await $.settings.read({ source: 'policy' }),
+        ],
       },
       next.signal,
     ),
@@ -159,7 +174,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', ($, e, next) => {
-    app.voice?.onTurnComplete(e)
+    // The turn that held a command for a spoken yes ends with Jarvis's own question about it.
+    const closingLine = app.pc.onTurnComplete(e)
+    app.voice?.onTurnComplete(e, closingLine)
     if (e.agentId === undefined) void app.onTurnComplete()
     return next(e)
   })
@@ -240,8 +257,10 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // Typing at the prompt brings the conversation back from focus mode.
+  // Typing at the prompt brings the conversation back from focus mode. Any prompt but
+  // Jarvis's own also drops a command held for a spoken yes: the yes answers only the question just asked.
   on('prompt.submit', ($, e, next) => {
+    app.pc.onPrompt(e.origin)
     if (e.origin.kind === 'composer') app.onTyped()
     return next(e)
   }).catch(($, e, next) => next(e))

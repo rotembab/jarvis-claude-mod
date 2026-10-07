@@ -177,6 +177,7 @@ export class Jarvis {
       onSubmitted: text => this.patch({ lastUtterance: text }),
       onStandDown: () => this.pc.standDown(),
       isAwaitingClick: () => this.pc.isAwaitingClick,
+      onWords: (text, isSubmitted) => this.pc.noteHeard(text, isSubmitted),
       router: new ModelRouter(engine, { mode: () => this.routingMode(), complete: request => engine.complete(request) }),
     })
     this.isLocal = !isRemoteSession(env)
@@ -184,7 +185,18 @@ export class Jarvis {
       this.publish({ phase: 'unavailable' })
       return
     }
-    if (await this.pc.onSessionStart()) return // Claude Code runs elevated: never as administrator (PLAN.md:150)
+    // Claude Code runs elevated, or the check failed: never as administrator (PLAN.md:150).
+    if (await this.pc.onSessionStart()) return
+    await this.startLocal()
+    // The desktop app starts its sessions with no surface, then attaches one
+    // (perhaps while the awaits above ran).
+    if ((surface !== null && LOCAL_SURFACES.has(surface)) || this.hasLocalAttach) this.autoStart()
+  }
+
+  /** The HUD and focus mode, once the administrator check has passed. */
+  private async startLocal(): Promise<void> {
+    const engine = this.engine
+    if (engine === undefined) return
     this.hud?.dispose()
     this.hud = new Hud(engine)
     this.hud.setPhase(this.view.phase)
@@ -196,9 +208,6 @@ export class Jarvis {
     this.isFolded = false
     void engine.writeFolded(false).catch(() => undefined)
     if (await this.isHudOn()) void this.openHud()
-    // The desktop app starts its sessions with no surface, then attaches one
-    // (perhaps while the awaits above ran).
-    if ((surface !== null && LOCAL_SURFACES.has(surface)) || this.hasLocalAttach) this.autoStart()
   }
 
   onAttach(surface: RenderSurface): void {
@@ -218,8 +227,24 @@ export class Jarvis {
 
   async restartHelper(): Promise<void> {
     if (!this.isLocal || this.isSetupRunning || this.helper === undefined) return
+    if (this.pc.hasAdminCheckFailed) {
+      await this.recheckAdmin()
+      return
+    }
     if (this.pc.refusesElevated()) return
     await this.helper.restart()
+  }
+
+  /**
+   * /jarvis restart after the administrator check failed: runs it again and,
+   * once it passes, starts what it held back (the HUD, the helper).
+   */
+  private async recheckAdmin(): Promise<void> {
+    if (await this.pc.recheckAdmin()) return
+    this.patch({ phase: 'stopped', detail: undefined })
+    await this.startLocal()
+    this.hasAutoStarted = true
+    this.startHelper(true)
   }
 
   /** The voice override /jarvis voice saved, else the userConfig value. */
