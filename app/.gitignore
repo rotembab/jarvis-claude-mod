@@ -1,0 +1,5 @@
+# Built by scripts/build.mjs and the test runners; node_modules/ is ignored at the root.
+dist/
+dist-test/
+test-results/
+playwright-report/

@@ -39,6 +39,7 @@ export const register: Register = (on, options) => {
         HOME: await $.env.get('HOME'),
         NO_PROXY: await $.env.get('NO_PROXY'),
         CLAUDE_CODE_REMOTE: await $.env.get('CLAUDE_CODE_REMOTE'),
+        JARVIS_HOME: await $.env.get('JARVIS_HOME'),
       }),
       now: () => $.clock.now(),
       after: (ms, fn) => $.clock.after(ms, fn),
@@ -118,6 +119,7 @@ export const register: Register = (on, options) => {
   on('turn.start', ($, e, next) => {
     app.voice?.onTurnStart(e)
     app.hud?.onTurnStart()
+    app.companion?.onTurnStart()
     return next(e)
   })
 

@@ -6,6 +6,7 @@
 import type { PluginOptions, RenderSurface, UiOpenResult } from 'claude-code'
 
 import type { JarvisPhase, JarvisView } from '../types'
+import { appEndpointPath, Companion } from './companion'
 import type { Engine } from './engine'
 import { describeError } from './engine'
 import type { HandsEngine, HandsSettings } from './hands'
@@ -133,6 +134,8 @@ export class Jarvis {
   hands: Hands | undefined
   /** The HUD pane's ring and action log (local sessions). */
   hud: Hud | undefined
+  /** Sends the HUD to the Jarvis desktop app while it runs (local sessions). */
+  companion: Companion | undefined
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined
@@ -199,6 +202,14 @@ export class Jarvis {
     this.hud.setPhase(this.view.phase)
     this.hud.save()
     this.hud.onShownChange = () => this.updateFocus()
+    this.companion?.dispose()
+    const companion = new Companion(engine, {
+      endpointPath: appEndpointPath(platform, env),
+      source: { hud: this.hud, view: () => this.view, isOwner: () => this.helper?.isRunning === true },
+    })
+    this.companion = companion
+    this.hud.onChange = () => companion.poke()
+    void companion.start()
     this.isFocusOn = await this.focusSetting()
     // $.state outlives a reload: focus mode starts hidden until the new HUD draws.
     this.isFocusShown = false
@@ -308,14 +319,15 @@ export class Jarvis {
     this.updateFocus()
   }
 
-  /** A turn of the main conversation ended: in focus mode the HUD shows the reply. */
+  /** A turn of the main conversation ended: focus mode and the Jarvis app show the start of the reply. */
   async onTurnComplete(): Promise<void> {
     this.hud?.onTurnComplete()
-    if (!this.isFocusOn || this.engine === undefined) return
+    if ((!this.isFocusOn && this.companion?.isConnected !== true) || this.engine === undefined) return
     try {
       const messages = await this.engine.messages()
       const reply = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim() !== '')
-      this.hud?.setLastReply(reply?.text.trim())
+      if (this.isFocusOn) this.hud?.setLastReply(reply?.text.trim())
+      this.companion?.setReply(reply?.text)
     } catch (error) {
       this.engine.debug(`jarvis: could not read the last reply: ${describeError(error)}`)
     }
@@ -574,6 +586,7 @@ export class Jarvis {
       }
       case 'level': {
         this.hud?.setLevels(event.mic, event.out)
+        this.companion?.poke()
         const now = performance.now()
         if (this.view.phase !== 'listening' || now - this.lastLevelAt < LEVEL_INTERVAL_MS) return
         this.lastLevelAt = now
@@ -647,6 +660,7 @@ export class Jarvis {
     this.view = clean
     this.hud?.setPhase(clean.phase)
     this.updateFocus()
+    this.companion?.poke()
     const engine = this.engine
     if (engine === undefined) return
     void engine.writeView(clean).catch(() => undefined)
