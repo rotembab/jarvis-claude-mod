@@ -39,7 +39,7 @@ describe('helper process', () => {
     const w = world(on)
     await startHelper($, w)
     expect(w.lastHelper().argv).toEqual([VENV_PYTHON, '-m', 'jarvis_voice', 'run', '--data-dir', DATA_DIR, '--stt-model', 'small.en'])
-    expect(w.named('config')[0]?.body).toEqual({ pttKey: 'right ctrl', language: 'en' })
+    expect(w.named('config')[0]?.body).toMatchObject({ pttKey: 'right ctrl', language: 'en' })
   })
 
   test('the model /jarvis setup installed wins over the setting', { options: { sttModel: 'small.en' } }, async ($, on) => {
@@ -77,7 +77,7 @@ describe('helper process', () => {
     expect(w.status()).toBe('JARVIS · ready · hold right ctrl to talk')
     const config = w.named('config')
     expect(config).toHaveLength(1)
-    expect(config[0]?.body).toEqual({ pttKey: 'right ctrl', language: 'en' })
+    expect(config[0]?.body).toMatchObject({ pttKey: 'right ctrl', language: 'en' })
     expect(config[0]?.url).toBe(`http://127.0.0.1:${PORT}/v1/config`)
     expect(config[0]?.headers.authorization).toBe(`Bearer ${token}`)
 

@@ -3,9 +3,19 @@
 
 export const PROTOCOL_VERSION = 1 as const
 
-export type HelperState = 'starting' | 'sleeping' | 'listening' | 'transcribing' | 'speaking' | 'error'
+export type HelperState =
+  | 'starting'
+  | 'sleeping'
+  | 'listening'
+  | 'transcribing'
+  | 'speaking'
+  /** A few seconds after a reply: the user can follow up without the wake word. */
+  | 'awake'
+  | 'error'
 export type HelperPlatform = 'windows' | 'macos' | 'linux'
 export type UtteranceSource = 'ptt' | 'command' | 'wake'
+/** What interrupts Jarvis by voice: any speech, only the wake word, or nothing. */
+export type BargeInMode = 'speech' | 'wake' | 'off'
 
 export type ErrorCode =
   | 'already_running'
@@ -20,6 +30,7 @@ export type ErrorCode =
   | 'stt_model_missing'
   | 'stt_failed'
   | 'ptt_unavailable'
+  | 'wake_unavailable'
   | 'bad_request'
   | 'unauthorized'
   | 'internal'
@@ -70,6 +81,9 @@ export type ReadyEvent = Envelope<'ready'> & {
   sttDevice: 'cuda' | 'cpu'
   voiceId?: string
   pttKey: string
+  /** "Hey Jarvis" while the wake word is loaded and switched on. */
+  wakePhrase?: string
+  bargeIn?: BargeInMode
 }
 
 export type HelperEvent =
@@ -90,7 +104,16 @@ export type HelperEventType = HelperEvent['type']
 export type SpeakCommand = { replyId: string; seq: number; text: string; final: boolean }
 export type StopCommand = { reason?: string }
 export type ListenCommand = { action: 'start' | 'stop' }
-export type ConfigCommand = { voiceId?: string; pttKey?: string; sttModel?: string; language?: string }
+export type ConfigCommand = {
+  voiceId?: string
+  pttKey?: string
+  sttModel?: string
+  language?: string
+  wakeWord?: boolean
+  bargeIn?: BargeInMode
+  /** 0.05 to 0.95; lower wakes more easily. */
+  wakeThreshold?: number
+}
 export type TestVoiceCommand = { text?: string }
 type Empty = Record<string, never>
 
@@ -126,6 +149,9 @@ export type StatusResponse = {
   pttKey?: string
   fishKeySet?: boolean
   ttsEngine?: 'fish' | 'local'
+  /** The wake phrase, while it is loaded and switched on. */
+  wakeWord?: string
+  bargeIn?: BargeInMode
 }
 
 /** schema.json's maxLength on SpeakCommand.text. */

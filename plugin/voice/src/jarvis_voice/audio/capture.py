@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 from typing import Protocol
 
 import numpy as np
@@ -11,6 +12,9 @@ import numpy as np
 from .levels import meter
 
 STT_SAMPLERATE = 16_000
+
+# Receives every block the microphone delivers, with its sample rate, on the audio thread.
+BlockListener = Callable[[np.ndarray, int], None]
 
 
 class Capture(Protocol):
@@ -43,6 +47,10 @@ class Capture(Protocol):
         ...
 
     def recording_seconds(self) -> float: ...
+
+    def set_listener(self, listener: BlockListener | None) -> None:
+        """Also hand every block to ``listener`` (which must return at once)."""
+        ...
 
 
 class CaptureBuffer:

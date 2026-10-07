@@ -5,16 +5,17 @@
   "description": "Messages between the Jarvis Claude Code mod and the jarvis-voice helper. Events: helper -> mod, one JSON object per stdout line. Commands: mod -> helper, HTTP POST /v1/<name> with a JSON body; responses are CommandResponse.",
   "$defs": {
     "v": { "const": 1 },
-    "HelperState": { "enum": ["starting", "sleeping", "listening", "transcribing", "speaking", "error"] },
+    "HelperState": { "enum": ["starting", "sleeping", "listening", "transcribing", "speaking", "awake", "error"] },
     "Platform": { "enum": ["windows", "macos", "linux"] },
     "ErrorCode": {
       "enum": [
         "already_running", "fish_key_missing", "fish_auth_failed", "fish_unreachable", "local_voice_failed",
         "mic_blocked", "mic_in_use", "no_input_device", "no_output_device",
-        "stt_model_missing", "stt_failed", "ptt_unavailable", "bad_request", "unauthorized", "internal"
+        "stt_model_missing", "stt_failed", "ptt_unavailable", "wake_unavailable", "bad_request", "unauthorized", "internal"
       ]
     },
     "UtteranceSource": { "enum": ["ptt", "command", "wake"] },
+    "BargeInMode": { "enum": ["speech", "wake", "off"] },
 
     "HelloEvent": {
       "type": "object", "additionalProperties": false,
@@ -89,7 +90,9 @@
       "properties": {
         "v": { "$ref": "#/$defs/v" }, "type": { "const": "ready" },
         "sttModel": { "type": "string" }, "sttDevice": { "enum": ["cuda", "cpu"] },
-        "voiceId": { "type": "string" }, "pttKey": { "type": "string" }
+        "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
+        "wakePhrase": { "type": "string", "description": "present while the wake word is loaded and switched on" },
+        "bargeIn": { "$ref": "#/$defs/BargeInMode" }
       }
     },
     "Event": {
@@ -120,7 +123,10 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
-        "sttModel": { "type": "string" }, "language": { "type": "string" }
+        "sttModel": { "type": "string" }, "language": { "type": "string" },
+        "wakeWord": { "type": "boolean" },
+        "bargeIn": { "$ref": "#/$defs/BargeInMode" },
+        "wakeThreshold": { "type": "number", "minimum": 0.05, "maximum": 0.95 }
       }
     },
     "StatusCommand": { "type": "object", "additionalProperties": false, "properties": {} },
@@ -153,7 +159,9 @@
         "sttModel": { "type": "string" }, "sttDevice": { "type": "string" },
         "inputDevice": { "type": "string" }, "outputDevice": { "type": "string" },
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
-        "fishKeySet": { "type": "boolean" }, "ttsEngine": { "enum": ["fish", "local"] }
+        "fishKeySet": { "type": "boolean" }, "ttsEngine": { "enum": ["fish", "local"] },
+        "wakeWord": { "type": "string", "description": "the wake phrase, while it is loaded and switched on" },
+        "bargeIn": { "$ref": "#/$defs/BargeInMode" }
       }
     }
   },

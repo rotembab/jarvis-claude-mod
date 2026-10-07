@@ -5,7 +5,7 @@ import type { Engine as TestEngine } from 'claude-code/testing'
 import type { FakeChild, World } from './test-harness'
 import { completeTurn, runStep, startHelper, textChunks, world } from './test-harness'
 import { CODE_PLACEHOLDER } from './sentences'
-import { PERSONA_SECTION_ID, VOICE_NOTE, VOICE_TURN_SECTION_ID } from './voice'
+import { isStopPhrase, PERSONA_SECTION_ID, VOICE_NOTE, VOICE_TURN_SECTION_ID } from './voice'
 
 const COMPOSE_INPUT = {
   model: 'claude-test',
@@ -251,5 +251,28 @@ describe('voice turns', () => {
     await w.settle()
     expect(w.named('stop').map(command => command.body)).toEqual([{ reason: 'turn_aborted' }])
     expect(spoken(w).some(one => one.final)).toBe(false)
+  })
+})
+
+describe('spoken stop', () => {
+  test('"Jarvis, stop." stops the reply and sends no prompt', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w)
+    await speak(w, helper, 'Tell me a long story')
+    await startTurn($, w, 'Tell me a long story', 'turn-8')
+    await runStep($, w, 'turn-8', textChunks('Once upon a time, sir. '))
+    helper.event({ type: 'utterance', id: 'u2', text: 'Jarvis, stop.', source: 'wake', durationMs: 900, language: 'en' })
+    await w.settle()
+    expect(w.submits).toHaveLength(1)
+    expect(w.aborts).toEqual(['turn-8'])
+    expect(w.named('stop').map(command => command.body)).toEqual([{ reason: 'voice' }])
+    expect(w.logs).toContain('Jarvis: stopped ("Jarvis, stop.")')
+  })
+
+  test('stop phrases, and words that only contain them', () => {
+    for (const said of ['Stop.', 'stop it', 'Jarvis, stand down.', 'Never mind, thanks.', "That's enough, Jarvis.", 'Hey Jarvis cancel that', 'Quiet please'])
+      expect(isStopPhrase(said)).toBe(true)
+    for (const said of ['Stop the build.', 'Cancel my 3 pm meeting', 'Never mind the tests, ship it', 'Is that enough?', ''])
+      expect(isStopPhrase(said)).toBe(false)
   })
 })

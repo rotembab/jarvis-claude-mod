@@ -18,7 +18,7 @@ unused pre-opened stream is closed after ``warm_ttl`` seconds.
 
 Locking: all reply state and every event this module emits are guarded by
 ``self._cond`` so events come out in a consistent order. Callbacks into the
-daemon (``on_speaking``) run under that lock; the daemon must therefore never
+daemon (``on_speaking``, ``on_reply_done``) run under that lock; the daemon must therefore never
 call into the pipeline while holding its own lock.
 """
 
@@ -122,6 +122,7 @@ class SpeechPipeline:
         *,
         voice_id: Callable[[], str | None] = lambda: None,
         on_speaking: Callable[[bool], None] = lambda speaking: None,
+        on_reply_done: Callable[[str, bool, bool], None] = lambda reply_id, interrupted, more_queued: None,
         gap_timeout: float = 3.0,
         stale_after: float = 3.0,
         stall_timeout: float = 5.0,
@@ -133,6 +134,7 @@ class SpeechPipeline:
         self._events = events
         self._voice_id = voice_id
         self._on_speaking = on_speaking
+        self._on_reply_done = on_reply_done
         self._gap_timeout = gap_timeout
         self._stale_after = stale_after
         self._stall_timeout = stall_timeout
@@ -503,4 +505,5 @@ class SpeechPipeline:
         self._events.emit(protocol.SpeechDone(reply_id=reply.id, interrupted=interrupted, spoken_text=spoken))
         if reply.started:
             self._on_speaking(False)
+            self._on_reply_done(reply.id, interrupted, bool(self._order))
         self._cond.notify_all()

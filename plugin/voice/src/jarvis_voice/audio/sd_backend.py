@@ -17,7 +17,7 @@ import numpy as np
 
 from .. import platform as plat
 from ..protocol import ErrorCode
-from .capture import STT_SAMPLERATE, CaptureBuffer, to_stt_rate
+from .capture import STT_SAMPLERATE, BlockListener, CaptureBuffer, to_stt_rate
 from .devices import DeviceInfo, select_device
 from .errors import AudioError, classify_audio_error
 from .playback import TTS_SAMPLERATE, PlaybackMixer
@@ -122,10 +122,14 @@ class SoundDeviceCapture:
         self._channels = 1
         self._dead = False
         self._began_at = 0.0
+        self._listener: BlockListener | None = None
 
     @property
     def device_name(self) -> str | None:
         return self._device.name if self._device else None
+
+    def set_listener(self, listener: BlockListener | None) -> None:
+        self._listener = listener
 
     @property
     def is_open(self) -> bool:
@@ -137,7 +141,12 @@ class SoundDeviceCapture:
 
     def _callback(self, indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
         # Real-time thread: copy channel 0 and hand it over; nothing else.
-        self._buffer.feed(indata[:, 0].copy())
+        block = indata[:, 0].copy()
+        buffer = self._buffer
+        buffer.feed(block)
+        listener = self._listener
+        if listener is not None:
+            listener(block, buffer.samplerate)
 
     def _finished(self) -> None:
         self._dead = True

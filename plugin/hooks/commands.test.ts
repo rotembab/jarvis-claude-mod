@@ -45,7 +45,8 @@ describe('/jarvis', () => {
     expect(text).toContain('JARVIS · ready · hold right ctrl to talk')
     expect(text).toContain('Helper 0.1.0 (pid 4242) · speech model large-v3-turbo on cuda · voice Fish Audio default')
     expect(text).toContain(`Data folder: ${DATA_DIR}`)
-    expect(text).toContain('/jarvis stop                  stop speaking and cancel the spoken reply')
+    expect(text).toContain('/jarvis stop                     stop speaking and cancel the spoken reply')
+    expect(text).toContain('Wake word loading · talking over Jarvis interrupts him')
     expect(w.helpers()).toHaveLength(1) // a running helper is left alone
     expect(await jarvis($, 'frobnicate')).toContain('Unknown subcommand "frobnicate"')
   })
@@ -183,7 +184,7 @@ describe('/jarvis voice', () => {
     const w = world(on)
     w.store.set('voiceId', 'saved-voice')
     await startHelper($, w)
-    expect(w.named('config')[0]?.body).toEqual({ pttKey: 'right ctrl', language: 'en', voiceId: 'saved-voice' })
+    expect(w.named('config')[0]?.body).toMatchObject({ pttKey: 'right ctrl', language: 'en', voiceId: 'saved-voice' })
   })
 
   test('without a running helper the voice is saved for later', async ($, on) => {
@@ -501,5 +502,77 @@ describe('the local voice', () => {
     await w.settle(20)
     expect(w.helpers()).toHaveLength(3)
     expect(w.lastHelper().request.env?.JARVIS_TTS_ENGINE).toBeUndefined()
+  })
+})
+
+describe('hands-free', () => {
+  test('the helper starts with the wake word on and talking over Jarvis interrupting him', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(w.named('config')[0]?.body).toEqual({
+      pttKey: 'right ctrl',
+      language: 'en',
+      wakeWord: true,
+      bargeIn: 'speech',
+      wakeThreshold: 0.5,
+    })
+  })
+
+  test('the settings shape the first config', { options: { wakeWord: 'off', bargeIn: 'wake', wakeSensitivity: 'high' } }, async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(w.named('config')[0]?.body).toMatchObject({ wakeWord: false, bargeIn: 'wake', wakeThreshold: 0.3 })
+  })
+
+  test('ready with the wake phrase: the status line and the toast say it; awake reads as keep talking', async ($, on) => {
+    const w = world(on)
+    const helper = await startHelper($, w) // the first ready came without the phrase (the model was loading)
+    expect(w.toasts).toEqual(['Jarvis is ready. Hold right ctrl to talk.'])
+    helper.event({ type: 'ready', sttModel: 'large-v3-turbo', sttDevice: 'cuda', pttKey: 'right ctrl', wakePhrase: 'Hey Jarvis', bargeIn: 'speech' })
+    await w.settle()
+    expect(w.status()).toBe('JARVIS · ready · say "Hey Jarvis" or hold right ctrl to talk')
+    expect(w.toasts.at(-1)).toBe('Jarvis is listening for "Hey Jarvis".')
+    helper.event({ type: 'state', state: 'awake' })
+    await w.settle()
+    expect(w.status()).toBe('JARVIS · awake · keep talking')
+    expect(await jarvis($, 'wake')).toBe('Say "Hey Jarvis" · talking over Jarvis interrupts him. Switch with /jarvis wake on or /jarvis wake off.')
+  })
+
+  test('/jarvis wake off and on tell the running helper and are remembered', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(await jarvis($, 'wake off')).toBe('Wake word off: hold the push-to-talk key to talk.')
+    expect(w.store.get('wakeWord')).toBe(false)
+    expect(w.named('config').at(-1)?.body).toEqual({ wakeWord: false })
+    expect(await jarvis($, 'wake on')).toBe('Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.')
+    expect(w.named('config').at(-1)?.body).toEqual({ wakeWord: true })
+    expect(await jarvis($, 'wake maybe')).toBe('Unknown choice "maybe". Use /jarvis wake on or /jarvis wake off.')
+  })
+
+  test('a saved choice reaches the helper when it starts', async ($, on) => {
+    const w = world(on)
+    w.store.set('wakeWord', false)
+    w.store.set('bargeIn', 'off')
+    await startHelper($, w)
+    expect(w.named('config')[0]?.body).toMatchObject({ wakeWord: false, bargeIn: 'off' })
+  })
+
+  test('/jarvis bargein picks what interrupts Jarvis', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(await jarvis($, 'bargein wake')).toBe('Now only "Hey Jarvis" interrupts him.')
+    expect(w.store.get('bargeIn')).toBe('wake')
+    expect(w.named('config').at(-1)?.body).toEqual({ bargeIn: 'wake' })
+    expect(await jarvis($, 'bargein speech')).toContain('use /jarvis bargein wake there')
+    expect(await jarvis($, 'bargein')).toBe('Now talking over Jarvis interrupts him. Choose with /jarvis bargein speech, wake or off.')
+    expect(await jarvis($, 'bargein loud')).toBe('Unknown choice "loud". Use /jarvis bargein speech, wake or off.')
+  })
+
+  test('without a running helper the choice is saved for later', async ($, on) => {
+    const w = world(on, { installed: false })
+    await startSession($, w)
+    expect(await jarvis($, 'wake off')).toBe('Wake word off: hold the push-to-talk key to talk.')
+    expect(w.store.get('wakeWord')).toBe(false)
+    expect(w.commands).toHaveLength(0)
   })
 })

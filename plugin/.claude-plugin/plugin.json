@@ -1,10 +1,10 @@
 {
   "name": "jarvis",
   "version": "0.1.0",
-  "description": "A JARVIS-style voice for Claude Code: hold push-to-talk to speak, hear the reply. Local speech-to-text, Fish Audio speech.",
+  "description": "A JARVIS-style voice for Claude Code: say \"Hey Jarvis\" (or hold push-to-talk) to speak, hear the reply, talk over it to interrupt. Local wake word and speech-to-text, Fish Audio speech.",
   "author": { "name": "Rotem" },
   "license": "MIT",
-  "keywords": ["voice", "speech", "push-to-talk", "tts", "stt", "jarvis"],
+  "keywords": ["voice", "speech", "wake word", "push-to-talk", "tts", "stt", "jarvis"],
   "types": "./types/index.d.ts",
   "userConfig": {
     "fishApiKey": {
@@ -39,6 +39,27 @@
       "title": "Local voice clip",
       "description": "Full path of a clean 10 to 20 second recording (wav or mp3) whose voice the local engine copies. Empty uses Chatterbox's built-in voice. Run /jarvis restart after changing it.",
       "required": false
+    },
+    "wakeWord": {
+      "type": "string",
+      "title": "Wake word",
+      "description": "on: Jarvis listens for \"Hey Jarvis\" on this computer (nothing is recorded or sent before it hears it). off: push-to-talk only. /jarvis wake on|off switches without opening the settings.",
+      "options": ["on", "off"],
+      "default": "on"
+    },
+    "bargeIn": {
+      "type": "string",
+      "title": "Interrupting Jarvis",
+      "description": "speech: talking while Jarvis speaks stops him and he listens (best with a headset). wake: only \"Hey Jarvis\" interrupts (for speakers or a noisy room). off: only push-to-talk or /jarvis stop. /jarvis bargein switches it.",
+      "options": ["speech", "wake", "off"],
+      "default": "speech"
+    },
+    "wakeSensitivity": {
+      "type": "string",
+      "title": "Wake word sensitivity",
+      "description": "high wakes more easily but also more often by mistake (TV, other people); low needs a clearer \"Hey Jarvis\". Run /jarvis restart after changing it.",
+      "options": ["low", "medium", "high"],
+      "default": "medium"
     },
     "pttKey": {
       "type": "string",

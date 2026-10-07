@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .capture import STT_SAMPLERATE
+from .capture import STT_SAMPLERATE, BlockListener
 from .playback import TTS_SAMPLERATE, PlaybackMixer
 
 
@@ -26,6 +26,7 @@ class FakeCapture:
         self.opened = False
         self._began_at: float | None = None
         self.begins = 0
+        self.listener: BlockListener | None = None
 
     @property
     def device_name(self) -> str | None:
@@ -54,6 +55,16 @@ class FakeCapture:
 
     def recording_seconds(self) -> float:
         return 0.0 if self._began_at is None else time.monotonic() - self._began_at
+
+    def set_listener(self, listener: BlockListener | None) -> None:
+        self.listener = listener
+
+    def push(self, pcm: np.ndarray, rate: int = STT_SAMPLERATE) -> None:
+        """Deliver audio to the listener the way the sound card would, 10 ms at a time."""
+        step = rate // 100
+        for start in range(0, pcm.size, step):
+            if self.listener is not None:
+                self.listener(pcm[start : start + step].astype(np.float32), rate)
 
     def end(self) -> np.ndarray:
         seconds = self.preroll_s + self.recording_seconds()

@@ -17,6 +17,7 @@ export type JarvisPhase =
   | 'listening'
   | 'transcribing'
   | 'speaking'
+  | 'awake'
   | 'error'
   /** Waiting out a restart backoff. */
   | 'restarting'
@@ -31,6 +32,8 @@ export type JarvisView = {
   detail?: string
   /** The push-to-talk key as the helper reported it ("right ctrl"). */
   pttKey?: string
+  /** The wake phrase ("Hey Jarvis") while the helper listens for it. */
+  wakePhrase?: string
   /** The last transcribed utterance. */
   lastUtterance?: string
   /** Microphone level 0..1, updated a few times a second while listening. */

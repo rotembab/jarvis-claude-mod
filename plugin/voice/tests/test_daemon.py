@@ -54,6 +54,9 @@ def build(
     stt_fail: SttError | None = None,
     stt_delay: float = 0.0,
     config: DaemonConfig | None = None,
+    stt_text: str = "turn on the lights",
+    vad: Any = None,
+    wake_loader: Callable[[], Any] | None = None,
 ) -> Rig:
     rig = Rig(
         daemon=None,  # type: ignore[arg-type]
@@ -65,7 +68,7 @@ def build(
     )
 
     def factory(requested: str) -> FakeTranscriber:
-        t = FakeTranscriber("turn on the lights", name=f"fake-{requested}", load_delay=stt_delay, fail=stt_fail)
+        t = FakeTranscriber(stt_text, name=f"fake-{requested}", load_delay=stt_delay, fail=stt_fail)
         rig.transcribers.append(t)
         return t
 
@@ -78,6 +81,8 @@ def build(
         ptt=rig.ptt,
         transcriber_factory=factory,
         platform_name="linux",
+        vad=vad,
+        wake_loader=wake_loader,
     )
     return rig
 
@@ -147,6 +152,7 @@ def test_short_and_silent_clips_are_ignored(rig: Rig) -> None:
     rig.capture.next_clip = np.full(1600, 0.3, np.float32)  # 100 ms
     rig.ptt.press()
     rig.ptt.release()
+    wait_until(lambda: rig.capture.next_clip is None)  # taken by the first release, not replaced before it
     rig.capture.next_clip = (np.random.default_rng(1).standard_normal(16_000) * 1e-4).astype(np.float32)
     rig.ptt.press()
     rig.ptt.release()

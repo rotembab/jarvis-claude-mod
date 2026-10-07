@@ -1,15 +1,18 @@
-"""The helper's state machine, wiring capture, STT, TTS, playback and push-to-talk.
+"""The helper's state machine, wiring capture, STT, TTS, playback, push-to-talk and the listener.
 
 States: starting -> sleeping (model loaded; ``ready``) -> listening (PTT held,
-chime, capture with pre-roll) -> transcribing -> sleeping (``utterance`` if
-the clip had words) ... speaking (first audio of a reply) -> sleeping.
-"error" replaces sleeping while no speech model is usable.
+or the listener heard the wake word; chime, capture with pre-roll) ->
+transcribing -> sleeping (``utterance`` if the clip had words) ... speaking
+(first audio of a reply) -> awake (a few seconds to follow up without the
+wake word) -> sleeping. "error" replaces sleeping while no speech model is
+usable.
 
-Threads: push-to-talk callbacks and the ``listen`` command are funnelled into
-one action queue served by ``run()`` (the main thread), so listening
-transitions never race and the keyboard hook returns immediately (Windows
-silently unhooks slow low-level hooks). Transcription runs on its own worker;
-speech on the pipeline's worker.
+Threads: push-to-talk callbacks, the ``listen`` command and the listener's
+decisions are funnelled into one action queue served by ``run()`` (the main
+thread), so listening transitions never race and the keyboard hook returns
+immediately (Windows silently unhooks slow low-level hooks). Transcription
+runs on its own worker; speech on the pipeline's worker; the wake word and
+voice activity on the listener's thread.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import queue
+import re
 import threading
 import uuid
 from collections.abc import Callable
@@ -33,6 +37,10 @@ from .audio.levels import is_digital_silence, is_silent
 from .audio.playback import Playback
 from .events import EventSink
 from .lifecycle import HeartbeatWatchdog
+from .listen.listener import BARGE_MODES, BargeMode, Kind, Listener, ListenerConfig
+from .listen.models import WAKE_PHRASE
+from .listen.vad import VoiceDetector
+from .listen.wakeword import WakeScorer
 from .ptt.base import PttUnavailable, PushToTalk
 from .ptt.keys import Hotkey, parse_hotkey
 from .speech import SpeechPipeline
@@ -44,7 +52,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TEST_LINE = "Good evening, sir. Voice systems are online and at your service."
 KEY_HINT = "Use a key name like 'right ctrl', 'f13' or 'alt+space' in the Jarvis plugin settings."
+WAKE_HINT = "Run /jarvis setup to download it. Push-to-talk still works."
 _EXIT = object()
+# "Hey Jarvis," at the start of a hands-free transcript is the wake word itself, not the request.
+_WAKE_PREFIX = re.compile(r"^\W*(?:(?:hey|hi|hello|ok|okay|a)\W+)?jarvis\b\W*", re.IGNORECASE)
+
+
+def strip_wake_phrase(text: str) -> str:
+    return _WAKE_PREFIX.sub("", text, count=1).strip()
 
 
 @dataclass
@@ -60,6 +75,10 @@ class DaemonConfig:
     level_hz: float = 15.0
     chimes: bool = True
     stt_wait_s: float = 180.0  # how long a clip waits for a model that is still loading
+    wake_word: bool = True
+    barge_in: BargeMode = "speech"
+    wake_threshold: float = 0.5
+    follow_up_s: float = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +101,8 @@ class Daemon:
         transcriber_factory: Callable[[str], Transcriber],
         platform_name: protocol.PlatformName,
         rescan_audio: Callable[[], None] | None = None,
+        vad: VoiceDetector | None = None,
+        wake_loader: Callable[[], WakeScorer] | None = None,
     ) -> None:
         self.config = config
         self._events = events
@@ -105,6 +126,8 @@ class Daemon:
         self._last_state: str | None = None
         self._ptt_armed = False
         self._ready_sent = False
+        self._awake = False  # the follow-up window is open
+        self._wake_loader = wake_loader
 
         self._transcriber: Transcriber | None = None
         self._stt_error: SttError | None = None
@@ -126,8 +149,23 @@ class Daemon:
             events,
             voice_id=lambda: self._voice_id,
             on_speaking=self._on_speaking,
+            on_reply_done=self._on_reply_done,
         )
         self._threads: list[threading.Thread] = []
+        self.listener: Listener | None = None
+        if vad is not None:
+            self.listener = Listener(
+                ListenerConfig(wake_threshold=config.wake_threshold, follow_up_s=config.follow_up_s),
+                vad=vad,
+                wake=None,  # loaded in the background by start()
+                on_start=self._on_listener_start,
+                on_end=self._on_listener_end,
+                on_follow_up=self._on_follow_up,
+                on_digital_silence=self._on_digital_silence,
+                audio_playing=lambda: not self._playback.speech_idle(),
+                wake_enabled=config.wake_word,
+                barge_mode=config.barge_in,
+            )
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -157,8 +195,14 @@ class Daemon:
                 if self._hotkey != hotkey:
                     self._ptt.set_hotkey(self._hotkey)
 
+        if self.listener is not None:
+            self.listener.start()
+            self._capture.set_listener(self.listener.feed)
+            if self._wake_loader is not None:
+                thread = threading.Thread(target=self._load_wake, name="wake-load", daemon=True)
+                thread.start()
         try:
-            self._capture.open()  # kept open so the 300 ms pre-roll is always there
+            self._capture.open()  # kept open: the pre-roll, and the listener, need it
         except AudioError as exc:
             self._emit_error(exc.code, exc.message, exc.hint)
         try:
@@ -198,6 +242,8 @@ class Daemon:
         self._stopping.set()
         self.watchdog.stop()
         steps = [self._ptt.stop, self.pipeline.close, self._capture.close, self._playback.close]
+        if self.listener is not None:
+            steps.insert(1, self.listener.close)
         close_synth = getattr(self._synth, "close", None)  # the local voice owns a child process
         if callable(close_synth):
             steps.insert(2, close_synth)
@@ -234,6 +280,8 @@ class Daemon:
             return "transcribing"
         if self._speaking:
             return "speaking"
+        if self._awake and self._base == "sleeping":
+            return "awake"
         return self._base
 
     @property
@@ -249,9 +297,17 @@ class Daemon:
                 self._events.emit(protocol.State(state=state))
 
     def _on_speaking(self, speaking: bool) -> None:
+        if self.listener is not None:
+            self.listener.set_speaking(speaking)
         with self._lock:
             self._speaking = speaking
         self._refresh_state()
+
+    def _on_reply_done(self, reply_id: str, interrupted: bool, more_queued: bool) -> None:
+        """A reply finished playing: give the user a moment to follow up without the wake word."""
+        if self.listener is None or interrupted or more_queued or reply_id.startswith("test-"):
+            return
+        self.listener.open_follow_up()
 
     def _emit_error(self, code: protocol.ErrorCode, message: str, hint: str | None = None, fatal: bool = False) -> None:
         self._events.emit(protocol.Error(code=code, message=message, hint=hint, fatal=fatal))
@@ -295,11 +351,14 @@ class Daemon:
             self._chime("error")
             return protocol.error_response(exc.code, exc.message)
 
+        if self.listener is not None:
+            self.listener.pause()
         self._playback.set_paused(True)  # hold any new speech while the user talks
         self._capture.begin()
         self._chime("start")
         with self._lock:
             self._listen_source = source
+            self._awake = False
         self._refresh_state()
         return {"ok": True}
 
@@ -319,9 +378,11 @@ class Daemon:
     def _end_listening(self, only_source: protocol.UtteranceSource | None = None) -> dict[str, Any]:
         with self._lock:
             source = self._listen_source
-            if source is None or (only_source is not None and source != only_source):
+            if source is None or source == "wake" or (only_source is not None and source != only_source):
                 return {"ok": True, "already": True}
             self._listen_source = None
+        if self.listener is not None:
+            self.listener.resume()
         self._playback.set_paused(False)
         try:
             pcm = self._capture.end()
@@ -331,6 +392,9 @@ class Daemon:
             self._refresh_state()
             return protocol.error_response(exc.code, exc.message)
         self._chime("stop")
+        return self._queue_clip(pcm, source)
+
+    def _queue_clip(self, pcm: np.ndarray, source: protocol.UtteranceSource) -> dict[str, Any]:
         queued = False
         duration_s = pcm.size / STT_SAMPLERATE
         if duration_s < self.config.min_clip_s:
@@ -349,6 +413,75 @@ class Daemon:
         if queued:
             self.pipeline.prewarm()  # a reply is coming: connect to the voice service meanwhile
         return {"ok": True}
+
+    # ------------------------------------------------------------------ hands-free
+
+    def _load_wake(self) -> None:
+        assert self._wake_loader is not None and self.listener is not None
+        try:
+            scorer = self._wake_loader()
+        except Exception as exc:
+            log.warning("wake word unavailable: %s", exc, exc_info=True)
+            self._emit_error("wake_unavailable", f"The wake word model could not be loaded: {exc}", WAKE_HINT)
+            return
+        self.listener.set_wake_scorer(scorer)
+        log.info("wake word ready: %s", scorer.name)
+        self._emit_ready(only_if_sent=True)  # the mod learns that "Hey Jarvis" works now
+
+    def _on_listener_start(self, kind: Kind) -> None:  # listener thread: enqueue only
+        self._actions.put(lambda: self._begin_hands_free(kind))
+
+    def _on_listener_end(self, pcm: np.ndarray | None, kind: Kind) -> None:
+        self._actions.put(lambda: self._end_hands_free(pcm))
+
+    def _begin_hands_free(self, kind: Kind) -> None:
+        assert self.listener is not None
+        with self._lock:
+            busy = self._listen_source is not None
+            stt_error = self._stt_error if self._transcriber is None else None
+        if busy:
+            self.listener.cancel()
+            return
+        if stt_error is not None:
+            self.listener.cancel()
+            self._emit_error(stt_error.code, stt_error.message, stt_error.hint)
+            self._chime("error")
+            return
+        # Only cut Jarvis off when he is audible: a reply that is open but quiet
+        # (Claude is running a tool) keeps going, and the mod queues the new words.
+        if kind == "barge" or not self._playback.speech_idle():
+            self.pipeline.stop("wake word" if kind == "wake" else "voice", barge_in=True)
+        self._playback.set_paused(True)
+        if kind == "wake":
+            self._chime("start")
+        with self._lock:
+            self._listen_source = "wake"
+            self._awake = False
+        self._refresh_state()
+
+    def _end_hands_free(self, pcm: np.ndarray | None) -> None:
+        with self._lock:
+            if self._listen_source != "wake":
+                return
+            self._listen_source = None
+        self._playback.set_paused(False)
+        self._chime("stop")
+        if pcm is None:
+            self._refresh_state()
+            return
+        self._queue_clip(pcm, "wake")
+
+    def _on_follow_up(self, opened: bool) -> None:
+        with self._lock:
+            self._awake = opened
+        self._refresh_state()
+
+    def _on_digital_silence(self, silent: bool) -> None:
+        if silent:
+            err = digital_silence_error()
+            self._emit_error(err.code, err.message, err.hint)
+        else:
+            log.info("the microphone is delivering sound again")
 
     # ------------------------------------------------------------------ speech-to-text
 
@@ -401,8 +534,13 @@ class Daemon:
                     stt_device=transcriber.device,
                     ptt_key=self._hotkey.text,
                     voice_id=self._voice_id,
+                    wake_phrase=self._wake_phrase(),
+                    barge_in=self.listener.barge_mode if self.listener is not None else None,
                 )
             )
+
+    def _wake_phrase(self) -> str | None:
+        return WAKE_PHRASE if self.listener is not None and self.listener.wake_ready else None
 
     def _stt_worker(self) -> None:
         while True:
@@ -419,6 +557,8 @@ class Daemon:
                     continue
                 result = transcriber.transcribe(clip.pcm, self._language)
                 text = result.text.strip()
+                if clip.source == "wake":
+                    text = strip_wake_phrase(text)
                 if text:
                     self._events.emit(
                         protocol.Utterance(
@@ -504,8 +644,20 @@ class Daemon:
             except ValueError as exc:
                 key_error = f"invalid push-to-talk key {body['pttKey']!r}: {exc}"
         applied: list[str] = []
+        listener = self.listener
         with self._lock:
-            announced = (self._hotkey, self._voice_id)
+            announced = (self._hotkey, self._voice_id, self._wake_phrase(), listener and listener.barge_mode)
+        if listener is not None:
+            if "wakeWord" in body:
+                listener.set_wake_enabled(bool(body["wakeWord"]))
+                applied.append("wakeWord")
+            if "bargeIn" in body and body["bargeIn"] in BARGE_MODES:
+                listener.set_barge_mode(body["bargeIn"])
+                applied.append("bargeIn")
+            if "wakeThreshold" in body:
+                listener.set_wake_threshold(float(body["wakeThreshold"]))
+                applied.append("wakeThreshold")
+        with self._lock:
             if "voiceId" in body:
                 self._voice_id = body["voiceId"].strip() or None
                 applied.append("voiceId")
@@ -516,7 +668,7 @@ class Daemon:
                 self._hotkey = hotkey
                 self._ptt.set_hotkey(hotkey)  # under the lock so concurrent configs apply in order
                 applied.append("pttKey")
-            changed = (self._hotkey, self._voice_id) != announced
+            changed = (self._hotkey, self._voice_id, self._wake_phrase(), listener and listener.barge_mode) != announced
         model = (body.get("sttModel") or "").strip()
         if model and model != self._stt_requested:
             self._load_stt(model)  # announces ready again once loaded
@@ -548,6 +700,8 @@ class Daemon:
                 "fishKeySet": self._synth.configured,
                 "ttsEngine": getattr(self._synth, "engine", "fish"),
                 "pttArmed": self._ptt_armed,
+                "wakeWord": self._wake_phrase(),
+                "bargeIn": self.listener.barge_mode if self.listener is not None else None,
                 "sttRequested": self._stt_requested,
                 "language": self._language,
                 "speakingReplyId": reply_id,

@@ -88,3 +88,48 @@ class FakeSynth:
         with self.lock:
             self.streams.append(stream)
         return stream
+
+
+class LoudnessVad:
+    """VoiceDetector stand-in: a 32 ms frame is speech when it is louder than -30 dBFS."""
+
+    def __init__(self) -> None:
+        self._pending = np.zeros(0, np.float32)
+
+    def reset(self) -> None:
+        self._pending = np.zeros(0, np.float32)
+
+    def process(self, audio: np.ndarray) -> list[float]:
+        self._pending = np.concatenate([self._pending, audio])
+        probs = []
+        while self._pending.size >= 512:
+            frame, self._pending = self._pending[:512], self._pending[512:]
+            probs.append(0.95 if float(np.sqrt(np.mean(frame**2))) > 0.03 else 0.02)
+        return probs
+
+
+class ScriptedWake:
+    """WakeScorer stand-in: scores 0.9 on the next 80 ms chunk after ``say()``."""
+
+    name = "scripted"
+
+    def __init__(self) -> None:
+        self._pending = 0
+        self._armed = False
+        self.resets = 0
+
+    def say(self) -> None:
+        self._armed = True
+
+    def reset(self) -> None:
+        self._pending = 0
+        self.resets += 1
+
+    def process(self, audio: np.ndarray) -> list[float]:
+        self._pending += audio.size
+        scores = []
+        while self._pending >= 1280:
+            self._pending -= 1280
+            scores.append(0.9 if self._armed else 0.01)
+            self._armed = False
+        return scores

@@ -5,22 +5,24 @@
 import type { CommandRunResult } from 'claude-code'
 
 import type { Jarvis, SttModel, VoiceEngine } from './app'
-import { STT_MODELS, VOICE_ENGINES } from './app'
+import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
 import { findUv, shellCommandLine } from './platform'
-import type { StatusResponse } from './protocol'
+import type { BargeInMode, StatusResponse } from './protocol'
 import { uvMissingMessage } from './setup'
 import { statusLine } from './ui'
 
 const HELP = [
-  '/jarvis setup [model] [cpu]   install or repair the voice helper and its speech model',
-  '/jarvis setup local [cpu]     install the local voice (Chatterbox, about 6 GB)',
-  '/jarvis engine <fish|local>   speak with Fish Audio or the local voice',
-  '/jarvis stop                  stop speaking and cancel the spoken reply',
-  '/jarvis talk                  start or stop listening without the push-to-talk key',
-  '/jarvis test                  speak a test line',
-  '/jarvis restart               restart the voice helper',
-  '/jarvis voice <id|default>    use a Fish Audio voice (its model id)',
-  '/jarvis devices               show the audio devices and models in use',
+  '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model',
+  '/jarvis setup local [cpu]        install the local voice (Chatterbox, about 6 GB)',
+  '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
+  '/jarvis wake <on|off>            listen for "Hey Jarvis" (push-to-talk always works)',
+  '/jarvis bargein <speech|wake|off>  what interrupts Jarvis: any speech, "Hey Jarvis", or nothing',
+  '/jarvis stop                     stop speaking and cancel the spoken reply',
+  '/jarvis talk                     start or stop listening without the push-to-talk key',
+  '/jarvis test                     speak a test line',
+  '/jarvis restart                  restart the voice helper',
+  '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
+  '/jarvis devices                  show the audio devices and models in use',
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -50,6 +52,11 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: await voice(app, rest[0]) }
       case 'engine':
         return { text: await voiceEngine(app, rest[0]) }
+      case 'wake':
+        return { text: await wake(app, rest[0]) }
+      case 'bargein':
+      case 'barge-in':
+        return { text: await bargeIn(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
       default:
@@ -75,6 +82,7 @@ async function status(app: Jarvis): Promise<string> {
     const model = ready ? `speech model ${ready.sttModel} on ${ready.sttDevice}` : 'loading models'
     const voiceId = (await app.voiceEngine()) === 'local' ? 'local' : ((await app.voiceId()) ?? 'Fish Audio default')
     lines.push(`Helper ${hello.version} (pid ${hello.pid}) · ${model} · voice ${voiceId}`)
+    lines.push(await handsFreeLine(app))
   } else if (isRetry) {
     lines.push('Starting the voice helper…')
   }
@@ -156,6 +164,54 @@ async function voiceEngine(app: Jarvis, choice: string | undefined): Promise<str
     : 'Switched to Fish Audio. The helper restarts.'
 }
 
+const BARGE_IN_LABELS: Record<BargeInMode, string> = {
+  speech: 'talking over Jarvis interrupts him',
+  wake: 'only "Hey Jarvis" interrupts him',
+  off: 'only push-to-talk or /jarvis stop interrupts him',
+}
+
+async function handsFreeLine(app: Jarvis): Promise<string> {
+  const isOn = await app.wakeWord()
+  const phrase = app.ready?.wakePhrase
+  const wakeText = !isOn ? 'Wake word off' : phrase !== undefined ? `Say "${phrase}"` : 'Wake word loading'
+  return `${wakeText} · ${BARGE_IN_LABELS[await app.bargeIn()]}`
+}
+
+/** Sends a hands-free change to a running helper; undefined when none runs (it applies at the next start). */
+async function sendConfig(app: Jarvis, body: { wakeWord?: boolean; bargeIn?: BargeInMode }): Promise<string | undefined> {
+  if (app.helper?.isRunning !== true) return undefined
+  const outcome = await app.helper.send('config', body)
+  return outcome.ok ? '' : outcome.message
+}
+
+async function wake(app: Jarvis, choice: string | undefined): Promise<string> {
+  const word = choice?.toLowerCase()
+  if (word === undefined) {
+    return `${await handsFreeLine(app)}. Switch with /jarvis wake on or /jarvis wake off.`
+  }
+  if (word !== 'on' && word !== 'off') return `Unknown choice "${choice}". Use /jarvis wake on or /jarvis wake off.`
+  const isOn = word === 'on'
+  await app.setWakeWord(isOn)
+  const refused = await sendConfig(app, { wakeWord: isOn })
+  if (refused) return `Saved, but the helper refused it: ${refused}`
+  return isOn
+    ? 'Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.'
+    : 'Wake word off: hold the push-to-talk key to talk.'
+}
+
+async function bargeIn(app: Jarvis, choice: string | undefined): Promise<string> {
+  if (choice === undefined) {
+    return `Now ${BARGE_IN_LABELS[await app.bargeIn()]}. Choose with /jarvis bargein speech, wake or off.`
+  }
+  const mode = BARGE_IN_MODES.find(one => one === choice.toLowerCase())
+  if (mode === undefined) return `Unknown choice "${choice}". Use /jarvis bargein speech, wake or off.`
+  await app.setBargeIn(mode)
+  const refused = await sendConfig(app, { bargeIn: mode })
+  if (refused) return `Saved, but the helper refused it: ${refused}`
+  const note = mode === 'speech' ? ' With speakers instead of a headset, Jarvis may hear himself: use /jarvis bargein wake there.' : ''
+  return `Now ${BARGE_IN_LABELS[mode]}.${note}`
+}
+
 async function stop(app: Jarvis): Promise<string> {
   const voice = app.voice
   if (voice === undefined) return 'Jarvis is not running in this session.'
@@ -230,5 +286,6 @@ async function devices(app: Jarvis): Promise<string> {
     `Speech model: ${report.sttModel ?? 'unknown'}${report.sttDevice ? ` on ${report.sttDevice}` : ''}`,
     `Voice: ${report.voiceId ?? 'Fish Audio default'} · Fish Audio key ${report.fishKeySet === true ? 'set' : 'missing'}`,
     `Push-to-talk: ${report.pttKey ?? app.settings.pttKey} · helper ${report.version ?? '?'} on ${report.platform ?? '?'}`,
+    `Wake word: ${report.wakeWord ?? 'off'} · barge-in: ${report.bargeIn ?? 'push-to-talk only'}`,
   ].join('\n') + doctor
 }

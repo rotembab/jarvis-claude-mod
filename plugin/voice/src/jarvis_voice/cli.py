@@ -134,6 +134,9 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
         "level",
         "ptt",
         "barge_in.ptt",
+        "barge_in.speech",
+        "wake",
+        "follow_up",
         "stt.faster-whisper",
         "tts.local" if args.tts_engine == "local" else "tts.fish-live",
     ]
@@ -195,6 +198,26 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         settings = FishSettings.from_env(fake_url=args.fake_fish)
         secret_filter.add(settings.api_key)
         synth = FishLiveSynth(settings)
+    vad: Any = None
+    try:
+        from .listen.vad import SileroVad
+
+        vad = SileroVad()
+    except Exception as exc:  # noqa: BLE001 - hands-free is off, push-to-talk still works
+        log.warning("voice activity detection unavailable, hands-free listening is off: %s", exc)
+    wake_loader = None
+    if not args.fake_audio:  # fake audio never hears anything; don't download for it
+
+        def wake_loader() -> Any:
+            from .listen.models import download, is_downloaded, wake_dir
+            from .listen.wakeword import OpenWakeWord
+            from .stt.models import models_dir as wake_models_dir
+
+            folder = wake_dir(wake_models_dir(data_dir))
+            if not is_downloaded(folder):
+                download(folder)  # about 3.7 MB, once
+            return OpenWakeWord(folder)
+
     config = DaemonConfig(
         stt_model=args.stt_model,
         language=args.language,
@@ -213,6 +236,8 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         transcriber_factory=transcriber_factory,
         platform_name=plat.name(),
         rescan_audio=rescan,
+        vad=vad,
+        wake_loader=wake_loader,
     )
 
 

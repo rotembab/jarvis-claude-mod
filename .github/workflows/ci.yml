@@ -49,7 +49,11 @@ jobs:
       - name: Install the helper and its dev dependencies
         run: uv sync --locked --project plugin/voice --group dev
 
+      # JARVIS_WAKE_MODELS_DIR lets the two tests that need the real "Hey Jarvis"
+      # model download it (about 3.7 MB from openWakeWord's GitHub release).
       - name: Run helper tests
+        env:
+          JARVIS_WAKE_MODELS_DIR: ${{ runner.temp }}/wake-models
         run: uv run --locked --project plugin/voice pytest -q plugin/voice/tests
 
   local-voice:

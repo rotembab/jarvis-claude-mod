@@ -1,8 +1,10 @@
 """``setup``: download (and verify) the speech model, reporting JSON-lines progress.
 
 Each stdout line is ``{"v":1,"type":"progress","step":...,"pct":0-100,"message":...}``.
-Steps: prepare, detect, download, verify, then ``done`` (pct 100) on success
-or ``error`` on failure (exit code 1).
+Steps: prepare, detect, download (the speech model, then the small wake word
+model), verify, then ``done`` (pct 100) on success or ``error`` on failure
+(exit code 1). A wake word download failure is reported but does not fail
+setup: push-to-talk works without it, and the helper retries at its next start.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .listen import models as wake_models
 from .stt.base import SttDevice, SttError
 from .stt.models import (
     AUTO,
@@ -104,6 +107,12 @@ def download_model(name: str, cache_dir: Path, on_progress: ProgressFn) -> Path:
     return Path(path)
 
 
+def download_wake(models: Path) -> None:
+    folder = wake_models.wake_dir(models)
+    if not wake_models.is_downloaded(folder):
+        wake_models.download(folder)
+
+
 def _verify(requested: str, cache_dir: Path, device: SttDevice) -> tuple[str, SttDevice]:
     from .stt.faster_whisper_engine import FasterWhisperTranscriber
 
@@ -139,6 +148,7 @@ def run_setup(
     detect: Callable[[], SttDevice] = detect_device,
     download: Callable[[str, Path, ProgressFn], Path] = download_model,
     verifier: Callable[[str, Path, SttDevice], tuple[str, SttDevice]] = _verify,
+    fetch_wake: Callable[[Path], None] = download_wake,
 ) -> int:
     progress = _Progress(emit)
     requested = (stt_model or AUTO).strip()
@@ -170,6 +180,16 @@ def run_setup(
             pct = hi
 
         fetch(name, 5, 85)
+
+        progress("download", 85, f'Downloading the "{wake_models.WAKE_PHRASE}" wake word model')
+        try:
+            fetch_wake(cache)
+        except Exception as exc:
+            log.warning("wake word download failed", exc_info=True)
+            progress("download", 87, f"Could not download the wake word model ({exc}); push-to-talk still works")
+        else:
+            progress("download", 87, "Wake word model ready")
+        pct = 87
 
         if verify:
             pct = 88

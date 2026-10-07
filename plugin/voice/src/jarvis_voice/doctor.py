@@ -135,6 +135,21 @@ def _local_voice_section(data_dir: Path, env: Mapping[str, str]) -> dict[str, An
     return section
 
 
+def _wake_section(data_dir: Path) -> dict[str, Any]:
+    from .listen.models import WAKE_PHRASE, is_downloaded, wake_dir
+    from .listen.vad import silero_model_path
+    from .stt.models import models_dir
+
+    folder = wake_dir(models_dir(data_dir))
+    section: dict[str, Any] = {"phrase": WAKE_PHRASE, "downloaded": is_downloaded(folder), "folder": str(folder)}
+    try:
+        section["vad"] = silero_model_path().name
+    except Exception as exc:  # noqa: BLE001
+        section["vad"] = None
+        section["vadError"] = f"{type(exc).__name__}: {exc}"
+    return section
+
+
 def _ptt_section() -> dict[str, Any]:
     try:
         from pynput import keyboard  # noqa: F401
@@ -164,6 +179,7 @@ def run_doctor(
         ("models", lambda: _models_section(data_dir)),
         ("fish", lambda: _fish_section(env, network)),
         ("localVoice", lambda: _local_voice_section(data_dir, env)),
+        ("wake", lambda: _wake_section(data_dir)),
         ("ptt", _ptt_section),
     ):
         try:

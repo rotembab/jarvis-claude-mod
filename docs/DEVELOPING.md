@@ -9,7 +9,7 @@ Commands below are for PowerShell (Windows Terminal). Git Bash is not needed.
 ```text
 .claude-plugin/marketplace.json   makes the repo a plugin marketplace listing "jarvis" at ./plugin
 plugin/                           the plugin, the only folder that ships
-  .claude-plugin/plugin.json      manifest and userConfig (fishApiKey, voiceId, pttKey, sttModel, language)
+  .claude-plugin/plugin.json      manifest and userConfig (Fish Audio, voice engine, wake word, barge-in, push-to-talk, speech model)
   hooks/                          the mod: TypeScript hooks module (register.tsx) and its *.test.ts
   types/index.d.ts                the mod's $.state contract
   tsconfig.json                   type-checks the mod (tsc -p plugin)
@@ -87,7 +87,7 @@ uv sync --locked --project plugin\voice --group dev
 uv run --locked --project plugin\voice pytest -q plugin\voice\tests
 ```
 
-This creates `plugin\voice\.venv` (ignored by git). The tests need no microphone, speakers, GPU or network: audio, push-to-talk, speech-to-text and Fish Audio are faked, the Fish fake being a local WebSocket server (`tests\fish_fake.py`). `tests\test_integration.py` starts `python -m jarvis_voice run` as a subprocess in fake mode and drives it over HTTP the way the mod does. The named-mutex test runs on Windows only.
+This creates `plugin\voice\.venv` (ignored by git). The tests need no microphone, speakers, GPU or network: audio, push-to-talk, speech-to-text and Fish Audio are faked, the Fish fake being a local WebSocket server (`tests\fish_fake.py`). The hands-free tests drive the listener with fakes too, and Silero VAD (shipped inside faster-whisper) on synthetic speech in `tests\data`. Two tests run the real "Hey Jarvis" model and are skipped unless `JARVIS_WAKE_MODELS_DIR` names a folder for it (they download it there, about 3.7 MB, when it is missing); CI sets it. `tests\test_integration.py` starts `python -m jarvis_voice run` as a subprocess in fake mode and drives it over HTTP the way the mod does. The named-mutex test runs on Windows only.
 
 `--locked` fails if `uv.lock` no longer matches `pyproject.toml`. After changing dependencies, run `uv lock --project plugin\voice` and commit the new `uv.lock`; `/jarvis setup` installs from it.
 
@@ -180,6 +180,8 @@ Secrets (the Fish Audio key, the control token) are masked in the helper's log.
 The helper reports `mic_blocked` when Windows denies microphone access. Open Settings > Privacy & security > Microphone (Win+R, `ms-settings:privacy-microphone`) and turn on **Microphone access**, **Let apps access your microphone** and **Let desktop apps access your microphone**. Then:
 
 - Check the headset's own mute button and that its microphone boom is plugged in.
+- `mic_blocked` with "pure digital silence" means Windows gets exact zeros from the device: it is muted before Windows (a mute button or light, a flipped-up or loose boom, or the headset's own software such as Logitech G HUB), not by Windows. The listener reports it after 3 seconds of exact zeros.
+- `wake_unavailable` means the "Hey Jarvis" model could not be downloaded or loaded (it comes from openWakeWord's GitHub releases into `%USERPROFILE%\.jarvis\models\wake`). Push-to-talk still works; `/jarvis setup`, or the next helper start, tries again.
 - `mic_in_use` means another app holds the microphone in exclusive mode: close it, or untick **Allow applications to take exclusive control of this device** in the microphone's Properties > Advanced.
 - The helper picks the Windows default input and output devices (WASAPI first). To pick another, set `JARVIS_INPUT_DEVICE` or `JARVIS_OUTPUT_DEVICE` in the `env` block of your user settings to part of the device name, such as `PRO X`, and restart Claude Code. `/jarvis devices` shows what is in use.
 

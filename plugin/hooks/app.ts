@@ -11,7 +11,7 @@ import { Helper } from './helper'
 import type { HelperPhase } from './helper'
 import type { Platform } from './platform'
 import { detectPlatform, isRemoteSession } from './platform'
-import type { ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
+import type { BargeInMode, ConfigCommand, HelperEvent, HelperState, ReadyEvent } from './protocol'
 import { hasNvidiaGpu, runLocalVoiceSetup, runSetup } from './setup'
 import { statusLine } from './ui'
 import { Voice } from './voice'
@@ -31,6 +31,13 @@ export const FISH_MODELS = ['s2.1-pro-free', 's2.1-pro'] as const
 export const VOICE_ENGINES = ['fish', 'local'] as const
 export type VoiceEngine = (typeof VOICE_ENGINES)[number]
 
+/** What interrupts Jarvis by voice: any speech (default), only the wake word, or nothing. */
+export const BARGE_IN_MODES = ['speech', 'wake', 'off'] as const satisfies readonly BargeInMode[]
+
+/** Wake word sensitivity, as the helper's score threshold: high wakes more easily, and falsely more often. */
+export const WAKE_SENSITIVITY = { low: 0.7, medium: 0.5, high: 0.3 } as const
+export type WakeSensitivity = keyof typeof WAKE_SENSITIVITY
+
 export type JarvisSettings = {
   fishApiKey?: string
   fishModel: string
@@ -40,6 +47,9 @@ export type JarvisSettings = {
   pttKey: string
   sttModel: SttModel
   language: string
+  wakeWord: boolean
+  bargeIn: BargeInMode
+  wakeSensitivity: WakeSensitivity
 }
 
 const optionString = (options: PluginOptions, key: string): string | undefined => {
@@ -59,6 +69,11 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
     sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
     language: optionString(options, 'language') ?? 'en',
+    wakeWord: optionString(options, 'wakeWord') !== 'off',
+    bargeIn: BARGE_IN_MODES.find(mode => mode === optionString(options, 'bargeIn')) ?? 'speech',
+    wakeSensitivity:
+      (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
+      'medium',
   }
 }
 
@@ -68,11 +83,14 @@ const HELPER_STATES: ReadonlySet<string> = new Set<HelperState>([
   'listening',
   'transcribing',
   'speaking',
+  'awake',
   'error',
 ])
 const LOCAL_SURFACES: ReadonlySet<RenderSurface> = new Set<RenderSurface>(['terminal', 'desktop'])
 const VOICE_OVERRIDE_KEY = 'voiceId'
 const ENGINE_OVERRIDE_KEY = 'voiceEngine'
+const WAKE_OVERRIDE_KEY = 'wakeWord'
+const BARGE_IN_OVERRIDE_KEY = 'bargeIn'
 /**
  * The speech model the last `/jarvis setup <model>` installed (the helper
  * never downloads one itself), with the sttModel setting it overrode: it
@@ -97,6 +115,7 @@ export class Jarvis {
   /** A local surface attached; it may come while session.start is still binding. */
   private hasLocalAttach = false
   private hasAnnouncedReady = false
+  private hasAnnouncedWake = false
   private lastLevelAt = 0
   private shownStatus: string | undefined
 
@@ -167,6 +186,26 @@ export class Jarvis {
 
   async setVoiceEngine(engine: VoiceEngine): Promise<void> {
     await this.engine?.storeSet(ENGINE_OVERRIDE_KEY, engine)
+  }
+
+  /** Whether Jarvis listens for "Hey Jarvis": /jarvis wake's choice, else the wakeWord setting. */
+  async wakeWord(): Promise<boolean> {
+    const stored = await this.engine?.storeGet(WAKE_OVERRIDE_KEY).catch(() => undefined)
+    return typeof stored === 'boolean' ? stored : this.settings.wakeWord
+  }
+
+  async setWakeWord(isOn: boolean): Promise<void> {
+    await this.engine?.storeSet(WAKE_OVERRIDE_KEY, isOn)
+  }
+
+  /** What interrupts Jarvis by voice: /jarvis bargein's choice, else the bargeIn setting. */
+  async bargeIn(): Promise<BargeInMode> {
+    const stored = await this.engine?.storeGet(BARGE_IN_OVERRIDE_KEY).catch(() => undefined)
+    return BARGE_IN_MODES.find(mode => mode === stored) ?? this.settings.bargeIn
+  }
+
+  async setBargeIn(mode: BargeInMode): Promise<void> {
+    await this.engine?.storeSet(BARGE_IN_OVERRIDE_KEY, mode)
   }
 
   /**
@@ -328,6 +367,9 @@ export class Jarvis {
     return {
       pttKey: this.settings.pttKey,
       language: this.settings.language,
+      wakeWord: await this.wakeWord(),
+      bargeIn: await this.bargeIn(),
+      wakeThreshold: WAKE_SENSITIVITY[this.settings.wakeSensitivity],
       ...(voiceId === undefined ? {} : { voiceId }),
     }
   }
@@ -341,14 +383,25 @@ export class Jarvis {
       case 'state':
         this.patch({ phase: event.state, ...(event.state === 'listening' ? {} : { micLevel: undefined }) })
         return
-      case 'ready':
+      case 'ready': {
         this.ready = event
-        this.patch({ pttKey: event.pttKey })
+        this.patch({ pttKey: event.pttKey, wakePhrase: event.wakePhrase })
+        const wake = event.wakePhrase
         if (!this.hasAnnouncedReady) {
           this.hasAnnouncedReady = true
-          this.engine?.toast(`Jarvis is ready. Hold ${event.pttKey} to talk.`)
+          this.hasAnnouncedWake = wake !== undefined
+          this.engine?.toast(
+            wake === undefined
+              ? `Jarvis is ready. Hold ${event.pttKey} to talk.`
+              : `Jarvis is ready. Say "${wake}" or hold ${event.pttKey} to talk.`,
+          )
+        } else if (wake !== undefined && !this.hasAnnouncedWake) {
+          // The wake word model arrived after the first ready (its first download).
+          this.hasAnnouncedWake = true
+          this.engine?.toast(`Jarvis is listening for "${wake}".`)
         }
         return
+      }
       case 'level': {
         const now = performance.now()
         if (this.view.phase !== 'listening' || now - this.lastLevelAt < LEVEL_INTERVAL_MS) return

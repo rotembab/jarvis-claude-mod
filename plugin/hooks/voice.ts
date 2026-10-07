@@ -36,7 +36,7 @@ export type VoiceOptions = {
 
 /** The note a voice prompt carries (classic UserPromptSubmit additionalContext). */
 export const VOICE_NOTE =
-  '[Jarvis voice] The user spoke this message aloud (push-to-talk and local speech-to-text, so a word may be misheard). Your reply will be read aloud: follow the "Jarvis voice mode" section of the system prompt.'
+  '[Jarvis voice] The user spoke this message aloud (local speech-to-text, so a word may be misheard). Your reply will be read aloud: follow the "Jarvis voice mode" section of the system prompt.'
 
 /** Fallback when the note could not ride with the prompt: a section for this turn only. */
 export const VOICE_TURN_SECTION_ID = 'jarvis:voice-turn'
@@ -49,7 +49,7 @@ export const PERSONA_SECTION_ID = 'jarvis:voice'
 export function personaText(platform: Platform): string {
   return [
     '# Jarvis voice mode',
-    'The user can talk to you out loud through Jarvis, a voice add-on for Claude Code: they hold a push-to-talk key, speak, and local speech-to-text turns their words into the message you receive. A message that arrived this way carries a note starting "[Jarvis voice]", or this prompt says voice mode is on for the current message. Every other message was typed: answer typed messages in your usual style and ignore this section for them.',
+    'The user can talk to you out loud through Jarvis, a voice add-on for Claude Code: they say "Hey Jarvis" (or hold a push-to-talk key), speak, and local speech-to-text turns their words into the message you receive. They can talk over you to interrupt. A message that arrived this way carries a note starting "[Jarvis voice]", or this prompt says voice mode is on for the current message. Every other message was typed: answer typed messages in your usual style and ignore this section for them.',
     '',
     "Your reply to a voice message is spoken by a text-to-speech voice as you write it, so answer as JARVIS, the user's composed AI butler:",
     '- Dry, British, unflappable, quietly witty, never gushing. Call the user "sir" sparingly: at most once in a reply, and not in every reply.',
@@ -65,6 +65,39 @@ export function personaText(platform: Platform): string {
 }
 
 const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim()
+
+/** Said on its own, these just stop Jarvis: no prompt is sent. */
+const STOP_PHRASES: ReadonlySet<string> = new Set([
+  'stop',
+  'stop it',
+  'stop talking',
+  'stand down',
+  'never mind',
+  'nevermind',
+  'cancel',
+  'cancel that',
+  'quiet',
+  'be quiet',
+  'silence',
+  'enough',
+  'thats enough',
+  'shut up',
+  'hush',
+])
+
+/** True when the words are only a request to stop ("Jarvis, stop.", "Never mind, thanks."). */
+export function isStopPhrase(text: string): boolean {
+  const words = text
+    .toLowerCase()
+    .replace(/[’']/g, '')
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(word => word !== '')
+  while (words.length > 0 && ['hey', 'ok', 'okay', 'jarvis'].includes(words[0] ?? '')) words.shift()
+  while (words.length > 0 && ['jarvis', 'please', 'thanks', 'now'].includes(words[words.length - 1] ?? '')) words.pop()
+  if (words.length > 1 && words[words.length - 2] === 'thank' && words[words.length - 1] === 'you') words.splice(-2)
+  return STOP_PHRASES.has(words.join(' '))
+}
 
 /** One spoken reply: sentences of one voice turn, numbered for the helper. */
 export class VoiceReply {
@@ -198,6 +231,11 @@ export class Voice {
   async onUtterance(event: UtteranceEvent): Promise<void> {
     const text = event.text.trim()
     if (text === '') return
+    if (isStopPhrase(text)) {
+      await this.interrupt('voice')
+      this.engine.log(`Jarvis: stopped ("${text}")`)
+      return
+    }
     this.enablePersona()
     // Speaking over Jarvis means "stop and listen to me", not "queue this".
     const turn = this.turn

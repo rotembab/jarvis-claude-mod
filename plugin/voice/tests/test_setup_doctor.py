@@ -33,8 +33,13 @@ def fake_download(name: str, cache: Path, on_progress: Any) -> Path:
     return cache
 
 
+def no_wake(models_dir: Path) -> None:
+    pass
+
+
 def test_setup_progress_lines(tmp_path: Path) -> None:
     lines: list[dict[str, Any]] = []
+    wake_dirs: list[Path] = []
     code = run_setup(
         tmp_path,
         "auto",
@@ -42,8 +47,11 @@ def test_setup_progress_lines(tmp_path: Path) -> None:
         detect=lambda: "cpu",
         download=fake_download,
         verifier=lambda req, cache, dev: ("small.en", "cpu"),
+        fetch_wake=wake_dirs.append,
     )
     assert code == 0
+    assert wake_dirs == [tmp_path / "models"]
+    assert any(line["message"] == "Wake word model ready" for line in lines)
     assert all(set(line) == {"v", "type", "step", "pct", "message"} and line["type"] == "progress" for line in lines)
     steps = [line["step"] for line in lines]
     assert steps[0] == "prepare" and "download" in steps and "verify" in steps
@@ -53,6 +61,25 @@ def test_setup_progress_lines(tmp_path: Path) -> None:
     assert len(pcts) == len({(line["step"], line["pct"]) for line in lines})  # no duplicate lines
     assert models.is_downloaded("small.en", tmp_path / "models")
     assert (tmp_path / "logs").is_dir()
+
+
+def test_a_wake_word_download_failure_does_not_fail_setup(tmp_path: Path) -> None:
+    lines: list[dict[str, Any]] = []
+
+    def offline(models_dir: Path) -> None:
+        raise OSError("github.com unreachable")
+
+    code = run_setup(
+        tmp_path,
+        "small.en",
+        lines.append,
+        detect=lambda: "cpu",
+        download=fake_download,
+        verifier=lambda req, cache, dev: ("small.en", "cpu"),
+        fetch_wake=offline,
+    )
+    assert code == 0 and lines[-1]["step"] == "done"
+    assert any("github.com unreachable" in line["message"] and "push-to-talk" in line["message"] for line in lines)
 
 
 def test_setup_skips_present_model_and_falls_back_to_cpu(tmp_path: Path) -> None:
@@ -67,7 +94,18 @@ def test_setup_skips_present_model_and_falls_back_to_cpu(tmp_path: Path) -> None
     def verifier(req: str, cache: Path, dev: str) -> tuple[str, str]:
         return ("large-v3-turbo", "cpu") if dev == "cuda" else ("small.en", "cpu")
 
-    assert run_setup(tmp_path, "auto", lines.append, detect=lambda: "cuda", download=download, verifier=verifier) == 0
+    assert (
+        run_setup(
+            tmp_path,
+            "auto",
+            lines.append,
+            detect=lambda: "cuda",
+            download=download,
+            verifier=verifier,
+            fetch_wake=no_wake,
+        )
+        == 0
+    )
     assert downloads == ["small.en"]  # turbo was present; small.en fetched for CPU use
     assert any("already downloaded" in line["message"] for line in lines)
     assert any("falling back to the CPU" in line["message"] for line in lines)
@@ -80,7 +118,7 @@ def test_setup_reports_errors(tmp_path: Path) -> None:
     def boom(name: str, cache: Path, on_progress: Any) -> Path:
         raise OSError("network down")
 
-    assert run_setup(tmp_path, "small.en", lines.append, detect=lambda: "cpu", download=boom) == 1
+    assert run_setup(tmp_path, "small.en", lines.append, detect=lambda: "cpu", download=boom, fetch_wake=no_wake) == 1
     assert lines[-1]["step"] == "error" and "network down" in lines[-1]["message"]
 
     def bad_verify(req: str, cache: Path, dev: str) -> tuple[str, str]:
@@ -88,7 +126,15 @@ def test_setup_reports_errors(tmp_path: Path) -> None:
 
     lines.clear()
     assert (
-        run_setup(tmp_path, "small.en", lines.append, detect=lambda: "cpu", download=fake_download, verifier=bad_verify)
+        run_setup(
+            tmp_path,
+            "small.en",
+            lines.append,
+            detect=lambda: "cpu",
+            download=fake_download,
+            verifier=bad_verify,
+            fetch_wake=no_wake,
+        )
         == 1
     )
     assert lines[-1] == {"v": 1, "type": "progress", "step": "error", "pct": 88, "message": "cannot load reinstall"}

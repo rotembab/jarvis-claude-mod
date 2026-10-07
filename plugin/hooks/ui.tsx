@@ -1,4 +1,4 @@
-// Minimal phase 1 UI: one status line entry ("JARVIS · <state>") and a band
+// Minimal UI: one status line entry ("JARVIS · <state>") and a band
 // above the prompt while the user is talking. Nothing is drawn when idle.
 
 import type { Elements, RenderElement } from 'claude-code'
@@ -14,10 +14,11 @@ export function statusLine(view: JarvisView): string | undefined {
     not_installed: 'not set up · run /jarvis setup',
     setup: `setting up${detail}`,
     starting: 'starting',
-    sleeping: `ready · hold ${view.pttKey ?? 'the push-to-talk key'} to talk${detail}`,
+    sleeping: `ready · ${view.wakePhrase ? `say "${view.wakePhrase}" or hold` : 'hold'} ${view.pttKey ?? 'the push-to-talk key'} to talk${detail}`,
     listening: 'listening',
     transcribing: 'transcribing',
     speaking: 'speaking · /jarvis stop',
+    awake: 'awake · keep talking',
     error: `error${detail}`,
     restarting: `restarting${detail}`,
     elsewhere: 'active in another window',

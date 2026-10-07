@@ -54,6 +54,8 @@ voice-ref/
 *.ogg
 *.m4a
 *.opus
+# ...except the synthetic test speech (espeak-ng) the listener tests use.
+!plugin/voice/tests/data/*.wav
 
 # ---------------------------------------------------------------- Secrets
 .env

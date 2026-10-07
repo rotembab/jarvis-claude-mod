@@ -23,7 +23,7 @@ from typing import Any, ClassVar, Literal
 
 PROTOCOL_VERSION = 1
 
-HelperState = Literal["starting", "sleeping", "listening", "transcribing", "speaking", "error"]
+HelperState = Literal["starting", "sleeping", "listening", "transcribing", "speaking", "awake", "error"]
 PlatformName = Literal["windows", "macos", "linux"]
 ErrorCode = Literal[
     "already_running",
@@ -38,6 +38,7 @@ ErrorCode = Literal[
     "stt_model_missing",
     "stt_failed",
     "ptt_unavailable",
+    "wake_unavailable",
     "bad_request",
     "unauthorized",
     "internal",
@@ -342,6 +343,8 @@ class Ready(Event):
     stt_device: Literal["cuda", "cpu"]
     ptt_key: str
     voice_id: str | None = None
+    wake_phrase: str | None = None
+    barge_in: Literal["speech", "wake", "off"] | None = None
 
 
 EVENT_DEFS: dict[str, str] = {

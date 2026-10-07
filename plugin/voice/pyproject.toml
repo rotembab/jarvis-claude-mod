@@ -1,7 +1,7 @@
 [project]
 name = "jarvis-voice"
 version = "0.1.0"
-description = "Local voice helper for the Jarvis Claude Code mod: push-to-talk, faster-whisper STT, Fish Audio live TTS."
+description = "Local voice helper for the Jarvis Claude Code mod: wake word, push-to-talk, faster-whisper STT, Fish Audio live TTS."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.13"
@@ -10,6 +10,8 @@ dependencies = [
     "sounddevice>=0.5.1",
     "soxr>=0.5",
     "faster-whisper>=1.1.1",
+    # The wake word and voice activity models run on it (faster-whisper needs it too).
+    "onnxruntime>=1.17,<2",
     # Pinned exactly: the Windows wheel bundles cuDNN's cudnn64_9.dll dispatcher
     # (9.10.2.21 in 4.8.2), and the cuDNN sub-libraries in the `cuda` extra must
     # be the same version. Bump both together.
