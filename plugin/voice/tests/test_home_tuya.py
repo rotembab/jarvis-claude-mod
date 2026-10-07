@@ -1248,7 +1248,8 @@ def test_a_rescan_leaves_room_for_the_retry(home: Home) -> None:
     forget_address(home, "Porch light")
     assert home.driver().run(home.device("Porch light"), "toggle", None).text == "The Porch light is now off."
     scantime = home.scanner.calls[-1]["scantime"]
-    assert tuya.RESCAN_MIN_S <= scantime < tuya.RESCAN_S and scantime + 2 * one + 1.0 <= tuya.RUN_BUDGET_S
+    # Exactly the budget when no time has passed (Windows' clock often reads none): compare with a float margin.
+    assert tuya.RESCAN_MIN_S <= scantime < tuya.RESCAN_S and scantime + 2 * one + 1.0 <= tuya.RUN_BUDGET_S + 1e-9
     # With less time, a toggle does not scan at all; a single command still does, within what is left.
     forget_address(home, "Porch light")
     home.ctx.call_timeout = 14.0
