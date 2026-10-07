@@ -4,7 +4,7 @@ import type { RenderPropsOf } from 'claude-code'
 import { completeTurn, jarvis, startHelper, startSession, world } from './test-harness'
 import { actionLabel, FRAME_MS, HUD_PANE, hudMode, RING_KEY, ringSize } from './hud'
 import type { HudMode } from './hud'
-import { ringCells, ringPixels, toBase64 } from './hud-ring'
+import { hudZoom, ringCells, ringPixels, toBase64 } from './hud-ring'
 import { ringSvg } from './hud-svg'
 
 const PANE: RenderPropsOf['Pane'] = {
@@ -78,6 +78,16 @@ describe('HUD ring', () => {
   test('the white arc sweeps with your voice and the core flares with Jarvis speaking', () => {
     expect(brightness('listening', 0.9)).toBeGreaterThan(brightness('listening', 0.05))
     expect(brightness('speaking', 0, 0.9)).toBeGreaterThan(brightness('speaking', 0, 0.05))
+  })
+
+  test('the HUD swells and shrinks with the voice', () => {
+    const zoom = (mode: HudMode, level: number) => hudZoom({ mode, t: 0, mic: level, out: level })
+    expect(zoom('speaking', 0.9)).toBeGreaterThan(zoom('speaking', 0.1) + 0.1)
+    expect(zoom('speaking', 1)).toBeLessThanOrEqual(1)
+    expect(zoom('listening', 0.9)).toBeGreaterThan(zoom('listening', 0.1))
+    expect(zoom('sleeping', 0.9)).toBe(1)
+    const scale = (svg: string) => Number(/scale\(([\d.]+)\)/.exec(svg)?.[1])
+    expect(scale(ringSvg('speaking', 0, 0.9, 1))).toBeGreaterThan(scale(ringSvg('speaking', 0, 0.1, 1)))
   })
 
   test('the ring moves at rest and stands still when Jarvis is off', () => {
