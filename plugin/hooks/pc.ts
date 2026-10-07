@@ -823,6 +823,7 @@ export class PcControl {
       this.adminCheck = 'failed'
       this.adminFailure = clip(describeError(error), 160)
       await this.app.helper?.stop()
+      await this.app.hands?.helper.stop()
       this.app.patch({ phase: 'error', detail: ADMIN_FAILED_DETAIL })
       engine?.log(adminFailedLog(this.adminFailure))
       engine?.toast('Jarvis stays off: it could not check whether Claude Code runs as administrator.', { timeoutMs: 10_000 })
@@ -831,6 +832,7 @@ export class PcControl {
     if (this.admin.isElevated) {
       // Nothing started during the check (holdsHelper); stopping is a second line.
       await this.app.helper?.stop()
+      await this.app.hands?.helper.stop()
       this.app.patch({ phase: 'error', detail: ELEVATED_DETAIL })
       engine.log(ELEVATED_LOG)
       engine.toast('Jarvis stays off: Claude Code runs as administrator.', { timeoutMs: 10_000 })

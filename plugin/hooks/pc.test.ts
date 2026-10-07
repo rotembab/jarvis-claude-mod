@@ -5,7 +5,7 @@ import type { JarvisHud } from '../types'
 import { DESKTOP_TOOL, GUARD_FAILED } from './pc'
 import { parseUacPolicy, parseWhoamiGroups, system32 } from './platform'
 import type { FakeChild, RunAnswer, RunCall, World } from './test-harness'
-import { completeTurn, jarvis, runStep, startHelper, startSession, textChunks, WINDOWS_ENV, world } from './test-harness'
+import { completeTurn, HANDS_PYTHON, jarvis, runStep, startHelper, startSession, textChunks, WINDOWS_ENV, WINGET_UV, world } from './test-harness'
 import { isNoPhrase, isStandDownPhrase, isStopPhrase, isYesPhrase } from './voice'
 
 const CLOUD_ENV = { ...WINDOWS_ENV, CLAUDE_CODE_REMOTE: 'true' }
@@ -22,6 +22,8 @@ const COULD_NOT_ASK = 'Jarvis could not ask the user on screen, so nothing ran.'
 const BYPASS = "Permission checks are off. Jarvis still asks before risky commands, but Claude Code's own rules are skipped."
 const ELEVATED_STATUS = 'JARVIS · error · Claude Code runs as administrator, so Jarvis stays off'
 const FAILED_STATUS = 'JARVIS · error · Jarvis could not check for administrator rights, so it stays off (/jarvis restart checks again)'
+/** What /jarvis hands on stores under the default Hand control setting (off). */
+const HANDS_ON = { isOn: true, setting: false }
 
 /** `whoami /groups /fo csv /nh` for an administrator: elevated (High label) or not (Medium, Administrators for deny only). */
 function groups(elevated: boolean, admin = true): string {
@@ -983,6 +985,62 @@ describe('never as administrator', () => {
     await w.settle()
     expect(w.helpers()).toHaveLength(1)
     expect(await jarvis($, 'pc')).toContain('Administrator: Claude Code runs with normal rights.')
+  })
+
+  test('nor does hand control: no hand helper and no hand setup, by command, by the tool or by itself', async ($, on) => {
+    const w = world(on)
+    adminCheck(w, groups(true), ALWAYS_NOTIFY)
+    w.store.set('handsEnabled', HANDS_ON)
+    w.existing.add(HANDS_PYTHON)
+    w.existing.add(WINGET_UV)
+    await startSession($, w)
+    expect(w.status()).toBe(ELEVATED_STATUS)
+    for (const args of ['hands on', 'hands restart', 'setup hands', 'hands setup']) {
+      expect(await jarvis($, args), args).toMatch(/^Jarvis stays off: Claude Code runs as administrator/)
+    }
+    expect(await jarvis($, 'hands camera 1')).toBe('Camera set to "1"; it applies when hand control starts.')
+    expect((await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })).result).toMatch(/^Jarvis stays off: Claude Code runs as administrator/)
+    await w.clock.advance(5000)
+    await w.settle()
+    expect(w.children).toEqual([])
+    expect(w.runs).toEqual([])
+    // Off still works: it starts nothing.
+    expect(await jarvis($, 'hands off')).toBe('Hand control is off and the camera is closed.')
+  })
+
+  test('hand control waits for a failed check too, and starts once /jarvis restart passes it', async ($, on) => {
+    const w = world(on)
+    w.store.set('handsEnabled', HANDS_ON)
+    w.existing.add(HANDS_PYTHON)
+    w.onRun = call => (call.argv[0] === WHOAMI ? { deny: 'timed out after 5000 ms' } : call.argv[0] === REG ? { exitCode: 0, stdout: ALWAYS_NOTIFY } : undefined)
+    await startSession($, w)
+    expect(await jarvis($, 'hands on')).toMatch(/^Jarvis stays off: it could not check/)
+    expect(await jarvis($, 'setup hands')).toMatch(/^Jarvis stays off: it could not check/)
+    await w.clock.advance(5000)
+    await w.settle()
+    expect(w.children).toEqual([])
+
+    adminCheck(w, groups(false), ALWAYS_NOTIFY)
+    await jarvis($, 'restart')
+    await w.clock.advance(5000)
+    await w.settle()
+    expect(w.helpers()).toHaveLength(1)
+    expect(w.handsHelpers()).toHaveLength(1)
+  })
+
+  test('hand control turned on while the check runs starts nothing, then nothing when it finds administrator', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    adminCheck(w, groups(true), ALWAYS_NOTIFY, 3000)
+    const starting = $.session.start({ cwd: 'C:\\work', surface: 'terminal', isInteractive: true })
+    await w.settle()
+    expect(await jarvis($, 'hands on')).toMatch(/^Jarvis is still checking whether Claude Code runs as administrator/)
+    await w.clock.advance(3000)
+    await starting
+    await w.clock.advance(5000)
+    await w.settle()
+    expect(w.status()).toBe(ELEVATED_STATUS)
+    expect(w.children).toEqual([])
   })
 
   test('UAC levels from the policy values', () => {

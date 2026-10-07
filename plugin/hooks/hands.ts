@@ -272,6 +272,8 @@ export type HandsHelperOptions = {
   onEvent: (event: HandsEvent) => void
   /** `isFinal`: a failure no restart cures (FINAL_ERRORS), so the user is not told to restart. */
   onPhase: (phase: HandsHelperPhase, detail?: string, isFinal?: boolean) => void
+  /** Why no child may start now (pc.ts whyHeld: Claude Code runs elevated, or the administrator check has not passed). */
+  whyHeld: () => string | undefined
 }
 
 type Exit = {
@@ -420,6 +422,13 @@ export class HandsHelper {
   }
 
   private launch(): void {
+    // Never as administrator, nor before the check has passed (pc.ts holdsHelper): every start and retry comes here.
+    const held = this.options.whyHeld()
+    if (held !== undefined) {
+      this.engine.debug(`jarvis: the hand helper was not started: ${held}`)
+      if (this.phase !== 'stopped') this.setPhase('stopped')
+      return
+    }
     this.generation += 1
     const generation = this.generation
     this.running = this.runOnce(generation)
@@ -953,6 +962,13 @@ export type HandsOptions = {
   /** The voice helper, which speaks the calibration steps while it runs. */
   voice: () => Pick<Helper, 'isRunning' | 'send'> | undefined
   onView: (view: JarvisHandsView) => void
+  /**
+   * Why nothing of Jarvis's may start now (pc.ts whyHeld): Claude Code runs
+   * elevated, or the administrator check is still running or failed.
+   * Undefined when it may. The hand helper and its setup wait for it, as the
+   * voice helper does.
+   */
+  whyHeld: () => string | undefined
 }
 
 /**
@@ -996,7 +1012,13 @@ export class Hands {
       isPaused: () => this.isPaused(),
       onEvent: event => this.onEvent(event),
       onPhase: (phase, detail, isFinal) => this.onHelperPhase(phase, detail, isFinal),
+      whyHeld: () => options.whyHeld(),
     })
+  }
+
+  /** Why the hand helper and its setup may not start now (elevated, or the administrator check has not passed); undefined when they may. */
+  whyHeld(): string | undefined {
+    return this.options.whyHeld()
   }
 
   /**
@@ -1075,13 +1097,16 @@ export class Hands {
 
   /** A local surface drew: starts the hand helper when hand control is on. */
   async autoStart(): Promise<void> {
-    if (!this.isLocal) return
+    if (!this.isLocal || this.whyHeld() !== undefined) return
     this.engage = await this.engageMode()
     if (await this.isEnabled()) this.helper.start()
   }
 
   async turnOn(): Promise<string> {
     if (!this.isLocal) return NOT_LOCAL
+    // Nothing changes while Jarvis is held: the camera never runs under an administrator's token.
+    const held = this.whyHeld()
+    if (held !== undefined) return held
     await this.setEnabled(true)
     // "On" means the camera on: it ends a pause too.
     const wasPaused = await this.isPaused()
@@ -1121,6 +1146,8 @@ export class Hands {
   }
 
   async restart(): Promise<string> {
+    const held = this.whyHeld()
+    if (held !== undefined) return held
     if (this.isSetupRunning) return 'Hand control setup is running; the hand helper starts when it is done.'
     if (!(await this.isEnabled())) return 'Hand control is off. Turn it on with /jarvis hands on.'
     void this.restartHelper()
@@ -1250,7 +1277,7 @@ export class Hands {
     const label = camera === undefined ? 'the first camera' : `"${camera}"`
     const isRunning = this.helper.isRunning
     // A helper that gave up (a wrong camera is the likely first-run failure) tries again with the new one.
-    if (!isRunning && (this.isSetupRunning || !(await this.isEnabled()) || !(await this.isInstalled()))) {
+    if (!isRunning && (this.whyHeld() !== undefined || this.isSetupRunning || !(await this.isEnabled()) || !(await this.isInstalled()))) {
       return `Camera set to ${label}; it applies when hand control starts.`
     }
     void this.restartHelper()
@@ -1311,6 +1338,12 @@ export class Hands {
   async runSetup(uv: string, { isRefresh = false }: { isRefresh?: boolean } = {}): Promise<void> {
     const engine = this.engine
     if (this.isSetupRunning) return
+    // Nothing installs as administrator, or before the check has said.
+    const held = this.whyHeld()
+    if (held !== undefined) {
+      engine.log(held)
+      return
+    }
     if (isRefresh && this.helper.phase === 'elsewhere') {
       engine.log(
         'The hand helper was not reinstalled: another Claude Code window runs it, which keeps its files in use. Turn it off there (/jarvis hands off), then run /jarvis setup hands here.',
@@ -1602,6 +1635,9 @@ export async function runHandsSetupCommand(hands: Hands | undefined, args: reado
   const unknown = args.find(arg => arg.toLowerCase() !== 'cpu')
   if (unknown !== undefined) return `Unknown option "${unknown}" for /jarvis setup hands; it takes none.`
   if (hands.isSetupRunning) return 'Hand control setup is already running; its progress is in the status line.'
+  // Nothing installs as administrator, or before the check has said.
+  const held = hands.whyHeld()
+  if (held !== undefined) return held
   const { engine, platform } = hands
   const uv = await findUv(engine, platform)
   if (uv === undefined) return uvMissingMessage(platform)

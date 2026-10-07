@@ -195,6 +195,7 @@ export class Jarvis {
       noProxy: env.NO_PROXY,
       voice: () => this.helper,
       onView: hands => this.patch({ hands }),
+      whyHeld: () => this.pc.whyHeld(),
     })
     if (!this.isLocal) {
       this.publish({ phase: 'unavailable' })
@@ -252,7 +253,8 @@ export class Jarvis {
 
   /**
    * /jarvis restart after the administrator check failed: runs it again and,
-   * once it passes, starts what it held back (the HUD, the helper).
+   * once it passes, starts what it held back (the HUD, the voice helper, and
+   * the hand helper when hand control is on).
    */
   private async recheckAdmin(): Promise<void> {
     if (await this.pc.recheckAdmin()) return
@@ -260,6 +262,7 @@ export class Jarvis {
     await this.startLocal()
     this.hasAutoStarted = true
     this.startHelper(true)
+    void this.hands?.autoStart()
   }
 
   /** The voice override /jarvis voice saved, else the userConfig value. */
