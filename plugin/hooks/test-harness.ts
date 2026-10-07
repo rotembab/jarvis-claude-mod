@@ -133,6 +133,8 @@ export type World = {
   existing: Set<string>
   /** File contents `$.fs.read` serves (`$.fs.write` sets them); the plugin's own plugin.json is served apart. */
   files: Map<string, string>
+  /** Every path `$.fs.read` was asked for. */
+  reads: string[]
   /** Every path `$.fs.exists` was asked about. */
   checked: string[]
   /** When set, `$.fs.write` fails (the hook beneath throws this). */
@@ -145,7 +147,7 @@ export type World = {
   uvOnPath: string | undefined
   /** Scripted behaviour per spawn (default: nothing, the test drives the child). */
   onSpawn: (child: FakeChild) => void
-  /** The helper's answer per command (default `{ ok: true }`); a promise answers when it resolves. */
+  /** The answer per request (default `{ ok: true }`); a promise answers when it resolves, and a throw fails the fetch as a refused connection does. */
   respond: (command: SentCommand) => Answer | Promise<Answer>
   helpers: () => FakeChild[]
   lastHelper: () => FakeChild
@@ -210,6 +212,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     state: new Map(),
     existing: new Set(installed ? [VENV_PYTHON] : []),
     files: new Map(),
+    reads: [],
     checked: [],
     writeError: undefined,
     submitDrop: undefined,
@@ -301,6 +304,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   })
   on('fs.read', ($, e) => {
     const path = windowsPath(e.path)
+    w.reads.push(path)
     if (PLUGIN_JSON.test(path)) return { value: JSON.stringify({ name: 'jarvis', version: PLUGIN_VERSION }) }
     const text = w.files.get(path)
     if (text === undefined) throw new Error(`ENOENT: no such file or directory, open '${path}'`)

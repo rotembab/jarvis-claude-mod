@@ -34,6 +34,8 @@ export type EnvSnapshot = {
   HOME?: string
   NO_PROXY?: string
   CLAUDE_CODE_REMOTE?: string
+  /** Where the Jarvis app writes its address (docs/APP.md); unset, the data folder. */
+  JARVIS_HOME?: string
 }
 
 export type Engine = {
