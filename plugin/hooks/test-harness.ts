@@ -66,8 +66,9 @@ export class FakeChild {
     this.stdout(`${JSON.stringify({ v: 1, ...event })}\n`)
   }
 
-  hello(port = PORT): void {
-    this.event({ type: 'hello', port, pid: 4242, platform: 'windows', version: '0.1.0', capabilities: ['ptt'] })
+  /** The default capabilities are an older helper's, without `wake.plain`. */
+  hello(port = PORT, capabilities: string[] = ['ptt']): void {
+    this.event({ type: 'hello', port, pid: 4242, platform: 'windows', version: '0.1.0', capabilities })
   }
 
   exit(code: number | null): void {
@@ -376,10 +377,10 @@ export async function startSession($: TestEngine, w: World): Promise<void> {
 }
 
 /** Starts the session and brings a helper up to `hello` and `ready`. */
-export async function startHelper($: TestEngine, w: World): Promise<FakeChild> {
+export async function startHelper($: TestEngine, w: World, capabilities?: string[]): Promise<FakeChild> {
   await startSession($, w)
   const helper = w.lastHelper()
-  helper.hello()
+  helper.hello(PORT, capabilities)
   helper.event({ type: 'state', state: 'sleeping' })
   helper.event({ type: 'ready', sttModel: 'large-v3-turbo', sttDevice: 'cuda', pttKey: 'right ctrl' })
   await w.settle()

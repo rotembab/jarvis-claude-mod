@@ -10,6 +10,13 @@ daemon, when an utterance starts and ends:
   Jarvis is audibly speaking, in barge-in mode "speech", 200 ms of the user's
   voice also starts one ("barge"); in mode "wake" only the wake word does,
   and in mode "off" nothing does.
+* **plain "Jarvis"** (optional): a second model that hears "Jarvis" alone.
+  The word turns up inside ordinary sentences, and sound-alikes ("Travis")
+  score close to it, so it only starts an utterance ("jarvis") at the start
+  of one: within 1.5 s of speech that began after a 0.3 s pause. It never
+  interrupts Jarvis while he speaks (that stays with "Hey Jarvis" and the
+  barge-in mode), and the daemon drops the clip unless its transcript
+  starts with "Jarvis".
 * **follow**: for a few seconds after Jarvis finished a reply, a quarter
   second of speech starts an utterance with no wake word ("follow").
 * **record**: the utterance is being captured. It ends after 0.7 s of
@@ -24,13 +31,18 @@ its software) send exact zeros whenever the user is quiet, so once any sound
 has arrived, zeros mean quiet, not muted, and are never reported.
 
 Utterances start with some audio from before their start (pre-roll), so the
-first syllable is kept. Time is measured in audio, not on the wall clock, so
-the decisions are the same however the blocks arrive.
+first syllable is kept; a plain "Jarvis" utterance keeps everything from
+where the speech began, so the transcript holds the whole word (and so does
+"Hey Jarvis" at the start of an utterance while plain "Jarvis" is ready and
+Jarvis is quiet). Time is
+measured in audio, not on the wall clock, so the decisions are the same
+however the blocks arrive.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 from collections import deque
@@ -48,7 +60,7 @@ log = logging.getLogger(__name__)
 RATE = 16_000
 VAD_FRAME_S = 512 / RATE
 
-Kind = Literal["wake", "follow", "barge"]
+Kind = Literal["wake", "jarvis", "follow", "barge"]
 BargeMode = Literal["speech", "wake", "off"]
 BARGE_MODES: tuple[BargeMode, ...] = ("speech", "wake", "off")
 Mode = Literal["idle", "follow", "record", "paused"]
@@ -57,6 +69,7 @@ Mode = Literal["idle", "follow", "record", "paused"]
 @dataclass
 class ListenerConfig:
     wake_threshold: float = 0.5
+    plain_wake_threshold: float = 0.5  # plain "Jarvis"
     speech_threshold: float = 0.5  # Silero probability that counts as speech
     end_silence_s: float = 0.7
     min_speech_s: float = 0.4
@@ -68,6 +81,9 @@ class ListenerConfig:
     wake_preroll_s: float = 0.3
     onset_preroll_s: float = 0.5
     wake_refractory_s: float = 1.5
+    gate_silence_s: float = 0.3  # a pause at least this long before speech starts a new utterance...
+    gate_window_s: float = 1.5  # ...and plain "Jarvis" counts only this soon after that
+    plain_preroll_pad_s: float = 0.2  # kept from before the utterance's first voiced frame
     silence_alarm_s: float = 30.0  # only exact zeros since the start for this long: muted at the source
 
 
@@ -89,6 +105,7 @@ class Listener:
         audio_playing: Callable[[], bool] = lambda: False,
         wake_enabled: bool = True,
         barge_mode: BargeMode = "speech",
+        plain_wake: bool = False,
     ) -> None:
         self.config = config
         self._vad = vad
@@ -100,13 +117,15 @@ class Listener:
         self._audio_playing = audio_playing
         self._wake_enabled = wake_enabled
         self._barge_mode: BargeMode = barge_mode
+        self._plain_enabled = plain_wake
 
         self._lock = threading.Lock()
         self._mode: Mode = "idle"
         self._speaking = False
         self._t = 0.0  # seconds of audio processed
         self._follow_until = 0.0
-        self._refractory_until = 0.0
+        self._refractory_until = 0.0  # "Hey Jarvis"
+        self._plain_refractory_until = 0.0
         self._reset_models = False
 
         self._in_speech = False
@@ -115,11 +134,14 @@ class Listener:
         self._zero_run = 0.0
         self._silence_alarm = False
         self._heard_sound = False
+        self._gap_s = math.inf  # silence before the current speech (none heard yet counts as a pause)
+        self._utt_onset: float | None = None  # when the current utterance began, after a pause
 
         self._ring: deque[np.ndarray] = deque()
         self._ring_s = 0.0
         self._ring_max_s = 2.0
         self._kind: Kind = "wake"
+        self._long_preroll = False
         self._clip: list[np.ndarray] = []
         self._rec_s = 0.0
         self._rec_voiced = 0.0
@@ -143,8 +165,31 @@ class Listener:
         return self._wake is not None and self._wake_enabled
 
     @property
+    def plain_enabled(self) -> bool:
+        """Plain "Jarvis" is switched on (it also needs the wake word on, and its model)."""
+        return self._plain_enabled
+
+    @property
+    def plain_ready(self) -> bool:
+        """Plain "Jarvis" is switched on and its model is loaded, beside the wake word."""
+        wake = self._wake
+        return wake is not None and self._wake_enabled and self._plain_enabled and wake.plain_name is not None
+
+    @property
+    def long_preroll(self) -> bool:
+        """The utterance being recorded (or just handed to ``on_end``) reaches back to where its speech began.
+
+        Read it in ``on_end``: the next utterance sets it afresh.
+        """
+        return self._long_preroll
+
+    @property
     def wake_name(self) -> str | None:
         return self._wake.name if self._wake is not None else None
+
+    @property
+    def plain_name(self) -> str | None:
+        return self._wake.plain_name if self._wake is not None else None
 
     @property
     def barge_mode(self) -> BargeMode:
@@ -165,13 +210,18 @@ class Listener:
             self._wake_enabled = enabled
             self._reset_models = True
 
+    def set_plain_wake(self, enabled: bool) -> None:
+        with self._lock:
+            self._plain_enabled = enabled
+
     def set_barge_mode(self, mode: BargeMode) -> None:
         with self._lock:
             self._barge_mode = mode
 
     def set_wake_threshold(self, threshold: float) -> None:
+        """The wake word sensitivity, for "Hey Jarvis" and plain "Jarvis" alike."""
         with self._lock:
-            self.config.wake_threshold = min(0.95, max(0.05, threshold))
+            self.config.wake_threshold = self.config.plain_wake_threshold = min(0.95, max(0.05, threshold))
 
     def set_speaking(self, speaking: bool) -> None:
         with self._lock:
@@ -271,6 +321,7 @@ class Listener:
             mode = self._mode
             reset, self._reset_models = self._reset_models, False
             wake = self._wake if self._wake_enabled else None
+            plain = wake is not None and self._plain_enabled and wake.plain_name is not None
         if mode == "paused":
             return
         if reset:
@@ -280,6 +331,7 @@ class Listener:
             self._ring.clear()
             self._ring_s = 0.0
             self._in_speech, self._voiced_run, self._silence_run = False, 0.0, 0.0
+            self._gap_s, self._utt_onset = math.inf, None
 
         self._ring.append(audio)
         self._ring_s += seconds
@@ -287,21 +339,39 @@ class Listener:
             self._ring_s -= self._ring.popleft().size / RATE
 
         voiced_now = 0.0
-        for prob in self._vad.process(audio):
+        probs = self._vad.process(audio)
+        # The pause before an utterance is counted in whole 32 ms frames, so
+        # allow half a frame: a 0.3 s pause shows as 9 silent frames (0.288 s).
+        gate_silence = self.config.gate_silence_s - VAD_FRAME_S / 2
+        for i, prob in enumerate(probs):
             threshold = self.config.speech_threshold
+            was_in_speech = self._in_speech
             self._in_speech = prob >= threshold or (self._in_speech and prob >= threshold - 0.15)
             if self._in_speech:
+                if not was_in_speech and self._gap_s >= gate_silence:
+                    self._utt_onset = self._t - (len(probs) - i) * VAD_FRAME_S  # where this frame began
                 self._voiced_run += VAD_FRAME_S
-                self._silence_run = 0.0
+                self._silence_run = self._gap_s = 0.0
                 voiced_now += VAD_FRAME_S
             else:
                 self._silence_run += VAD_FRAME_S
+                self._gap_s += VAD_FRAME_S
                 self._voiced_run = 0.0
-        scores = wake.process(audio) if wake is not None else []
-        best = max(scores, default=0.0)
-        self._decide(audio, best, voiced_now)
+        if wake is None:
+            pairs: list[tuple[float, float | None]] = []
+        elif plain:
+            pairs = wake.process_pair(audio)
+        else:
+            pairs = [(score, None) for score in wake.process(audio)]
+        best = max((score for score, _ in pairs), default=0.0)
+        best_plain = max((score for _, score in pairs if score is not None), default=0.0)
+        self._decide(audio, best, voiced_now, best_plain)
 
-    def _decide(self, audio: np.ndarray, wake_score: float, voiced_now: float) -> None:
+    def _at_utterance_start(self) -> bool:
+        """The current utterance began after a pause, and not long ago (the gate for plain "Jarvis")."""
+        return self._utt_onset is not None and self._t - self._utt_onset <= self.config.gate_window_s
+
+    def _decide(self, audio: np.ndarray, wake_score: float, voiced_now: float, plain_score: float = 0.0) -> None:
         cfg = self.config
         started: Kind | None = None
         ended: tuple[np.ndarray | None, Kind] | None = None
@@ -323,8 +393,17 @@ class Listener:
                     self._mode, self._clip = "idle", []
             elif mode in ("idle", "follow"):
                 woke = wake_score >= cfg.wake_threshold and self._t >= self._refractory_until
+                # Plain "Jarvis" never cuts Jarvis off: the daemon would stop him
+                # before the transcript could show it was only a sound-alike.
+                called = (
+                    plain_score >= cfg.plain_wake_threshold
+                    and self._t >= self._plain_refractory_until
+                    and not self._speaking
+                )
                 if woke and (not self._speaking or self._barge_mode != "off"):
                     started = "wake"
+                elif called and self._at_utterance_start():
+                    started = "jarvis"
                 elif mode == "follow" and self._voiced_run >= cfg.follow_onset_s:
                     started = "follow"
                 elif (
@@ -352,9 +431,26 @@ class Listener:
 
     def _start_locked(self, kind: Kind) -> None:
         cfg = self.config
-        if kind == "wake":
-            self._refractory_until = self._t + cfg.wake_refractory_s
+        self._long_preroll = False
+        if kind in ("wake", "jarvis"):
+            # "Hey Jarvis" holds off both phrases (the plain model hears its
+            # "Jarvis" too). Plain "Jarvis" holds off only itself: when the daemon
+            # cancels one (Jarvis just became audible), "Hey Jarvis, stop" right
+            # after must still work. The cost: in that case the "Hey Jarvis" model
+            # firing late on the same word can start a "wake" too.
+            self._plain_refractory_until = self._t + cfg.wake_refractory_s
+            if kind == "wake":
+                self._refractory_until = self._plain_refractory_until
             preroll, self._min_speech, self._rec_voiced = cfg.wake_preroll_s, cfg.min_speech_s, 0.0
+            # The short pre-roll cuts plain "Jarvis" off (and "Hey Jarvis" often
+            # fires on it too): at the start of an utterance, keep all of it. Not
+            # while Jarvis speaks: what began after a pause may be his own voice,
+            # heard through speakers, so "Hey Jarvis" over him keeps its short pre-roll.
+            if self._utt_onset is not None and (
+                kind == "jarvis" or (self.plain_ready and not self._speaking and self._at_utterance_start())
+            ):
+                preroll = max(preroll, min(self._ring_max_s, self._t - self._utt_onset + cfg.plain_preroll_pad_s))
+                self._long_preroll = True
         else:
             # The speech that triggered this is part of the utterance, plus a little before it.
             preroll = self._voiced_run + cfg.onset_preroll_s

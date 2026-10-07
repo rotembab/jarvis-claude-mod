@@ -4,8 +4,8 @@
 
 import type { CommandRunResult, UiOpenResult } from 'claude-code'
 
-import type { Jarvis, SttModel, VoiceEngine } from './app'
-import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
+import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
+import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
 import { ROUTING_MODES } from './router'
@@ -16,7 +16,7 @@ const HELP = [
   '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model',
   '/jarvis setup local [cpu]        install the local voice (Chatterbox, about 6 GB)',
   '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
-  '/jarvis wake <on|off>            listen for "Hey Jarvis" (push-to-talk always works)',
+  '/jarvis wake <on|jarvis|off>     wake on "Hey Jarvis", also on plain "Jarvis", or push-to-talk only',
   '/jarvis bargein <speech|wake|off>  what interrupts Jarvis: any speech, "Hey Jarvis", or nothing',
   '/jarvis routing <auto|off>       Sonnet answers voice requests, Opus or Fable the hard ones; off: your model',
   '/jarvis stop                     stop speaking and cancel the spoken reply',
@@ -182,33 +182,54 @@ const BARGE_IN_LABELS: Record<BargeInMode, string> = {
   off: 'only push-to-talk or /jarvis stop interrupts him',
 }
 
+/** The helper's ready.wakePhrase while plain "Jarvis" works (it says "Hey Jarvis" otherwise). */
+const PLAIN_WAKE_PHRASE = 'Jarvis'
+// A helper that takes plain "Jarvis" fetches its model when it is switched on; an older one never will.
+const PLAIN_NOT_READY = 'plain "Jarvis" is not ready yet: its model is downloading; if it stays so, run /jarvis setup'
+const PLAIN_NEEDS_SETUP = 'plain "Jarvis" is not ready: run /jarvis setup'
+
 async function handsFreeLine(app: Jarvis): Promise<string> {
-  const isOn = await app.wakeWord()
+  const mode = await app.wakeWord()
   const phrase = app.ready?.wakePhrase
-  const wakeText = !isOn ? 'Wake word off' : phrase !== undefined ? `Say "${phrase}"` : 'Wake word loading'
+  let wakeText = mode === 'off' ? 'Wake word off' : phrase !== undefined ? `Say "${phrase}"` : 'Wake word loading'
+  if (mode === 'jarvis' && phrase !== undefined) {
+    const notReady = app.canPlainWake ? PLAIN_NOT_READY : PLAIN_NEEDS_SETUP
+    wakeText = phrase === PLAIN_WAKE_PHRASE ? 'Say "Jarvis" or "Hey Jarvis"' : `${wakeText} (${notReady})`
+  }
   return `${wakeText} · ${BARGE_IN_LABELS[await app.bargeIn()]}`
 }
 
+type HandsFreeConfig = { wakeWord?: boolean; plainWake?: boolean; bargeIn?: BargeInMode }
+
 /** Sends a hands-free change to a running helper; undefined when none runs (it applies at the next start). */
-async function sendConfig(app: Jarvis, body: { wakeWord?: boolean; bargeIn?: BargeInMode }): Promise<string | undefined> {
+async function sendConfig(app: Jarvis, body: HandsFreeConfig): Promise<string | undefined> {
   if (app.helper?.isRunning !== true) return undefined
   const outcome = await app.helper.send('config', body)
   return outcome.ok ? '' : outcome.message
 }
 
+const WAKE_SAVED: Record<WakeMode, string> = {
+  on: 'Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.',
+  jarvis:
+    'Jarvis listens for "Jarvis" at the start of what you say, and for "Hey Jarvis". Nothing is recorded or sent until he hears one; plain "Jarvis" never interrupts him.',
+  off: 'Wake word off: hold the push-to-talk key to talk.',
+}
+
 async function wake(app: Jarvis, choice: string | undefined): Promise<string> {
-  const word = choice?.toLowerCase()
-  if (word === undefined) {
-    return `${await handsFreeLine(app)}. Switch with /jarvis wake on or /jarvis wake off.`
+  if (choice === undefined) {
+    return `${await handsFreeLine(app)}. Switch with /jarvis wake on, jarvis or off.`
   }
-  if (word !== 'on' && word !== 'off') return `Unknown choice "${choice}". Use /jarvis wake on or /jarvis wake off.`
-  const isOn = word === 'on'
-  await app.setWakeWord(isOn)
-  const refused = await sendConfig(app, { wakeWord: isOn })
+  const mode = WAKE_MODES.find(one => one === choice.toLowerCase())
+  if (mode === undefined) return `Unknown choice "${choice}". Use /jarvis wake on, jarvis or off.`
+  await app.setWakeWord(mode)
+  // A helper installed before plain "Jarvis" would refuse plainWake, and with it the whole change.
+  const canPlain = app.canPlainWake
+  const refused = await sendConfig(app, { wakeWord: mode !== 'off', ...(canPlain ? { plainWake: mode === 'jarvis' } : {}) })
   if (refused) return `Saved, but the helper refused it: ${refused}`
-  return isOn
-    ? 'Jarvis listens for "Hey Jarvis". Nothing is recorded or sent until he hears it.'
-    : 'Wake word off: hold the push-to-talk key to talk.'
+  if (mode === 'jarvis' && app.helper?.isRunning === true && !canPlain) {
+    return 'Saved, but this voice helper is older than plain "Jarvis": run /jarvis setup to update it. Until then, say "Hey Jarvis".'
+  }
+  return WAKE_SAVED[mode]
 }
 
 async function bargeIn(app: Jarvis, choice: string | undefined): Promise<string> {

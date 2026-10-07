@@ -91,7 +91,7 @@
         "v": { "$ref": "#/$defs/v" }, "type": { "const": "ready" },
         "sttModel": { "type": "string" }, "sttDevice": { "enum": ["cuda", "cpu"] },
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
-        "wakePhrase": { "type": "string", "description": "present while the wake word is loaded and switched on" },
+        "wakePhrase": { "type": "string", "description": "present while the wake word is loaded and switched on: \"Hey Jarvis\", or \"Jarvis\" while plain \"Jarvis\" works too" },
         "bargeIn": { "$ref": "#/$defs/BargeInMode" }
       }
     },
@@ -125,6 +125,7 @@
         "voiceId": { "type": "string" }, "pttKey": { "type": "string" },
         "sttModel": { "type": "string" }, "language": { "type": "string" },
         "wakeWord": { "type": "boolean" },
+        "plainWake": { "type": "boolean", "description": "also wake on plain \"Jarvis\" at the start of an utterance (helpers with the wake.plain capability)" },
         "bargeIn": { "$ref": "#/$defs/BargeInMode" },
         "wakeThreshold": { "type": "number", "minimum": 0.05, "maximum": 0.95 }
       }

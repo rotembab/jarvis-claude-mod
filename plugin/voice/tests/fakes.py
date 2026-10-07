@@ -109,27 +109,56 @@ class LoudnessVad:
 
 
 class ScriptedWake:
-    """WakeScorer stand-in: scores 0.9 on the next 80 ms chunk after ``say()``."""
+    """WakeScorer stand-in: scores 0.9 on the next 80 ms chunk after ``say()``.
+
+    With ``plain=True`` it also has a plain "Jarvis" model, which scores 0.9
+    on the next chunk after ``say_plain()``. Either can wait instead for the
+    chunk that reaches ``at`` seconds of audio since the last reset (for audio
+    a thread delivers).
+    """
 
     name = "scripted"
 
-    def __init__(self) -> None:
+    def __init__(self, *, plain: bool = False) -> None:
+        self.plain_name = "scripted_plain" if plain else None
         self._pending = 0
+        self._heard = 0
         self._armed = False
+        self._at = 0
+        self._plain_armed = False
+        self._plain_at = 0
         self.resets = 0
 
-    def say(self) -> None:
+    def say(self, at: float | None = None) -> None:
         self._armed = True
+        self._at = 0 if at is None else int(at * 16_000)
+
+    def attach_plain(self) -> None:
+        """The plain model, loaded after the scorer went live."""
+        self.plain_name = "scripted_plain"
+
+    def say_plain(self, at: float | None = None) -> None:
+        self._plain_armed = True
+        self._plain_at = 0 if at is None else int(at * 16_000)
 
     def reset(self) -> None:
         self._pending = 0
+        self._heard = 0
         self.resets += 1
 
     def process(self, audio: np.ndarray) -> list[float]:
+        return [score for score, _plain in self.process_pair(audio)]
+
+    def process_pair(self, audio: np.ndarray) -> list[tuple[float, float | None]]:
         self._pending += audio.size
-        scores = []
+        scores: list[tuple[float, float | None]] = []
         while self._pending >= 1280:
             self._pending -= 1280
-            scores.append(0.9 if self._armed else 0.01)
-            self._armed = False
+            self._heard += 1280
+            woke = self._armed and self._heard >= self._at
+            called = self._plain_armed and self._heard >= self._plain_at
+            plain = None if self.plain_name is None else (0.9 if called else 0.01)
+            scores.append((0.9 if woke else 0.01, plain))
+            self._armed = self._armed and not woke
+            self._plain_armed = self._plain_armed and not called
         return scores

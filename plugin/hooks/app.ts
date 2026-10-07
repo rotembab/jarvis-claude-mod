@@ -37,6 +37,12 @@ export type VoiceEngine = (typeof VOICE_ENGINES)[number]
 /** What interrupts Jarvis by voice: any speech (default), only the wake word, or nothing. */
 export const BARGE_IN_MODES = ['speech', 'wake', 'off'] as const satisfies readonly BargeInMode[]
 
+/** What wakes Jarvis: "Hey Jarvis" (default), plain "Jarvis" as well, or nothing (push-to-talk only). */
+export const WAKE_MODES = ['on', 'jarvis', 'off'] as const
+export type WakeMode = (typeof WAKE_MODES)[number]
+/** The hello capability of a helper whose config takes `plainWake` (older ones refuse the whole config). */
+export const PLAIN_WAKE_CAPABILITY = 'wake.plain'
+
 /** Wake word sensitivity, as the helper's score threshold: high wakes more easily, and falsely more often. */
 export const WAKE_SENSITIVITY = { low: 0.7, medium: 0.5, high: 0.3 } as const
 export type WakeSensitivity = keyof typeof WAKE_SENSITIVITY
@@ -50,7 +56,7 @@ export type JarvisSettings = {
   pttKey: string
   sttModel: SttModel
   language: string
-  wakeWord: boolean
+  wakeWord: WakeMode
   bargeIn: BargeInMode
   wakeSensitivity: WakeSensitivity
   modelRouting: RoutingMode
@@ -73,7 +79,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
     pttKey: optionString(options, 'pttKey') ?? 'right ctrl',
     sttModel: STT_MODELS.find(model => model === stt) ?? 'auto',
     language: optionString(options, 'language') ?? 'en',
-    wakeWord: optionString(options, 'wakeWord') !== 'off',
+    wakeWord: WAKE_MODES.find(mode => mode === optionString(options, 'wakeWord')) ?? 'on',
     bargeIn: BARGE_IN_MODES.find(mode => mode === optionString(options, 'bargeIn')) ?? 'speech',
     wakeSensitivity:
       (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
@@ -205,14 +211,21 @@ export class Jarvis {
     await this.engine?.storeSet(ENGINE_OVERRIDE_KEY, engine)
   }
 
-  /** Whether Jarvis listens for "Hey Jarvis": /jarvis wake's choice, else the wakeWord setting. */
-  async wakeWord(): Promise<boolean> {
+  /** What wakes Jarvis: /jarvis wake's choice, else the wakeWord setting. */
+  async wakeWord(): Promise<WakeMode> {
     const stored = await this.engine?.storeGet(WAKE_OVERRIDE_KEY).catch(() => undefined)
-    return typeof stored === 'boolean' ? stored : this.settings.wakeWord
+    // Before plain "Jarvis", /jarvis wake saved on and off as true and false.
+    if (typeof stored === 'boolean') return stored ? 'on' : 'off'
+    return WAKE_MODES.find(mode => mode === stored) ?? this.settings.wakeWord
   }
 
-  async setWakeWord(isOn: boolean): Promise<void> {
-    await this.engine?.storeSet(WAKE_OVERRIDE_KEY, isOn)
+  async setWakeWord(mode: WakeMode): Promise<void> {
+    await this.engine?.storeSet(WAKE_OVERRIDE_KEY, mode)
+  }
+
+  /** The running helper takes `plainWake` (a helper installed before it would refuse the whole config). */
+  get canPlainWake(): boolean {
+    return this.helper?.hello?.capabilities.includes(PLAIN_WAKE_CAPABILITY) === true
   }
 
   /** What interrupts Jarvis by voice: /jarvis bargein's choice, else the bargeIn setting. */
@@ -423,11 +436,14 @@ export class Jarvis {
 
   private async initialConfig(): Promise<ConfigCommand> {
     const voiceId = await this.voiceId()
+    const wake = await this.wakeWord()
     // The speech model is not here: the helper loads it from its argv at start.
+    // plainWake is off in a fresh helper, so it is sent only to switch it on.
     return {
       pttKey: this.settings.pttKey,
       language: this.settings.language,
-      wakeWord: await this.wakeWord(),
+      wakeWord: wake !== 'off',
+      ...(wake === 'jarvis' && this.canPlainWake ? { plainWake: true } : {}),
       bargeIn: await this.bargeIn(),
       wakeThreshold: WAKE_SENSITIVITY[this.settings.wakeSensitivity],
       ...(voiceId === undefined ? {} : { voiceId }),

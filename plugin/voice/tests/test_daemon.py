@@ -57,6 +57,7 @@ def build(
     stt_text: str = "turn on the lights",
     vad: Any = None,
     wake_loader: Callable[[], Any] | None = None,
+    plain_loader: Callable[[Any], None] | None = None,
 ) -> Rig:
     rig = Rig(
         daemon=None,  # type: ignore[arg-type]
@@ -83,6 +84,7 @@ def build(
         platform_name="linux",
         vad=vad,
         wake_loader=wake_loader,
+        plain_loader=plain_loader,
     )
     return rig
 

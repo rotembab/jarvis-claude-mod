@@ -136,12 +136,25 @@ def _local_voice_section(data_dir: Path, env: Mapping[str, str]) -> dict[str, An
 
 
 def _wake_section(data_dir: Path) -> dict[str, Any]:
-    from .listen.models import WAKE_PHRASE, is_downloaded, wake_dir
+    from .listen.models import (
+        HEY_JARVIS_FILES,
+        PLAIN_JARVIS_FILES,
+        PLAIN_WAKE_PHRASE,
+        WAKE_PHRASE,
+        is_downloaded,
+        wake_dir,
+    )
     from .listen.vad import silero_model_path
     from .stt.models import models_dir
 
     folder = wake_dir(models_dir(data_dir))
-    section: dict[str, Any] = {"phrase": WAKE_PHRASE, "downloaded": is_downloaded(folder), "folder": str(folder)}
+    section: dict[str, Any] = {
+        "phrase": WAKE_PHRASE,
+        "downloaded": is_downloaded(folder, HEY_JARVIS_FILES),
+        "plainPhrase": PLAIN_WAKE_PHRASE,
+        "plainDownloaded": is_downloaded(folder, PLAIN_JARVIS_FILES),
+        "folder": str(folder),
+    }
     try:
         section["vad"] = silero_model_path().name
     except Exception as exc:  # noqa: BLE001

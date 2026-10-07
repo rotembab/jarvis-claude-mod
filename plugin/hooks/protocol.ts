@@ -81,7 +81,7 @@ export type ReadyEvent = Envelope<'ready'> & {
   sttDevice: 'cuda' | 'cpu'
   voiceId?: string
   pttKey: string
-  /** "Hey Jarvis" while the wake word is loaded and switched on. */
+  /** "Hey Jarvis" while the wake word is loaded and switched on; "Jarvis" while plain "Jarvis" works too. */
   wakePhrase?: string
   bargeIn?: BargeInMode
 }
@@ -110,6 +110,8 @@ export type ConfigCommand = {
   sttModel?: string
   language?: string
   wakeWord?: boolean
+  /** Also wake on plain "Jarvis" at the start of an utterance (helpers with the `wake.plain` capability). */
+  plainWake?: boolean
   bargeIn?: BargeInMode
   /** 0.05 to 0.95; lower wakes more easily. */
   wakeThreshold?: number
