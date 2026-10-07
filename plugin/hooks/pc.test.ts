@@ -196,8 +196,46 @@ describe('the guard hook', () => {
     await startHelper($, w)
     const refused = await $.tool.call({ tool: 'Write', file_path: '/home/rotem/.claude/settings.json', content: '{}' })
     expect(refused).toEqual({ deny: expect.stringMatching(/^Jarvis blocks this: it changes Claude Code's own permissions or plugins/) })
+    // Any other path is placed first (where it really lands): a new file in an existing folder.
+    w.realPaths.set('/home/rotem', '/home/rotem')
     expect(await $.tool.call({ tool: 'Write', file_path: '/home/rotem/notes.md', content: 'hi' })).toMatchObject({ result: 'ok' })
     expect(w.asked).toEqual([])
+  })
+
+  test('a Write through a link or junction is judged where it lands; one that cannot be placed asks first', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    // C:\work\cfg is a junction to .claude: the settings file and a new plugin behind it are blocked.
+    w.realPaths.set('C:\\work\\cfg\\', 'C:\\Users\\Rotem\\.claude')
+    for (const file_path of ['C:\\work\\cfg\\settings.json', 'C:\\work\\cfg\\plugins\\evil\\hooks\\hooks.json']) {
+      expect(await $.tool.call({ tool: 'Write', file_path, content: '{}' }), file_path).toEqual({ deny: expect.stringMatching(/^Jarvis blocks this/) })
+    }
+    // New folders under an ordinary one are placed through the nearest folder that is there.
+    w.realPaths.set('C:\\work\\', 'C:\\work')
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\work\\new\\deep\\a.ts', content: 'x' })).toMatchObject({ result: 'ok' })
+    expect(w.asked).toEqual([])
+    // A link that leads nowhere (a write would make its target), or a path with `..` past a missing folder: asked first.
+    w.links.add('C:\\work\\docs.md')
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\work\\docs.md', content: 'x' })).toMatchObject({ result: 'ok' })
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\work\\gone\\..\\cfg\\settings.json', content: '{}' })).toMatchObject({ result: 'ok' })
+    expect(w.asked).toHaveLength(2)
+  })
+
+  test('a file Claude wrote is read and judged when a later command names it, by any launcher', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.realPaths.set('C:\\proj\\', 'C:\\proj')
+    expect(await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\deploy.ps1', content: 'x' })).toMatchObject({ result: 'ok' })
+    w.fileText.set('C:\\proj\\deploy.ps1', 'Set-MpPreference -DisableRealtimeMonitoring $true')
+    expect(await bash($, 'wt -d . pwsh deploy.ps1')).toEqual({ deny: expect.stringMatching(/^Jarvis blocks this: it turns off Windows Defender/) })
+    // A command that only reads it runs nothing of it; once it is deleted, there is nothing to judge.
+    expect(await bash($, 'cat deploy.ps1')).toMatchObject({ result: 'ok' })
+    w.fileText.delete('C:\\proj\\deploy.ps1')
+    expect(await bash($, 'wt -d . pwsh deploy.ps1')).toMatchObject({ result: 'ok' })
+    expect(w.asked).toEqual([])
+    // Its text never reaches the logs.
+    expect(w.logs.join('\n')).not.toContain('Set-MpPreference')
   })
 
   test('a script file is read and judged before it runs; what it contains decides the tier', async ($, on) => {

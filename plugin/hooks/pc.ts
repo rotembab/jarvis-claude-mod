@@ -104,6 +104,14 @@ const HEARD_WHILE_TALKING =
 /** A held command waits this long for its spoken OK. */
 const CONSENT_MS = 120_000
 const TASKS_MAX = 20
+/** How many written files the guard remembers (the oldest drop first). */
+const WRITTEN_MAX = 256
+/**
+ * How many rounds of reads one judgement takes (a script that runs a script ...) and how many files
+ * it reads in all: what is still wanted after that counts as unreadable, so the call is screen.
+ */
+const READ_ROUNDS = 4
+const READS_MAX = 256
 /** Long enough for an aborted call's result (and its background task id) to arrive. */
 const STAND_DOWN_WAIT_MS = 300
 
@@ -174,14 +182,14 @@ function commandField(call: Readonly<Record<string, unknown>>): { field: string;
 export const holdKey = (text: string): string => textLines(text).join('\n')
 
 /**
- * What the guard read to judge a call (a script file's text, where a short
- * name lands), as its hold key carries it: a yes for running a script is for
- * what the script held when Jarvis asked, not for whatever it holds later.
- * Empty when nothing was read. Only ever compared, never logged.
+ * What the guard read to judge a call (a script file's text, where a file
+ * tool's path lands), as its hold key carries it: a yes for running a script
+ * is for what the script held when Jarvis asked, not for whatever it holds
+ * later. Empty when nothing was read. Only ever compared, never logged.
  */
 function readsKey(resolved: Resolved | undefined): string {
-  if (resolved === undefined) return ''
-  const scripts = Object.entries(resolved.scripts ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const scripts = Object.entries(resolved?.scripts ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  if (resolved === undefined || (resolved.realPath === undefined && scripts.length === 0)) return ''
   return `\n${JSON.stringify([resolved.realPath ?? null, scripts])}`
 }
 
@@ -357,6 +365,10 @@ export class PcControl {
   private readonly openQuestions = new Set<string>()
   /** Background commands and monitors the guard saw start, by task id, for stand down. */
   private readonly tasks = new Map<string, string>()
+  /** The files Claude wrote or edited this session (as the tools named them), oldest first: a command naming one has it read and judged. */
+  private readonly written = new Map<string, true>()
+  /** The user's home folder, for `~` and `$HOME` in a path the guard reads: looked up once (null: none). */
+  private home: string | null | undefined
   private admin: AdminFacts | undefined
   /** The administrator check: running, done, or failed (Jarvis then stays off until /jarvis restart checks again). */
   private adminCheck: 'pending' | 'done' | 'failed' = 'pending'
@@ -424,7 +436,21 @@ export class PcControl {
     const refused = await this.decide(call, ask, signal)
     // The HUD's own hook sits beneath the guard: a refused call never reaches it.
     if (refused !== undefined) this.logAction(call, false)
+    else this.noteWritten(call)
     return refused
+  }
+
+  /** A file Claude is about to write or edit: a later command that names it has it read and judged (it may be a script). */
+  private noteWritten(call: GuardCall): void {
+    if (!isFileTool(String(call.tool))) return
+    const path = call.tool === 'NotebookEdit' ? call.notebook_path : call.file_path
+    if (typeof path !== 'string' || path === '') return
+    this.written.delete(path)
+    this.written.set(path, true)
+    for (const oldest of this.written.keys()) {
+      if (this.written.size <= WRITTEN_MAX) break
+      this.written.delete(oldest)
+    }
   }
 
   private async decide(call: GuardCall, ask: CallAsk, signal: AbortSignal | undefined): Promise<string | undefined> {
@@ -458,22 +484,75 @@ export class PcControl {
   }
 
   /**
-   * The guard's judgement. judge() is pure, so a `never` stands on its own, but a script run and a
-   * Write to an 8.3 short name leave a read for Jarvis: reads it (through the engine's file system,
-   * never the real clipboard or keys) and judges again. A read that fails leaves the call at screen.
-   * What was read comes back too: the question and a spoken yes are for those contents.
+   * The guard's judgement. judge() is pure, so a `never` stands on its own, but a file a command runs
+   * (or a file Claude wrote that it names) and every Write/Edit/NotebookEdit path leave a read for
+   * Jarvis: reads it (through the engine's file system, never the real clipboard or keys) and judges
+   * again, in rounds, since a script can run another. A read that fails, or one still wanted after the
+   * last round, leaves the call at screen. What was read comes back too: the question and a spoken yes
+   * are for those contents.
    */
   private async classify(call: GuardCall): Promise<{ verdict: Verdict; resolved?: Resolved }> {
-    const first = judge(String(call.tool), call)
-    if (first.tier === 'never' || first.needs === undefined || first.needs.length === 0) return { verdict: first }
+    const tool = String(call.tool)
     const engine = this.app.engine
-    const resolved: Resolved = { scripts: {} }
-    const scripts = resolved.scripts as Record<string, string | null>
-    for (const need of first.needs) {
-      if (need.kind === 'script') scripts[need.path] = engine === undefined ? null : await engine.readFileText(need.path).catch(() => null)
-      else resolved.realPath = engine === undefined ? null : await engine.realPath(need.path).catch(() => null)
+    const known: Resolved = { written: [...this.written.keys()] }
+    let verdict = judge(tool, call, known)
+    if (verdict.tier === 'never' || verdict.needs === undefined || verdict.needs.length === 0) {
+      // Without the home folder `~` and `$HOME` cannot be read; with it the call may need a read after all.
+      if (verdict.tier !== 'screen' || engine === undefined) return { verdict }
     }
-    return { verdict: judge(String(call.tool), call, resolved), resolved }
+    const home = await this.homeFolder()
+    const scripts: Record<string, string | null | false> = {}
+    let realPath: string | null | undefined
+    const resolvedNow = (): Resolved => ({
+      ...known,
+      ...(home === undefined ? {} : { home }),
+      scripts: { ...scripts },
+      ...(realPath === undefined ? {} : { realPath }),
+    })
+    verdict = judge(tool, call, resolvedNow())
+    let reads = 0
+    for (let round = 0; verdict.tier !== 'never' && verdict.needs !== undefined && verdict.needs.length > 0; round++) {
+      const isLast = round >= READ_ROUNDS || engine === undefined
+      const pending: Promise<void>[] = []
+      for (const need of verdict.needs) {
+        if (need.kind === 'realpath') {
+          if (realPath !== undefined) continue
+          realPath = null
+          if (!isLast && engine !== undefined) {
+            pending.push(engine.realPath(need.path).then(real => void (realPath = real), () => undefined))
+          }
+          continue
+        }
+        if (need.path in scripts) continue
+        scripts[need.path] = null
+        if (isLast || reads >= READS_MAX) continue
+        reads++
+        const path = need.path
+        pending.push(this.readForGuard(path, need.optional === true).then(text => void (scripts[path] = text)))
+      }
+      await Promise.all(pending)
+      verdict = judge(tool, call, resolvedNow())
+      if (isLast) break
+    }
+    return { verdict, resolved: resolvedNow() }
+  }
+
+  /** A file the guard judges: its text; false when an optional one (a name a shell looks up, a file deleted since) is not there; null when it cannot be read. */
+  private async readForGuard(path: string, isOptional: boolean): Promise<string | null | false> {
+    const engine = this.app.engine
+    if (engine === undefined) return null
+    const text = await engine.readFileText(path).catch(() => null)
+    if (text !== null || !isOptional) return text
+    return (await engine.exists(path).catch(() => true)) ? null : false
+  }
+
+  /** The user's home folder (USERPROFILE on Windows, else HOME), looked up once. */
+  private async homeFolder(): Promise<string | undefined> {
+    if (this.home === undefined) {
+      const env = await this.app.engine?.env().catch(() => undefined)
+      this.home = env?.USERPROFILE ?? env?.HOME ?? null
+    }
+    return this.home ?? undefined
   }
 
   /**

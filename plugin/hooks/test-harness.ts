@@ -141,8 +141,10 @@ export type World = {
   checked: string[]
   /** What `$.fs.read` returns per path (the guard reads a script it is about to run); a missing path rejects. */
   fileText: Map<string, string>
-  /** What `$.fs.stat(path, { resolve: true })` resolves a path to (an 8.3 short name's real target); a missing path rejects. */
+  /** What `$.fs.stat(path, { resolve: true })` resolves a path to (a link's or 8.3 short name's real target); a missing path rejects. */
   realPaths: Map<string, string>
+  /** Paths that are symbolic links leading nowhere: `$.fs.list` of their folder shows them, and they do not stat. */
+  links: Set<string>
   /** When set, `$.fs.write` fails (the hook beneath throws this). */
   writeError: string | undefined
   /** When set, `$.prompt.submit` answers `{ drop }` with it (a hook beneath refused). */
@@ -269,6 +271,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     checked: [],
     fileText: new Map(),
     realPaths: new Map(),
+    links: new Set(),
     writeError: undefined,
     submitDrop: undefined,
     exists: path => w.existing.has(path),
@@ -403,6 +406,13 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     const real = w.realPaths.get(windowsPath(e.path))
     if (real === undefined) throw new Error('ENOENT')
     return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: real } : {}) } }
+  })
+  on('fs.list', ($, e) => {
+    const folder = windowsPath(e.path).replace(/[\\/]$/, '')
+    const entries = [...w.links]
+      .filter(link => link.slice(0, Math.max(link.lastIndexOf('/'), link.lastIndexOf('\\'))) === folder)
+      .map(link => ({ name: link.slice(Math.max(link.lastIndexOf('/'), link.lastIndexOf('\\')) + 1), kind: 'other' as const, size: 0, mtimeMs: 0, isLink: true }))
+    return { value: entries }
   })
   on('process.run', async ($, e) => {
     const [command] = e.argv
