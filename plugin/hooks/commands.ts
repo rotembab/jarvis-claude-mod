@@ -2,7 +2,7 @@
 // `/jarvis stop` works while a reply is streaming; work that takes longer
 // than a moment (setup, restart) runs on after the command has answered.
 
-import type { CommandRunResult } from 'claude-code'
+import type { CommandRunResult, UiOpenResult } from 'claude-code'
 
 import type { Jarvis, SttModel, VoiceEngine } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
@@ -25,6 +25,7 @@ const HELP = [
   '/jarvis restart                  restart the voice helper',
   '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
   '/jarvis devices                  show the audio devices and models in use',
+  '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -32,7 +33,10 @@ const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cl
 const VOICE_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 /** Runs `/jarvis <args>`; never throws (a failure is the command's output). */
-export async function runJarvisCommand(app: Jarvis, args: string): Promise<CommandRunResult> {
+/** What the command's own hook does for it: opens the HUD as the person asked. */
+export type CommandUi = { openHud?: () => Promise<UiOpenResult> }
+
+export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi = {}): Promise<CommandRunResult> {
   const [sub = '', ...rest] = args.trim().split(/\s+/).filter(word => word !== '')
   try {
     switch (sub.toLowerCase()) {
@@ -64,6 +68,8 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: await routing(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
+      case 'hud':
+        return { text: await hud(app, rest[0], ui) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }
@@ -232,6 +238,25 @@ async function routing(app: Jarvis, choice: string | undefined): Promise<string>
   return mode === 'auto'
     ? 'Sonnet answers voice requests; a quick check sends complex ones to Opus and the hardest to Fable. Typed messages keep your model.'
     : "Your session's model answers voice requests."
+}
+
+async function hud(app: Jarvis, choice: string | undefined, ui: CommandUi): Promise<string> {
+  if (!app.isLocal) return NOT_LOCAL
+  switch (choice?.toLowerCase()) {
+    case undefined:
+    case 'show':
+      return (await app.openHud(ui.openHud)) ? 'HUD open.' : 'The HUD could not open here; it shows once there is room.'
+    case 'on':
+      await app.setHudOn(true)
+      await app.openHud(ui.openHud)
+      return 'The HUD opens with each session (it shows beside the conversation in wide windows).'
+    case 'off':
+      await app.setHudOn(false)
+      await app.closeHud()
+      return 'HUD closed. It stays closed in new sessions until /jarvis hud on.'
+    default:
+      return `Unknown choice "${choice}". Use /jarvis hud, /jarvis hud on or /jarvis hud off.`
+  }
 }
 
 async function stop(app: Jarvis): Promise<string> {
