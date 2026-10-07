@@ -60,7 +60,7 @@ export type ScreenQuestion = {
 
 /** A voice-tier confirmation: a spoken yes in the voice turn, else a click. */
 export type Consent = {
-  /** What a spoken yes is for: the tool and the exact command (its line breaks kept), or "desktop:clipboard_read". */
+  /** What a spoken yes is for: the tool, the exact command (its line breaks kept) and the text of any script it runs; or "desktop:clipboard_read". */
   key: string
   /** A plain phrase: "pushes commits to the remote". */
   reason: string
@@ -173,6 +173,18 @@ function commandField(call: Readonly<Record<string, unknown>>): { field: string;
  */
 export const holdKey = (text: string): string => textLines(text).join('\n')
 
+/**
+ * What the guard read to judge a call (a script file's text, where a short
+ * name lands), as its hold key carries it: a yes for running a script is for
+ * what the script held when Jarvis asked, not for whatever it holds later.
+ * Empty when nothing was read. Only ever compared, never logged.
+ */
+function readsKey(resolved: Resolved | undefined): string {
+  if (resolved === undefined) return ''
+  const scripts = Object.entries(resolved.scripts ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return `\n${JSON.stringify([resolved.realPath ?? null, scripts])}`
+}
+
 /** "it deletes files", or the reason alone where it is not a verb phrase ("unreadable Bash input"). */
 const itDoes = (verdict: Verdict): string => (verdict.reason.startsWith('unreadable ') ? verdict.reason : `it ${verdict.reason}`)
 
@@ -189,13 +201,15 @@ function callWords(call: GuardCall, verdict: Verdict): string {
 /**
  * The parts of a long command that set its tier: each line, else each piece
  * of one between `;`, `&&`, `||` and `|`, that the guard puts in the same tier
- * for the same rule on its own (short ones only). None when no short part does.
+ * for the same rule on its own (short ones only), with the same files read as
+ * for the whole (so the part that runs a script is found by what the script
+ * does). None when no short part does.
  */
-function decidingParts(call: GuardCall, verdict: Verdict): string[] {
+function decidingParts(call: GuardCall, verdict: Verdict, resolved: Resolved | undefined): string[] {
   const found = commandField(call)
   if (found === undefined || isFileTool(String(call.tool))) return []
   const sameTier = (part: string): boolean => {
-    const alone = judge(String(call.tool), { ...call, [found.field]: part })
+    const alone = judge(String(call.tool), { ...call, [found.field]: part }, resolved)
     return alone.tier === verdict.tier && alone.rule === verdict.rule
   }
   const parts: string[] = []
@@ -215,12 +229,12 @@ function decidingParts(call: GuardCall, verdict: Verdict): string[] {
  * long one by the parts that set its tier, as many as fit (else its start),
  * with how much is not shown.
  */
-function shownCommand(call: GuardCall, verdict: Verdict): { text: string; parts: number; hidden: number } {
+function shownCommand(call: GuardCall, verdict: Verdict, resolved: Resolved | undefined): { text: string; parts: number; hidden: number } {
   const whole = visibleText(commandText(call))
   if (whole.length <= SHOWN_MAX) return { text: whole, parts: 0, hidden: 0 }
   const shown: string[] = []
   let length = 0
-  for (const part of decidingParts(call, verdict)) {
+  for (const part of decidingParts(call, verdict, resolved)) {
     if (length + part.length > SHOWN_MAX) break
     shown.push(part)
     length += part.length
@@ -231,10 +245,10 @@ function shownCommand(call: GuardCall, verdict: Verdict): { text: string; parts:
 }
 
 /** The on-screen question for a guarded call: what it does, and the command itself (a long one by the parts that matter). */
-function guardQuestion(call: GuardCall, verdict: Verdict): ScreenQuestion {
+function guardQuestion(call: GuardCall, verdict: Verdict, resolved?: Resolved): ScreenQuestion {
   const isFile = isFileTool(String(call.tool))
   const warning = WARNINGS[verdict.rule]
-  const shown = shownCommand(call, verdict)
+  const shown = shownCommand(call, verdict, resolved)
   const where = shown.parts === 0 ? '' : shown.parts === 1 ? ', in this part' : ', in these parts'
   const quoted =
     shown.text === ''
@@ -416,7 +430,7 @@ export class PcControl {
   private async decide(call: GuardCall, ask: CallAsk, signal: AbortSignal | undefined): Promise<string | undefined> {
     // A cloud session runs nothing on the user's PC (and its platform is set before isLocal).
     if (this.app.platform !== undefined && !this.app.isLocal) return undefined
-    const verdict = await this.classify(call)
+    const { verdict, resolved } = await this.classify(call)
     switch (verdict.tier) {
       case 'pass':
         return undefined
@@ -426,12 +440,12 @@ export class PcControl {
         const command = commandText(call)
         return await this.confirm(
           {
-            key: `${String(call.tool)}\n${holdKey(command)}`,
+            key: `${String(call.tool)}\n${holdKey(command)}${readsKey(resolved)}`,
             reason: verdict.reason,
             again: 'run exactly the same command again',
             spoken: `Claude wants to ${callWords(call, verdict)}: ${spokenCommand(command)}. Say yes to ${isFileTool(String(call.tool)) ? 'go ahead' : 'run it'}, sir.`,
             shown: shownForYes(call),
-            screen: guardQuestion(call, verdict),
+            screen: guardQuestion(call, verdict, resolved),
             agentId: call.agentId,
           },
           ask,
@@ -439,7 +453,7 @@ export class PcControl {
         )
       }
       default:
-        return await this.askOnScreen(guardQuestion(call, verdict), ask, signal, call.agentId)
+        return await this.askOnScreen(guardQuestion(call, verdict, resolved), ask, signal, call.agentId)
     }
   }
 
@@ -447,10 +461,11 @@ export class PcControl {
    * The guard's judgement. judge() is pure, so a `never` stands on its own, but a script run and a
    * Write to an 8.3 short name leave a read for Jarvis: reads it (through the engine's file system,
    * never the real clipboard or keys) and judges again. A read that fails leaves the call at screen.
+   * What was read comes back too: the question and a spoken yes are for those contents.
    */
-  private async classify(call: GuardCall): Promise<Verdict> {
+  private async classify(call: GuardCall): Promise<{ verdict: Verdict; resolved?: Resolved }> {
     const first = judge(String(call.tool), call)
-    if (first.tier === 'never' || first.needs === undefined || first.needs.length === 0) return first
+    if (first.tier === 'never' || first.needs === undefined || first.needs.length === 0) return { verdict: first }
     const engine = this.app.engine
     const resolved: Resolved = { scripts: {} }
     const scripts = resolved.scripts as Record<string, string | null>
@@ -458,7 +473,7 @@ export class PcControl {
       if (need.kind === 'script') scripts[need.path] = engine === undefined ? null : await engine.readFileText(need.path).catch(() => null)
       else resolved.realPath = engine === undefined ? null : await engine.realPath(need.path).catch(() => null)
     }
-    return judge(String(call.tool), call, resolved)
+    return { verdict: judge(String(call.tool), call, resolved), resolved }
   }
 
   /**
@@ -486,7 +501,7 @@ export class PcControl {
       const said = voice.consentTo(held.turnId)
       if (said === 'yes') {
         this.held = undefined
-        engine.debug(`jarvis: spoken OK for: ${clip(consent.key.replace('\n', ' '), 120)}`)
+        engine.debug(`jarvis: spoken OK to ${clip(consent.shown, 120)}`)
         return undefined
       }
       if (said === 'yes_while_talking') {

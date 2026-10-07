@@ -325,6 +325,11 @@ describe('the guard hook', () => {
     // One long line: the piece of it that deletes.
     await bash($, `${filler}; rm -rf ~/Documents`)
     expect(w.asked.at(-1)).toMatch(/that deletes files, in this part: "rm -rf ~\/Documents" \([\d,]+ more characters not shown\)\. Run it\?$/)
+
+    // The piece that runs a script, when what the script does sets the tier.
+    w.fileText.set('/home/rotem/clean.sh', 'rm -rf "$HOME/Downloads"')
+    await bash($, `${filler}; bash /home/rotem/clean.sh`)
+    expect(w.asked.at(-1)).toMatch(/that deletes files, in this part: "bash \/home\/rotem\/clean\.sh" \([\d,]+ more characters not shown\)\. Run it\?$/)
   })
 
   test('a cloud session is left alone', async ($, on) => {
@@ -606,6 +611,35 @@ describe('voice consent', () => {
     await turn($, w, 'Yes.', 't2')
     expect(await bash($, 'git push origin\nnpm publish')).toEqual({ deny: expect.stringMatching(/^Jarvis held this/) })
     expect(ran).toEqual([])
+  })
+
+  test('a yes for a script run is bound to what the script held: one rewritten since is held again', async ($, on) => {
+    const ran: string[] = []
+    on('tool.call', { tool: 'Bash' }, ($, e) => {
+      ran.push(e.command)
+      return { result: { stdout: '', stderr: '', interrupted: false } }
+    })
+    const w = world(on)
+    const helper = await startHelper($, w)
+    w.fileText.set('/home/rotem/ship.sh', 'git push')
+    await heard(w, helper, 'Ship it', 'u1')
+    await turn($, w, 'Ship it', 't1')
+    expect(await bash($, 'bash /home/rotem/ship.sh')).toEqual({ deny: expect.stringMatching(HELD) })
+    await completeTurn($, 't1')
+    await answered(w, helper, 't1', 'Yes.', 'u2')
+    await turn($, w, 'Yes.', 't2')
+    // The same command, but the script now does something else: the yes was not for that.
+    w.fileText.set('/home/rotem/ship.sh', 'npm publish')
+    expect(await bash($, 'bash /home/rotem/ship.sh')).toEqual({ deny: expect.stringMatching(/^Jarvis held this: it publishes a package/) })
+    await completeTurn($, 't2')
+    // Asked again and answered: exactly that script runs.
+    await answered(w, helper, 't2', 'Yes.', 'u3')
+    await turn($, w, 'Yes.', 't3')
+    expect(await bash($, 'bash /home/rotem/ship.sh')).toMatchObject({ result: { stdout: '' } })
+    expect(ran).toEqual(['bash /home/rotem/ship.sh'])
+    expect(w.asked).toEqual([])
+    // The script's text never reaches the logs.
+    expect(w.logs.join('\n')).not.toContain('npm publish')
   })
 
   test('a yes with more words, or a typed yes, is not a spoken OK', async ($, on) => {
