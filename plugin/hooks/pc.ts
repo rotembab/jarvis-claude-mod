@@ -71,7 +71,11 @@ export type Consent = {
    * after the model's own words: the yes answers this line, not the model's.
    */
   spoken: string
-  /** What the yes would let happen, as the toast and the transcript show it: 'run a Bash command: "git push"'. */
+  /**
+   * What the yes would let happen, as the toast and the transcript show it:
+   * 'run a Bash command: "git push"'; a long command by the parts that set its
+   * tier, with how much is not shown, as the on-screen question shows it.
+   */
   shown: string
   screen: ScreenQuestion
   agentId?: string
@@ -95,7 +99,7 @@ const ON_SCREEN = 'That one needs your OK on screen, sir.'
 const SHOWN_MAX = 300
 /** The longest part of a long command shown as the part that set its tier. */
 const PART_MAX = 200
-/** The few words of a held command Jarvis says aloud (the whole of it is on screen). */
+/** The few words of a held command Jarvis says aloud (the toast and the transcript quote more). */
 const SPOKEN_WORDS = 3
 const SPOKEN_MAX = 40
 const HEARD_WHILE_TALKING =
@@ -244,18 +248,23 @@ function shownCommand(call: GuardCall, verdict: Verdict, resolved: Resolved | un
   return { text: `${head}…`, parts: 0, hidden: whole.length - head.length }
 }
 
-/** The on-screen question for a guarded call: what it does, and the command itself (a long one by the parts that matter). */
-function guardQuestion(call: GuardCall, verdict: Verdict, resolved?: Resolved): ScreenQuestion {
+/**
+ * The command quoted after what the call does, for the question, the toast and
+ * the transcript alike: ': "git push"'; a long one ', in this part: "…" (N more
+ * characters not shown)'. Empty when the call has no text.
+ */
+function quotedCommand(call: GuardCall, verdict: Verdict, resolved: Resolved | undefined): string {
+  const shown = shownCommand(call, verdict, resolved)
+  if (shown.text === '') return ''
+  if (shown.hidden === 0) return `: "${shown.text}"`
+  const where = shown.parts === 0 ? '' : shown.parts === 1 ? ', in this part' : ', in these parts'
+  return `${where}: "${shown.text}" (${shown.hidden.toLocaleString('en-US')} more characters not shown)`
+}
+
+/** The on-screen question for a guarded call: what it does, and the command itself (`quoted`: a long one by the parts that matter). */
+function guardQuestion(call: GuardCall, verdict: Verdict, quoted: string): ScreenQuestion {
   const isFile = isFileTool(String(call.tool))
   const warning = WARNINGS[verdict.rule]
-  const shown = shownCommand(call, verdict, resolved)
-  const where = shown.parts === 0 ? '' : shown.parts === 1 ? ', in this part' : ', in these parts'
-  const quoted =
-    shown.text === ''
-      ? ''
-      : shown.hidden === 0
-        ? `: "${shown.text}"`
-        : `${where}: "${shown.text}" (${shown.hidden.toLocaleString('en-US')} more characters not shown)`
   return {
     question: `${LEAD}Claude wants to ${callWords(call, verdict)}${quoted}.${warning === undefined ? '' : ` ${warning}`} ${isFile ? 'Go ahead?' : 'Run it?'}`,
     no: NO_RUN,
@@ -274,13 +283,14 @@ function spokenCommand(text: string): string {
   return said === first && lines.length === 1 ? said : `${said} and more`
 }
 
-/** What a held guarded call would do, for the toast and the transcript: 'run a Bash command: "git push"'. */
-function shownForYes(call: GuardCall): string {
+/**
+ * What a held guarded call would do, for the toast and the transcript, the
+ * command quoted as the question quotes it: 'run a Bash command: "git push"';
+ * a long one by the parts that set its tier, so what the yes lets run is in view.
+ */
+function shownForYes(call: GuardCall, quoted: string): string {
   const tool = String(call.tool)
-  const what = TOOL_WORDS[tool] ?? `use ${tool}`
-  const whole = visibleText(commandText(call))
-  const text = whole.length <= SHOWN_MAX ? whole : `${whole.slice(0, SHOWN_MAX)}… (${(whole.length - SHOWN_MAX).toLocaleString('en-US')} more characters)`
-  return text === '' ? what : `${what}: "${text}"`
+  return `${TOOL_WORDS[tool] ?? `use ${tool}`}${quoted}`
 }
 
 const ABORTED = Symbol('aborted')
@@ -336,8 +346,11 @@ export class PcControl {
   /** The main-loop turn running now, and the turn the mode was last noted in (a prompt's own turn, or a tool's). */
   private runningTurnId: string | undefined
   private modeTurnId: string | undefined
-  /** A prompt noted the mode: the next turn to start is that prompt's. */
-  private isModeForNextTurn = false
+  /**
+   * The prompt that noted the mode while no turn ran, until the next turn
+   * starts: the mode is that turn's only when the turn starts with this text.
+   */
+  private modePrompt: string | undefined
 
   /**
    * The one command held for a spoken OK: when, in which turn (the yes must
@@ -438,14 +451,15 @@ export class PcControl {
         return `Jarvis blocks this: it ${verdict.reason}, which is on Jarvis's never list. Do not retry it or work around it; the user can do it themselves.`
       case 'voice': {
         const command = commandText(call)
+        const quoted = quotedCommand(call, verdict, resolved)
         return await this.confirm(
           {
             key: `${String(call.tool)}\n${holdKey(command)}${readsKey(resolved)}`,
             reason: verdict.reason,
             again: 'run exactly the same command again',
             spoken: `Claude wants to ${callWords(call, verdict)}: ${spokenCommand(command)}. Say yes to ${isFileTool(String(call.tool)) ? 'go ahead' : 'run it'}, sir.`,
-            shown: shownForYes(call),
-            screen: guardQuestion(call, verdict, resolved),
+            shown: shownForYes(call, quoted),
+            screen: guardQuestion(call, verdict, quoted),
             agentId: call.agentId,
           },
           ask,
@@ -453,7 +467,7 @@ export class PcControl {
         )
       }
       default:
-        return await this.askOnScreen(guardQuestion(call, verdict, resolved), ask, signal, call.agentId)
+        return await this.askOnScreen(guardQuestion(call, verdict, quotedCommand(call, verdict, resolved)), ask, signal, call.agentId)
     }
   }
 
@@ -479,16 +493,16 @@ export class PcControl {
   /**
    * The voice tier. In the running voice turn (main loop): the call is held;
    * when the turn ends, Jarvis speaks his own question about it (consent.spoken)
-   * after the model's words, and a toast shows it whole. The next main-loop
-   * turn lets exactly that call through once if its words are only a yes the
-   * user began saying after that question had played out, by the helper's own
-   * clock: a yes said over Jarvis holds it again; one said before he finished
-   * asking (a queued one, say), or one the helper did not time, goes to a click
-   * on screen instead. Any turn in between, an abort, a stop, any other words,
-   * a typed prompt or a new session drops the hold. One call is held at a
-   * time: a later turn's hold replaces it, and a second command held in the
-   * same turn voids both (the yes would answer two questions). Any other turn
-   * or loop asks on screen.
+   * after the model's words, and a toast quotes it as the question would. The
+   * next main-loop turn lets exactly that call through once if its words are
+   * only a yes the user began saying after that question had played out, by
+   * the helper's own clock: a yes said over Jarvis holds it again; one said
+   * before he finished asking (a queued one, say), or one the helper did not
+   * time, goes to a click on screen instead. Any turn in between, an abort, a
+   * stop, any other words, a typed prompt or a new session drops the hold. One
+   * call is held at a time: a later turn's hold replaces it, and a second
+   * command held in the same turn voids both (the yes would answer two
+   * questions). Any other turn or loop asks on screen.
    */
   async confirm(consent: Consent, ask: CallAsk, signal?: AbortSignal): Promise<string | undefined> {
     const engine = this.app.engine
@@ -543,17 +557,23 @@ export class PcControl {
     this.clearHold()
   }
 
-  /** turn.start in the main loop: the turn a prompt's mode belongs to. */
-  onTurnStart(turnId: string): void {
-    this.runningTurnId = turnId
-    if (this.isModeForNextTurn) this.modeTurnId = turnId
-    this.isModeForNextTurn = false
+  /**
+   * turn.start in the main loop: the turn a prompt's mode belongs to, when it
+   * is that prompt's own (it starts with the prompt's text). Any other turn (a
+   * continuation, one after a prompt a hook blocked) starts with its mode unknown.
+   */
+  onTurnStart(e: { turnId: string; text: string }): void {
+    this.runningTurnId = e.turnId
+    if (this.modePrompt !== undefined && e.text !== '' && e.text === this.modePrompt) this.modeTurnId = e.turnId
+    this.modePrompt = undefined
   }
 
   /**
    * turn.complete in the main loop. An abort drops the hold; the turn that
    * held a command ends with Jarvis's own question about it, returned for
-   * voice.ts to speak last in its reply, and with a toast showing it whole.
+   * voice.ts to speak last in its reply, and with a toast and a transcript
+   * line that quote the command as the question does (a long one by the parts
+   * that set its tier, with how much is not shown): what the yes lets run.
    */
   onTurnComplete(e: { turnId: string; isAborted: boolean; agentId?: string }): string | undefined {
     if (e.agentId !== undefined) return undefined
@@ -566,7 +586,7 @@ export class PcControl {
     if (held === undefined || held.isVoid === true || held.turnId !== e.turnId) return undefined
     const engine = this.app.engine
     engine?.log(`Jarvis is waiting for a spoken yes to ${held.shown}`)
-    engine?.toast(`Jarvis: say yes to ${clip(held.shown, 200)}`, { timeoutMs: 15_000 })
+    engine?.toast(`Jarvis: say yes to ${held.shown}`, { timeoutMs: 15_000 })
     return held.spoken
   }
 
@@ -754,11 +774,19 @@ export class PcControl {
     return BYPASS_WARNING
   }
 
-  /** classic.UserPromptSubmit: the mode the prompt's turn runs in. A subagent's or teammate's is not the main loop's. */
-  notePermissionMode(mode: string | undefined, agentId?: string): void {
-    if (agentId !== undefined || mode === undefined || mode === '') return
+  /**
+   * classic.UserPromptSubmit: the mode the prompt's turn runs in. A subagent's
+   * or teammate's is not the main loop's. A prompt typed while a turn runs
+   * fires this at Enter and waits (or goes into that turn): the mode may change
+   * before its own turn starts, so that turn starts with its mode unknown.
+   */
+  notePermissionMode(mode: string | undefined, prompt: string, agentId?: string): void {
+    if (agentId !== undefined) return
+    // No earlier prompt's mode is this one's.
+    this.modePrompt = undefined
+    if (mode === undefined || mode === '') return
     this.permissionMode = mode
-    this.isModeForNextTurn = true
+    if (this.runningTurnId === undefined) this.modePrompt = prompt
   }
 
   /**
@@ -802,7 +830,7 @@ export class PcControl {
         return [
           'Permission rules from the same table the guard uses. Jarvis writes no settings: paste these into the "permissions" (and "env") of your user settings yourself (.claude\\settings.json in your user folder). Claude cannot do it for you: the guard blocks edits to Claude Code\'s settings.',
           'The deny rules keep the never list blocked even without Jarvis. There are no allow rules (Jarvis only makes Claude Code stricter) and no ask rules (Jarvis asks itself; an ask rule would add a second dialog). The env line turns on the PowerShell tool.',
-          `The desktop tool asks on screen before each action unless your rules allow it. To let its actions run without that question, add "${DESKTOP_TOOL}" to "allow" yourself. Even then Jarvis asks before reading the clipboard or taking a screenshot (a spoken yes in a voice conversation, else a click), and asks on screen when: a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it, PostToolUse ones included), the permission mode is not known for the turn (a subagent's call, or a turn Jarvis did not see a prompt start), or the allow comes from the mode alone (bypassPermissions) rather than your rule. If your rules or settings cannot be read, nothing is done.`,
+          `The desktop tool asks on screen before each action unless your rules allow it. To let its actions run without that question, add "${DESKTOP_TOOL}" to "allow" yourself. Even then Jarvis asks before reading the clipboard or taking a screenshot (a spoken yes in a voice conversation, else a click), and asks on screen when: a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it, PostToolUse ones included), the permission mode is not known for the turn (a subagent's call, a turn Jarvis did not see a prompt start, or one whose prompt was typed while another turn ran), or the allow comes from the mode alone (bypassPermissions) rather than your rule. If your rules or settings cannot be read, nothing is done.`,
           '',
           rulesSnippet(),
         ].join('\n')
