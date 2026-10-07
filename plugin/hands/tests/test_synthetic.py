@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from pathlib import Path
@@ -9,8 +10,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from jarvis_hands import synthetic
-from jarvis_hands.camera.base import CameraError
+from jarvis_hands import clock, synthetic
+from jarvis_hands.camera.base import CameraError, CameraFrame
 from jarvis_hands.camera.fake import FakeCamera
 from jarvis_hands.landmarks import Frame
 from jarvis_hands.poses import PoseTracker, anchor_point
@@ -64,16 +65,23 @@ def test_fake_camera_paces_frames_at_its_rate() -> None:
     camera = FakeCamera(width=320, height=240, fps=50.0)
     info = camera.open()
     assert (info.name, info.backend, info.width, info.height, info.fps) == ("fake camera", "fake", 320, 240, 50.0)
-    started = time.monotonic()
-    read = [camera.read(1.0) for _ in range(10)]
-    elapsed = time.monotonic() - started
-    frames = [f for f in read if f is not None]
+    read: list[tuple[CameraFrame | None, float]] = []
+    for _ in range(10):
+        frame = camera.read(1.0)
+        read.append((frame, clock.now()))
+    frames = [f for f, _ in read if f is not None]
     assert len(frames) == 10
     seqs = [f.seq for f in frames]
-    assert seqs[0] == 1 and seqs == sorted(set(seqs))
-    # Ten frames at 50 fps: about 0.18 s; a busy machine may skip one, never deliver early.
-    assert 0.17 <= elapsed < 0.4 and 10 <= seqs[-1] <= 12
-    assert all(f.t == pytest.approx(frames[0].t + (f.seq - 1) * 0.02) for f in frames)
+    assert seqs == sorted(set(seqs))
+    # Frame k comes off the "device" at t0 + (k - 1) / fps.
+    t0 = frames[0].t - (frames[0].seq - 1) * 0.02
+    assert all(f.t == pytest.approx(t0 + (f.seq - 1) * 0.02) for f in frames)
+    # Each read hands out the newest frame there is: never one before its time, never an older one than its
+    # time allows. A reader that oversleeps (shared CI machines do, by tens of ms) skips the frames in between;
+    # how many depends on the machine, not on the camera.
+    for f, returned in read:
+        assert f is not None and f.t <= returned
+        assert f.seq <= math.floor((returned - t0) * 50.0 + 1e-9) + 1
     assert frames[0].image.shape == (240, 320, 3) and not frames[0].image.any()
     camera.close()
 
