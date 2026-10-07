@@ -145,7 +145,7 @@ Sonnet answers what you say, so replies start quickly. Before each voice request
 
 Your webcam can drive the mouse and windows: point with your hand, pinch to click and drag files, make a fist to grab a window and fling it to another screen. It runs on Windows, needs a webcam, and is off until you turn it on.
 
-1. Install it once: `/jarvis setup hands` (about 500 MB: MediaPipe, OpenCV and an 8 MB hand model, all in `%USERPROFILE%\.jarvis\hands`).
+1. Install it once: `/jarvis setup hands` (about 500 MB: MediaPipe and OpenCV in `%USERPROFILE%\.jarvis\hands`, and an 8 MB hand model in `%USERPROFILE%\.jarvis\models\hands`).
 2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control". The camera light comes on.
 3. Hold an open palm toward the camera, still, for half a second. A cyan ring appears at the cursor, which now follows your hand.
 
@@ -165,7 +165,7 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 - `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
 - `/jarvis hands pause` turns the camera off without turning hand control off; `/jarvis hands resume` turns it back on.
 - Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays are left out. `/jarvis hands display 1` keeps your hand on one display.
-- Windows run as administrator can't be moved or clicked by hand control (Windows blocks it); Jarvis says so once.
+- Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.
 - `/jarvis hands` shows the camera, the displays and the gestures. The camera picture never leaves your computer.
 
 ## Commands

@@ -233,7 +233,7 @@ Two more commands help while tuning:
 & "$env:USERPROFILE\.jarvis\hands\venv\Scripts\python.exe" -m jarvis_hands preview       # the camera with the tracked hands and their poses; q or Esc quits
 ```
 
-The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name (`palm`, `point`, `pinch`, `fist`, ...) with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
+The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. The names are the ones the gesture engine works from: `hover` (pointing, or a relaxed hand), `palm`, `pinch` (thumb and index), `pinch_middle` (thumb and middle), `fist` and `two` (index and middle up: scroll). `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
 
 ## Logs
 
@@ -289,4 +289,4 @@ The helper reports `mic_blocked` when Windows denies microphone access. Open Set
 
 ### Hand control
 
-The README's [Hand control](../README.md#hand-control-preview) section covers the camera being blocked or in use and gestures that are missed. For anything else, `hands.log` says why the helper stopped, `/jarvis hands` shows its state, and the doctor and preview above show what the camera and the model see. If clicks or window moves do nothing on one window while the cursor still follows your hand, that window runs as administrator: Windows does not let a normal program click or move it, and the helper reports `input_blocked`.
+The README's [Hand control](../README.md#hand-control-preview) section covers the camera being blocked or in use and gestures that are missed. For anything else, `hands.log` says why the helper stopped, `/jarvis hands` shows its state, and the doctor and preview above show what the camera and the model see. If clicks or window moves do nothing on one window while the cursor still follows your hand, that window runs as administrator: Windows does not let a normal program click or move it. Grabbing it makes the helper report `input_blocked`; a click on it fails silently.
