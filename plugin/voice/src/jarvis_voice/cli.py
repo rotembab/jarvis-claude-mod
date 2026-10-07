@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--fake-audio", action="store_true", help="no audio hardware or keyboard hook (tests)")
     run.add_argument("--fake-stt", action="store_true", help="fixed transcription instead of faster-whisper (tests)")
     run.add_argument("--fake-fish", metavar="URL", default=None, help="Fish Audio base URL of a fake server (tests)")
+    run.add_argument("--fake-desktop", action="store_true", help="desktop actions are recorded, not performed (tests)")
     run.add_argument("--stt-model", default=_env("JARVIS_STT_MODEL") or "auto")
     run.add_argument("--ptt-key", default=_env("JARVIS_PTT_KEY") or "right ctrl")
     run.add_argument("--voice-id", default=_env("JARVIS_VOICE_ID"))
@@ -152,6 +153,9 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
     ]
     fakes = (("audio", args.fake_audio), ("stt", args.fake_stt), ("fish", args.fake_fish), ("local", args.fake_local))
     caps += [f"fake.{n}" for n, on in fakes if on]
+    from .desktop import desktop_capabilities  # lazy
+
+    caps += desktop_capabilities(fake=getattr(args, "fake_desktop", False) or args.fake_audio)
     return caps
 
 
@@ -359,7 +363,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         daemon = _build_daemon(args, data_dir, writer)
         daemon_ref.append(daemon)
-        server = ControlServer(token, daemon.handle_command).start()
+        from .desktop import create_service, route_desktop  # lazy: nothing Windows-only at import
+
+        desktop = create_service(fake=args.fake_desktop or args.fake_audio)
+        server = ControlServer(token, route_desktop(daemon.handle_command, desktop)).start()
         writer.emit(
             protocol.Hello(
                 port=server.port,

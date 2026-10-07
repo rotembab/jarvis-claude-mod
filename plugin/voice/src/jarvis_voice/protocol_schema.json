@@ -120,6 +120,17 @@
       "type": "object", "additionalProperties": false, "required": ["action"],
       "properties": { "action": { "enum": ["start", "stop"] } }
     },
+    "DesktopCommand": {
+      "type": "object", "additionalProperties": false, "required": ["action"],
+      "properties": {
+        "action": { "enum": ["open", "focus", "media", "volume", "screenshot", "lock", "clipboard_read", "clipboard_write"] },
+        "target": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "key": { "enum": ["play_pause", "next", "previous", "stop"] },
+        "level": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "change": { "enum": ["up", "down", "mute", "unmute"] },
+        "text": { "type": "string", "maxLength": 20000 }
+      }
+    },
     "ConfigCommand": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -145,6 +156,7 @@
           "properties": { "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" } }
         },
         "stopped": { "type": "boolean", "description": "stop: true when a reply was playing or queued" },
+        "desktop": { "type": "object", "description": "desktop: { result: done|failed|refused|unsupported, text, path?, clipboard? }" },
         "dropped": { "type": "boolean", "description": "speak: the sentence was ignored (stopped or finished reply, duplicate seq)" },
         "replyId": { "type": "string", "description": "test_voice: the reply id its speech events carry" },
         "applied": { "type": "array", "items": { "type": "string" }, "description": "config: the fields that took effect" },
@@ -175,6 +187,7 @@
     "listen": "#/$defs/ListenCommand",
     "config": "#/$defs/ConfigCommand",
     "status": "#/$defs/StatusCommand",
+    "desktop": "#/$defs/DesktopCommand",
     "test_voice": "#/$defs/TestVoiceCommand",
     "shutdown": "#/$defs/ShutdownCommand"
   }
