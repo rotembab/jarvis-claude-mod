@@ -368,6 +368,18 @@ def test_replies_hold_the_output_open_until_the_last_speech_done(sink: Recording
         pipe.close()
 
 
+def test_a_queued_id_without_its_reply_still_releases_the_output(sink: RecordingSink, playback: FakePlayback) -> None:
+    pipe = SpeechPipeline(FakeSynth(), playback, sink)
+    playback.hold_open(True)
+    pipe._order.append("ghost")  # the worker's defensive case: queue and replies out of sync
+    pipe.start()
+    try:
+        wait_until(lambda: not playback.held)
+        assert not pipe.busy()
+    finally:
+        pipe.close()
+
+
 def test_paused_output_is_not_a_stall(sink: RecordingSink, playback: FakePlayback) -> None:
     pipe, _, _ = make(sink, playback, stall_timeout=0.1)
     try:

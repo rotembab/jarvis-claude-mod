@@ -339,6 +339,8 @@ class SpeechPipeline:
                 reply = self._replies.get(self._order[0])
                 if reply is None:  # defensive: order and map out of sync
                     self._order.popleft()
+                    if not self._order:
+                        self._playback.hold_open(False)  # as _finish_locked does
                     continue
             try:
                 self._run_reply(reply)

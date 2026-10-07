@@ -41,6 +41,7 @@ class FakeStream:
         self.active = False
         self.aborts = 0
         self.closed = False
+        self.closed_with_com = False  # close() ran on a thread set up for COM
         self._thread: threading.Thread | None = None
         failure = sd.fail_open.get((kind, self.samplerate))
         if failure is not None:
@@ -91,6 +92,7 @@ class FakeStream:
         self.kwargs["finished_callback"]()
 
     def close(self) -> None:
+        self.closed_with_com = getattr(self.sd.com, "ready", False)
         self.closed = True
 
 
@@ -169,17 +171,27 @@ class FakeSD(types.ModuleType):
         return self.devices
 
     def _terminate(self) -> None:
+        self._require_com("_terminate")
         self.terminations += 1
-        self.live_at_terminate += [s for s in self.streams if not s.closed]
+        self.live_at_terminate += self.unclosed()
         for stream in self.streams:
             stream.active = False
 
     def _initialize(self) -> None:
-        pass
+        self._require_com("_initialize")
+
+    def _require_com(self, call: str) -> None:
+        # Re-initialising PortAudio is a WASAPI call like a stream start: only on a thread set up for COM.
+        if not getattr(self.com, "ready", False):
+            raise AssertionError(f"{call} on thread {threading.current_thread().name!r} without ensure_com")
 
     def ensure_com(self) -> None:
         """Stands in for platform.windows.ensure_com."""
         self.com.ready = True
+
+    def unclosed(self) -> list[FakeStream]:
+        """Streams constructed and never closed: each one a PortAudio stream leaked."""
+        return [s for s in self.streams if not s.closed]
 
     def outputs(self) -> list[FakeStream]:
         return [s for s in self.streams if s.kind == "output"]
@@ -370,6 +382,7 @@ def test_playback_closes_when_idle_and_reopens_on_audio(sd: FakeSD) -> None:
     try:
         first = sd.streams[0]
         wait_until(lambda: first.closed, 3.0)
+        assert first.closed_with_com  # on the reaper's thread, which opened nothing
         pb.add_speech(np.full(240, 0.3, np.float32))
         assert len(sd.streams) == 2 and sd.streams[1].active
         wait_until(lambda: pb.speech_idle())
@@ -399,14 +412,14 @@ def test_open_reply_holds_the_output_through_a_long_silence(sd: FakeSD, sink: Re
 
 
 def test_a_held_output_still_closes_after_the_cap(sd: FakeSD) -> None:
-    pb = SoundDevicePlayback(None, idle_close_s=0.2, hold_max_s=1.0)
+    pb = SoundDevicePlayback(None, idle_close_s=0.2, hold_max_s=2.0)
     pb.open()
     pb.hold_open(True)  # a reply whose final never comes
     try:
         stream = sd.outputs()[0]
         time.sleep(0.5)
         assert not stream.closed
-        wait_until(lambda: stream.closed, 3.0)
+        wait_until(lambda: stream.closed, 5.0)
     finally:
         pb.close()
 
@@ -462,6 +475,54 @@ def test_stop_restarts_the_output_from_another_thread(sd: FakeSD) -> None:
         pb.close()
 
 
+def test_stop_does_not_restart_a_stream_closed_under_it(sd: FakeSD) -> None:
+    """The reaper (or a reopen, or a rescan) closes the output just as a stop is about to restart it."""
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    pb.open()
+    try:
+        stream = sd.outputs()[0]
+        pb.add_speech(np.full(24_000, 0.3, np.float32), pb.speech_generation)
+        wait_until(lambda: pb.speech_frames_played > 0)
+        stopper = threading.Thread(target=pb.stop_speech, name="control-request", daemon=True)
+        with pb._lock:  # what the reaper holds while it closes an idle output
+            stopper.start()
+            time.sleep(0.2)
+            assert stopper.is_alive() and stream.aborts == 0  # the stop waits for the lock
+            pb._close_locked()
+        stopper.join(2.0)
+        assert not stopper.is_alive()
+        assert stream.closed and not stream.active and stream.aborts == 1  # the close's abort, no restart after it
+    finally:
+        pb.close()
+
+
+def test_open_on_a_running_stream_does_not_wait_for_the_portaudio_lock(sd: FakeSD) -> None:
+    """A rescan or the other device's slow open holds the PortAudio lock; an open with nothing to do skips it."""
+    cap = SoundDeviceCapture(None)
+    pb = SoundDevicePlayback(None, idle_close_s=None)
+    cap.open()
+    pb.open()
+    opener = threading.Thread(target=lambda: (cap.open(), pb.open()), name="speech", daemon=True)
+    try:
+        with sd_backend._PORTAUDIO_LOCK:
+            opener.start()
+            opener.join(2.0)
+            assert not opener.is_alive()
+        assert len(sd.streams) == 2
+    finally:
+        cap.close()
+        pb.close()
+
+
+@pytest.mark.parametrize("kind", ["input", "output"])
+def test_a_stream_that_will_not_start_is_closed(sd: FakeSD, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+    monkeypatch.setattr(windows, "ensure_com", lambda: None)  # every start fails, as on a thread without COM
+    owner = SoundDeviceCapture(None) if kind == "input" else SoundDevicePlayback(None, idle_close_s=None)
+    with pytest.raises(AudioError):
+        on_worker(owner.open, "speech")
+    assert sd.opens[kind] == 3 and sd.unclosed() == []  # each attempt opened, failed to start and was closed
+
+
 def test_capture_opens_from_a_worker_thread(sd: FakeSD) -> None:
     cap = SoundDeviceCapture(None)
     try:
@@ -484,10 +545,17 @@ def test_rescan_closes_every_stream_before_portaudio_frees_them(sd: FakeSD) -> N
 
         on_worker(rescan_and_reopen, "control-request")
         assert sd.terminations == 1 and sd.live_at_terminate == []
-        assert cap.is_open and [s.kind for s in sd.streams if not s.closed] == ["input"]
+        assert cap.is_open and [s.kind for s in sd.unclosed()] == ["input"]
     finally:
         cap.close()
         pb.close()
+
+
+def test_rescan_sets_up_com_on_its_own_thread(sd: FakeSD) -> None:
+    # Nothing is open (the output idled out), so no stream close sets up COM on that thread first.
+    owners = SoundDeviceCapture(None), SoundDevicePlayback(None, idle_close_s=None)
+    on_worker(lambda: sd_backend.rescan_devices(*owners), "control-request")
+    assert sd.terminations == 1
 
 
 def test_output_lost_mid_reply_fails_it_once_without_hammering(sd: FakeSD, sink: RecordingSink) -> None:

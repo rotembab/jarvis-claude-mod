@@ -250,6 +250,39 @@ def test_windows_ensure_com_initialises_com_on_the_calling_thread() -> None:
     assert probe == [windows.S_FALSE]  # COM was already up on that thread, multithreaded
 
 
+@pytest.mark.parametrize(
+    ("hresult", "ready"),
+    [(0x0, True), (0x1, True), (0x80010106, True), (0x80070057, False)],
+    ids=["S_OK", "S_FALSE", "RPC_E_CHANGED_MODE", "E_INVALIDARG"],
+)
+def test_windows_ensure_com_is_done_only_once_com_is_up(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, hresult: int, ready: bool
+) -> None:
+    import ctypes
+    import threading
+    import types
+
+    from jarvis_voice.platform import windows
+
+    calls: list[str] = []
+
+    def co_initialize_ex(reserved: object, coinit: int) -> int:
+        calls.append(threading.current_thread().name)
+        return hresult - (1 << 32) if hresult & 0x80000000 else hresult  # signed, as its c_long restype gives it
+
+    ole32 = types.SimpleNamespace(CoInitializeEx=co_initialize_ex)
+    fake_ctypes = types.SimpleNamespace(
+        WinDLL=lambda name: ole32, c_void_p=ctypes.c_void_p, c_ulong=ctypes.c_ulong, c_long=ctypes.c_long
+    )
+    monkeypatch.setattr(windows, "ctypes", fake_ctypes)
+    thread = threading.Thread(target=lambda: (windows.ensure_com(), windows.ensure_com()), name="com-probe")
+    with caplog.at_level("WARNING", logger="jarvis_voice.platform.windows"):
+        thread.start()
+        thread.join(5.0)
+    assert calls.count("com-probe") == (1 if ready else 2)  # a failure is tried again on the next call
+    assert len([r for r in caplog.records if "com-probe" in r.getMessage()]) == (0 if ready else 1)  # logged once
+
+
 def test_a_zero_host_error_code_is_left_out() -> None:
     # What a start on a thread without COM raised on Windows: the WDM-KS text is stale, its code 0.
     exc = FakePortAudioError("Error starting stream: Unanticipated host error", -9999, (11, 0, "WdmSyncIoctl: ..."))

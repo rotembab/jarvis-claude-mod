@@ -72,7 +72,7 @@ def make_instance_lock(instance_name: str, lock_dir: Path) -> NamedMutexLock:
 
 
 def ensure_com() -> None:
-    """Initialise COM on the calling thread, once per thread; it is never uninitialised.
+    """Initialise COM on the calling thread, once per thread (retried after a failure); it is never uninitialised.
 
     PortAudio's WASAPI backend marshals COM interfaces when it starts a stream.
     On a thread where COM was never initialised (any thread Python starts) that
@@ -80,17 +80,22 @@ def ensure_com() -> None:
     """
     if getattr(_com, "ready", False):
         return
-    _com.ready = True  # once, even if it fails: the stream start then reports PortAudio's own error
     try:
         ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
         ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         ole32.CoInitializeEx.restype = ctypes.c_long  # HRESULT
         hr = ole32.CoInitializeEx(None, COINIT_MULTITHREADED) & 0xFFFFFFFF
     except (AttributeError, OSError) as exc:
-        log.warning("could not initialise COM on thread %s: %s", threading.current_thread().name, exc)
-        return
-    if hr not in (S_OK, S_FALSE, RPC_E_CHANGED_MODE):
-        log.warning("CoInitializeEx failed on thread %s: 0x%08X", threading.current_thread().name, hr)
+        failure = str(exc)
+    else:
+        if hr in (S_OK, S_FALSE, RPC_E_CHANGED_MODE):
+            _com.ready = True
+            return
+        failure = f"CoInitializeEx returned 0x{hr:08X}"
+    # Not ready: the next stream call tries again, and its start reports PortAudio's own error.
+    if not getattr(_com, "warned", False):
+        _com.warned = True
+        log.warning("could not initialise COM on thread %s: %s", threading.current_thread().name, failure)
 
 
 def mic_blocked_hint() -> str:

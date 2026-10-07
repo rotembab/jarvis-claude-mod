@@ -117,7 +117,7 @@ def last_host_error(sd: ModuleType) -> int | None:
 
 
 def _ensure_com() -> None:
-    """Set up the calling thread for PortAudio stream calls (opens, starts, restarts).
+    """Set up the calling thread for PortAudio stream calls (opens, starts, restarts, closes).
 
     PortAudio's WASAPI backend marshals COM interfaces in Pa_StartStream, and on
     a thread without COM (every thread but the one that loaded PortAudio) the
@@ -193,6 +193,8 @@ class SoundDeviceCapture:
         self._dead = True
 
     def open(self) -> None:
+        if self.is_open:
+            return  # without the PortAudio lock: a rescan or the output's slow open must not hold up a no-op
         with _PORTAUDIO_LOCK, self._lock:
             if self.is_open:
                 return
@@ -233,6 +235,7 @@ class SoundDeviceCapture:
 
     def _close_locked(self) -> None:
         if self._stream is not None:
+            _ensure_com()  # a rescan or a worker may close it, not the thread that opened it
             try:
                 self._stream.abort()
                 self._stream.close()
@@ -364,6 +367,10 @@ class SoundDevicePlayback:
         self._last_active = time.monotonic()
 
     def open(self) -> None:
+        with self._lock:  # ours only: a rescan or the mic's slow open may hold the PortAudio lock
+            self._last_active = time.monotonic()
+            if self._stream is not None and not self._dead:
+                return
         with _PORTAUDIO_LOCK, self._lock:
             self._last_active = time.monotonic()
             if self._idle_close_s is not None and self._reaper is None:
@@ -428,6 +435,7 @@ class SoundDevicePlayback:
 
     def _close_locked(self) -> None:
         if self._stream is not None:
+            _ensure_com()  # the reaper, a rescan or a worker may close it, not the thread that opened it
             try:
                 self._stream.abort()
                 self._stream.close()
@@ -489,15 +497,20 @@ class SoundDevicePlayback:
             # Nothing left to cut (the device holds at most one buffer of tail).
             # Restarting a WASAPI stream can fail on some devices, so don't.
             return
-        try:
-            # abort() discards what the device already buffered; restart for chimes.
-            _ensure_com()  # stop() runs on whichever thread the user's barge-in or command came from
-            stream.abort()
-            stream.start()
-            self._dead = False  # abort() fired finished_callback; the stream is alive again
-        except Exception:
-            log.warning("output stream restart failed; will reopen", exc_info=True)
-            self._dead = True
+        # Under our lock, so the reaper, a reopen or a rescan cannot close the stream mid-restart.
+        # The PortAudio callbacks (_callback, _finished) take none of our locks.
+        with self._lock:
+            if self._stream is not stream:
+                return  # closed or replaced meanwhile: there is nothing of the old speech to cut
+            try:
+                # abort() discards what the device already buffered; restart for chimes.
+                _ensure_com()  # stop() runs on whichever thread the user's barge-in or command came from
+                stream.abort()
+                stream.start()
+                self._dead = False  # abort() fired finished_callback; the stream is alive again
+            except Exception:
+                log.warning("output stream restart failed; will reopen", exc_info=True)
+                self._dead = True
 
     def reset_speech_counters(self) -> None:
         self._mixer.reset_counters()
