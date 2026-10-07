@@ -8,6 +8,7 @@ import type { PaneSize } from './hud'
 
 import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
+import { runHandsCommand, runHandsSetupCommand } from './hands'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
 import { ROUTING_MODES } from './router'
@@ -15,7 +16,7 @@ import { uvMissingMessage } from './setup'
 import { statusLine } from './ui'
 
 const HELP = [
-  '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model',
+  '/jarvis setup [model] [cpu]      install or repair the voice helper and its speech model (and update hand control)',
   '/jarvis setup local [cpu]        install the local voice (Chatterbox, about 6 GB)',
   '/jarvis engine <fish|local>      speak with Fish Audio or the local voice',
   '/jarvis wake <on|jarvis|off>     wake on "Hey Jarvis", also on plain "Jarvis", or push-to-talk only',
@@ -29,6 +30,8 @@ const HELP = [
   '/jarvis devices                  show the audio devices and models in use',
   '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
   '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
+  '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
+  '/jarvis setup hands              install hand control (about 500 MB)',
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -75,6 +78,8 @@ export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi 
         return { text: await hud(app, rest[0], ui) }
       case 'focus':
         return { text: await focus(app, rest[0], ui) }
+      case 'hands':
+        return { text: await runHandsCommand(app.hands, rest) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }
@@ -108,6 +113,7 @@ async function status(app: Jarvis): Promise<string> {
 }
 
 async function setup(app: Jarvis, args: string[]): Promise<string> {
+  if (args[0]?.toLowerCase() === 'hands') return await runHandsSetupCommand(app.hands, args.slice(1))
   const { engine, platform } = app
   if (!app.isLocal || engine === undefined || platform === undefined) return NOT_LOCAL
   if (app.isSetupRunning) return 'Setup is already running; its progress is in the status line.'
@@ -127,11 +133,15 @@ async function setup(app: Jarvis, args: string[]): Promise<string> {
   if (uv === undefined) return uvMissingMessage(platform)
   // Without a model named here, setup repairs the one in use.
   const model = await app.setupModel({ sttModel, useCuda })
+  // An installed hand helper is updated too (runSetup), so it matches this version.
+  const hands = app.hands
+  const hasHands = hands !== undefined && !hands.isSetupRunning && (await hands.isInstalled())
   void app.runSetup(uv, { sttModel, useCuda })
   return [
     `Setting up Jarvis with ${uv}:`,
     `  1. a Python 3.12 environment in ${platform.venvDir} with the voice helper`,
     `  2. the speech model (${model === 'auto' ? 'chosen for your hardware' : model})`,
+    ...(hasHands ? [`  3. then the hand helper in ${platform.handsVenvDir} again, from this version of Jarvis`] : []),
     'Progress shows in the status line; the helper starts when it is done.',
   ].join('\n')
 }

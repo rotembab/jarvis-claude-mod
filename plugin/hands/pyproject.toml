@@ -1,0 +1,47 @@
+[project]
+name = "jarvis-hands"
+version = "0.1.0"
+description = "Hand-gesture control for the Jarvis Claude Code mod: webcam hand tracking (MediaPipe) that drives the mouse and windows."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    # 0.10.33 is the newest MediaPipe without usage telemetry: 0.10.35 and later
+    # (1.x included) report usage to play.googleapis.com with no way to turn it
+    # off. Same ctypes Tasks API (mediapipe.tasks.python.vision.HandLandmarker),
+    # same hand model and the same results on MediaPipe's test photos.
+    "mediapipe==0.10.33",
+    "numpy>=2",
+    # Camera capture, drawing and (later) ArUco calibration; mediapipe depends on
+    # it too. OpenCV 5 changed APIs this code uses (cv2.utils.logging, ArucoDetector).
+    "opencv-contrib-python>=5.0,<6",
+]
+
+[project.scripts]
+jarvis-hands = "jarvis_hands.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "jsonschema>=4.23"]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "BLE", "I", "UP", "SIM", "RUF", "N"]
+ignore = ["SIM105", "RUF001", "RUF002", "RUF003", "N818"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["jarvis_hands"]
+known-local-folder = ["conftest", "scripted"]

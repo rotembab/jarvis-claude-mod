@@ -242,6 +242,26 @@ Decisions made now so the Mac port is cheap:
 
 Engineering details and what still needs testing on your PC: [Windows build notes](WINDOWS-NOTES.md)
 
+## Hand control (gestures)
+
+Added Oct 7, 2026, from Rotem's ask: control the screen with your hands through the webcam, like Tony Stark (move and size windows, drag files), and later a projector on the wall driven by the same gestures. The build contract is [SPEC-hands.md](SPEC-hands.md).
+
+- **A second helper.** `jarvis-hands` is its own Python program with its own environment (`%USERPROFILE%\.jarvis\hands\venv`, MediaPipe and OpenCV), started by the same mod the same way as the voice helper: JSON lines out, token-protected commands in, heartbeats, one per user. A crash in one never takes down the other, and the camera is off until you turn hand control on.
+- **Tracking runs on your PC.** MediaPipe's hand landmarker reads 21 points per hand from each camera frame on the CPU. It is pinned to MediaPipe 0.10.33, the newest release that sends no usage statistics to Google (0.10.35 and later do, with no off switch). No camera picture is stored or sent anywhere.
+- **The gestures.** An open palm held still for half a second takes the cursor, so a hand passing by does nothing. The cursor follows your knuckles (they barely move when you pinch, which keeps clicks on target). Pinch thumb and index to click, pinch and move to drag (files included), pinch twice to double-click, thumb and middle finger for a right click, two fingers up to scroll, a fist to grab the window under the cursor, a fist with each hand to resize it, and a fling to throw it to the next display, maximize or minimize it. Dropping your hand or touching the real mouse lets go at once, and no button is ever left held down.
+- **Feedback.** A small click-through reticle follows the cursor: a cyan ring that closes as you pinch, amber brackets while grabbing, a progress arc while engaging and during calibration.
+- **Fit to your reach.** By default the middle of the camera's view maps to your screens, so your hand moves in a small box in front of you, elbow down. `/jarvis hands calibrate` fits it to where you actually reach.
+- **Displays.** Every display Windows reports, except virtual ones (your Virtual Display Driver), is in reach as Windows arranges them, so a projector set up to the right of the monitor is reached by moving your hand right, and a window flung right lands on it. `/jarvis hands display` picks which.
+- **By voice or command.** `/jarvis hands on|off|calibrate|pause|resume`, and "Jarvis, turn on hand control" through the mod's `hands` tool.
+
+Stages:
+
+1. **Desk prototype (now).** One webcam on the monitor, the gestures above on Windows, the reticle, calibration, the doctor and a camera preview (`python -m jarvis_hands preview`). Done when you can drag a file into a folder and fling a window to another display without touching the mouse.
+2. **Tune on your PC.** One short session at your desk: pinch thresholds, smoothing, the box size and the engage hold, set from what your hands and camera actually do.
+3. **Projector wall mode.** The camera faces the projected image; calibration projects ArUco markers and fits the camera-to-projector mapping automatically; pointing at the wall moves the cursor on the projector display and a pinch clicks. Needs a camera that sees the whole wall (or a second camera) and the projector set up as its own display in Windows.
+4. **Touch on the wall (optional).** A plain webcam can't tell touching the wall from hovering near it reliably; real touch needs a depth camera (Intel RealSense, Orbbec, OAK-D) or an IR light curtain.
+5. **Together with voice.** "Put this on the projector" while pointing at a window, and the HUD showing hand state. macOS later: the desktop backend through Quartz and the Accessibility API.
+
 ## Build phases
 
 Five phases, each ending in something you can try on your PC.
@@ -251,6 +271,8 @@ Five phases, each ending in something you can try on your PC.
 3. **HUD.** The ring in all six states in the desktop Code tab, the Windows Terminal version, the status line and the live transcript band. Done when the ring visibly tracks your voice and Jarvis's.
 4. **PC control.** The Windows desktop actions, PowerShell and Bash permission rules, the guard with voice and on-screen confirmations, the UAC check, and the action log. Done when "Jarvis, open Spotify and play my focus playlist" works and "delete my Downloads folder" stops for a click.
 5. **Polish.** Sound design, voice audio treatment, wake word tuning for your room, a smoother one-command install, and the optional full-screen HUD. Optional extras: NVIDIA speed-up for transcription, and hardened mode.
+
+**Alongside the phases: hand control**, in its own stages (see [Hand control](#hand-control-gestures)).
 
 **Then the Mac port.** Most of it is new helper backend files plus Mac permission setup; the mod and the action list carry over (see Windows now, Mac later).
 
