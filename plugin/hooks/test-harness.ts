@@ -28,6 +28,9 @@ export const DATA_DIR = 'C:\\Users\\Rotem\\.jarvis'
 export const VENV_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\venv\\Scripts\\python.exe'
 export const WINGET_UV = 'C:\\Users\\Rotem\\AppData\\Local\\Microsoft\\WinGet\\Links\\uv.exe'
 export const PORT = 50123
+/** The hand helper's python (hands.ts), a child of its own beside the voice helper. */
+export const HANDS_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\hands\\venv\\Scripts\\python.exe'
+export const HANDS_PORT = 50124
 
 /** One spawned child the test drives: what it writes and when it exits. */
 export class FakeChild {
@@ -43,6 +46,10 @@ export class FakeChild {
 
   get isHelperRun(): boolean {
     return this.request.argv[0] === VENV_PYTHON && this.request.argv.includes('run')
+  }
+
+  get isHandsRun(): boolean {
+    return this.request.argv[0] === HANDS_PYTHON && this.request.argv.includes('run')
   }
 
   get hasExited(): boolean {
@@ -132,6 +139,12 @@ export type World = {
   helpers: () => FakeChild[]
   lastHelper: () => FakeChild
   named: (name: string) => SentCommand[]
+  /** The hand helper's runs, and the commands sent to the one on HANDS_PORT. */
+  handsHelpers: () => FakeChild[]
+  lastHands: () => FakeChild
+  handsNamed: (name: string) => SentCommand[]
+  /** The model tools the plugin registered, by short name. */
+  tools: string[]
   status: () => string | undefined
   /** Model responses served beneath `turn.step`, by `${turnId}:${index}`. */
   steps: Map<string, TurnStepChunk[]>
@@ -188,6 +201,14 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       return helper
     },
     named: name => w.commands.filter(command => command.name === name),
+    handsHelpers: () => w.children.filter(child => child.isHandsRun),
+    lastHands: () => {
+      const hands = w.handsHelpers().at(-1)
+      if (hands === undefined) throw new Error('no hand helper was spawned')
+      return hands
+    },
+    handsNamed: name => w.commands.filter(command => command.url === `http://127.0.0.1:${HANDS_PORT}/v1/${name}`),
+    tools: [],
     status: () => w.statuses.at(-1),
     settle: async (rounds = 8) => {
       for (let i = 0; i < rounds; i += 1) await clock.settle()
@@ -198,6 +219,10 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('tool.register', ($, e) => {
+    w.tools.push(e.name)
+    return { value: { tool: `mcp__jarvis__${e.name}` } }
+  })
   on('ui.status', ($, e) => {
     w.statuses.push(e.text)
     return { value: undefined }

@@ -6,6 +6,7 @@ import type { CommandRunResult } from 'claude-code'
 
 import type { Jarvis, SttModel, VoiceEngine } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES } from './app'
+import { runHandsCommand, runHandsSetupCommand } from './hands'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
 import { ROUTING_MODES } from './router'
@@ -25,6 +26,8 @@ const HELP = [
   '/jarvis restart                  restart the voice helper',
   '/jarvis voice <id|default>       use a Fish Audio voice (its model id)',
   '/jarvis devices                  show the audio devices and models in use',
+  '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
+  '/jarvis setup hands              install hand control (about 500 MB)',
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -64,6 +67,8 @@ export async function runJarvisCommand(app: Jarvis, args: string): Promise<Comma
         return { text: await routing(app, rest[0]) }
       case 'devices':
         return { text: await devices(app) }
+      case 'hands':
+        return { text: await runHandsCommand(app.hands, rest) }
       default:
         return { text: `Unknown subcommand "${sub}".\n\n${HELP}` }
     }
@@ -97,6 +102,7 @@ async function status(app: Jarvis): Promise<string> {
 }
 
 async function setup(app: Jarvis, args: string[]): Promise<string> {
+  if (args[0]?.toLowerCase() === 'hands') return await runHandsSetupCommand(app.hands, args.slice(1))
   const { engine, platform } = app
   if (!app.isLocal || engine === undefined || platform === undefined) return NOT_LOCAL
   if (app.isSetupRunning) return 'Setup is already running; its progress is in the status line.'

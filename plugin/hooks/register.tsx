@@ -7,11 +7,14 @@ import type { Register } from 'claude-code'
 import { Jarvis, readSettings } from './app'
 import { runJarvisCommand } from './commands'
 import type { Engine } from './engine'
+import { describeError } from './engine'
+import { HANDS_TOOL, runHandsTool } from './hands'
 import { bandTree, isBandShown } from './ui'
 
 // The session state this mod owns (types/index.d.ts declares it).
 const viewAtom = atom({ plugin: 'jarvis', key: 'view' } as const, { phase: 'stopped' })
 const helperRefAtom = atom({ plugin: 'jarvis', key: 'helper' } as const, null)
+const handsRefAtom = atom({ plugin: 'jarvis', key: 'handsHelper' } as const, null)
 
 export const register: Register = (on, options) => {
   const app = new Jarvis(readSettings(options))
@@ -45,6 +48,10 @@ export const register: Register = (on, options) => {
       writeHelperRef: async ref => {
         await update($, helperRefAtom, () => ref)
       },
+      readHandsRef: () => read($, handsRefAtom),
+      writeHandsRef: async ref => {
+        await update($, handsRefAtom, () => ref)
+      },
       writeView: async view => {
         await update($, viewAtom, () => view)
       },
@@ -58,11 +65,17 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices]',
+      description: 'Jarvis voice and hand control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hands',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hands]',
       immediate: true,
     })
     await app.onSessionStart(engine, e.surface)
+    // "Jarvis, turn on hand control": only where the hand helper can run.
+    if (app.isLocal) {
+      await $.tool.register(HANDS_TOOL).catch((error: unknown) => {
+        engine.debug(`jarvis: the hands tool was not registered: ${describeError(error)}`)
+      })
+    }
     return started
   })
 
@@ -73,6 +86,10 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'jarvis' }, ($, e) => runJarvisCommand(app, e.args))
+
+  on('tool.call', { tool: 'mcp__jarvis__hands' }, async ($, e) => ({ result: await runHandsTool(app.hands, e) })).catch(() => ({
+    result: 'Hand control did not answer in time; /jarvis hands shows its state.',
+  }))
 
   on('turn.start', ($, e, next) => {
     app.voice?.onTurnStart(e)

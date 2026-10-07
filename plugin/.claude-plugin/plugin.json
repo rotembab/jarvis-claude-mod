@@ -86,6 +86,26 @@
       "title": "Spoken language",
       "description": "Language code for speech-to-text, such as en, de or he. English-only models (.en) ignore it.",
       "default": "en"
+    },
+    "handControl": {
+      "type": "string",
+      "title": "Hand control",
+      "description": "on: Jarvis watches your hands through the webcam and turns gestures into mouse and window actions (install it with /jarvis setup hands). The camera picture never leaves this computer. off: the camera stays off. /jarvis hands on|off switches without opening the settings.",
+      "options": ["on", "off"],
+      "default": "off"
+    },
+    "handCamera": {
+      "type": "string",
+      "title": "Hand control camera",
+      "description": "The webcam hand control uses: its number (0 is the first) or part of its name, such as UGREEN. Empty uses the first camera. /jarvis hands camera overrides it.",
+      "required": false
+    },
+    "handEngage": {
+      "type": "string",
+      "title": "Starting hand control",
+      "description": "palm: hold an open palm toward the camera for half a second to take the cursor, so a hand passing by does nothing. always: any hand in view takes it at once (for a projector room). /jarvis hands engage palm|always switches it.",
+      "options": ["palm", "always"],
+      "default": "palm"
     }
   }
 }

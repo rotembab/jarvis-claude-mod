@@ -1,12 +1,15 @@
 // The mod's session-wide coordinator: built in register() from the user's
 // settings, bound to the engine port at session.start, it owns the helper
-// supervisor, the voice controller and the view the status line and band draw.
+// supervisor, the voice controller, hand control and the view the status line
+// and band draw.
 
 import type { PluginOptions, RenderSurface } from 'claude-code'
 
 import type { JarvisPhase, JarvisView } from '../types'
 import type { Engine } from './engine'
 import { describeError } from './engine'
+import type { HandsSettings } from './hands'
+import { Hands, readHandsSettings } from './hands'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
 import type { Platform } from './platform'
@@ -53,6 +56,7 @@ export type JarvisSettings = {
   bargeIn: BargeInMode
   wakeSensitivity: WakeSensitivity
   modelRouting: RoutingMode
+  hands: HandsSettings
 }
 
 const optionString = (options: PluginOptions, key: string): string | undefined => {
@@ -78,6 +82,7 @@ export function readSettings(options: PluginOptions): JarvisSettings {
       (Object.keys(WAKE_SENSITIVITY) as WakeSensitivity[]).find(level => level === optionString(options, 'wakeSensitivity')) ??
       'medium',
     modelRouting: ROUTING_MODES.find(mode => mode === optionString(options, 'modelRouting')) ?? 'auto',
+    hands: readHandsSettings(options),
   }
 }
 
@@ -110,6 +115,8 @@ export class Jarvis {
   platform: Platform | undefined
   helper: Helper | undefined
   voice: Voice | undefined
+  /** Hand control (hands.ts): its own helper, started only when the user turned it on. */
+  hands: Hands | undefined
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined
@@ -151,6 +158,14 @@ export class Jarvis {
       router: new ModelRouter(engine, { mode: () => this.routingMode(), complete: request => engine.complete(request) }),
     })
     this.isLocal = !isRemoteSession(env)
+    this.hands = new Hands(engine, {
+      platform,
+      settings: this.settings.hands,
+      isLocal: this.isLocal,
+      noProxy: env.NO_PROXY,
+      voice: () => this.helper,
+      onView: hands => this.patch({ hands }),
+    })
     if (!this.isLocal) {
       this.publish({ phase: 'unavailable' })
       return
@@ -375,6 +390,7 @@ export class Jarvis {
     if (this.hasAutoStarted) return
     this.hasAutoStarted = true
     this.startHelper(false)
+    void this.hands?.autoStart()
   }
 
   private async initialConfig(): Promise<ConfigCommand> {

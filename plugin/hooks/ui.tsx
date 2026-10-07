@@ -1,9 +1,10 @@
-// Minimal UI: one status line entry ("JARVIS · <state>") and a band
-// above the prompt while the user is talking. Nothing is drawn when idle.
+// Minimal UI: one status line entry ("JARVIS · <state>", with hand
+// control's part while it is on) and a band above the prompt while the user
+// is talking. Nothing is drawn when idle.
 
 import type { Elements, RenderElement } from 'claude-code'
 
-import type { JarvisPhase, JarvisView } from '../types'
+import type { HandsPhase, JarvisHandsView, JarvisPhase, JarvisView } from '../types'
 
 /** The status line text for a view; undefined hides the entry. */
 export function statusLine(view: JarvisView): string | undefined {
@@ -25,7 +26,29 @@ export function statusLine(view: JarvisView): string | undefined {
     failed: `stopped${detail} · /jarvis restart`,
   }
   const label = labels[view.phase]
-  return label === undefined ? undefined : `JARVIS · ${label}`
+  if (label === undefined) return undefined
+  const hands = view.hands === undefined ? undefined : handsLabel(view.hands)
+  return hands === undefined ? `JARVIS · ${label}` : `JARVIS · ${label} · ${hands}`
+}
+
+/** Hand control's part of the status line; undefined while it is off. */
+export function handsLabel(hands: JarvisHandsView): string | undefined {
+  const detail = hands.detail ? ` · ${hands.detail}` : ''
+  const labels: Record<HandsPhase, string | undefined> = {
+    off: undefined,
+    not_installed: 'hands not set up · /jarvis setup hands',
+    setup: `hands setting up${detail}`,
+    starting: 'hands starting',
+    idle: `hands ready · ${hands.engage === 'always' ? 'raise a hand' : 'open palm'} to start`,
+    active: 'hands active',
+    paused: 'hands paused',
+    calibrating: `hands calibrating${detail}`,
+    error: `hands stopped${detail}`,
+    restarting: `hands restarting${detail}`,
+    elsewhere: 'hands active in another window',
+    failed: `hands stopped${detail} · /jarvis hands restart`,
+  }
+  return labels[hands.phase]
 }
 
 /** A ten-cell level meter for the microphone. */

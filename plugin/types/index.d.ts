@@ -26,6 +26,36 @@ export type JarvisPhase =
   /** Gave up restarting; /jarvis restart tries again. */
   | 'failed'
 
+/** Hand control's part of the view (hands.ts): off unless the user turned it on. */
+export type HandsPhase =
+  /** Hand control is off (the default: it turns the camera on). */
+  | 'off'
+  /** On, but the hand helper's venv is missing: /jarvis setup hands installs it. */
+  | 'not_installed'
+  /** /jarvis setup hands is running. */
+  | 'setup'
+  /** The hand helper's own states (protocol HandsState). */
+  | 'starting'
+  | 'idle'
+  | 'active'
+  | 'paused'
+  | 'calibrating'
+  | 'error'
+  /** Waiting out a restart backoff. */
+  | 'restarting'
+  /** Another Claude Code window owns the hand helper (single instance). */
+  | 'elsewhere'
+  /** Gave up restarting; /jarvis hands restart tries again. */
+  | 'failed'
+
+export type JarvisHandsView = {
+  phase: HandsPhase
+  /** An error message, the calibration step or the setup step, shown after the phase. */
+  detail?: string
+  /** palm: an open palm starts control; always: any hand does. */
+  engage?: 'palm' | 'always'
+}
+
 export type JarvisView = {
   phase: JarvisPhase
   /** A hint, an error message or the setup step, shown after the phase. */
@@ -38,6 +68,8 @@ export type JarvisView = {
   lastUtterance?: string
   /** Microphone level 0..1, updated a few times a second while listening. */
   micLevel?: number
+  /** Hand control, when this session has looked at it. */
+  hands?: JarvisHandsView
 }
 
 /**
@@ -56,6 +88,8 @@ declare module 'claude-code' {
     jarvis: {
       view: JarvisView
       helper: JarvisHelperRef | null
+      /** The hand helper's control address, for the same reason. */
+      handsHelper: JarvisHelperRef | null
     }
   }
 }

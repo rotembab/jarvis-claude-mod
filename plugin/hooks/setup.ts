@@ -75,7 +75,7 @@ export async function hasNvidiaGpu(engine: Engine, platform: Platform): Promise<
 }
 
 /** Runs a child to its end, handing each output line to `onLine`; resolves its exit code. */
-async function runStreaming(
+export async function runStreaming(
   engine: Engine,
   request: { argv: string[]; cwd: string; env: Record<string, string> },
   onLine: (stream: 'stdout' | 'stderr', line: string) => void,

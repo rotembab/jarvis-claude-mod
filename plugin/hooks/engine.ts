@@ -51,6 +51,8 @@ export type Engine = {
   storeDelete: (key: string) => Promise<void>
   readHelperRef: () => Promise<JarvisHelperRef | null>
   writeHelperRef: (ref: JarvisHelperRef | null) => Promise<void>
+  readHandsRef: () => Promise<JarvisHelperRef | null>
+  writeHandsRef: (ref: JarvisHelperRef | null) => Promise<void>
   writeView: (view: JarvisView) => Promise<void>
 
   status: (text: string | undefined) => void

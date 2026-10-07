@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rotembab/jarvis-claude-mod/plugin/protocol/hands.schema.json",
+  "title": "Jarvis hands protocol v1",
+  "description": "Messages between the Jarvis Claude Code mod and the jarvis-hands helper. Events: helper -> mod, one JSON object per stdout line. Commands: mod -> helper, HTTP POST /v1/<name> with a JSON body; responses are CommandResponse.",
+  "$defs": {
+    "v": { "const": 1 },
+    "HandsState": { "enum": ["starting", "idle", "active", "paused", "calibrating", "error"] },
+    "Platform": { "enum": ["windows", "macos", "linux"] },
+    "ErrorCode": {
+      "enum": [
+        "already_running", "unsupported_platform", "no_camera", "camera_blocked", "camera_in_use", "camera_lost",
+        "model_missing", "tracker_failed", "input_blocked", "overlay_failed", "bad_request", "unauthorized", "internal"
+      ]
+    },
+    "GestureName": {
+      "enum": [
+        "engage", "disengage", "click", "double_click", "right_click", "drag_start", "drag_end", "scroll_start",
+        "grab", "release", "throw_left", "throw_right", "throw_up", "throw_down", "resize_start", "user_input"
+      ]
+    },
+    "CalibrationStep": { "enum": ["top_left", "top_right", "bottom_right", "bottom_left", "done", "cancelled"] },
+    "EngageMode": { "enum": ["palm", "always"] },
+    "HandChoice": { "enum": ["right", "left", "any"] },
+    "AnchorChoice": { "enum": ["knuckles", "index"] },
+    "Display": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "x", "y", "width", "height", "primary", "virtual", "used"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "name": { "type": "string" },
+        "x": { "type": "integer" }, "y": { "type": "integer" },
+        "width": { "type": "integer", "minimum": 0 }, "height": { "type": "integer", "minimum": 0 },
+        "primary": { "type": "boolean" },
+        "virtual": { "type": "boolean" },
+        "used": { "type": "boolean", "description": "Whether hand control maps onto this display." }
+      }
+    },
+
+    "HelloEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "port", "pid", "platform", "version", "capabilities"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "hello" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "pid": { "type": "integer" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "version": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "StateEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "state"],
+      "properties": { "v": { "$ref": "#/$defs/v" }, "type": { "const": "state" }, "state": { "$ref": "#/$defs/HandsState" } }
+    },
+    "ReadyEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "camera", "width", "height", "fps", "displays"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "ready" },
+        "camera": { "type": "string", "description": "The camera's name, or its index when the name is unknown." },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "fps": { "type": "number", "minimum": 0 },
+        "displays": { "type": "array", "items": { "$ref": "#/$defs/Display" } }
+      }
+    },
+    "GestureEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "name"],
+      "properties": { "v": { "$ref": "#/$defs/v" }, "type": { "const": "gesture" }, "name": { "$ref": "#/$defs/GestureName" } }
+    },
+    "CalibrationEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "step"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "calibration" },
+        "step": { "$ref": "#/$defs/CalibrationStep" },
+        "display": { "type": "string", "description": "The display (or span of displays) being calibrated." }
+      }
+    },
+    "ErrorEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "code", "message", "fatal"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "error" },
+        "code": { "$ref": "#/$defs/ErrorCode" },
+        "message": { "type": "string" },
+        "hint": { "type": "string" },
+        "fatal": { "type": "boolean" }
+      }
+    },
+    "Event": {
+      "oneOf": [
+        { "$ref": "#/$defs/HelloEvent" }, { "$ref": "#/$defs/StateEvent" }, { "$ref": "#/$defs/ReadyEvent" },
+        { "$ref": "#/$defs/GestureEvent" }, { "$ref": "#/$defs/CalibrationEvent" }, { "$ref": "#/$defs/ErrorEvent" }
+      ]
+    },
+
+    "EmptyCommand": { "type": "object", "additionalProperties": false, "properties": {} },
+    "ConfigCommand": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "engage": { "$ref": "#/$defs/EngageMode" },
+        "displays": {
+          "oneOf": [
+            { "const": "all" },
+            { "type": "array", "items": { "type": "integer", "minimum": 1 } }
+          ]
+        },
+        "hand": { "$ref": "#/$defs/HandChoice" },
+        "anchor": { "$ref": "#/$defs/AnchorChoice" },
+        "overlay": { "type": "boolean" },
+        "scrollSpeed": { "type": "number", "minimum": 0.1, "maximum": 10 }
+      }
+    },
+    "CalibrateCommand": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action"],
+      "properties": { "action": { "enum": ["start", "cancel"] } }
+    },
+    "Commands": {
+      "description": "Command name -> body schema.",
+      "type": "object",
+      "properties": {
+        "heartbeat": { "$ref": "#/$defs/EmptyCommand" },
+        "status": { "$ref": "#/$defs/EmptyCommand" },
+        "config": { "$ref": "#/$defs/ConfigCommand" },
+        "pause": { "$ref": "#/$defs/EmptyCommand" },
+        "resume": { "$ref": "#/$defs/EmptyCommand" },
+        "engage": { "$ref": "#/$defs/EmptyCommand" },
+        "disengage": { "$ref": "#/$defs/EmptyCommand" },
+        "calibrate": { "$ref": "#/$defs/CalibrateCommand" },
+        "shutdown": { "$ref": "#/$defs/EmptyCommand" }
+      }
+    },
+
+    "StatusResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ok", "state", "version", "platform", "engaged", "fps", "inferMs", "displays", "settings"],
+      "properties": {
+        "ok": { "const": true },
+        "state": { "$ref": "#/$defs/HandsState" },
+        "version": { "type": "string" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "camera": { "type": "string" },
+        "engaged": { "type": "boolean" },
+        "fps": { "type": "number", "minimum": 0, "description": "Frames tracked per second, last few seconds." },
+        "inferMs": { "type": "number", "minimum": 0, "description": "Mean hand-landmark time per frame." },
+        "displays": { "type": "array", "items": { "$ref": "#/$defs/Display" } },
+        "calibrated": { "type": "boolean" },
+        "settings": {
+          "type": "object", "additionalProperties": false,
+          "required": ["engage", "hand", "anchor", "overlay", "scrollSpeed"],
+          "properties": {
+            "engage": { "$ref": "#/$defs/EngageMode" },
+            "hand": { "$ref": "#/$defs/HandChoice" },
+            "anchor": { "$ref": "#/$defs/AnchorChoice" },
+            "overlay": { "type": "boolean" },
+            "scrollSpeed": { "type": "number" }
+          }
+        }
+      }
+    },
+    "OkResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ok"],
+      "properties": { "ok": { "const": true } }
+    },
+    "ErrorResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ok", "error"],
+      "properties": {
+        "ok": { "const": false },
+        "error": {
+          "type": "object", "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": { "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" } }
+        }
+      }
+    },
+    "CommandResponse": {
+      "oneOf": [{ "$ref": "#/$defs/StatusResponse" }, { "$ref": "#/$defs/OkResponse" }, { "$ref": "#/$defs/ErrorResponse" }]
+    }
+  }
+}
