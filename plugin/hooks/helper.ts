@@ -39,6 +39,8 @@ const COMMAND_TIMEOUT_MS: Record<CommandName, number> = {
   listen: 6000,
   config: 5000,
   status: 5000,
+  // The helper gives each desktop action 6 s.
+  desktop: 8000,
   test_voice: 5000,
   shutdown: 2000,
   // The helper gives a device 20 s (an Apple TV connect, a TV waking up) and

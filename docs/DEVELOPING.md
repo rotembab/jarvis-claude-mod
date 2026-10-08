@@ -17,8 +17,9 @@ plugin/                           the plugin, the only folder that ships
   protocol/hands.schema.json      hand helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
     src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard, network scan
+    src/jarvis_voice/desktop/     the desktop tool's actions (open, focus, media, volume, screenshot, lock, clipboard)
   hands/                          the hand helper: Python package jarvis_hands (its own uv project and venv)
-docs/                             the specs, the plan, the home-control guide (HOME.md) and this file
+docs/                             the specs, the plan, the home-control guide (HOME.md), the PC-control guide (PC-CONTROL.md) and this file
 ```
 
 ## Prerequisites
@@ -150,7 +151,7 @@ uv run --project plugin\voice python -m jarvis_voice run --data-dir "$env:TEMP\j
 - The two heartbeat flags stretch the watchdog to 10 minutes, so it does not exit while you type. Without them it exits when no heartbeat has arrived for 15 seconds (60 before the first).
 - With no `JARVIS_TOKEN` set, fake mode accepts the token `jarvis-fake-token`.
 
-Its first stdout line is `hello`, carrying the port; every other stdout line is an event (one JSON object per line). Its log goes to stderr and to `logs\voice.log` in the data folder. From a second terminal:
+Its first stdout line is `hello`, carrying the port; every other stdout line is an event (one JSON object per line). Its log goes to stderr and to `logs\voice.log` in the data folder. From a second terminal of your own (with the mod loaded, Jarvis's guard blocks these requests when Claude runs them, so don't ask Claude to):
 
 ```powershell
 $port = 53124   # the port from the hello line
@@ -250,7 +251,7 @@ The sensitivity settings behind `/jarvis hands tune` and `set` are table-driven.
 1. **Helper.** Add `Knob(wire key, attribute, low, high, default)` to `KNOBS` in `plugin\hands\src\jarvis_hands\settings.py`, and the matching field on `HandsSettings`; its default is the value that leaves today's behaviour exactly as it is. `apply_config`, `status()` and the validator in `protocol.py` are built from the table, so nothing else lists the keys.
 2. **Engine.** Read the field from `self.settings` where it is used, every frame. If a change could move something that is held (the cursor under a press or a grab, a drag, a button), follow the live-apply rule in [SPEC-hands.md](SPEC-hands.md#live-apply): wait for the engine to be back in `point` mode, or take the value when the press begins.
 3. **Schema.** Add the key, with the same range, to `ConfigCommand` and to `StatusResponse` (its `settings` properties and `required` list) in `plugin\protocol\hands.schema.json`.
-4. **Mod.** Add one line to `ROWS` in `plugin\hooks\hands.ts`: the wire key, the name the commands use, a label, the range and default, the words for "higher means" and aliases. `tune`, `set`, `reset`, the status, the presets and the tool all read that table. An everyday setting also gets a `setting` name there and a `userConfig` entry of that name in `plugin.json`; no test reads `plugin.json`, so check its range and wording against the table yourself.
+4. **Mod.** Add one line to `ROWS` in `plugin\hooks\hands.ts`: the wire key, the name the commands use, a label, the range and default, the words for "higher means" and aliases. `tune`, `set`, `reset`, the status, the presets and the tool all read that table, and so does the tool's permission gate (`hands-gate.ts`), which words what it asks about from the label and unit (a new unit needs its words in `UNIT_WORDS` there). An everyday setting also gets a `setting` name there and a `userConfig` entry of that name in `plugin.json`; no test reads `plugin.json`, so check its range and wording against the table yourself.
 5. **Tests.** Add the setting to `CONTRACT` in `tests\test_knobs.py` and in `hands.test.ts` (both write the numbers out on purpose: they are the contract between the helper and the mod), and test its effect and a live change in the middle of a press in `tests\test_sensitivity.py`. Timing tests run on scripted frames or an injected clock and compare times from `jarvis_hands.clock.now`, never real sleeps: a CI runner can oversleep by tens of milliseconds.
 6. **Range and docs.** Set each end of the range from a measurement, not a guess, and add it to the SPEC's "Where each range ends" table. Add the setting to the tables in SPEC-hands.md and in the README's "Tuning the feel" (and its Settings table for an everyday one).
 
@@ -276,7 +277,7 @@ plugin/voice/src/jarvis_voice/home/
                    (plex_roots.pem: extra root certificates for plex.direct, see Plex below)
 ```
 
-**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode without checking permission rules, as it does `list` and `status`.
+**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` and `setup` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. The mod applies the user's own rules for the tool to every call, as it does for the desktop and hands tools (`desktop.ts` `checkRules`, through `$.tool.check`, with the plan-mode state `pc.ts` keeps for all three): a deny or a failed check refuses any action. Home control alone also runs on the engine's own default verdict with no rule behind it (`byDefault: true` on its `OwnToolCall`, the user's choice, like a remote's button; the desktop and hands tools never take it), but never past an ask rule, an `ask` ceiling, a deny or dontAsk, plan mode (for `do` and `setup`), a settings hook that could match the tool, or a mode not known for the turn (for `do` and `setup`): those ask on screen or refuse. `scan`, `list` and `status` are read-only: they need no tier, and the mod lets them through in plan mode. The `screen` tier (locks, alarms, gates) still asks on screen whatever the rules say, and its question is read like the guard's: a dialog that closed by itself while the user was away, or to talk it over first, is no yes (`PcControl.askDialog`).
 
 **Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
 

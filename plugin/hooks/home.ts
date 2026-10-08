@@ -1,18 +1,27 @@
 // Home control: the `home_control` tool the model calls, and /jarvis home.
 //
 // A tool the mod answers itself skips the engine's whole permission path (no
-// prompt, no input-schema check, no plan-mode block, no allow/ask rules), so
-// this module is the guard: it checks every argument, keeps plan mode
-// read-only, honours the user's own rules for the tool (`$.tool.check`), and
-// asks the user on screen (never by voice) before a command the helper answers
-// with "confirm". The voice helper, or a one-shot `jarvis_voice home call` when
-// it is not running, finds the device and runs the command.
+// prompt, no input-schema check, no plan-mode block, no allow/ask rules, no
+// settings hooks), so this module is the guard: it checks every argument,
+// keeps plan mode read-only, applies the user's own rules for the tool to
+// every call (desktop.ts checkRules, through `$.tool.check`, as for the
+// desktop and hands tools: a deny refuses; on the engine's own default or the
+// user's allow rule a call runs unasked, like a remote's button, while an ask
+// rule, a settings hook that could match, dontAsk or an unknown mode ask or
+// refuse), and asks the user on screen (never by voice) before a command the
+// helper answers with "confirm" (a lock, an alarm, a garage door). The voice
+// helper, or a one-shot `jarvis_voice home call` when it is not running,
+// finds the device and runs the command.
 
 import type { ToolSpec } from 'claude-code'
 
 import type { Jarvis } from './app'
+import type { OwnToolCall } from './desktop'
+import { checkRules } from './desktop'
 import { describeError } from './engine'
-import type { ToolVerdict } from './engine'
+import { actionLabel, logOwnTool } from './hud'
+import { HOME_HEADER } from './pc'
+import type { AskPorts } from './pc'
 import { shellCommandLine } from './platform'
 import { HOME_DEVICE_MAX, HOME_VALUE_MAX } from './protocol'
 import type { HomeCommand, HomeResponse } from './protocol'
@@ -96,6 +105,15 @@ const MODE_UNKNOWN =
   "Jarvis cannot tell yet whether plan mode is on (it has not seen a prompt since it started), so it does not change devices or open windows until the user's next message. list, status and scan still work."
 
 const NOT_READY = 'Home control is not ready yet: Jarvis is still starting. Try again in a moment.'
+
+/** What each action would do, in a few words, for a refusal by the user's rules. */
+const RULE_WORDS: Record<HomeToolAction, string> = {
+  list: 'list devices',
+  status: "read a device's state",
+  do: 'change devices',
+  scan: 'search the network for devices',
+  setup: 'open the setup window',
+}
 
 /** After a time-out the command may still run: a blind retry would toggle twice. */
 const CHECK_FIRST = 'Check its status before trying again.'
@@ -241,28 +259,6 @@ export function readHomeResponse(value: unknown): HomeResponse | undefined {
   }
 }
 
-const ABORTED = Symbol('aborted')
-
-/** `promise`, or ABORTED as soon as `signal` aborts (what it would settle to is then dropped). */
-function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
-  if (signal === undefined) return promise
-  return new Promise((resolve, reject) => {
-    const onAbort = () => resolve(ABORTED)
-    if (signal.aborted) onAbort()
-    else signal.addEventListener('abort', onAbort, { once: true })
-    promise.then(
-      value => {
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (error: unknown) => {
-        signal.removeEventListener('abort', onAbort)
-        reject(error)
-      },
-    )
-  })
-}
-
 /** The last stdout line that is a JSON object (the helper's answer), if any. */
 function lastJsonLine(stdout: string): Record<string, unknown> | undefined {
   const lines = stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('{'))
@@ -290,47 +286,33 @@ function describeAnswer(response: HomeResponse, audience: Audience): string {
 }
 
 export class HomeControl {
-  /**
-   * The main loop's permission mode, as the latest classic hook input told
-   * it (a prompt, or a tool that ran). Undefined until one has: before the
-   * first prompt, and after a reload or a lost hooks worker built this anew,
-   * so do and setup are held then rather than run in a plan-mode turn.
-   */
-  private permissionMode: string | undefined
-
   constructor(private readonly app: Jarvis) {}
 
-  /** classic.UserPromptSubmit: the mode the prompt's turn runs in. A subagent's or teammate's is not the main loop's. */
-  notePermissionMode(mode: string | undefined, agentId?: string): void {
-    if (agentId !== undefined) return
-    if (mode !== undefined && mode !== '') this.permissionMode = mode
-  }
-
   /**
-   * classic.PostToolUse of any tool in the main loop: the mode now, which a
-   * Shift+Tab may have changed mid-turn. EnterPlanMode and ExitPlanMode
-   * report the mode they were called in, so they set it themselves.
+   * Why do and setup are held now: plan mode, or a mode not known yet (the
+   * main loop's, as pc.ts notes it; undefined before the first prompt, and
+   * after a reload or a lost hooks worker built this anew). Undefined when
+   * they may run.
    */
-  noteToolUse(tool: string, mode: string | undefined, agentId?: string): void {
-    if (agentId !== undefined) return
-    if (tool === 'EnterPlanMode') this.permissionMode = 'plan'
-    else if (tool === 'ExitPlanMode') this.permissionMode = mode !== undefined && mode !== '' && mode !== 'plan' ? mode : 'default'
-    else if (mode !== undefined && mode !== '') this.permissionMode = mode
-  }
-
-  /** Why do and setup are held now (plan mode, or a mode not known yet); undefined when they may run. */
   private heldByMode(): string | undefined {
-    if (this.permissionMode === undefined) return MODE_UNKNOWN
-    return this.permissionMode === 'plan' ? PLAN_MODE : undefined
+    const mode = this.app.pc.permissionMode
+    if (mode === undefined) return MODE_UNKNOWN
+    return mode === 'plan' ? PLAN_MODE : undefined
   }
 
   /**
-   * The model's call: `{ result }` in words, or `{ deny }` for arguments it
-   * must fix or a call the user's permission rules refuse. Never throws for
-   * a device's failure (that is a result). `signal` is the call's own: once
-   * it aborts (the user interrupted), nothing more is sent or confirmed.
+   * The model's call (its hook's closures over its own `$` in `ports`):
+   * `{ result }` in words, or `{ deny }` for arguments it must fix or a call
+   * the user's permission rules refuse. Never throws for a device's failure
+   * (that is a result). `signal` is the call's own: once it aborts (the user
+   * interrupted), nothing more is sent or confirmed. On the HUD's action log
+   * as the HUD's own hook would put it, which sits beneath and never sees it.
    */
-  async tool(input: Record<string, unknown>, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
+  async tool(input: Record<string, unknown>, ports: AskPorts, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
+    return await logOwnTool(this.app.hud, actionLabel({ ...input, tool: HOME_TOOL }), () => this.call(input, ports, signal))
+  }
+
+  private async call(input: Record<string, unknown>, ports: AskPorts, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
     let request: HomeToolRequest
     try {
       request = parseHomeToolInput(input)
@@ -338,58 +320,51 @@ export class HomeControl {
       if (error instanceof BadHomeInput) return { deny: `home_control: ${error.message}.` }
       throw error
     }
-    if (request.action === 'do' || request.action === 'setup') {
+    const isChange = request.action === 'do' || request.action === 'setup'
+    if (isChange) {
       // Plan mode reads only: the engine's own plan-mode block never sees this tool.
       const held = this.heldByMode()
       if (held !== undefined) return { result: held }
-      const unavailable = this.unavailable('model')
-      if (unavailable !== undefined) return { result: unavailable }
-      const gate = await this.checkRules(request)
-      if (typeof gate === 'object') return gate
-      if (gate === 'ask') {
-        // In the model's words: the helper has not looked the device up yet.
-        const { command = '', device = '', value } = request.action === 'do' ? request.body : {}
-        const question =
-          request.action === 'setup'
-            ? 'Let Jarvis open the home setup window?'
-            : `Let Jarvis run ${command}${value === undefined ? '' : ` (${clip(String(value), 60)})`} on "${clip(device, 80)}"?`
-        const refused = await this.askOnScreen(question, 'model', signal)
-        if (refused !== undefined) return { result: refused }
-      }
+    }
+    // Nothing to ask about when it cannot run anyway.
+    const unavailable = this.unavailable('model')
+    if (unavailable !== undefined) return { result: unavailable }
+    const pc = this.app.pc
+    const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
+    const call: OwnToolCall = {
+      tool: HOME_TOOL,
+      name: HOME_TOOL_NAME,
+      what: RULE_WORDS[request.action],
+      // Only the checked fields: `confirmed` and anything else the model sent are not asked about.
+      input: request.action === 'setup' ? { action: 'setup' } : { ...request.body },
+      // By design, on Claude Code's own default a device command runs, like a remote's button; a deny, an ask rule or dontAsk still stops it.
+      byDefault: true,
+    }
+    // A change needs the mode known for this very turn: a Shift+Tab into plan mode may have come since.
+    const gate = await checkRules(this.app, pc, call, ports, isChange && !pc.isModeKnownForTurn(agentId))
+    if (typeof gate === 'object') return gate
+    if (gate === 'ask') {
+      const refused = await this.askOnScreen(this.question(request), 'model', signal)
+      if (refused !== undefined) return { result: refused }
     }
     if (request.action === 'setup') return { result: await this.openSetup('model') }
     return { result: await this.request(request.body, 'model', signal) }
   }
 
-  /**
-   * The user's own permission rules for the tool (`$.tool.check`), which the
-   * engine never applies to a tool its plugin answers: a deny (a deny rule,
-   * dontAsk without an allow rule, an organization's ceiling) refuses; an ask
-   * rule the user wrote, or an `ask` ceiling, needs a yes on screen first.
-   * The engine's plain "ask" with no rule behind it is its default for any
-   * tool not allowed yet, which the helper's own tiers stand in for here.
-   */
-  private async checkRules(request: HomeToolRequest): Promise<'allow' | 'ask' | { deny: string }> {
-    const engine = this.app.engine
-    if (engine === undefined) return 'ask'
-    const input = request.action === 'setup' ? { action: 'setup' } : { ...request.body }
-    let verdict: ToolVerdict
-    try {
-      verdict = await engine.checkTool(HOME_TOOL, input)
-    } catch (error) {
-      // The rules could not be read: ask rather than guess.
-      engine.debug(`jarvis: home_control permission check failed: ${describeError(error)}`)
-      return 'ask'
+  /** The question before a call the user's rules do not allow outright, in the model's words: the helper has not looked the device up yet. */
+  private question(request: HomeToolRequest): string {
+    if (request.action === 'setup') return 'Let Jarvis open the home setup window?'
+    const { command = '', device = '', value } = request.body
+    switch (request.action) {
+      case 'list':
+        return 'Let Jarvis list your home devices?'
+      case 'status':
+        return `Let Jarvis read the state of "${clip(device, 80)}"?`
+      case 'scan':
+        return 'Let Jarvis search your home network for smart devices?'
+      case 'do':
+        return `Let Jarvis run ${command}${value === undefined ? '' : ` (${clip(String(value), 60)})`} on "${clip(device, 80)}"?`
     }
-    const why = verdict.reason === undefined || verdict.reason === '' ? '' : ` (${clip(verdict.reason, 200)})`
-    const refused = {
-      deny: `The user's permission settings do not let home_control ${request.action === 'setup' ? 'open the setup window' : 'change devices'} here${why}.`,
-    }
-    if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
-    if (verdict.decision === 'allow') return verdict.ceiling === 'ask' ? 'ask' : 'allow'
-    // dontAsk: what is not allowed beforehand is refused, never asked.
-    if (this.permissionMode === 'dontAsk') return refused
-    return verdict.rule !== undefined || verdict.ceiling === 'ask' ? 'ask' : 'allow'
   }
 
   /** `/jarvis home [setup|list|status|do|scan] ...`, the words after `home`. */
@@ -463,19 +438,27 @@ export class HomeControl {
     const engine = this.app.engine
     if (engine === undefined) return NOT_READY
     if (signal?.aborted === true) return INTERRUPTED
-    let answer: string | typeof ABORTED
-    try {
-      answer = await unlessAborted(engine.ask(question, { options: CONFIRM_OPTIONS, header: 'Jarvis home' }), signal)
-    } catch (error) {
-      engine.debug(`jarvis: home confirmation not answered: ${describeError(error)}`)
+    const dialog = await this.app.pc.askDialog(question, CONFIRM_OPTIONS, HOME_HEADER, (text, options) => engine.ask(text, options), signal)
+    if (dialog.kind === 'interrupted') {
+      engine.debug('jarvis: home confirmation abandoned: the call was interrupted')
+      return INTERRUPTED
+    }
+    if (dialog.kind === 'unasked') {
+      engine.debug(`jarvis: home confirmation not answered: ${describeError(dialog.error)}`)
       return audience === 'model'
         ? 'The user could not be asked on screen (the question was dismissed, or nobody is at this session), so nothing was done.'
         : 'Not confirmed, so nothing was done.'
     }
-    if (answer === ABORTED) {
-      engine.debug('jarvis: home confirmation abandoned: the call was interrupted')
-      return INTERRUPTED
+    // An idle auto-resolve picks an option nobody chose, so it is no yes whichever it picked.
+    if (dialog.end === 'idle') {
+      return audience === 'model'
+        ? "Jarvis's on-screen question closed while the user was away, so nothing was done. Ask them again when they are back."
+        : 'The question closed while you were away, so nothing was done.'
     }
+    if (dialog.end === 'follow_up') {
+      return audience === 'model' ? 'The user wants to talk it over first, so nothing was done. Ask them what they want.' : 'Nothing was done.'
+    }
+    const { answer } = dialog
     if (answer === CONFIRM_YES) return undefined
     if (audience === 'user') return 'Nothing was done.'
     return answer === CONFIRM_NO
@@ -583,7 +566,9 @@ export class HomeControl {
 
   private unavailable(audience: Audience): string | undefined {
     if (this.app.engine === undefined || this.app.platform === undefined) return NOT_READY
-    return this.app.isLocal ? undefined : CLOUD[audience]
+    if (!this.app.isLocal) return CLOUD[audience]
+    // Never as administrator, nor before that check has passed (pc.ts whyHeld): the one-shot command and the setup window start programs too.
+    return this.app.pc.whyHeld()
   }
 
   private async isInstalled(): Promise<boolean> {

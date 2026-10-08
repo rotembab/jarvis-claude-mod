@@ -14,6 +14,8 @@ import type {
   ProcessSpawnRequest,
   PromptSubmitInput,
   SessionMessage,
+  Settings,
+  SettingsSource,
   ToolSpec,
   TurnCompleteInput,
   TurnStepChunk,
@@ -29,6 +31,7 @@ export const WINDOWS_ENV = {
   USERPROFILE: 'C:\\Users\\Rotem',
   LOCALAPPDATA: 'C:\\Users\\Rotem\\AppData\\Local',
   NO_PROXY: 'corp.example',
+  SystemRoot: 'C:\\WINDOWS',
 }
 export const DATA_DIR = 'C:\\Users\\Rotem\\.jarvis'
 export const VENV_PYTHON = 'C:\\Users\\Rotem\\.jarvis\\venv\\Scripts\\python.exe'
@@ -123,8 +126,14 @@ export type SentCommand = {
 /** One `$.process.run` the mod made (cwd as the mod gave it). */
 export type RunCall = { argv: readonly string[]; cwd?: string; env?: Record<string, string>; timeoutMs?: number }
 
-/** What a scripted `$.process.run` answers; `deny` rejects the call (it did not start, or timed out). */
-export type RunAnswer = { exitCode: number; stdout: string; stderr?: string } | { deny: string }
+/**
+ * What a scripted `$.process.run` answers; `deny` rejects the call (it did not
+ * start, or timed out), and `delayMs` holds the answer back that long on the mocked clock.
+ */
+export type RunAnswer = { exitCode: number; stdout: string; stderr?: string; delayMs?: number } | { deny: string }
+
+/** One question dialog, as `$.ui.ask` raised it. */
+export type AskedDialog = { question: string; header: string | undefined; options: string[]; multiSelect: boolean }
 
 export type World = {
   clock: MockClock
@@ -140,10 +149,18 @@ export type World = {
   state: Map<string, unknown>
   /** Paths that exist (`$.fs.write` adds to them). */
   existing: Set<string>
-  /** File contents `$.fs.read` serves (`$.fs.write` sets them); the plugin's own plugin.json is served apart. */
+  /**
+   * File contents `$.fs.read` serves (`$.fs.write` sets them; a test sets a
+   * script the guard reads before it runs); a missing path rejects. The
+   * plugin's own plugin.json is served apart.
+   */
   files: Map<string, string>
   /** Every path `$.fs.exists` was asked about. */
   checked: string[]
+  /** What `$.fs.stat(path, { resolve: true })` resolves a path to (a link's or 8.3 short name's real target); a missing path rejects. */
+  realPaths: Map<string, string>
+  /** Paths that are symbolic links leading nowhere: `$.fs.list` of their folder shows them, and they do not stat. */
+  links: Set<string>
   /** When set, `$.fs.write` fails (the hook beneath throws this). */
   writeError: string | undefined
   /** When set, `$.prompt.submit` answers `{ drop }` with it (a hook beneath refused). */
@@ -204,21 +221,58 @@ export type World = {
   askAnswer: string | undefined
   /** When set, the answer comes this long after the dialog opened, on the mocked clock. */
   askDelayMs: number | undefined
+  /** When set, the dialog auto-resolved to `askAnswer` after this long idle (the user was away). */
+  askIdleMs: number | undefined
+  /** When set, the dialog closed with the person asking to talk it over first (the answer is then not theirs). */
+  askFollowUp: boolean
   /** Every `$.tool.check` question, and the verdict it gets (default: the engine's plain "ask"). */
   checks: { tool: string; input: unknown }[]
   toolCheck: (tool: string, input: unknown) => ToolVerdict | Promise<ToolVerdict>
   /** When set, the helper answers a `home` command this long after it came, on the mocked clock. */
   homeDelayMs: number | undefined
-  /** Every `$.process.run` the mod made. */
+  /** The task ids TaskStop was called with. */
+  stoppedTasks: string[]
+  /** Every `$.process.run` the mod made, but the administrator check's. */
   runs: RunCall[]
-  /** Answers a `$.process.run` the world does not know; undefined: exit 127 (no such program). */
+  /** The administrator check's runs (whoami, reg, id), kept apart so other tests' runs stay their own. */
+  probes: RunCall[]
+  /**
+   * Answers a `$.process.run` the world does not know; undefined: exit 127 (no
+   * such program), but for the administrator check, which then finds a normal
+   * user (ADMIN_PROBE_ANSWERS).
+   */
   onRun: (call: RunCall) => RunAnswer | undefined
+  /** Each settings source as `$.settings.read({ source })` answers it (`merged` for no source); none: `{}`. */
+  settings: Partial<Record<SettingsSource | 'merged', Settings>>
+  /** When set, `$.settings.read` fails with it. */
+  settingsError: string | undefined
+  /** The sources the mod read (`merged` for none). */
+  settingsReads: string[]
+}
+
+/**
+ * What the administrator check finds when a test does not say: Windows'
+ * whoami (an administrator's token, not elevated) and its UAC policy (Always
+ * notify), or a normal user's uid elsewhere.
+ */
+export const ADMIN_PROBE_ANSWERS: Record<'whoami' | 'reg' | 'id', string> = {
+  whoami: [
+    '"Everyone","Well-known group","S-1-1-0","Mandatory group, Enabled by default, Enabled group"',
+    '"BUILTIN\\Administrators","Alias","S-1-5-32-544","Group used for deny only"',
+    '"Mandatory Label\\Medium Mandatory Level","Label","S-1-16-8192",""',
+  ].join('\r\n'),
+  reg: [
+    '',
+    'HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System',
+    '    ConsentPromptBehaviorAdmin    REG_DWORD    0x2',
+    '    EnableLUA    REG_DWORD    0x1',
+    '    PromptOnSecureDesktop    REG_DWORD    0x1',
+    '',
+  ].join('\r\n'),
+  id: '1000\n',
 }
 
 export type Answer = { status: number; body: unknown }
-
-/** One question dialog, as `$.ui.ask` raised it. */
-export type AskedDialog = { question: string; header: string | undefined; options: string[]; multiSelect: boolean }
 
 export type WorldOptions = {
   env?: Record<string, string>
@@ -244,6 +298,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     existing: new Set(installed ? [VENV_PYTHON] : []),
     files: new Map(),
     checked: [],
+    realPaths: new Map(),
+    links: new Set(),
     writeError: undefined,
     submitDrop: undefined,
     exists: path => w.existing.has(path),
@@ -288,16 +344,24 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     dialogs: [],
     askAnswer: undefined,
     askDelayMs: undefined,
+    askIdleMs: undefined,
+    askFollowUp: false,
     checks: [],
     toolCheck: () => ({ decision: 'ask' }),
     homeDelayMs: undefined,
+    stoppedTasks: [],
     runs: [],
+    probes: [],
     onRun: () => undefined,
+    settings: {},
+    settingsError: undefined,
+    settingsReads: [],
   }
   const state = w.state
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.attach', ($, e) => ({ clientId: e.clientId }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => {
     if (w.toolRefusal !== undefined) return { deny: w.toolRefusal }
@@ -305,7 +369,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     w.toolSpecs.push(e)
     return { value: { tool: `mcp__jarvis__${e.name}` } }
   })
-  // `$.ui.ask` is a call of the AskUserQuestion tool: the person's answer, or a dismissal.
+  on('tool.describe', { tool: 'mcp__jarvis__desktop' }, ($, e) => ({ description: e.description, ...(e.isDeferred === true ? { isDeferred: true } : {}) }))
+  // `$.ui.ask` is a call of the AskUserQuestion tool: the person's answer, a dismissal, or an idle auto-resolve.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
     const [first] = e.questions
     const question = first?.question ?? ''
@@ -318,13 +383,20 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     })
     if (w.askDelayMs !== undefined) await clock.sleep(w.askDelayMs)
     if (w.askAnswer === undefined) return { deny: 'dismissed' }
-    return { result: { questions: e.questions, answers: { [question]: w.askAnswer } } }
+    const idle = w.askIdleMs === undefined ? {} : { afkTimeoutMs: w.askIdleMs }
+    const followUp = w.askFollowUp ? { followUp: true } : {}
+    return { result: { questions: e.questions, answers: { [question]: w.askAnswer }, ...idle, ...followUp } }
   })
   // The engine's verdict for the session's rules and mode; the default is its
   // plain "ask" for a tool nothing allows yet (default mode, no rule).
   on('tool.check', async ($, e) => {
     w.checks.push({ tool: e.tool, input: e.input })
     return await w.toolCheck(e.tool, e.input)
+  })
+  on('tool.call', { tool: 'TaskStop' }, ($, e) => {
+    const taskId = e.task_id ?? ''
+    w.stoppedTasks.push(taskId)
+    return { result: { message: `Stopped ${taskId}`, task_id: taskId, task_type: 'local_bash' } }
   })
   on('ui.status', ($, e) => {
     w.statuses.push(e.text)
@@ -373,7 +445,19 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     if (text === undefined) throw new Error(`ENOENT: no such file or directory, open '${path}'`)
     return { value: text }
   })
-  on('process.run', ($, e) => {
+  on('fs.stat', ($, e) => {
+    const real = w.realPaths.get(windowsPath(e.path))
+    if (real === undefined) throw new Error('ENOENT')
+    return { value: { kind: 'file', size: 0, mtimeMs: 0, isLink: false, ...(e.resolve ? { realPath: real } : {}) } }
+  })
+  on('fs.list', ($, e) => {
+    const folder = windowsPath(e.path).replace(/[\\/]$/, '')
+    const entries = [...w.links]
+      .filter(link => link.slice(0, Math.max(link.lastIndexOf('/'), link.lastIndexOf('\\'))) === folder)
+      .map(link => ({ name: link.slice(Math.max(link.lastIndexOf('/'), link.lastIndexOf('\\')) + 1), kind: 'other' as const, size: 0, mtimeMs: 0, isLink: true }))
+    return { value: entries }
+  })
+  on('process.run', async ($, e) => {
     const [command] = e.argv
     if (command === 'where' || command === 'which') {
       return { value: run(w.uvOnPath === undefined ? 1 : 0, w.uvOnPath ?? '') }
@@ -386,10 +470,15 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       ...(init.env === undefined ? {} : { env: init.env }),
       ...(init.timeoutMs === undefined ? {} : { timeoutMs: init.timeoutMs }),
     }
-    w.runs.push(call)
+    const program = (command ?? '').split(/[\\/]/).at(-1)?.toLowerCase().replace(/\.exe$/, '')
+    const isProbe = program === 'whoami' || program === 'reg' || program === 'id'
+    if (isProbe) w.probes.push(call)
+    else w.runs.push(call)
     const answer = w.onRun(call)
+    if (answer === undefined && isProbe) return { value: run(0, ADMIN_PROBE_ANSWERS[program]) }
     if (answer === undefined) return { value: run(127, '') }
     if ('deny' in answer) return { deny: answer.deny }
+    if (answer.delayMs !== undefined) await clock.sleep(answer.delayMs)
     return { value: { ...run(answer.exitCode, answer.stdout), stderr: answer.stderr ?? '' } }
   })
   on('process.spawn', async function* ($, e) {
@@ -454,6 +543,13 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     },
   }))
   on('session.messages', () => ({ value: w.messages }))
+  // The settings, never the real ones: each source as the test set it.
+  on('settings.read', ($, e) => {
+    const source = e.source ?? 'merged'
+    w.settingsReads.push(source)
+    if (w.settingsError !== undefined) throw new Error(w.settingsError)
+    return { value: w.settings[source] ?? {} }
+  })
   on('ui.open', ($, e) => {
     w.opens.push(e)
     return { value: { isPlaced: true as const } }
@@ -473,6 +569,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('tool.call', () => ({ result: 'ok' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'You are Claude Code.', scope: 'shared' }] }))
   on('classic.UserPromptSubmit', () => ({}))
+  on('classic.SessionStart', () => ({}))
   on('classic.PostToolUse', () => ({}))
   return w
 }
@@ -524,6 +621,27 @@ export async function jarvis($: TestEngine, args: string): Promise<string> {
     presentation: { isFullscreen: false, columns: 100 },
   })
   return result.text ?? ''
+}
+
+let promptedTurns = 0
+
+/** A prompt in the main loop and the turn it starts (how the mod learns the turn's permission mode); the turn's id. */
+export async function promptTurn($: TestEngine, mode = 'default', text = 'Jarvis, hand control'): Promise<string> {
+  await $.classic.UserPromptSubmit({ prompt: text, permission_mode: mode })
+  promptedTurns += 1
+  const turnId = `prompted-${promptedTurns}`
+  await $.turn.start({ text, turnId })
+  return turnId
+}
+
+/**
+ * The user's own allow rule for `tool` (one the plugin answers itself, such as
+ * mcp__jarvis__hands) and a prompt's turn: its actions then run with no
+ * question of the rules' own. The turn's id.
+ */
+export async function allowedTurn($: TestEngine, w: World, tool: string, mode = 'default'): Promise<string> {
+  w.toolCheck = () => ({ decision: 'allow', rule: tool })
+  return await promptTurn($, mode)
 }
 
 /** Text chunks as a model streams them, cut into small deltas. */

@@ -229,7 +229,7 @@ Ask for a streamer or a link, for example "open xQc on Kick on the Apple TV". Cl
 - **Sony TV.** Sony's control API only starts apps; it can't open a link inside one. So Jarvis opens Kick and asks you to select Kick's search box; say the name and Jarvis types it. Get Kick from the Google Play Store on the TV. It needs Android 8 or later: see **Settings > Device Preferences > About**. Typing works only where the TV's own on-screen keyboard comes up. If an app has a keyboard of its own, type with the remote.
 - **Channel names.** A channel's link uses its Kick name, which can differ from how people know the streamer. If Kick shows "Channel Not Found", check the name on kick.com.
 - **Don't have Jarvis type a password.** What Jarvis types passes through the chat.
-- **On this PC**, Claude can open the channel in your browser instead. Claude Code asks before it runs the command.
+- **On this PC**, Claude can open the channel in your browser instead, with Jarvis's desktop tool (Windows). It asks you on screen first unless your rules allow `mcp__jarvis__desktop`; see [the desktop tool](PC-CONTROL.md#the-desktop-tool).
 
 ## Play something from Plex
 
@@ -241,7 +241,17 @@ Ask for a title and the device to show it on, for example "put on the next episo
 
 ## What Jarvis asks you first
 
-Most commands just happen, the way a remote control does. A few need your OK on screen first, in a Claude Code dialog: unlocking a lock, disarming an alarm, and opening a garage door or gate. Jarvis never accepts a spoken "yes" for these, because a TV or a video could say it too.
+Jarvis applies your Claude Code permission rules to the device tool, and asks once more for a device that needs your OK.
+
+**Your Claude Code rules.** Jarvis's device tool is `mcp__jarvis__home_control`. Jarvis answers it itself, so Claude Code's own permission prompt never sees its calls. Jarvis applies your rules for it instead, as it does for the [desktop tool](PC-CONTROL.md#the-desktop-tool), except that it runs on Claude Code's default (you chose this, so that commands work like a remote control):
+
+- **Commands run.** With no rule for the tool, Claude Code's own default is to ask, but Jarvis runs a device command, a read or the setup window without a question, the way a remote control's button does. That also holds when the permission mode alone allows it (bypassPermissions), and with your own allow rule.
+- **An ask rule brings the question back.** To have Jarvis ask before every call, add `"mcp__jarvis__home_control"` to `ask` in your settings yourself, or with `/permissions`: Jarvis asks on screen ("No" / "Yes, do it"). It also asks when a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it), and before a change when the permission mode isn't known for the turn: a subagent's call, or a turn that didn't start from a prompt Jarvis saw just before it.
+- **Deny rule**: Jarvis can't use the tool at all, not even to list devices. `/jarvis home` still works when you type it.
+- **dontAsk mode**: only your allow rule lets a call run, reading included. Anything that would ask is refused.
+- If your rules or your settings can't be read, nothing is done.
+
+**Devices that need your OK.** A few commands need your OK on screen even though the tool otherwise runs without a question: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of an ask rule, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too. A question that closes by itself while you are away, or when you ask to talk it over first, counts as a no, whichever option was picked.
 
 In the setup window, **Ask before Jarvis uses a device** sets any device you added there (not Home Assistant's) to:
 
@@ -249,17 +259,11 @@ In the setup window, **Ask before Jarvis uses a device** sets any device you add
 - **Ask me on screen first**: for example, a plug that powers a heater.
 - **Never**: Jarvis may only read its state.
 
-In plan mode, Jarvis only looks at devices and doesn't change them.
+In plan mode, Jarvis only looks at devices and doesn't change them. If Jarvis doesn't know the mode at all (right after the plugin reloads, before your next prompt), it changes nothing; in a turn that didn't start from a prompt Jarvis saw, a change asks you first.
 
-Your Claude Code permission rules apply too. Jarvis's device tool is `mcp__jarvis__home_control`, and you can add rules for it with `/permissions`:
+While Claude Code runs as administrator, or before Jarvis's check for that has passed, home control does nothing, from Claude or from `/jarvis home`. See [Never as administrator](PC-CONTROL.md#never-as-administrator).
 
-- **Deny rule**: Jarvis can't change any device. `/jarvis home` still works when you type it.
-- **Ask rule**: Jarvis asks on screen before every change, whatever the device's setting.
-- **dontAsk mode**: changes are refused unless you have an allow rule for the tool.
-
-Listing devices, reading their state and searching the network are always allowed.
-
-These checks cover Jarvis's own device tool. Programs that run under your Windows account can still use the helper, and that includes shell commands Claude runs: DPAPI keeps your keys from other accounts, not from your own programs. Claude Code asks before it runs a shell command you haven't allowed, and that prompt is what stops Claude going around the tool. So don't allow commands that run Jarvis's Python (`.jarvis\venv`) without asking.
+These checks cover Jarvis's own device tool. Programs that run under your Windows account can still use the helper, and that includes shell commands Claude runs: DPAPI keeps your keys from other accounts, not from your own programs. Jarvis's guard asks on screen before Claude runs Jarvis's own Python (`-m jarvis_voice`), even when your rules allow the command, and blocks Claude's requests to the helper's port. The guard only reads command text and can miss a spelling it doesn't know, so Claude Code's own prompt for a shell command you haven't allowed is what really stops Claude going around the tool. So don't allow commands that run Jarvis's Python (`.jarvis\venv`) without asking.
 
 ## Commands
 
@@ -272,7 +276,7 @@ These checks cover Jarvis's own device tool. Programs that run under your Window
 | `/jarvis home do <device> -- <command> [value]` | Runs one command, for example `/jarvis home do Sony TV -- set_volume 20`. Asks on screen first where the device needs it. |
 | `/jarvis home scan` | Searches your home network for smart devices, about ten seconds; see [Find what's on your network](#find-whats-on-your-network) |
 
-From a terminal on the PC, the same commands work without Claude Code, for example to try a device. There, a command that needs confirming asks you to type yes:
+From a terminal on the PC, the same commands work without Claude Code, for example to try a device. There, a command that needs confirming asks you to type yes. These are for a terminal of your own: if Claude runs them, Jarvis's guard asks you on screen first.
 
 ```powershell
 & "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice home list
@@ -339,10 +343,12 @@ To remove a device, use **Rename a device, set its room, or remove it** in the s
 | Home Assistant "rejected Jarvis's token" | Create a new long-lived token and connect Home Assistant again in the setup window. |
 | Home Assistant says the PC is banned | Too many failed logins. Remove the PC's address from `ip_bans.yaml` in Home Assistant's config folder and restart Home Assistant. |
 | Claude says home control isn't available | Home control runs on your own PC, so it isn't available in cloud sessions. Run `/jarvis setup` to repair the helper if it isn't installed. |
+| Home control says "Jarvis stays off" or "Jarvis is still checking whether Claude Code runs as administrator" | Home control does nothing while Claude Code runs as administrator, or before Jarvis's check for that has passed. Start Claude Code from a normal window, not with "Run as administrator". If the check is still running, try again in a few seconds; if it failed, `/jarvis restart` checks again. See [Never as administrator](PC-CONTROL.md#never-as-administrator). |
+| Jarvis asks on screen before a device command | Your Claude Code rules have an `ask` rule for `mcp__jarvis__home_control`, or a PreToolUse or PermissionRequest hook in your settings could match it, or this is a subagent's call. Remove the `ask` rule (or add the tool to `allow`) to skip the question; see [What Jarvis asks you first](#what-jarvis-asks-you-first). |
 
 ## How it works
 
-The `home_control` tool belongs to the Jarvis mod. The mod checks each call and sends it to the voice helper on your PC (`jarvis_voice.home`). The helper finds the device, checks the command against the device's tier, and runs it with that device's driver:
+The `home_control` tool belongs to the Jarvis mod. The mod checks each call (its arguments, plan mode and your permission rules) and sends it to the voice helper on your PC (`jarvis_voice.home`). The helper finds the device, checks the command against the device's tier, and runs it with that device's driver:
 
 - **Apple TV**: [pyatv](https://pyatv.dev), over Apple's Companion protocol.
 - **Sony**: the Bravia REST API and IRCC remote codes, over HTTP or HTTPS, with the pre-shared key.
@@ -352,6 +358,6 @@ The `home_control` tool belongs to the Jarvis mod. The mod checks each call and 
 
 A network search (`scan`) needs no driver: it uses [python-zeroconf](https://github.com/python-zeroconf/python-zeroconf) for mDNS, an SSDP search, tinytuya's scanner without connecting to anything, and the discovery messages of Kasa, LIFX, WiZ, Yeelight and Govee.
 
-If the helper isn't running, the mod runs a one-off `jarvis_voice home call` instead. That path never accepts an on-screen confirmation.
+If the helper isn't running, the mod runs a one-off `jarvis_voice home call` instead. That path never accepts an on-screen confirmation. Neither path, nor the setup window, runs while Claude Code runs as administrator or before Jarvis's check for that has passed.
 
 Developer notes are in [DEVELOPING.md](DEVELOPING.md#home-control), and the message format is the `home` command in [plugin/protocol/schema.json](../plugin/protocol/schema.json).

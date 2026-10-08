@@ -40,8 +40,12 @@ def all_events() -> list[protocol.Event]:
         protocol.Level(mic=0.25, out=1.0),
         protocol.Utterance(id="utt-1", text="what time is it", source="ptt", duration_ms=1200, language="en"),
         protocol.Utterance(id="utt-2", text="hi", source="command", duration_ms=400),
+        protocol.Utterance(
+            id="utt-3", text="yes", source="wake", duration_ms=600, started_at_ms=90_500, over_speech=False
+        ),
         protocol.SpeechStarted(reply_id="r1"),
         protocol.SpeechDone(reply_id="r1", interrupted=True, spoken_text="Very good, sir."),
+        protocol.SpeechDone(reply_id="r2", interrupted=False, spoken_text="Shall I?", ended_at_ms=90_000),
         protocol.BargeIn(spoken_text="", reply_id="r1"),
         protocol.BargeIn(spoken_text="partial"),
         protocol.Error(code="mic_blocked", message="blocked", hint="Settings > Privacy", fatal=False),
@@ -65,6 +69,19 @@ def test_camel_case_and_optional_fields() -> None:
     wire = protocol.Utterance(id="u", text="x", source="ptt", duration_ms=5).to_wire()
     assert wire == {"v": 1, "type": "utterance", "id": "u", "text": "x", "source": "ptt", "durationMs": 5}
     assert protocol.SpeechDone(reply_id="r", interrupted=False, spoken_text="").to_wire()["spokenText"] == ""
+    timed = protocol.Utterance(
+        id="u", text="x", source="ptt", duration_ms=5, started_at_ms=7, over_speech=True
+    ).to_wire()
+    assert timed["startedAtMs"] == 7 and timed["overSpeech"] is True
+    assert (
+        protocol.SpeechDone(reply_id="r", interrupted=False, spoken_text="", ended_at_ms=9).to_wire()["endedAtMs"] == 9
+    )
+
+
+def test_the_event_clock_counts_milliseconds_forward() -> None:
+    assert protocol.clock_ms(12.3456) == 12_346
+    first = protocol.clock_ms()
+    assert protocol.clock_ms() >= first >= 0
 
 
 INVALID_EVENTS = [
@@ -78,6 +95,9 @@ INVALID_EVENTS = [
     {"v": 1, "type": "utterance", "id": "u", "text": "x", "source": "ptt", "durationMs": 1.5},
     {"v": 1, "type": "utterance", "id": "u", "text": "x", "source": "keyboard", "durationMs": 1},
     {"v": 1, "type": "speech_done", "replyId": "r", "interrupted": 0, "spokenText": ""},
+    {"v": 1, "type": "speech_done", "replyId": "r", "interrupted": False, "spokenText": "", "endedAtMs": 1.5},
+    {"v": 1, "type": "utterance", "id": "u", "text": "x", "source": "ptt", "durationMs": 1, "startedAtMs": -1},
+    {"v": 1, "type": "utterance", "id": "u", "text": "x", "source": "ptt", "durationMs": 1, "overSpeech": "yes"},
     {"v": 1, "type": "error", "code": "nope", "message": "m", "fatal": False},
     {"v": 1, "type": "hello", "port": 0, "pid": 1, "platform": "linux", "version": "x", "capabilities": []},
     {"v": 1, "type": "hello", "port": 1, "pid": 1, "platform": "linux", "version": "x", "capabilities": [1]},
@@ -118,6 +138,12 @@ COMMAND_CASES: list[tuple[str, Any]] = [
     ("config", {"voiceId": "abc", "pttKey": "f13", "sttModel": "small.en", "language": "en"}),
     ("config", {"volume": 3}),
     ("status", {}),
+    ("desktop", {"action": "open", "target": "Spotify"}),
+    ("desktop", {"action": "volume", "level": 30}),
+    ("desktop", {"action": "media", "key": "play_pause"}),
+    ("desktop", {"action": "volume", "level": 101}),
+    ("desktop", {"action": "type"}),
+    ("desktop", {"action": "lock", "x": 1}),
     ("test_voice", {"text": "hi"}),
     ("test_voice", {"text": "x" * 1001}),
     ("shutdown", {}),

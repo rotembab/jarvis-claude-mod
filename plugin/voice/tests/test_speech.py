@@ -42,6 +42,7 @@ def test_sentences_are_spoken_in_seq_order(sink: RecordingSink, playback: FakePl
         pipe.speak("r1", 1, "Second.", False)
         done = sink.wait_type("speech_done", replyId="r1")
         assert synth.log == ["First.", "Second.", "Third."]
+        assert isinstance(done.pop("endedAtMs"), int)
         assert done == {
             "v": 1,
             "type": "speech_done",

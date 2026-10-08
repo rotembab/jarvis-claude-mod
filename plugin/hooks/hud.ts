@@ -111,6 +111,23 @@ export function actionLabel(e: { tool: string } & Record<string, unknown>): stri
   return flat.length > 60 ? `${flat.slice(0, 59)}…` : flat
 }
 
+/**
+ * A call of a tool the mod answers itself (desktop, hands, home_control) on the
+ * action log, as the HUD's own hook would put it: that hook sits beneath their
+ * hooks and never sees them. Failed when refused (`deny`) or when it throws.
+ */
+export async function logOwnTool<T extends object>(hud: Hud | undefined, label: string, run: () => Promise<T>): Promise<T> {
+  const id = hud?.onToolStart(label)
+  let isOk = false
+  try {
+    const answer = await run()
+    isOk = !('deny' in answer)
+    return answer
+  } finally {
+    if (id !== undefined) hud?.onToolEnd(id, isOk)
+  }
+}
+
 type Mounted = { requestId: string; columns: number; rows: number }
 
 export class Hud {
