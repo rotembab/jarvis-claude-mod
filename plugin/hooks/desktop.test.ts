@@ -68,7 +68,7 @@ describe('desktop tool: registration', () => {
   test('a local Windows session registers it, kept in the prompt', async ($, on) => {
     const w = world(on)
     await startSession($, w)
-    expect(w.tools.map(tool => tool.name)).toContain('desktop')
+    expect(w.tools).toContain('desktop')
     expect(DESKTOP_TOOL_SPEC.description.length).toBeLessThan(2048)
     expect(DESKTOP_TOOL_SPEC.inputSchema).toMatchObject({ required: ['action'], additionalProperties: false })
     const described = await $.tool.describe({ tool: DESKTOP_TOOL, description: 'Desktop.', isDeferred: true, provider: { plugin: 'jarvis', tier: 'user' } })
@@ -78,20 +78,20 @@ describe('desktop tool: registration', () => {
   test('not in a cloud session', async ($, on) => {
     const w = world(on, { env: CLOUD_ENV })
     await startSession($, w)
-    expect(w.tools.map(tool => tool.name)).not.toContain('desktop')
+    expect(w.tools).not.toContain('desktop')
   })
 
   test('not on macOS (no backend there yet)', async ($, on) => {
     const w = world(on, { env: MAC_ENV })
     await startSession($, w)
-    expect(w.tools.map(tool => tool.name)).not.toContain('desktop')
+    expect(w.tools).not.toContain('desktop')
   })
 
   test('a refused registration costs only the tool', async ($, on) => {
     const w = world(on)
     w.toolRefusal = 'allowedMcpServers (managed): plugins outside policy may not add tools'
     await startSession($, w)
-    expect(w.tools.map(tool => tool.name)).not.toContain('desktop')
+    expect(w.tools).not.toContain('desktop')
     expect(w.helpers()).toHaveLength(1)
     expect(w.logs.some(line => line.startsWith('jarvis: the desktop tool is not available'))).toBe(true)
   })

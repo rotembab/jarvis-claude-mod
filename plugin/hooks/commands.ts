@@ -9,6 +9,7 @@ import type { PaneSize } from './hud'
 import type { Jarvis, SttModel, VoiceEngine, WakeMode } from './app'
 import { BARGE_IN_MODES, STT_MODELS, VOICE_ENGINES, WAKE_MODES } from './app'
 import { runHandsCommand, runHandsSetupCommand } from './hands'
+import { HOME_HELP } from './home'
 import { findUv, shellCommandLine } from './platform'
 import type { BargeInMode, StatusResponse } from './protocol'
 import { ROUTING_MODES } from './router'
@@ -33,6 +34,7 @@ const HELP = [
   '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
   '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
   '/jarvis setup hands              install hand control (about 500 MB)',
+  HOME_HELP,
 ].join('\n')
 
 const NOT_LOCAL = 'Jarvis runs on your own computer; this session runs in the cloud, so the voice helper is not started here.'
@@ -79,6 +81,8 @@ export async function runJarvisCommand(app: Jarvis, args: string, ui: CommandUi 
         return { text: await devices(app) }
       case 'hud':
         return { text: await hud(app, rest[0], ui) }
+      case 'home':
+        return { text: await app.home.command(rest) }
       case 'focus':
         return { text: await focus(app, rest[0], ui) }
       case 'hands':

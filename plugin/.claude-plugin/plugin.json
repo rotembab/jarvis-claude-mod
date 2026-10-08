@@ -1,7 +1,7 @@
 {
   "name": "jarvis",
   "version": "0.7.0",
-  "description": "A JARVIS-style voice for Claude Code: say \"Hey Jarvis\" (or hold push-to-talk) to speak, hear the reply, talk over it to interrupt. Local wake word and speech-to-text, Fish Audio speech, and optional webcam hand control for the mouse and windows.",
+  "description": "A JARVIS-style voice for Claude Code: say \"Hey Jarvis\" (or hold push-to-talk) to speak, hear the reply, talk over it to interrupt. Local wake word and speech-to-text, Fish Audio speech, optional webcam hand control for the mouse and windows, and control of your TVs and smart home devices.",
   "author": { "name": "Rotem" },
   "license": "MIT",
   "keywords": ["voice", "speech", "wake word", "push-to-talk", "tts", "stt", "jarvis", "hand tracking", "gestures"],

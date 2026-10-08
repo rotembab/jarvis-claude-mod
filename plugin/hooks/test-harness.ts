@@ -24,7 +24,7 @@ import type {
   UiBlitArgs,
 } from 'claude-code'
 
-import type { RuleVerdict } from './pc'
+import type { ToolVerdict } from './engine'
 
 export const WINDOWS_ENV = {
   OS: 'Windows_NT',
@@ -180,6 +180,8 @@ export type World = {
   handsHelpers: () => FakeChild[]
   lastHands: () => FakeChild
   handsNamed: (name: string) => SentCommand[]
+  /** The model tools the plugin registered, by short name. */
+  tools: string[]
   status: () => string | undefined
   /** Model responses served beneath `turn.step`, by `${turnId}:${index}`. */
   steps: Map<string, TurnStepChunk[]>
@@ -207,13 +209,13 @@ export type World = {
   blitDeny: string | undefined
   /** Lets every pending dispatch run, the clock where it is. */
   settle: (rounds?: number) => Promise<void>
-  /** Every tool `$.tool.register` declared, in order. */
-  tools: ToolSpec[]
+  /** Every tool `$.tool.register` declared, in order, whole. */
+  toolSpecs: ToolSpec[]
   /** When set, `$.tool.register` is refused with it (a managed policy, a host that cannot add tools). */
   toolRefusal: string | undefined
   /** The questions `$.ui.ask` put to the user (AskUserQuestion). */
   asked: string[]
-  /** Each of those dialogs as drawn: its header, its options in order, and whether it took several. */
+  /** Each of those dialogs as drawn: its header, its option labels in order, and whether it took several. */
   dialogs: AskedDialog[]
   /** The user's answer to `$.ui.ask`: a label, or text typed under "Other"; undefined dismisses the dialog. */
   askAnswer: string | undefined
@@ -223,7 +225,9 @@ export type World = {
   askIdleMs: number | undefined
   /** Every `$.tool.check` question, and the verdict it gets (default: the engine's plain "ask"). */
   checks: { tool: string; input: unknown }[]
-  toolCheck: (tool: string, input: unknown) => RuleVerdict | Promise<RuleVerdict>
+  toolCheck: (tool: string, input: unknown) => ToolVerdict | Promise<ToolVerdict>
+  /** When set, the helper answers a `home` command this long after it came, on the mocked clock. */
+  homeDelayMs: number | undefined
   /** The task ids TaskStop was called with. */
   stoppedTasks: string[]
   /** Every `$.process.run` the mod made, but the administrator check's. */
@@ -327,11 +331,12 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       return hands
     },
     handsNamed: name => w.commands.filter(command => command.url === `http://127.0.0.1:${HANDS_PORT}/v1/${name}`),
+    tools: [],
     status: () => w.statuses.at(-1),
     settle: async (rounds = 8) => {
       for (let i = 0; i < rounds; i += 1) await clock.settle()
     },
-    tools: [],
+    toolSpecs: [],
     toolRefusal: undefined,
     asked: [],
     dialogs: [],
@@ -340,6 +345,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     askIdleMs: undefined,
     checks: [],
     toolCheck: () => ({ decision: 'ask' }),
+    homeDelayMs: undefined,
     stoppedTasks: [],
     runs: [],
     probes: [],
@@ -356,7 +362,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('tool.register', ($, e) => {
     if (w.toolRefusal !== undefined) return { deny: w.toolRefusal }
-    w.tools.push(e)
+    w.tools.push(e.name)
+    w.toolSpecs.push(e)
     return { value: { tool: `mcp__jarvis__${e.name}` } }
   })
   on('tool.describe', { tool: 'mcp__jarvis__desktop' }, ($, e) => ({ description: e.description, ...(e.isDeferred === true ? { isDeferred: true } : {}) }))
@@ -486,6 +493,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
       headers: e.init?.headers ?? {},
     }
     w.commands.push(command)
+    if (command.name === 'home' && w.homeDelayMs !== undefined) await clock.sleep(w.homeDelayMs)
     const { status, body } = await w.respond(command)
     return { value: { status, ok: status < 300, headers: {}, text: JSON.stringify(body) } }
   })

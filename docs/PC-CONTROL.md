@@ -2,7 +2,7 @@
 
 Phase 4 lets Claude work the PC from a spoken request: open apps, press the media keys, set a timer, run PowerShell. This page covers what Jarvis lets through, what it asks about, what it blocks, and what to check on the PC.
 
-Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse. Jarvis's own two tools, the desktop tool and hand control's tool, are answered by Jarvis, so Claude Code's permission path never sees them. For those, Jarvis asks Claude Code for its verdict on your rules and applies it itself, asking you wherever that verdict isn't your own allow (see each tool below).
+Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse. Jarvis's own tools, the desktop tool, hand control's tool and home control's tool, are answered by Jarvis, so Claude Code's permission path never sees them. For each, Jarvis asks Claude Code for its verdict on your rules and applies it itself. The desktop and hands tools ask you wherever that verdict isn't your own allow (see each tool below); home control's tool is covered in [HOME.md](HOME.md#what-jarvis-asks-you-first).
 
 ## The guard
 
@@ -191,13 +191,14 @@ Say "Jarvis, stand down" or "Abort that" on its own, or type `/jarvis pc stop`. 
 
 ## Never as administrator
 
-At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`, or `/bin/id` where there is none). Until the check has finished, the voice helper, the hand helper and their setups wait. If it does run as administrator, Jarvis stays off:
+At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`, or `/bin/id` where there is none). Until the check has finished, the voice helper, the hand helper, their setups and home control wait. If it does run as administrator, Jarvis stays off:
 
 - no voice helper, and no hand helper (so no camera), even with hand control turned on;
 - an error on the HUD;
-- `/jarvis setup`, `/jarvis setup hands`, `/jarvis hands on`, restarting either helper, and the hands tool's `on` are refused.
+- `/jarvis setup`, `/jarvis setup hands`, `/jarvis hands on`, restarting either helper, and the hands tool's `on` are refused;
+- home control (`/jarvis home` and its tool) runs nothing: no one-shot command and no setup window.
 
-Every command Claude runs would run as administrator too. Start Claude Code from a normal window, not with "Run as administrator". Every part of Jarvis that starts a program checks this first (the voice helper, the hand helper and their setups), and new ones (such as the home helper) must too.
+Every command Claude runs would run as administrator too. Start Claude Code from a normal window, not with "Run as administrator". Every part of Jarvis that starts a program checks this first (the voice helper, the hand helper, their setups, and home control's one-shot command and setup window), and new ones must too.
 
 The check fails closed. If `whoami`, `reg` or `id` fails (or neither `/usr/bin/id` nor `/bin/id` can run), gives an answer Jarvis can't read, or takes longer than 5 seconds (a cold start under a virus scan, say), Jarvis stays off the same way. The HUD, `/jarvis` and `/jarvis pc` say the check failed and why. `/jarvis restart` runs the check again, and starts the voice helper (and the hand helper, when hand control is on) once it passes.
 

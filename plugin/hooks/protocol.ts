@@ -138,6 +138,21 @@ export type ConfigCommand = {
   wakeThreshold?: number
 }
 export type TestVoiceCommand = { text?: string }
+/** Home control: the `home_control` tool's request, plus `confirmed` (set by the mod only). */
+export type HomeAction = 'list' | 'status' | 'do' | 'info' | 'scan' | 'reload'
+export type HomeCommand = {
+  action: HomeAction
+  /** status, do: a device id, name, alias or room and name. */
+  device?: string
+  /** do: e.g. turn_on, set_volume, launch_app. */
+  command?: string
+  /** do: the command's value (a level, an app name, a colour). */
+  value?: string | number | boolean
+  /** list: only devices whose name, room or kind match. */
+  query?: string
+  /** do: the user confirmed it on screen, after a `confirm` answer. */
+  confirmed?: boolean
+}
 type Empty = Record<string, never>
 
 export type CommandBodies = {
@@ -150,6 +165,7 @@ export type CommandBodies = {
   desktop: DesktopCommand
   test_voice: TestVoiceCommand
   shutdown: Empty
+  home: HomeCommand
 }
 
 export type CommandName = keyof CommandBodies
@@ -179,6 +195,29 @@ export type StatusResponse = {
   /** Echo cancelling of what the listener hears: loading at start; unavailable if it failed to load or broke. */
   echoCancel?: EchoCancelState
 }
+
+export type HomeResult = 'done' | 'failed' | 'confirm'
+
+/** The home command's answer (its fields of CommandResponse). */
+export type HomeResponse = {
+  ok: true
+  result: HomeResult
+  /** Why it did not simply succeed: not_found, ambiguous, unsupported, unreachable, ... ; ok or confirm otherwise. */
+  code: string
+  /** Plain words for Claude (and the user); never a secret. */
+  text: string
+  /** confirm: the question to ask on screen. */
+  prompt?: string
+  tier?: 'screen'
+  device?: { id: string; name: string }
+  count?: number
+  devicesFile?: string
+  credentialsFile?: string
+}
+
+/** schema.json's maxLength on HomeCommand.value and .device. */
+export const HOME_VALUE_MAX = 500
+export const HOME_DEVICE_MAX = 200
 
 /** schema.json's maxLength on SpeakCommand.text. */
 export const SPEAK_TEXT_MAX = 4000

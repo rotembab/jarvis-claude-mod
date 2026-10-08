@@ -16,8 +16,9 @@ plugin/                           the plugin, the only folder that ships
   protocol/schema.json            voice helper <-> mod messages (authoritative)
   protocol/hands.schema.json      hand helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
+    src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard, network scan
   hands/                          the hand helper: Python package jarvis_hands (its own uv project and venv)
-docs/                             the specs, the plan and this file
+docs/                             the specs, the plan, the home-control guide (HOME.md) and this file
 ```
 
 ## Prerequisites
@@ -90,6 +91,8 @@ uv run --locked --project plugin\voice pytest -q plugin\voice\tests
 ```
 
 This creates `plugin\voice\.venv` (ignored by git). The tests need no microphone, speakers, GPU or network: audio, push-to-talk, speech-to-text and Fish Audio are faked, the Fish fake being a local WebSocket server (`tests\fish_fake.py`). The hands-free tests drive the listener with fakes too, and Silero VAD (shipped inside faster-whisper) on synthetic speech in `tests\data`. Two tests run the real "Hey Jarvis" model and are skipped unless `JARVIS_WAKE_MODELS_DIR` names a folder for it (they download it there, about 3.7 MB, when it is missing); CI sets it. Three more run the plain "Jarvis" model beside it, only when `jarvis_v2.onnx` is already in that folder: the tests never download it, so CI skips them. `tests\test_integration.py` starts `python -m jarvis_voice run` as a subprocess in fake mode and drives it over HTTP the way the mod does. The named-mutex test runs on Windows only.
+
+The home-control tests (`tests\test_home_*.py`) use fake drivers (`tests\home_fakes.py`) and fake devices served on 127.0.0.1, so they need no Apple TV, TV or Tuya device either. The DPAPI test runs on Windows only.
 
 `--locked` fails if `uv.lock` no longer matches `pyproject.toml`. After changing dependencies, run `uv lock --project plugin\voice` and commit the new `uv.lock`; `/jarvis setup` installs from it.
 
@@ -236,6 +239,52 @@ Two more commands help while tuning:
 ```
 
 The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. The names are the ones the gesture engine works from: `hover` (pointing, or a relaxed hand), `palm`, `pinch` (thumb and index), `pinch_middle` (thumb and middle), `fist` and `two` (index and middle up: scroll). `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
+
+## Home control
+
+The helper answers the `home` command (`list`, `status`, `do`, `info`, `scan`, `reload`); the mod registers it as the model tool `home_control` and handles on-screen confirmations. User-facing steps are in [HOME.md](HOME.md).
+
+```text
+plugin/voice/src/jarvis_voice/home/
+  model.py         devices, commands (CommandSpec), tiers, value parsing, command synonyms
+  store.py         devices.json and credentials.dat (DPAPI on Windows), shared by the helper and the setup window
+  service.py       HomeService: finds the device, checks the tier, runs the driver with a lock and a time limit
+  base.py          the Driver interface and the registries (DRIVERS, WIZARD_STEPS)
+  runner.py        one asyncio loop thread for the async libraries (pyatv)
+  net.py           plain HTTP without a proxy, Wake-on-LAN
+  wizard.py        the setup console (`/jarvis home setup`), run in a window of its own
+  commandline.py   `jarvis_voice home ...` without the helper
+  scan.py          the read-only network scan (mDNS, SSDP, Tuya broadcasts and discovery request, brand UDP
+                   discovery): `home scan` and the setup window's "Find smart devices on my network"
+  links.py         links that open inside an app on a TV (Kick channels): parse_link, LINK_APPS
+  appletv.py, bravia.py, tuya*.py, homeassistant.py   the drivers and their setup steps
+```
+
+**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode without checking permission rules, as it does `list` and `status`.
+
+**Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
+
+**Links.** `launch_app` takes an app name or a link; `links.parse_link` tells them apart, gives every link a scheme (pyatv sends a string without one as a bundle id), and names the `LinkApp` that claims it. Add an app to `LINK_APPS` only with a primary source for its tvOS bundle id, Android TV package and the paths its apple-app-site-association claims. The Apple TV sends the link (Companion `_urlS`) after checking the app is installed, and says "asked": tvOS can refuse a launch without an error (pyatv #2868). The Sony opens the app from its own list, since Sony's documented `setActiveApp` takes only that list's uri, and says it can't open the link inside. It finds the app by its package's uri, else by a title that is the app's name or starts with it as whole words, and names the title it opened; never `_best`'s looser match, which takes "Nick" or "Kickboxing Coach" for Kick. Never send it a `localapp://webappruntime` uri or an undocumented field. Sony typing is `setTextForm` version 1.0 with a plain string, sent once.
+
+**Adding a driver.** Subclass `base.Driver` (`commands` reads saved data only, never the network; `run` and `status` finish within `DriverContext.call_timeout`), add it to `DRIVERS`, and add its setup step to `WIZARD_STEPS`. Use the canonical command names in `model.COMMAND_SYNONYMS` so "switch on" and "turn on" mean the same everywhere. Never poll a device in the background: a request to an Apple TV wakes it and, over HDMI-CEC, the TV.
+
+**Buttons.** The `button` kind is a device that moves a switch it cannot see, such as a Tuya Fingerbot on a wall switch. Its commands come from the mode setup saved (`settings["button_mode"]`, from the cloud's `mode` status): in switch mode `turn_on`, `turn_off` and `toggle`, which write the switch DP's absolute value and skip the write when it is already there; in click mode, or when Tuya did not say, `press` (`push`, `click` and `tap` are synonyms), which writes the opposite of the value it reads (true when it reads none, and then the reply says the arm may not have moved); in program mode nothing. In switch mode, `settings["switch_inverted"]` (a setting, not a secret; setup asks it in the app's terms on every import in switch mode, the saved answer as the default, and carries it unchanged through imports in other modes) means what the button switches is on while the switch DP is false: `turn_on` writes `not inverted`, `turn_off` writes `inverted`, and the already-there check and the status compare through it, so a cloud replay writes the same absolute value. Every command reads first and refuses with `needs_setup` when the live mode differs from the one it needs. When that read fails or carries no mode (many hubs never pass on a Bluetooth device's state), the live mode is None and the saved mode decides, so a mode changed in the app is caught only when the hub reports it, and otherwise at the next refresh. A button's command goes through `_Link.send_once`: one tinytuya `nowait` frame on a persistent hub session, then receive-only reads for the device's echo; never `getresponse=True`, which resends after a silent timeout. An unconfirmed switch command fails with `unconfirmed`, which the cloud fallback may replay (an absolute value); an unconfirmed press fails with `unconfirmed_press`, which nothing replays. A button's status says on or off only when setup saved switch mode, the only time it asked `switch_inverted`; live switch mode with another saved mode says so, with no on or off, and asks for a refresh. Setup saves what the button presses as an alias, so "bedroom light" finds it; an alias that is or ends in a light's or a fan's word adds that kind's words (`service._spoken_kinds`), and replies drop the alias's leading "the" and trailing "switch" (`tuya_dps.presses`). A sub-device's parent is any device in `tuya_dps.HUB_CATEGORIES` or without `sub`, never chosen by `sub` alone, because Tuya lists many hubs as `sub`; a button whose key matches no hub goes to the account's only hub, and setup says so. A button saved earlier that setup now leaves out is offered for removal only when it cannot work as saved (`_works_as_saved`: saved as another kind, before Jarvis knew buttons; no parent, address or cloud route; or now `BLUETOOTH_ONLY`), rather than kept as if it worked; one left out for a reason that leaves its saved route intact (`NO_SWITCH_POINT`, `SEVERAL_HUBS`) is kept untouched, and setup says so. The setup tip that suggests the cloud fallback for a hub that drops commands is shown for switch mode only, as nothing replays a press. `tests/test_home_tuya_wire.py` pins the tinytuya behaviour this relies on against a loopback hub.
+
+**Tuya's cloud fallback** is opt-in: the choice is `cloud_fallback` in the `tuya:cloud` credential, next to the link and not in `devices.json`. A missing flag means off, and with it off the local path and its timing are unchanged. With it on, `_with_cloud` runs a command locally on the run budget less `CLOUD_SLICE_S`, and after a failure in `FALLBACK_ERRORS` replays the same handler on a `_CloudLink`, which reads and writes DP numbers the way `_Link` does. The replay is idempotent: it starts from what the local attempt read (nothing, once it wrote), and every write is an absolute value, so a toggle is never flipped twice; a click-mode press that went out unconfirmed is never replayed (`unconfirmed_press` is not in `FALLBACK_ERRORS`). It never follows a refused value (903) or an unsupported command. A reply through the cloud says "through Tuya's cloud" only when the cloud link sent something, or for a status; a command that sent nothing (a button already there) does not mention it. In the helper, every cloud call (the command fallback and scenes) goes through `tuya._CLOUD`, one session with one lock, which pauses those calls for `CLOUD_PAUSE_S` (60 s) after Tuya limits requests or reports a system error. A call that waits for the lock past its time is never sent (`_Late.started` is false), and only one that started is answered "may still change" ("may still run" for a scene). The newer tokens (by `token_info["t"]`) win: the session keeps its own over older saved ones and saves them again, and the refresh reads the saved link again just before saving. The setup window is a separate process: its link (`LoginControl`) and refresh (`_import`) use their own client and do not see the helper's pause. Never log a cloud reply (a device's details carry its local key), a token, or an SDK or requests exception's text (the token refresh puts the refresh token in its URL): only the Tuya id, local or cloud, error codes and exception type names.
+
+**Adding a driver for something the scan finds.** `scan.py` sorts what answered into statuses. A brand Jarvis has no driver for is a `could_add` entry in `_branded`. Once its driver exists (above), move the brand into a rule of its own in `_classify_host`'s list, before `_branded`, the way `_bravia`, `_home_assistant` and `_apple` work: match the device (its address, or an id it advertises) against your driver's saved records, and return `set_up` with the Jarvis name, or `_not_set_up` with how to add it. The scan stays read-only: queries, an HTTP GET of the description a device pointed to on its own address, and a lookup of the Home Assistant host name saved in home setup, but no pairing, sign-in, writes or other connections. Addresses, MACs and ids stay inside `scan.py` (`Sighting.host` and `Sighting.props`, which its repr leaves out): a `ScanEntry` never carries one, and `clean_name` strips the MACs, ids and serials it recognizes from names. Within a minute of a scan, `scan()` matches what that scan heard against the current config instead of searching again; the limit lives in the process, so the setup window's first search and every one-shot `home call` search afresh. Add a classifier test with recorded TXT or SSDP answers to `tests\test_home_scan.py`.
+
+Try it from a PowerShell window, using your real data folder or a scratch one:
+
+```powershell
+$py = "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe"
+& $py -m jarvis_voice home setup                      # the setup console, in this window
+& $py -m jarvis_voice home --data-dir "$env:TEMP\jh" setup   # the same, on a scratch folder
+& $py -m jarvis_voice home list
+& $py -m jarvis_voice home status "Sony TV"
+& $py -m jarvis_voice home do "Sony TV" set_volume 20  # asks y/n first for a confirm-tier command
+& $py -m jarvis_voice home scan                       # the network scan, about ten seconds
+```
 
 ## Logs
 
