@@ -15,6 +15,7 @@ Claude sees your devices through a tool called `home_control`, finds the one you
   - [Apple TV](#apple-tv)
   - [Sony Bravia TV](#sony-bravia-tv)
   - [Tuya Smart and Smart Life](#tuya-smart-and-smart-life)
+    - [Devices in a brand app (MOES and others)](#devices-in-a-brand-app-moes-and-others)
     - [Fingerbots and other button pushers](#fingerbots-and-other-button-pushers)
     - [Tuya's cloud fallback](#tuyas-cloud-fallback)
   - [Home Assistant](#home-assistant)
@@ -73,14 +74,14 @@ Some budget models (BRAVIA 2 II and some BRAVIA 3) list only **Simple IP control
 
 ### Tuya Smart and Smart Life
 
-Jarvis controls Tuya devices directly on your network with each device's *local key*. A short, one-time link with your Tuya account fetches those keys. It works with the Tuya Smart app and with the Smart Life app. You don't need a Tuya developer account.
+Jarvis controls Tuya devices directly on your network with each device's *local key*. A short, one-time link with your Tuya account fetches those keys. It works with the Smart Life app and with the Tuya Smart app, and only with those two. If your devices are in a brand's own app, such as MOES, Lidl Home or Gosund, [move them to Smart Life first](#devices-in-a-brand-app-moes-and-others). You don't need a Tuya developer account.
 
 Use the same app, the one your devices are in, for every step. Tuya Smart and Smart Life have separate accounts, so a User Code from one app doesn't work with a scan from the other.
 
 1. Check that your devices are added and working in the app.
 2. In the app, open **Me**, tap the gear (top right), then **Account and Security**. Your **User Code** is at the bottom. Note it exactly: it is case-sensitive.
 3. In the setup window, choose **Link Tuya devices (Tuya Smart or Smart Life)**, then **Link your Tuya account** if it asks, and type the User Code.
-4. A QR code appears in the window and as an image. In the same app, go to the **Home** tab and tap **+** (top right), then **Scan**. Scan the code, then tap **Confirm login** on the phone. Use the app's scanner, not the phone's camera, and do it straight away: the code is valid only briefly. **The phone may say the login is for Home Assistant.** That is expected: Jarvis signs in the same way Home Assistant's Tuya integration does. If the code expires or the phone refuses the login, Jarvis says so and offers a new code.
+4. A QR code appears in the window and as an image. In the same app, go to the **Home** tab and tap **+** (top right), then **Scan**. Scan the code, then tap **Confirm login** on the phone. Use the app's scanner, not the phone's camera, and do it straight away: the code is valid only briefly. **The phone may say the login is for Home Assistant.** That is expected: Jarvis signs in the same way Home Assistant's Tuya integration does. Then come back to the setup window (on Windows the QR image may cover it). Jarvis notices the login by itself within a few seconds, and says every 30 seconds that it is still waiting. If the code expires, or 3 minutes pass without a login, Jarvis says what usually causes that and offers a new code.
 5. Jarvis asks whether to also use Tuya's cloud when a device doesn't answer on your home network. Pressing Enter means no; see [Tuya's cloud fallback](#tuyas-cloud-fallback).
 6. Jarvis lists your devices and finds each one on your network. For a switch or plug with several buttons ("gangs"), each becomes its own device; name them when asked. For a Fingerbot, it asks what the Fingerbot presses, and in switch mode which way round it is ([below](#fingerbots-and-other-button-pushers)). Devices that are off, or run on batteries, may not be found. Jarvis keeps them anyway and looks again when you use them.
 
@@ -96,6 +97,18 @@ The **Link Tuya devices** step also has:
 - **Reverse a curtain's position**: if a curtain moves the wrong way when Jarvis sets its position.
 
 The link uses Home Assistant's Tuya sign-in. Tuya has not published it for other apps, so it could stop working one day. Your devices keep working locally even then, because Jarvis already has their keys; only scenes, refreshing and the cloud fallback need the link.
+
+#### Devices in a brand app (MOES and others)
+
+Many brands sell Tuya devices with an app of their own: MOES, Lidl Home, LSC Smart Connect, Gosund, Nedis, Konyks and more. The link works only with Smart Life and Tuya Smart. Tuya keeps each brand app's accounts separate, so a code scanned with a brand app never signs in (the phone often says "Please use the designated APP to scan the code to log in", sometimes only after you tap **Confirm login**). A device belongs to one account at a time, so move your devices to Smart Life:
+
+1. In the brand app, remove each device. For a Fingerbot behind a hub, remove the Fingerbot first, then the hub. If the app offers **Disconnect and wipe data**, pick it.
+2. Install Smart Life and sign up, choosing the same country or region as in the brand app.
+3. Add the hub first, then the Fingerbot through the hub, then your other devices.
+4. Set each Fingerbot's mode again (switch mode, for example): a reset can clear it.
+5. In the setup window, link your Tuya account with the User Code from Smart Life.
+
+Scenes and automations from the brand app don't move: make them again in Smart Life. Fingerbots from MOES officially work with Smart Life and Tuya Smart.
 
 #### Fingerbots and other button pushers
 
@@ -266,8 +279,9 @@ To remove a device, use **Rename a device, set its room, or remove it** in the s
 | Sony setup says the TV "refused the connection" | Check that IP control and **Control remotely** are on (see the [Sony Bravia TV](#sony-bravia-tv) steps). If IP control lists only **Simple IP control** and **Control4**, Jarvis can't control this model. |
 | The Sony TV "has no on-screen keyboard open" | Select the app's search box with the remote first. If it is selected, the app uses a keyboard of its own, which Jarvis can't type into: type with the remote. |
 | The Apple TV says pairing failed | See the [Apple TV](#apple-tv) steps: allow access, restart it, and pair again. |
-| The phone says "Please use the designated APP to scan the code to log in" | Scan with the same app you took the User Code from: Tuya Smart and Smart Life have separate accounts. Only those two apps work; if your devices are in another brand's app, move them to Tuya Smart or Smart Life. Jarvis offers a new QR code to scan. If you already used the same app, Tuya may be having trouble on its side: try again later. |
-| The QR code expired | Say yes when Jarvis offers a new code, and scan it straight away: a code is valid only briefly. If the wait ran out, choose **Link your Tuya account** again. |
+| The phone says "Please use the designated APP to scan the code to log in" | Only Smart Life and Tuya Smart work. If your devices are in a brand's app such as MOES, [move them to Smart Life](#devices-in-a-brand-app-moes-and-others) first. Otherwise, scan with the same app you took the User Code from: Tuya Smart and Smart Life have separate accounts. If you did, try the other of the two apps: since 2026 Tuya has sometimes accepted only one of them. Tuya doesn't tell Jarvis the phone refused, so Jarvis keeps waiting until the code expires or the wait ends, then offers a new code. |
+| Setup keeps waiting after you confirmed on the phone | Jarvis notices a confirmed login within a few seconds, so if it still waits, Tuya didn't accept the login. The causes are the same as for "designated APP" above: a brand app such as MOES, a User Code from the other app, or Tuya accepting only one of the two apps for now. When the wait ends, Jarvis shows Tuya's last answer (such as `E0020003`), and `%USERPROFILE%\.jarvis\logs\voice.log` keeps it: include it if you report the problem. |
+| The QR code expired | Say yes when Jarvis offers a new code, and scan it straight away: a code is valid only briefly. |
 | "The Tuya link has expired", or Tuya's cloud keeps turning Jarvis's sign-in away | In the setup window, choose **Link Tuya devices (Tuya Smart or Smart Life)**, then **Link your Tuya account**, and scan a new code. |
 | A Tuya device stopped answering after you re-paired it in the app | Its key changed. Use **Refresh devices and scenes from your Tuya account** in the setup window. |
 | A Fingerbot is "Not added" because it is a Bluetooth device | It needs a Tuya Bluetooth or multi-mode gateway. Add one in the Tuya Smart or Smart Life app, pair the Fingerbot to it, then choose **Refresh devices and scenes**. See [Fingerbots](#fingerbots-and-other-button-pushers). |
