@@ -46,6 +46,8 @@ export type EnvSnapshot = {
   HOME?: string
   NO_PROXY?: string
   CLAUDE_CODE_REMOTE?: string
+  /** Windows only: its own folder, for running System32 programs by full path. */
+  SystemRoot?: string
 }
 
 export type Engine = {
@@ -62,6 +64,10 @@ export type Engine = {
   run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult>
   exists: (path: string) => Promise<boolean>
   writeFile: (path: string, text: string) => Promise<void>
+  /** A file's text, or null when it cannot be read (missing, too big, or refused): the guard reads a script it is about to run. */
+  readFileText: (path: string) => Promise<string | null>
+  /** Where a path lands, every link and `..` folded, or null when it cannot be placed: the guard resolves an 8.3 short name before judging a Write. */
+  realPath: (path: string) => Promise<string | null>
 
   storeGet: (key: string) => Promise<unknown>
   storeSet: (key: string, value: unknown) => Promise<void>
@@ -94,16 +100,12 @@ export type Engine = {
    * dismissed, and in a `-p` run (nobody to ask).
    */
   ask: (question: string, options: readonly string[] | AskOptions) => Promise<string>
-  /**
-   * The session's permission decision for a call of `tool` now (its rules and
-   * mode): nothing runs, no dialog opens. A tool the mod answers itself never
-   * meets these rules otherwise.
-   */
-  checkTool: (tool: string, input: Record<string, unknown>) => Promise<ToolVerdict>
 
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>
   abortTurn: (turnId: string) => Promise<void>
+  /** Stops a background task (a backgrounded command or a monitor) through the TaskStop tool. */
+  stopTask: (taskId: string) => Promise<unknown>
   /** One completion through the session's own client and credentials. */
   complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
   /** The main conversation's messages (the newest 4096). */

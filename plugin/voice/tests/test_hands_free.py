@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -93,13 +94,16 @@ def test_a_follow_up_needs_no_wake_word(hf: tuple[Rig, ScriptedWake]) -> None:
     ready_with_wake(rig)
     mark = rig.sink.mark()
     rig.command("speak", {"replyId": "r1", "seq": 0, "text": "The lights are on, sir.", "final": True})
-    rig.sink.wait_type("speech_done", after=mark, interrupted=False)
+    done = rig.sink.wait_type("speech_done", after=mark, interrupted=False)
     rig.sink.wait_type("state", after=mark, state="awake")
+    time.sleep(0.5)  # the user answers a moment after Jarvis finished
     rig.capture.push(tone(1.0))
     rig.sink.wait_type("state", after=mark, state="listening")
     rig.capture.push(hush(0.9))
     utterance = rig.sink.wait_type("utterance", after=mark)
     assert utterance["source"] == "wake"
+    # The answer began after Jarvis's reply ended, and did not cut him off.
+    assert utterance["startedAtMs"] >= done["endedAtMs"] and utterance["overSpeech"] is False
 
 
 def test_the_test_line_opens_no_follow_up(hf: tuple[Rig, ScriptedWake]) -> None:
@@ -124,10 +128,13 @@ def test_talking_over_jarvis_stops_him_and_is_heard(sink: RecordingSink) -> None
         rig.capture.push(tone(0.4))
         barge = sink.wait_type("barge_in", after=mark)
         assert barge["replyId"] == "r9"
-        sink.wait_type("speech_done", after=mark, interrupted=True)
+        done = sink.wait_type("speech_done", after=mark, interrupted=True)
         sink.wait_type("state", after=mark, state="listening")
         rig.capture.push(hush(0.9))
-        assert sink.wait_type("utterance", after=mark)["text"] == "No, the other one."
+        utterance = sink.wait_type("utterance", after=mark)
+        assert utterance["text"] == "No, the other one."
+        # This clip is the one that cut Jarvis off, and it began before his reply ended.
+        assert utterance["overSpeech"] is True and utterance["startedAtMs"] <= done["endedAtMs"]
     finally:
         rig.daemon.request_exit(0)
         assert rig.thread is not None

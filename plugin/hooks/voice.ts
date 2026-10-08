@@ -35,6 +35,16 @@ export type VoiceOptions = {
   onSubmitted?: (text: string) => void
   /** Picks the model for each step of a voice turn. */
   router?: ModelRouter
+  /** "Stand down": stops speech, the running turn and the commands Jarvis saw start (pc.ts). */
+  onStandDown?: () => Promise<unknown>
+  /** True while an on-screen question waits for a click: a spoken yes or no then counts for nothing. */
+  isAwaitingClick?: () => boolean
+  /**
+   * Told of every utterance with words, before anything else is done with it:
+   * whether they go on as a prompt (a stop, a stand down, or an answer dropped
+   * while a question waits on screen do not).
+   */
+  onWords?: (text: string, isSubmitted: boolean) => void
 }
 
 /** The note a voice prompt carries (classic UserPromptSubmit additionalContext). */
@@ -70,6 +80,9 @@ export function personaText(platform: Platform): string {
 
 const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim()
 
+/** A reply id no earlier reply had, across reloads too. */
+const freshId = (): string => Array.from(crypto.getRandomValues(new Uint8Array(8)), byte => byte.toString(16).padStart(2, '0')).join('')
+
 /** Said on its own, these just stop Jarvis: no prompt is sent. */
 const STOP_PHRASES: ReadonlySet<string> = new Set([
   'stop',
@@ -89,19 +102,87 @@ const STOP_PHRASES: ReadonlySet<string> = new Set([
   'hush',
 ])
 
-/** True when the words are only a request to stop ("Jarvis, stop.", "Never mind, thanks."). */
-export function isStopPhrase(text: string): boolean {
+/**
+ * A short spoken phrase as plain words: lower case, no punctuation, without
+ * the words around it ("Hey Jarvis, ...", "..., please", "..., thank you").
+ * Its last word always stays, so "Okay." is still "okay". Words in any script
+ * stay words ("OK, не надо" is three), and so do numbers.
+ */
+export function phraseWords(text: string): string {
   const words = text
     .toLowerCase()
     .replace(/[’']/g, '')
-    .replace(/[^a-z\s]/g, ' ')
+    .replace(/[^\p{L}\p{M}\p{N}\s]/gu, ' ')
     .split(/\s+/)
     .filter(word => word !== '')
-  while (words.length > 0 && ['hey', 'ok', 'okay', 'jarvis'].includes(words[0] ?? '')) words.shift()
-  while (words.length > 0 && ['jarvis', 'please', 'thanks', 'now'].includes(words[words.length - 1] ?? '')) words.pop()
-  if (words.length > 1 && words[words.length - 2] === 'thank' && words[words.length - 1] === 'you') words.splice(-2)
-  return STOP_PHRASES.has(words.join(' '))
+  for (;;) {
+    if (words.length > 2 && words[words.length - 2] === 'thank' && words[words.length - 1] === 'you') words.splice(-2)
+    else if (words.length > 1 && ['jarvis', 'please', 'thanks', 'now'].includes(words[words.length - 1] ?? '')) words.pop()
+    else break
+  }
+  while (words.length > 1 && ['hey', 'ok', 'okay', 'jarvis'].includes(words[0] ?? '')) words.shift()
+  return words.join(' ')
 }
+
+/** True when the words are only a request to stop ("Jarvis, stop.", "Never mind, thanks."). */
+export function isStopPhrase(text: string): boolean {
+  return STOP_PHRASES.has(phraseWords(text))
+}
+
+/** Said on its own, these stand Jarvis down: speech, the running turn and the commands he saw start all stop. */
+const STAND_DOWN_PHRASES: ReadonlySet<string> = new Set(['stand down', 'abort', 'abort that', 'abort it'])
+
+/** True for "Jarvis, stand down." and "Abort that." ("stand down" is also a stop phrase, for a voice without PC control). */
+export function isStandDownPhrase(text: string): boolean {
+  return STAND_DOWN_PHRASES.has(phraseWords(text))
+}
+
+/** A spoken OK, said on its own: what lets Jarvis run a command he held for it. */
+const YES_PHRASES: ReadonlySet<string> = new Set([
+  'yes',
+  'yeah',
+  'yep',
+  'yes please',
+  'go ahead',
+  'go for it',
+  'do it',
+  'proceed',
+  'confirm',
+  'confirmed',
+  'affirmative',
+  'sure',
+  'ok',
+  'okay',
+])
+
+/** A letter of any script but Latin. */
+const NON_LATIN_LETTER = /(?!\p{Script=Latin})\p{L}/u
+
+/**
+ * True when the text holds a letter outside the Latin script: a yes then
+ * never counts, whatever else is said ("OK, не надо" is "OK, don't").
+ */
+export function hasNonLatinLetters(text: string): boolean {
+  return NON_LATIN_LETTER.test(text)
+}
+
+/**
+ * True when the words are only a yes ("Yes.", "Go ahead, Jarvis."); "Yes, and
+ * delete dist too" is not, nor is a yes beside words in another script.
+ */
+export function isYesPhrase(text: string): boolean {
+  return !hasNonLatinLetters(text) && YES_PHRASES.has(phraseWords(text))
+}
+
+const NO_PHRASES: ReadonlySet<string> = new Set(['no', 'nope', 'nah', 'no thanks', 'dont', 'dont do it', 'do not', 'negative'])
+
+/** True when the words are only a no ("No.", "Don't do it."). */
+export function isNoPhrase(text: string): boolean {
+  return NO_PHRASES.has(phraseWords(text))
+}
+
+/** Said when a spoken answer comes while an on-screen question waits. */
+const CLICK_NEEDED = 'I need a click on screen for that one, sir.'
 
 /** One spoken reply: sentences of one voice turn, numbered for the helper. */
 export class VoiceReply {
@@ -172,8 +253,29 @@ export class VoiceReply {
   }
 }
 
-type PendingPrompt = { key: string; hasNote: boolean }
-type VoiceTurn = { turnId: string; reply: VoiceReply; needsTurnSection: boolean }
+/**
+ * How a voice turn's plain yes answers the question Jarvis asked aloud:
+ * - `yes`: begun after Jarvis finished speaking the question, which played out;
+ * - `yes_while_talking`: it cut Jarvis off (a TV, perhaps, or his own voice);
+ * - `yes_too_soon`: begun before he finished, or the question did not play out;
+ * - `yes_untimed`: the helper did not say when (an older helper).
+ * Only `yes` counts.
+ */
+export type VoiceConsent = 'yes' | 'yes_while_talking' | 'yes_too_soon' | 'yes_untimed'
+
+/**
+ * When a spoken prompt's words began, on the clock of the helper that heard
+ * them (`epoch` counts helpers: each one's clock is its own), and whether they
+ * cut Jarvis off.
+ */
+type Heard = { startedAtMs: number | undefined; isOverSpeech: boolean; epoch: number }
+type PendingPrompt = { key: string; hasNote: boolean; heard: Heard }
+/** `yes`: the turn's words were only a yes, and how they were heard. */
+type VoiceTurn = { turnId: string; reply: VoiceReply; needsTurnSection: boolean; yes?: Heard }
+/** How a reply's speech ended: when (on the clock of helper `epoch`), and whether it was cut short. */
+type ReplyEnd = { endedAtMs: number | undefined; isInterrupted: boolean; epoch: number }
+/** How many replies' ends are remembered: the one a held question was in is recent. */
+const REPLY_ENDS_MAX = 16
 
 /** What an interrupt did: whether it aborted the voice turn, and what the helper said to `stop`. */
 export type InterruptResult = {
@@ -186,10 +288,18 @@ export class Voice {
   /** Voice prompts submitted and not yet started, oldest first. */
   private pending: PendingPrompt[] = []
   private runningTurnId: string | undefined
+  /** The latest main-loop turn to start, and the one before it (typed or spoken). */
+  private lastTurnId: string | undefined
+  private turnBefore: string | undefined
   private turn: VoiceTurn | undefined
   private speakingReplyId: string | undefined
   /** Sticky once voice is in use, so the system prompt stays the same afterwards. */
   private isPersonaOn = false
+  /** The latest replies' ends (speech_done), by reply id, oldest first. */
+  private readonly replyEnds = new Map<string, ReplyEnd>()
+  /** Which helper is running: one more for each hello. */
+  private helperEpoch = 0
+  private sayCount = 0
 
   constructor(
     private readonly engine: Engine,
@@ -204,6 +314,60 @@ export class Voice {
     return this.runningTurnId !== undefined
   }
 
+  /** The running turn's id, typed or spoken. */
+  get runningTurn(): string | undefined {
+    return this.runningTurnId
+  }
+
+  /** The main-loop turn that started just before the latest one, typed or spoken. */
+  get previousTurn(): string | undefined {
+    return this.turnBefore
+  }
+
+  /**
+   * How the running voice turn's words answer the question Jarvis spoke in
+   * reply `replyId`: undefined unless they were only a yes; `yes` only when
+   * the user began saying it after that question had played out in full
+   * (by the helper's own clock), and not over Jarvis's voice. Push-to-talk is
+   * a deliberate key press, which a TV cannot make, so it is never taken for
+   * speech over Jarvis.
+   */
+  consentTo(replyId: string): VoiceConsent | undefined {
+    const yes = this.turn?.yes
+    if (yes === undefined) return undefined
+    if (yes.isOverSpeech) return 'yes_while_talking'
+    const end = this.replyEnds.get(replyId)
+    if (yes.startedAtMs === undefined || end?.endedAtMs === undefined || end.epoch !== yes.epoch) return 'yes_untimed'
+    if (end.isInterrupted || yes.startedAtMs < end.endedAtMs) return 'yes_too_soon'
+    return 'yes'
+  }
+
+  /**
+   * Speaks a line of Jarvis's own (a notice, a timer). Inside a voice turn it
+   * is a line of that turn's reply: a second reply queued mid-turn would make
+   * the helper close the turn's reply early. Otherwise it is a reply of its
+   * own (not a `test-` one, so the helper listens for an answer after it).
+   */
+  say(text: string): void {
+    const turn = this.turn
+    if (turn !== undefined && !turn.reply.cancelled) {
+      this.sayIn(turn.reply, text)
+      return
+    }
+    const body = { replyId: `jarvis-say-${freshId()}`, seq: 0, text: text.slice(0, SPEAK_TEXT_MAX), final: true }
+    void this.options.helper.send('speak', body).then(outcome => {
+      if (!outcome.ok) this.engine.debug(`jarvis: "${text}" not spoken: ${outcome.message}`)
+    })
+  }
+
+  /** A line of Jarvis's own, on a line of its own in `reply`. */
+  private sayIn(reply: VoiceReply, text: string): void {
+    this.sayCount += 1
+    reply.endLine()
+    reply.feed(text, `jarvis:say:${this.sayCount}`)
+    reply.endLine()
+  }
+
   /** Turns the persona section on for the rest of the session. */
   enablePersona(): void {
     this.isPersonaOn = true
@@ -212,6 +376,7 @@ export class Voice {
   onHelperEvent(event: HelperEvent): void {
     switch (event.type) {
       case 'hello':
+        this.helperEpoch += 1
         this.enablePersona()
         return
       case 'utterance':
@@ -222,8 +387,15 @@ export class Voice {
         return
       case 'speech_done':
         if (this.speakingReplyId === event.replyId) this.speakingReplyId = undefined
+        this.replyEnds.delete(event.replyId)
+        this.replyEnds.set(event.replyId, { endedAtMs: event.endedAtMs, isInterrupted: event.interrupted, epoch: this.helperEpoch })
+        for (const oldest of this.replyEnds.keys()) {
+          if (this.replyEnds.size <= REPLY_ENDS_MAX) break
+          this.replyEnds.delete(oldest)
+        }
         return
       case 'barge_in':
+        // Which words cut Jarvis off is the utterance's own to say (overSpeech).
         void this.interrupt('barge_in')
         return
       default:
@@ -233,20 +405,49 @@ export class Voice {
 
   /** Submits the user's words as their own prompt; queued if a turn runs. */
   async onUtterance(event: UtteranceEvent): Promise<void> {
+    // The helper marks the clip that cut Jarvis off (overSpeech); push-to-talk
+    // is a deliberate key press, which a TV cannot make.
+    const heard: Heard = {
+      startedAtMs: event.startedAtMs,
+      isOverSpeech: event.overSpeech === true && event.source !== 'ptt',
+      epoch: this.helperEpoch,
+    }
     const text = event.text.trim()
     if (text === '') return
+    const onWords = (isSubmitted: boolean): void => {
+      try {
+        this.options.onWords?.(text, isSubmitted)
+      } catch (error) {
+        this.engine.debug(`jarvis: onWords failed: ${describeError(error)}`)
+      }
+    }
+    const onStandDown = this.options.onStandDown
+    if (onStandDown !== undefined && isStandDownPhrase(text)) {
+      onWords(false)
+      await onStandDown().catch((error: unknown) => this.engine.debug(`jarvis: stand down failed: ${describeError(error)}`))
+      return
+    }
     if (isStopPhrase(text)) {
+      onWords(false)
       await this.interrupt('voice')
       this.engine.log(`Jarvis: stopped ("${text}")`)
       return
     }
+    if (this.options.isAwaitingClick?.() === true && (isYesPhrase(text) || isNoPhrase(text))) {
+      // An on-screen question is open: a voice could be a TV's, so only a click answers it.
+      onWords(false)
+      this.engine.log(`Jarvis: "${text}" was not sent: the question on screen needs a click.`)
+      this.say(CLICK_NEEDED)
+      return
+    }
+    onWords(true)
     this.enablePersona()
     // Speaking over Jarvis means "stop and listen to me", not "queue this".
     const turn = this.turn
     if (turn !== undefined && turn.turnId === this.runningTurnId && this.speakingReplyId === turn.reply.replyId) {
       await this.interrupt('barge_in')
     }
-    const entry: PendingPrompt = { key: normalize(text), hasNote: false }
+    const entry: PendingPrompt = { key: normalize(text), hasNote: false, heard }
     this.pending = [...this.pending, entry].slice(-5)
     this.options.onSubmitted?.(text)
     // The model judgement runs while the engine sets the turn up.
@@ -310,6 +511,8 @@ export class Voice {
 
   onTurnStart(e: TurnStartInput): void {
     this.runningTurnId = e.turnId
+    this.turnBefore = this.lastTurnId
+    this.lastTurnId = e.turnId
     // A voice turn's text is exactly the words submitted. The mod's prompts
     // start in the order it submitted them, so this is the oldest pending
     // entry with those words, and older entries never started (refused or
@@ -324,10 +527,12 @@ export class Voice {
     const entry = this.pending[index]
     this.pending = this.pending.slice(index + 1)
     this.options.router?.onVoiceTurn(e.turnId, e.text)
+    const yes = entry !== undefined && isYesPhrase(e.text) ? entry.heard : undefined
     this.turn = {
       turnId: e.turnId,
       reply: new VoiceReply(e.turnId, this.options.helper, line => this.engine.debug(`jarvis: ${line}`)),
       needsTurnSection: entry?.hasNote !== true,
+      ...(yes === undefined ? {} : { yes }),
     }
   }
 
@@ -386,7 +591,12 @@ export class Voice {
     return await stream.result
   }
 
-  onTurnComplete(e: TurnCompleteInput): void {
+  /**
+   * turn.complete. `closingLine` is a line of Jarvis's own to speak last in
+   * the voice turn's reply (the question for a command he held), after the
+   * model's own words; it is dropped when the turn was aborted.
+   */
+  onTurnComplete(e: TurnCompleteInput, closingLine?: string): void {
     if (e.agentId !== undefined) return
     this.options.router?.onTurnComplete(e)
     const turn = this.turn
@@ -399,6 +609,7 @@ export class Voice {
           void this.options.helper.send('stop', { reason: 'turn_aborted' })
         }
       } else {
+        if (closingLine !== undefined && closingLine !== '') this.sayIn(turn.reply, closingLine)
         void turn.reply.finish()
       }
     }

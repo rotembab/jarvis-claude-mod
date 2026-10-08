@@ -59,6 +59,10 @@ export type UtteranceEvent = Envelope<'utterance'> & {
   source: UtteranceSource
   durationMs: number
   language?: string
+  /** When the user began speaking (the push-to-talk press, or where the voice began), on the helper's own millisecond clock. */
+  startedAtMs?: number
+  /** The clip began while Jarvis was audible: it cut him off. */
+  overSpeech?: boolean
 }
 
 export type SpeechStartedEvent = Envelope<'speech_started'> & { replyId: string }
@@ -67,6 +71,8 @@ export type SpeechDoneEvent = Envelope<'speech_done'> & {
   replyId: string
   interrupted: boolean
   spokenText: string
+  /** When the reply's speech ended (played out or stopped), on the helper's own millisecond clock. */
+  endedAtMs?: number
 }
 
 export type BargeInEvent = Envelope<'barge_in'> & { replyId?: string; spokenText: string }
@@ -106,6 +112,19 @@ export type HelperEventType = HelperEvent['type']
 export type SpeakCommand = { replyId: string; seq: number; text: string; final: boolean }
 export type StopCommand = { reason?: string }
 export type ListenCommand = { action: 'start' | 'stop' }
+export type DesktopAction = 'open' | 'focus' | 'media' | 'volume' | 'screenshot' | 'lock' | 'clipboard_read' | 'clipboard_write'
+/** One desktop action (the mod's desktop tool); the answer's `desktop` field is read in desktop.ts. */
+export type DesktopCommand = {
+  action: DesktopAction
+  /** open: an app's Start-menu name, an allowed link or a folder; focus: an app or a window title. 1 to 400 characters. */
+  target?: string
+  key?: 'play_pause' | 'next' | 'previous' | 'stop'
+  /** volume: 0 to 100. */
+  level?: number
+  change?: 'up' | 'down' | 'mute' | 'unmute'
+  /** clipboard_write: at most 20,000 characters. */
+  text?: string
+}
 export type ConfigCommand = {
   voiceId?: string
   pttKey?: string
@@ -143,6 +162,7 @@ export type CommandBodies = {
   listen: ListenCommand
   config: ConfigCommand
   status: Empty
+  desktop: DesktopCommand
   test_voice: TestVoiceCommand
   shutdown: Empty
   home: HomeCommand

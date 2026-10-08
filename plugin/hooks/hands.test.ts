@@ -15,8 +15,11 @@ import {
   parseKnobValue,
   PRESETS,
 } from './hands'
+// The tool's calls here run under the user's own allow rule (allowedTurn); hands-gate.test.ts has its permissions.
+import { HANDS_TOOL_ID } from './hands-gate'
 import type { Answer, FakeChild, World, WorldOptions } from './test-harness'
 import {
+  allowedTurn,
   DATA_DIR,
   HANDS_INSTALLED,
   HANDS_PORT,
@@ -142,7 +145,7 @@ describe('hand helper process', () => {
     expect(w.handsHelpers()).toHaveLength(0)
     expect(w.checked).not.toContain(HANDS_PYTHON)
     expect(w.status()).toBe(VOICE_READY)
-    expect(w.tools).toEqual(['home_control', 'hands'])
+    expect(w.tools).toEqual(['desktop', 'home_control', 'hands'])
     expect(await jarvis($, '')).toContain('/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows')
   })
 
@@ -220,6 +223,7 @@ describe('hand helper process', () => {
     w.existing.add(HANDS_PYTHON)
     await startSession($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect((await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })).result).toBe('Hand control is already on.')
     expect(w.store.has('handsEnabled')).toBe(false)
   })
@@ -989,6 +993,7 @@ describe('/jarvis hands', () => {
     first = await handsReady(w)
     expect(await jarvis($, 'hands restart')).toBe('Restarting the hand helper.')
     await w.settle()
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const toolOff = $.tool.call({ tool: 'mcp__jarvis__hands', action: 'off' })
     await w.settle()
     first.exit(0)
@@ -1306,7 +1311,8 @@ describe('the hands tool', () => {
     w.existing.add(HANDS_PYTHON)
     await startHelper($, w)
     exitOnShutdown(w)
-    expect(w.tools).toEqual(['home_control', 'hands'])
+    expect(w.tools).toEqual(['desktop', 'home_control', 'hands'])
+    await allowedTurn($, w, HANDS_TOOL_ID)
 
     const turnedOn = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })
     expect(turnedOn.result).toContain('Hand control is on. The camera starts in a moment')
@@ -1334,6 +1340,7 @@ describe('the hands tool', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const call = async (input: Record<string, unknown>): Promise<string> =>
       String((await $.tool.call({ tool: 'mcp__jarvis__hands', ...input })).result)
 
@@ -1355,6 +1362,7 @@ describe('the hands tool', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const call = async (action: string): Promise<string> =>
       String((await $.tool.call({ tool: 'mcp__jarvis__hands', action })).result)
 
@@ -1475,6 +1483,15 @@ describe('the sensitivity knobs', () => {
     if (dead === undefined) throw new Error('no dead zone knob')
     expect(parseKnobValue(dead, '0')).toEqual({ ok: true, value: 0 })
     expect(parseKnobValue(dead, '8.01')).toEqual({ ok: false, why: 'range' })
+  })
+
+  test('a very long value is answered at once, not matched in quadratic time', () => {
+    const speed = findKnob('speed')
+    if (speed === undefined) throw new Error('no speed knob')
+    // A pattern that backtracks takes seconds on this (8 s for 100,000 digits), before any permission check.
+    expect(parseKnobValue(speed, `${'9'.repeat(200_000)}x`)).toEqual({ ok: false, why: 'not_number' })
+    expect(parseKnobValue(speed, `${'1'.repeat(200_000)}.${'1'.repeat(200_000)}x`)).toEqual({ ok: false, why: 'not_number' })
+    expect(parseKnobValue(speed, `2.${'0'.repeat(200_000)}`)).toEqual({ ok: true, value: 2 })
   })
 
   test('the presets name known knobs with values in range, and balanced is every default', () => {
@@ -2041,6 +2058,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { setting: 'speed' })).toBe(
       'Cursor speed is 1 (default 1, range 0.7 to 3). Higher means a faster cursor, with less hand travel to cross the screen. Change it with /jarvis hands set speed <0.7 to 3|default>.',
     )
@@ -2061,6 +2079,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { preset: 'precise' })).toBe(
       'Preset precise: speed 0.8, smoothing 1.8, pinch 0.9, drag-distance 1.5, dead-zone 2 px (every other setting is at its default).',
     )
@@ -2103,6 +2122,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const both = await call($, { display: '2', setting: 'pinch', value: 1.1, action: 'status' })
     const parts = both.split('\n\n')
     expect(parts[0]).toBe('Hand control now reaches display 2 (EPSON Projector).')
@@ -2115,6 +2135,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     refuseConfig(w)
     expect(await call($, { setting: 'speed', value: 2.8 })).toBe(
       'The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed.',
@@ -2125,7 +2146,8 @@ describe('the hands tool: tuning', () => {
   test('it works while hand control is off: the choice waits for the start', async ($, on) => {
     const w = world(on)
     await startHelper($, w)
-    expect(w.tools).toEqual(['home_control', 'hands'])
+    expect(w.tools).toEqual(['desktop', 'home_control', 'hands'])
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { setting: 'fist', value: 0.9 })).toBe(
       'Fist sensitivity is now 0.9 (was 1; default 1, range 0.9 to 1.1); it applies when hand control starts.',
     )
@@ -2183,6 +2205,7 @@ describe('the palm hold time in the instructions', () => {
     await startHelper($, w)
     exitOnShutdown(w)
     const reply = 'Hand control is on. The camera starts in a moment; then hold an open palm toward the camera for 1.5 seconds to take the cursor. Nothing leaves this computer.'
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await jarvis($, 'hands on')).toBe(reply)
     await w.settle()
     await handsReady(w)
@@ -2195,6 +2218,7 @@ describe('the palm hold time in the instructions', () => {
     w.store.set(TUNING_KEY, held(1.5))
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     const status = await jarvis($, 'hands')
     expect(status).toContain('Hand control starts when you hold an open palm toward the camera for 1.5 seconds (/jarvis hands engage always switches).')
     expect(status).toContain('Open palm toward the camera, still for 1.5 seconds: start (the cursor follows your hand)')

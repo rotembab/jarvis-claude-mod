@@ -128,7 +128,7 @@ Jarvis can do anything Claude Code can do on your PC, so the plan is full automa
 
 | Tier | Examples on Windows | How it's handled |
 | --- | --- | --- |
-| Just do it | Open apps, media, volume, timers, lock the screen, read files, search, system info, save a screenshot for you | Allowed in settings, no prompt |
+| Just do it | Open apps, media, volume, timers, lock the screen, read files, search, system info, save a screenshot for you | Runs when your own permission rules allow the tool; otherwise Jarvis asks on screen (it never writes your settings) |
 | Do it, then tell you | Create or edit files in your projects, run scripts you've run before | Allowed for chosen folders; each action is logged in the HUD |
 | Ask by voice | Move or rename many files, install software with winget, change a setting, git push, put the PC to sleep, send the clipboard or a screenshot to Claude | Jarvis says what it's about to do and waits for "yes" or "go ahead". It ignores any "yes" heard while it is still talking. |
 | Ask on screen | Delete files, send email or messages, anything involving money, admin rights, shutdown or restart, services, scheduled tasks, registry edits | Needs a click or a typed yes, because a voice from a TV or video could say "yes" too. Admin actions also need your click on the Windows UAC prompt. |
@@ -138,7 +138,7 @@ Shutdown and restart count down 60 seconds so you can say "cancel". Windows then
 
 The tiers are enforced in two layers:
 
-- **Permission rules** in Claude Code's settings (allow, ask and deny lists) are the hard floor. Jarvis ships them for each shell, for example `PowerShell(Remove-Item *)` beside `Bash(rm *)`, and `/jarvis install-rules` merges them into your settings. It also sets `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`, because on Windows any Bash deny rule otherwise switches the PowerShell tool off.
+- **Permission rules** in Claude Code's settings (allow, ask and deny lists) are the hard floor. `/jarvis pc rules` prints deny rules for the Never tier, for each shell (for example `PowerShell(Format-Volume *)` beside `Bash(diskpart *)`), and the `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` env line (on Windows any Bash deny rule otherwise switches the PowerShell tool off), for you to paste into your settings. Jarvis never writes Claude Code's settings itself.
 - **The mod's guard** reads every PowerShell, Bash and Monitor command before it runs and sorts it into a tier. It catches tricks that text rules miss, such as shortened parameters, full program paths and nested shells. It only ever makes a decision stricter, never approves anything on its own, and blocks if it crashes.
 
 For the two Ask tiers, Jarvis asks you itself, by voice or with an on-screen button. Claude Code's own prompt is not enough, because in auto mode a classifier may answer it instead of you. Claude Code already refuses deletions of drive roots, the Windows folder and your home folder; Jarvis relies on that rather than repeating it.

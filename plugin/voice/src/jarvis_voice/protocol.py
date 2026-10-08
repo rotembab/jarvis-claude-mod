@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, fields
 from functools import lru_cache
 from pathlib import Path
@@ -249,6 +250,18 @@ class Schema:
 # --------------------------------------------------------------------------- events
 
 
+def clock_ms(seconds: float | None = None) -> int:
+    """The helper's event clock in whole milliseconds: ``time.perf_counter()``, or a reading of it.
+
+    ``utterance.startedAtMs`` and ``speech_done.endedAtMs`` are on this clock,
+    so the mod can tell whether the user began speaking after Jarvis finished.
+    Its zero is arbitrary: only the helper's own readings compare. It is the
+    clock the listener stamps audio with (on Windows, monotonic() only
+    advances every 15.6 ms).
+    """
+    return max(0, round((time.perf_counter() if seconds is None else seconds) * 1000))
+
+
 def _camel(name: str) -> str:
     head, *rest = name.split("_")
     return head + "".join(part.title() for part in rest)
@@ -305,6 +318,11 @@ class Utterance(Event):
     source: UtteranceSource
     duration_ms: int
     language: str | None = None
+    # When the user began speaking, on clock_ms(): the push-to-talk press, or
+    # where the listener heard the voice begin (before the wake word fired).
+    started_at_ms: int | None = None
+    # The clip cut Jarvis off: he was audible when it began.
+    over_speech: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +337,8 @@ class SpeechDone(Event):
     reply_id: str
     interrupted: bool
     spoken_text: str
+    # When the reply's speech ended (played out, or stopped), on clock_ms().
+    ended_at_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
