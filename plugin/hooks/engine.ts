@@ -4,6 +4,7 @@
 // closures, and every other module depends on the port instead of on `$`.
 
 import type {
+  AskOptions,
   HookStream,
   HttpInit,
   HttpResponse,
@@ -25,6 +26,17 @@ import type {
 
 import type { JarvisHelperRef, JarvisHud, JarvisView } from '../types'
 import type { PaneSize } from './hud'
+
+/** The engine's permission decision for a tool call (`$.tool.check`'s answer, the fields the mod reads). */
+export type ToolVerdict = {
+  decision: 'allow' | 'ask' | 'deny'
+  /** Why, in a sentence. */
+  reason?: string
+  /** The settings rule that decided, as written; absent for a mode's own decision. */
+  rule?: string
+  /** The most permissive verdict the organization lets a call of the tool reach. */
+  ceiling?: 'allow' | 'ask' | 'deny'
+}
 
 /** The environment variables the mod reads (each read by its literal name). */
 export type EnvSnapshot = {
@@ -76,6 +88,18 @@ export type Engine = {
   blit: (args: UiBlitArgs) => Promise<UiBlitResult>
   /** Redraws this plugin's drawings (the desktop ring follows the levels this way). */
   invalidate: () => void
+  /**
+   * Asks the user in the engine's on-screen question dialog; resolves to the
+   * label chosen or the text typed under "Other". Rejects when the dialog is
+   * dismissed, and in a `-p` run (nobody to ask).
+   */
+  ask: (question: string, options: readonly string[] | AskOptions) => Promise<string>
+  /**
+   * The session's permission decision for a call of `tool` now (its rules and
+   * mode): nothing runs, no dialog opens. A tool the mod answers itself never
+   * meets these rules otherwise.
+   */
+  checkTool: (tool: string, input: Record<string, unknown>) => Promise<ToolVerdict>
 
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>

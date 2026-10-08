@@ -1,6 +1,6 @@
 [project]
 name = "jarvis-voice"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local voice helper for the Jarvis Claude Code mod: wake word, push-to-talk, faster-whisper STT, Fish Audio live TTS."
 readme = "README.md"
 license = "MIT"
@@ -19,6 +19,20 @@ dependencies = [
     "websockets>=15",
     "ormsgpack>=1.9",
     "pynput>=1.8.1",
+    # Home control (jarvis_voice.home). Imported only when a home command runs,
+    # so the voice helper starts no slower; about 10 MB of wheels on Windows.
+    # Apple TV over the Companion protocol.
+    "pyatv>=0.18,<0.19",
+    # Tuya / Smart Life devices on the home network.
+    "tinytuya>=1.20,<2",
+    # The one-time Smart Life QR link that fetches the Tuya local keys.
+    "tuya-device-sharing-sdk>=0.2.15,<0.3",
+    # tuya-device-sharing-sdk imports cryptography without declaring it, and
+    # relies on paho-mqtt 2's default callback API, which 3.x may drop.
+    "cryptography>=44",
+    "paho-mqtt>=2,<3",
+    # Draws the Smart Life QR code (pure Python, no Pillow).
+    "segno>=1.6",
     # WebRTC's echo canceller (AEC3) and high-pass filter, so Jarvis doesn't hear himself through speakers.
     "livekit>=1.1.20,<2",
 ]
@@ -44,6 +58,10 @@ build-backend = "uv_build"
 
 [tool.uv]
 default-groups = ["dev"]
+# These ship compiled wheels for every platform Jarvis supports. Refusing to
+# build them from source makes a future lock that loses a wheel fail with a
+# clear message instead of a compiler error on the user's machine.
+no-build-package = ["cryptography", "pydantic-core", "miniaudio", "zeroconf", "aiohttp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -59,4 +77,4 @@ ignore = ["SIM105", "RUF001", "RUF002", "RUF003", "N818"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["jarvis_voice"]
-known-local-folder = ["conftest", "fakes", "fish_fake"]
+known-local-folder = ["conftest", "fakes", "fish_fake", "home_fakes"]

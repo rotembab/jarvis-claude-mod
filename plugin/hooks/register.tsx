@@ -10,7 +10,9 @@ import type { Engine } from './engine'
 import { describeError } from './engine'
 import type { HandsEngine } from './hands'
 import { HANDS_TOOL, runHandsTool } from './hands'
+import { HOME_TOOL, HOME_TOOL_SPEC } from './home'
 import { actionLabel, HUD_PANE, hudLayout, hudMode, PANE_START } from './hud'
+import { isRemoteSession } from './platform'
 import { bandTree, foldedRow, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
 
 // The session state this mod owns (types/index.d.ts declares it).
@@ -73,6 +75,8 @@ export const register: Register = (on, options) => {
       toast: (text, toastOptions) => $.ui.toast(text, toastOptions),
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
+      ask: (question, askOptions) => $.ui.ask(question, askOptions),
+      checkTool: (tool, input) => $.tool.check({ tool, input }),
       openPane: size => $.ui.open({ ...HUD_OPEN, ...size }),
       closePane: () => $.ui.close({ id: HUD_PANE }),
       blit: args => $.ui.blit(args),
@@ -88,11 +92,28 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice and hand control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, hands',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|hands]',
+      description: 'Jarvis voice and hand control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, hands, home',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|hands|home]',
       immediate: true,
     })
-    await app.onSessionStart(engine, e.surface)
+    // The home_control tool. A refused registration (a managed policy, a
+    // host that cannot add tools) costs nothing else, and a failing start of
+    // the rest does not cost the tool. A cloud session has no helper and no
+    // home network, so no tool there.
+    const registerHomeTool = async (): Promise<void> => {
+      try {
+        if (isRemoteSession({ CLAUDE_CODE_REMOTE: await $.env.get('CLAUDE_CODE_REMOTE') })) return
+        const { tool } = await $.tool.register(HOME_TOOL_SPEC)
+        if (tool !== HOME_TOOL) $.ui.log(`jarvis: home_control registered as ${tool}, but its hooks serve ${HOME_TOOL}`, { to: 'debug' })
+      } catch (error) {
+        $.ui.log(`jarvis: the home_control tool is not available in this session: ${describeError(error)}`, { to: 'debug' })
+      }
+    }
+    try {
+      await app.onSessionStart(engine, e.surface)
+    } finally {
+      await registerHomeTool()
+    }
     // "Jarvis, turn on hand control": only where the hand helper can run.
     if (app.isLocal) {
       await $.tool.register(HANDS_TOOL).catch((error: unknown) => {
@@ -101,6 +122,19 @@ export const register: Register = (on, options) => {
     }
     return started
   })
+
+  // The engine runs no permission check, schema check or plan-mode block for a
+  // tool its plugin answers: HomeControl does all of that itself. A failure
+  // here refuses the call rather than falling through to the engine. The
+  // call's signal goes along: a call abandoned while its dialog is open
+  // (Esc, a spoken stop) confirms nothing, whatever is clicked later.
+  on('tool.call', { tool: 'mcp__jarvis__home_control' }, ($, e, next) => app.home.tool(e, next.signal)).catch(($, e, next) =>
+    next.called ? next(e) : { deny: `home_control failed: ${next.error.message ?? next.error.kind}` },
+  )
+
+  // Kept in the prompt rather than behind ToolSearch, so a spoken request
+  // needs no extra round trip to find it.
+  on('tool.describe', { tool: 'mcp__jarvis__home_control' }, async ($, e, next) => ({ ...(await next(e)), isDeferred: false }))
 
   on('session.attach', async ($, e, next) => {
     const attached = await next(e)
@@ -158,7 +192,9 @@ export const register: Register = (on, options) => {
   // A voice prompt carries a note the persona keys on, so the system prompt
   // stays the same between typed and spoken turns (cache friendly). Fails open.
   // (Not at prompt.submit: a plugin's own hooks there skip its own prompts.)
+  // It also records the permission mode the turn runs in: home control keeps plan mode read-only.
   on('classic.UserPromptSubmit', async ($, e, next) => {
+    app.home.notePermissionMode(e.permission_mode, e.agent_id)
     const result = await next(e)
     return app.voice?.markPrompt(e.prompt, result) ?? result
   }).catch(($, e, next) => next(e))
@@ -186,6 +222,13 @@ export const register: Register = (on, options) => {
 
   on('ui.close', ($, e, next) => {
     if (e.id === HUD_PANE) app.hud?.onClosed()
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // The mode can also change mid-turn: EnterPlanMode, ExitPlanMode, or a
+  // Shift+Tab that the next tool's PostToolUse reports (main loop only).
+  on('classic.PostToolUse', ($, e, next) => {
+    app.home.noteToolUse(e.tool_name, e.permission_mode, e.agent_id)
     return next(e)
   }).catch(($, e, next) => next(e))
 

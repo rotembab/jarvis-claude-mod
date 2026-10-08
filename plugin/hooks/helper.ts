@@ -41,6 +41,9 @@ const COMMAND_TIMEOUT_MS: Record<CommandName, number> = {
   status: 5000,
   test_voice: 5000,
   shutdown: 2000,
+  // The helper gives a device 20 s (an Apple TV connect, a TV waking up) and
+  // answers "timeout" itself after that.
+  home: 25_000,
 }
 
 export type HelperPhase = 'stopped' | 'not_installed' | 'starting' | 'running' | 'restarting' | 'elsewhere' | 'failed'

@@ -12,6 +12,7 @@ import type { HandsEngine, HandsSettings } from './hands'
 import { Hands, readHandsSettings } from './hands'
 import { Helper } from './helper'
 import type { HelperPhase } from './helper'
+import { HomeControl } from './home'
 import { Hud, hudMode } from './hud'
 import type { PaneSize } from './hud'
 import type { Platform } from './platform'
@@ -133,6 +134,8 @@ export class Jarvis {
   hands: Hands | undefined
   /** The HUD pane's ring and action log (local sessions). */
   hud: Hud | undefined
+  /** The home_control tool and /jarvis home (home.ts). */
+  readonly home: HomeControl = new HomeControl(this)
   /** False in a cloud session: nothing local is started there. */
   isLocal = false
   ready: ReadyEvent | undefined

@@ -130,7 +130,7 @@ describe('hand helper process', () => {
     expect(w.handsHelpers()).toHaveLength(0)
     expect(w.checked).not.toContain(HANDS_PYTHON)
     expect(w.status()).toBe(VOICE_READY)
-    expect(w.tools).toEqual(['hands'])
+    expect(w.tools).toEqual(['home_control', 'hands'])
     expect(await jarvis($, '')).toContain('/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows')
   })
 
@@ -1294,7 +1294,7 @@ describe('the hands tool', () => {
     w.existing.add(HANDS_PYTHON)
     await startHelper($, w)
     exitOnShutdown(w)
-    expect(w.tools).toEqual(['hands'])
+    expect(w.tools).toEqual(['home_control', 'hands'])
 
     const turnedOn = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'on' })
     expect(turnedOn.result).toContain('Hand control is on. The camera starts in a moment')
