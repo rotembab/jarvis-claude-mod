@@ -794,9 +794,7 @@ def test_a_sign_in_plex_tv_itself_refuses_is_dropped_when_the_server_refuses_the
 # --------------------------------------------------------------------------- not answering
 
 
-def test_a_server_that_is_off_is_unreachable(
-    tmp_path: Path, fake: FakePlex, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_server_that_is_off_is_unreachable(tmp_path: Path, fake: FakePlex, monkeypatch: pytest.MonkeyPatch) -> None:
     # Windows takes about 2 s to refuse a connection to a closed port, so a short probe would read as a timeout.
     monkeypatch.setattr(plex, "PROBE_S", {"local": 5.0, "remote": 5.0, "relay": 5.0})
     driver, store = add_server(tmp_path, fake)
