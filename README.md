@@ -211,7 +211,7 @@ Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on 
 
 Run `/jarvis home setup`, or say "open home setup". A setup window opens where you add each device. PINs, keys and tokens are typed there, never into the chat, and are kept encrypted for your Windows account. Unlocking a lock, disarming an alarm and opening a garage door need your OK on screen first.
 
-Jarvis asks on screen before Claude changes a device, unless your own Claude Code rules allow `mcp__jarvis__home_control`; by default, reading your devices needs no question. See [What Jarvis asks you first](docs/HOME.md#what-jarvis-asks-you-first).
+Jarvis runs device commands without a question, like a remote control's button. To have it ask on screen first, add `mcp__jarvis__home_control` to `ask` in your Claude Code settings; a lock, an alarm or a garage door always asks. See [What Jarvis asks you first](docs/HOME.md#what-jarvis-asks-you-first).
 
 To see which smart devices are on your network and which ones Jarvis can control, run `/jarvis home scan` or ask "what smart devices are on my network?"
 

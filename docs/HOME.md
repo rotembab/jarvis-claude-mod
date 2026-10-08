@@ -208,18 +208,17 @@ Ask for a streamer or a link, for example "open xQc on Kick on the Apple TV". Cl
 
 ## What Jarvis asks you first
 
-Jarvis can ask you twice: once for your Claude Code permission rules, before Claude changes anything, and once more for a device that needs your OK.
+Jarvis applies your Claude Code permission rules to the device tool, and asks once more for a device that needs your OK.
 
-**Your Claude Code rules.** Jarvis's device tool is `mcp__jarvis__home_control`. Jarvis answers it itself, so Claude Code's own permission prompt never sees its calls. Jarvis applies your rules for it instead, the same way it does for the [desktop tool](PC-CONTROL.md#the-desktop-tool):
+**Your Claude Code rules.** Jarvis's device tool is `mcp__jarvis__home_control`. Jarvis answers it itself, so Claude Code's own permission prompt never sees its calls. Jarvis applies your rules for it instead, as it does for the [desktop tool](PC-CONTROL.md#the-desktop-tool), except that it runs on Claude Code's default (you chose this, so that commands work like a remote control):
 
-- **Changes ask first.** Before Claude runs a command on a device, or opens the setup window, Jarvis asks on screen ("No" / "Yes, do it"). That covers an ask rule, Claude Code's own default for a tool no rule allows yet, and an allow that comes from the mode alone (bypassPermissions).
-- **Your allow rule skips that question.** To have commands just happen, the way a remote control does, add `"mcp__jarvis__home_control"` to `allow` in your settings yourself, or with `/permissions`. Jarvis never adds it. Even then, Jarvis asks when a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it), and when the permission mode isn't known for the turn: a subagent's call, or a turn that didn't start from a prompt Jarvis saw just before it.
-- **Reading runs without a question.** Listing devices, reading a device's state and searching the network change nothing, so Claude Code's default lets them run too. They ask only when an ask rule covers the tool, or a settings hook could match it.
+- **Commands run.** With no rule for the tool, Claude Code's own default is to ask, but Jarvis runs a device command, a read or the setup window without a question, the way a remote control's button does. That also holds when the permission mode alone allows it (bypassPermissions), and with your own allow rule.
+- **An ask rule brings the question back.** To have Jarvis ask before every call, add `"mcp__jarvis__home_control"` to `ask` in your settings yourself, or with `/permissions`: Jarvis asks on screen ("No" / "Yes, do it"). It also asks when a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it), and before a change when the permission mode isn't known for the turn: a subagent's call, or a turn that didn't start from a prompt Jarvis saw just before it.
 - **Deny rule**: Jarvis can't use the tool at all, not even to list devices. `/jarvis home` still works when you type it.
 - **dontAsk mode**: only your allow rule lets a call run, reading included. Anything that would ask is refused.
 - If your rules or your settings can't be read, nothing is done.
 
-**Devices that need your OK.** A few commands need your OK on screen even when your rules allow the tool: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of your rules, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too.
+**Devices that need your OK.** A few commands need your OK on screen even though the tool otherwise runs without a question: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of an ask rule, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too.
 
 In the setup window, **Ask before Jarvis uses a device** sets any device you added there (not Home Assistant's) to:
 
@@ -299,7 +298,7 @@ To remove a device, use **Rename a device, set its room, or remove it** in the s
 | Home Assistant says the PC is banned | Too many failed logins. Remove the PC's address from `ip_bans.yaml` in Home Assistant's config folder and restart Home Assistant. |
 | Claude says home control isn't available | Home control runs on your own PC, so it isn't available in cloud sessions. Run `/jarvis setup` to repair the helper if it isn't installed. |
 | Home control says "Jarvis stays off" or "Jarvis is still checking whether Claude Code runs as administrator" | Home control does nothing while Claude Code runs as administrator, or before Jarvis's check for that has passed. Start Claude Code from a normal window, not with "Run as administrator". If the check is still running, try again in a few seconds; if it failed, `/jarvis restart` checks again. See [Never as administrator](PC-CONTROL.md#never-as-administrator). |
-| Jarvis asks on screen before every device command | Your Claude Code rules don't allow `mcp__jarvis__home_control` yet. Add it to `allow` in your settings to skip that question; see [What Jarvis asks you first](#what-jarvis-asks-you-first). |
+| Jarvis asks on screen before a device command | Your Claude Code rules have an `ask` rule for `mcp__jarvis__home_control`, or a PreToolUse or PermissionRequest hook in your settings could match it, or this is a subagent's call. Remove the `ask` rule (or add the tool to `allow`) to skip the question; see [What Jarvis asks you first](#what-jarvis-asks-you-first). |
 
 ## How it works
 

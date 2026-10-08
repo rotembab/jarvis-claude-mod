@@ -5,10 +5,11 @@
 // settings hooks), so this module is the guard: it checks every argument,
 // keeps plan mode read-only, applies the user's own rules for the tool to
 // every call (desktop.ts checkRules, through `$.tool.check`, as for the
-// desktop and hands tools: a deny refuses; a change runs unasked only on the
-// user's own allow rule, a read also on the engine's default), and asks the
-// user on screen (never by voice) before a change the rules do not allow
-// outright and before a command the helper answers with "confirm". The voice
+// desktop and hands tools: a deny refuses; on the engine's own default or the
+// user's allow rule a call runs unasked, like a remote's button, while an ask
+// rule, a settings hook that could match, dontAsk or an unknown mode ask or
+// refuse), and asks the user on screen (never by voice) before a command the
+// helper answers with "confirm" (a lock, an alarm, a garage door). The voice
 // helper, or a one-shot `jarvis_voice home call` when it is not running,
 // finds the device and runs the command.
 
@@ -356,7 +357,8 @@ export class HomeControl {
       what: RULE_WORDS[request.action],
       // Only the checked fields: `confirmed` and anything else the model sent are not asked about.
       input: request.action === 'setup' ? { action: 'setup' } : { ...request.body },
-      isRead: !isChange,
+      // By design, on Claude Code's own default a device command runs, like a remote's button; a deny, an ask rule or dontAsk still stops it.
+      byDefault: true,
     }
     // A change needs the mode known for this very turn: a Shift+Tab into plan mode may have come since.
     const gate = await checkRules(this.app, pc, call, ports, isChange && !pc.isModeKnownForTurn(agentId))

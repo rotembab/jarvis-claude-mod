@@ -372,11 +372,12 @@ export type OwnToolCall = {
   /** The call as `tool.call` carries it; its own keys (`tool`, `tool_use_id`, `agentId`) are not asked about. */
   input: Record<string, unknown>
   /**
-   * A read that changes nothing and shows Claude nothing private (home
-   * control's list, status and scan): the engine's own verdict with no rule
-   * behind it (its default ask, a mode's allow) lets it run unasked too.
+   * A call that runs on the engine's own verdict with no rule behind it (its
+   * default ask, a mode's allow), the way a remote control does: home
+   * control's calls, by the user's choice. Never past a deny, an ask rule, an
+   * `ask` ceiling or dontAsk.
    */
-  isRead?: boolean
+  byDefault?: boolean
 }
 
 /**
@@ -387,8 +388,8 @@ export type OwnToolCall = {
  * allows yet) needs a yes first. Only an allow by the user's own rule (one
  * the verdict names, not a mode's) runs unasked, and only while no hook in
  * their settings could decide about the call (the engine runs none for this
- * tool) and the turn's mode is known (`isModeStale` false). A read
- * (`call.isRead`) also runs unasked on the engine's own verdict with no rule
+ * tool) and the turn's mode is known (`isModeStale` false). A call marked
+ * `byDefault` also runs unasked on the engine's own verdict with no rule
  * behind it, under the same settings check; never past an ask rule or an
  * `ask` ceiling, nor in dontAsk. Rules or settings that cannot be read refuse.
  */
@@ -414,8 +415,8 @@ export async function checkRules(
   if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
   const hasRule = typeof verdict.rule === 'string' && verdict.rule !== ''
   const isUsersAllow = verdict.decision === 'allow' && hasRule && verdict.ceiling !== 'ask'
-  const isReadByDefault = call.isRead === true && !hasRule && verdict.ceiling !== 'ask' && pc.permissionMode !== 'dontAsk'
-  const gate = (isUsersAllow || isReadByDefault) && !isModeStale ? await settingsGate(app, call.tool, ports) : 'ask'
+  const isByDefault = call.byDefault === true && !hasRule && verdict.ceiling !== 'ask' && pc.permissionMode !== 'dontAsk'
+  const gate = (isUsersAllow || isByDefault) && !isModeStale ? await settingsGate(app, call.tool, ports) : 'ask'
   if (typeof gate === 'object') return gate
   // dontAsk: what is not allowed beforehand is refused, never asked.
   if (gate === 'ask' && pc.permissionMode === 'dontAsk') return refused

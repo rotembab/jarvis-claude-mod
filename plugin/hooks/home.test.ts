@@ -34,8 +34,8 @@ async function prompted($: TestEngine, mode = 'default', text = 'Jarvis, the hou
 
 /**
  * The helper up and a prompt's turn, as when the model calls the tool in a
- * turn; the user has allowed the tool (the engine's own default, a plain
- * "ask", puts a question before a change: see the permission tests).
+ * turn; the user has allowed the tool (the permission tests also cover the
+ * engine's own default, a plain "ask", which runs a call the same way).
  */
 async function startHome($: TestEngine, w: World): Promise<FakeChild> {
   const helper = await startHelper($, w)
@@ -521,7 +521,7 @@ describe('home_control: plan mode', () => {
 describe("home_control: the user's permission rules", () => {
   const turnOff = { action: 'do', device: 'Sony TV', command: 'turn_off' }
 
-  test("every call is checked against the rules; on the engine's own default, reads run unasked and a change asks on screen first", async ($, on) => {
+  test("every call is checked against the rules; on the engine's own default every call runs unasked, like a remote's button", async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('Done.'))
     oneShot(w, () => printed({ ok: true, opened: true, text: SETUP_OPEN }))
@@ -529,10 +529,7 @@ describe("home_control: the user's permission rules", () => {
     w.toolCheck = () => ({ decision: 'ask' })
     expect(await homeTool($, { action: 'list' })).toEqual({ result: 'Done.' })
     expect(await homeTool($, { action: 'status', device: 'Sony TV' })).toEqual({ result: 'Done.' })
-    expect(w.asked).toEqual([])
-    w.askAnswer = 'No'
-    expect(await homeTool($, { ...turnOff, value: 'now', confirmed: true })).toEqual({ result: SAID_NO })
-    w.askAnswer = 'Yes, do it'
+    expect(await homeTool($, { ...turnOff, value: 'now', confirmed: true })).toEqual({ result: 'Done.' })
     expect(((await homeTool($, { action: 'setup' })) as { result: string }).result).toMatch(/^The Jarvis home setup window is open/)
     expect(w.checks).toEqual([
       { tool: HOME_TOOL, input: { action: 'list' } },
@@ -540,28 +537,21 @@ describe("home_control: the user's permission rules", () => {
       { tool: HOME_TOOL, input: { action: 'do', device: 'Sony TV', command: 'turn_off', value: 'now' } },
       { tool: HOME_TOOL, input: { action: 'setup' } },
     ])
-    expect(w.asked).toEqual(['Let Jarvis run turn_off (now) on "Sony TV"?', 'Let Jarvis open the home setup window?'])
-    expect(w.dialogs.map(dialog => dialog.options)).toEqual([
-      ['No', 'Yes, do it'],
-      ['No', 'Yes, do it'],
-    ])
-    expect(homeBodies(w)).toEqual([{ action: 'list' }, { action: 'status', device: 'Sony TV' }])
+    expect(w.asked).toEqual([])
+    expect(homeBodies(w)).toEqual([{ action: 'list' }, { action: 'status', device: 'Sony TV' }, { ...turnOff, value: 'now' }])
     expect(w.runs.map(run => run.argv[4])).toEqual(['open-setup'])
   })
 
-  test('an allow from the mode alone (bypassPermissions, no rule) asks before a change too', async ($, on) => {
+  test('an allow from the mode alone (bypassPermissions, no rule) runs a change too', async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('The Sony TV is off.'))
     await startHome($, w)
     await prompted($, 'bypassPermissions')
     w.toolCheck = () => ({ decision: 'allow' })
-    w.askAnswer = 'No'
-    expect(await homeTool($, turnOff)).toEqual({ result: SAID_NO })
-    expect(await homeTool($, { action: 'scan' })).toEqual({ result: 'The Sony TV is off.' })
-    w.askAnswer = 'Yes, do it'
     expect(await homeTool($, turnOff)).toEqual({ result: 'The Sony TV is off.' })
-    expect(w.asked).toEqual(['Let Jarvis run turn_off on "Sony TV"?', 'Let Jarvis run turn_off on "Sony TV"?'])
-    expect(homeBodies(w)).toEqual([{ action: 'scan' }, turnOff])
+    expect(await homeTool($, { action: 'scan' })).toEqual({ result: 'The Sony TV is off.' })
+    expect(w.asked).toEqual([])
+    expect(homeBodies(w)).toEqual([turnOff, { action: 'scan' }])
   })
 
   test('an ask rule the user wrote for the tool asks on screen before every call, reads included', async ($, on) => {
@@ -638,7 +628,7 @@ describe("home_control: the user's permission rules", () => {
     expect(homeBodies(w)).toEqual([])
   })
 
-  test("with the user's allow rule, a settings hook that could match the tool asks first; unreadable settings refuse", async ($, on) => {
+  test('a settings hook that could match the tool asks first, with or without the user\'s allow rule; unreadable settings refuse', async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('The Sony TV is off.'))
     await startHome($, w)
@@ -648,14 +638,17 @@ describe("home_control: the user's permission rules", () => {
     expect(await homeTool($, turnOff)).toEqual({ result: SAID_NO })
     expect(await homeTool($, { action: 'list' })).toEqual({ result: SAID_NO })
     expect(w.settingsReads).toEqual(['user', 'project', 'local', 'flag', 'policy', 'user', 'project', 'local', 'flag', 'policy'])
+    // The engine's own default asks about a settings hook just the same.
+    w.toolCheck = () => ({ decision: 'ask' })
+    expect(await homeTool($, turnOff)).toEqual({ result: SAID_NO })
     w.settings = {}
     w.settingsError = 'unreadable'
     expect(await homeTool($, turnOff)).toEqual({ deny: 'Jarvis could not read the hooks in your settings, so nothing was done.' })
-    expect(w.asked).toEqual(['Let Jarvis run turn_off on "Sony TV"?', 'Let Jarvis list your home devices?'])
+    expect(w.asked).toEqual(['Let Jarvis run turn_off on "Sony TV"?', 'Let Jarvis list your home devices?', 'Let Jarvis run turn_off on "Sony TV"?'])
     expect(homeBodies(w)).toEqual([])
   })
 
-  test("a change asks even with the user's allow rule when the turn's mode is not known: a subagent's call, a turn with no prompt, a prompt typed during a turn", async ($, on) => {
+  test("a change asks even on the default or an allow rule when the turn's mode is not known: a subagent's call, a turn with no prompt, a prompt typed during a turn", async ($, on) => {
     const w = world(on)
     homeReplies(w, () => answer('The Sony TV is off.'))
     await startHome($, w)
