@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import requests
 
 from jarvis_voice.home import tuya
 from jarvis_voice.home import tuya_dps as tdp
@@ -47,7 +48,17 @@ KEYS = {
     "fbot": "FAKE-KEY-FBOT-01",
     "hub2": "FAKE-KEY-HUB2-01",
 }
-SECRETS = [*KEYS.values(), "ACCESS-TOKEN-1", "REFRESH-TOKEN-1", "ACCESS-TOKEN-2", "REFRESH-TOKEN-2", "UC-TEST-0001"]
+SECRETS = [
+    *KEYS.values(),
+    "ACCESS-TOKEN-1",
+    "REFRESH-TOKEN-1",
+    "ACCESS-TOKEN-2",
+    "REFRESH-TOKEN-2",
+    "UC-TEST-0001",
+    "QR-TOKEN-1",
+]
+# What login_result answers until the phone confirms: before the code is scanned, and after a phone refused it too.
+PENDING = {"success": False, "code": "E0020003", "msg": "Login failed, please scan and try again!"}
 LOGIN = {
     "t": 1_700_000_000_000,
     "uid": "uid-1",
@@ -98,6 +109,9 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
 
 
 class FakeNet:
@@ -368,7 +382,8 @@ class FakeCloud:
         self.scenes: list[SimpleNamespace] = []
         self.rooms: dict[str, str] = {}
         self.qr_response: dict[str, Any] = {"success": True, "result": {"qrcode": "QR-TOKEN-1"}}
-        self.logins: deque[Any] = deque()
+        self.logins: deque[Any] = deque()  # login_result's next answers (an exception is raised)
+        self.waiting: Any = (False, PENDING)  # its answer once those run out
         self.qr_requests: list[tuple[str, str, str]] = []
         self.login_checks = 0
         self.managers: list[dict[str, Any]] = []
@@ -399,12 +414,11 @@ class FakeCloud:
             def login_result(self, token: str, client_id: str, user_code: str) -> tuple[bool, dict[str, Any]]:
                 cloud.login_checks += 1
                 assert token == "QR-TOKEN-1" and client_id == tuya.CLIENT_ID
-                if not cloud.logins:
-                    return False, {"success": False, "code": 1, "msg": "not yet"}
-                answer = cloud.logins.popleft()
+                answer = cloud.logins.popleft() if cloud.logins else cloud.waiting
                 if isinstance(answer, BaseException):
                     raise answer
-                return answer
+                ok, info = answer
+                return ok, dict(info) if isinstance(info, dict) else info
 
         class Manager:
             def __init__(
@@ -604,7 +618,7 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Home]:
         SimpleNamespace(scene_id="scene-ac-off", name="AC off", home_id="home-1", enabled=True),
         SimpleNamespace(scene_id="scene-old", name="Old scene", home_id="home-1", enabled=False),
     ]
-    cloud.logins = deque([(False, {"success": False}), (True, dict(LOGIN))])
+    cloud.logins = deque([(False, PENDING), (True, LOGIN)])
     net.add(Phys("lamp-id", "192.168.1.20", KEYS["lamp"], 3.5, {"20": True, "21": "white", "22": 505, "23": 0}))
     net.add(Phys("hall-id", "192.168.1.21", KEYS["hall"], 3.3, {"1": False, "2": "white", "3": 140, "4": 255}))
     net.add(Phys("plug-id", "192.168.1.22", KEYS["plug"], 3.3, {"1": True, "19": 1205}))
@@ -658,10 +672,17 @@ def test_qr_link_saves_devices_scenes_and_keys(home: Home, caplog: pytest.LogCap
 
     assert home.cloud.qr_requests == [(tuya.CLIENT_ID, tuya.SCHEMA, "UC-TEST-0001")]
     assert ui.qr and ui.qr[0][0] == "tuyaSmart--qrLogin?token=QR-TOKEN-1"
-    assert "Scan" in ui.qr[0][1] and "Confirm login" in ui.qr[0][1] and "Tuya Smart or Smart Life" in ui.qr[0][1]
+    caption = ui.qr[0][1]
+    assert "Scan" in caption and "Confirm login" in caption and "Smart Life or Tuya Smart" in caption
+    assert "come back to this window" in caption
     assert home.cloud.login_checks == 2
     assert "Account and Security" in ui.text and "Home Assistant" in ui.text
     assert "case-sensitive" in ui.text and "same app" in ui.text and "case-sensitive" in ui.asked[0]
+    # Up front: which apps work, and that a brand app's devices must move first.
+    assert "Only the Smart Life and Tuya Smart apps work." in ui.text and "MOES" in ui.text
+    assert "move them to Smart Life first (docs/HOME.md says how)" in ui.text
+    assert "Smart Life or Tuya Smart" in ui.asked[0] and "MOES" in ui.asked[0]
+    assert "come back to this window. Jarvis notices the login by itself within a few seconds" in ui.text
 
     config = home.store.load()
     by_name = {d.name: d for d in config.devices}
@@ -747,50 +768,177 @@ def test_qr_link_keeps_tokens_renewed_while_loading(home: Home) -> None:
     assert saved is not None and saved["token_info"]["access_token"] == "ACCESS-TOKEN-2"
 
 
-def test_qr_not_confirmed_in_time_saves_nothing(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 0.05)
-    monkeypatch.setattr(tuya, "LOGIN_POLL_S", 0.01)
-    home.cloud.logins = deque()
-    ui = ScriptedPrompter(["UC-TEST-0001"])
-    tuya.wizard(ui, home.ctx)
-    assert "not confirmed in time" in ui.text and "Nothing was saved" in ui.text
-    assert home.cloud.login_checks >= 2
-    assert home.store.load().devices == [] and home.store.secret_keys() == []
+def login_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """The QR login wait on a clock that sleeping moves on: a check every 2 s, a progress line every 30 s, for 2 min
+    (61 checks: at 0, 2, ... 120 s)."""
+    clock = FakeClock()
+    monkeypatch.setattr(tuya, "time", SimpleNamespace(monotonic=clock, sleep=clock.sleep))
+    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 120.0)
+    monkeypatch.setattr(tuya, "LOGIN_POLL_S", 2.0)
+    monkeypatch.setattr(tuya, "LOGIN_PROGRESS_S", 30.0)
+    return clock
 
 
-def test_an_expired_qr_code_stops_the_wait_and_offers_a_new_one(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 30.0)  # a test that waited it out would show here
-    home.cloud.logins = deque([(False, {"success": False, "code": "E0020002", "msg": "expired"}), (True, dict(LOGIN))])
+def login_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING and "login" in r.getMessage()]
+
+
+def test_the_wait_goes_on_until_the_phone_confirms(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    clock = login_clock(monkeypatch)
+    home.cloud.logins = deque([*[(False, PENDING)] * 20, (True, LOGIN)])  # confirmed 40 s in
+    ui = link(home)
+    assert home.cloud.login_checks == 21 and len(ui.qr) == 1 and clock.now == 1040.0
+    assert [line for line in ui.said if line.startswith("Still waiting")] == [
+        "Still waiting for the phone (about 2 minutes left)..."
+    ]
+    # Tuya's "Login failed, please scan" while it waits is not shown: the user may not have scanned yet.
+    assert "Login failed" not in ui.text and "E0020003" not in ui.text and "refused" not in ui.text
+    assert "Signed in to your Tuya account." in ui.text and "Show a new QR code to scan?" not in ui.asked
+    assert home.device("Desk lamp").kind == "light" and not login_warnings(caplog)
+    assert_no_secrets(ui.text, *(r.getMessage() for r in caplog.records))
+
+
+@pytest.mark.parametrize(
+    ("expired", "last"),
+    [
+        (
+            {"success": False, "code": "E0020002", "msg": "The QR code has expired, please refresh it"},
+            "Tuya's last answer: E0020002 (The QR code has expired, please refresh it).",
+        ),
+        # The code alone decides, whatever the msg says (or in whatever language).
+        ({"success": False, "code": "E0020002"}, "Tuya's last answer: E0020002."),
+        # Older answers carried no code: the word decides, in any case.
+        ({"success": False, "msg": "QR code Expired"}, "Tuya's last answer: no code (QR code Expired)."),
+    ],
+)
+def test_an_expired_qr_code_stops_the_wait_and_offers_a_new_one(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, expired: dict[str, Any], last: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    clock = login_clock(monkeypatch)
+    home.cloud.logins = deque([(False, PENDING), (False, PENDING), (False, expired), (True, LOGIN)])
     ui = ScriptedPrompter(["UC-TEST-0001", True, False, "Kitchen light", "", True, False])
-    started = time.monotonic()
     tuya.wizard(ui, home.ctx)
-    assert time.monotonic() - started < 10.0
-    assert "The QR code expired" in ui.text and "Show a new QR code" in "\n".join(ui.asked)
-    assert len(ui.qr) == 2 and len(home.cloud.qr_requests) == 2 and home.cloud.login_checks == 2
+    assert home.cloud.login_checks == 4 and clock.now == 1004.0  # stopped 4 s in, then confirmed at once
+    assert "The QR code expired before Tuya reported a confirmed login." in ui.text and last in ui.text
+    assert "Only the Smart Life and Tuya Smart apps work" in ui.text.split("expired before")[1]
+    assert ui.asked.count("Show a new QR code to scan?") == 1 and "Still waiting" not in ui.text
+    assert len(ui.qr) == 2 and len(home.cloud.qr_requests) == 2
     assert home.device("Desk lamp").kind == "light"
+    assert login_warnings(caplog) == [f"the Tuya QR login ended without a sign-in (expired); {last[:-1]}"]
 
 
-def test_a_refused_login_says_to_use_the_same_app(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(tuya, "LOGIN_WAIT_S", 30.0)
-    refused = {"success": False, "code": "E0020003", "msg": "Please use the designated APP to scan the code to log in"}
-    home.cloud.logins = deque([(False, refused)])
-    ui = ScriptedPrompter(["UC-TEST-0001", False])  # no new QR code
+def test_a_wait_that_runs_out_explains_and_offers_a_new_code(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    login_clock(monkeypatch)
+    home.cloud.logins = deque()  # E0020003 throughout: never scanned, or refused on the phone
+    ui = ScriptedPrompter(["UC-TEST-0001", True, False])  # a new QR code, then no more
     tuya.wizard(ui, home.ctx)
-    assert home.cloud.login_checks == 1 and len(ui.qr) == 1
-    assert "The phone refused the login" in ui.text and "same app you took the User Code from" in ui.text
-    assert "designated" not in ui.text and "Nothing was saved." in ui.text
+
+    assert len(ui.qr) == 2 and len(home.cloud.qr_requests) == 2 and home.cloud.login_checks == 2 * 61
+    assert ui.asked.count("Show a new QR code to scan?") == 2
+    assert [line for line in ui.said if line.startswith("Still waiting")] == 2 * [
+        "Still waiting for the phone (about 2 minutes left)...",
+        "Still waiting for the phone (about 1 minute left)...",
+        "Still waiting for the phone (about 1 minute left)...",
+    ]
+    last = "Tuya's last answer: E0020003 (Login failed, please scan and try again!)."
+    # Tuya's words come once per wait, at its end, after what to do about them.
+    assert [line for line in ui.said if "Login failed" in line] == [last, last]
+    end = ui.said.index("Tuya did not report a confirmed login within 2 minutes.")
+    hints = ui.said[end + 1]
+    assert ui.said[end + 2] == last
+    assert "Only the Smart Life and Tuya Smart apps work" in hints
+    assert "MOES, Lidl Home, LSC Smart Connect" in hints and "Gosund" in hints and "docs/HOME.md" in hints
+    assert "same app that scans" in hints and '"use the designated APP", try the other official app' in hints
+    assert ui.said[-1] == "Nothing was saved."
+    assert login_warnings(caplog) == 2 * [
+        "the Tuya QR login ended without a sign-in (timeout); Tuya's last answer: "
+        "E0020003 (Login failed, please scan and try again!)"
+    ]
     assert home.store.load().devices == [] and home.store.secret_keys() == []
-    # Any other failure keeps the wait going, as before.
-    home.cloud.logins = deque([(False, {"success": False, "code": "E9999999"}), (True, dict(LOGIN))])
-    link(home)
-    assert home.cloud.login_checks == 3
+    assert_no_secrets(ui.text, *(r.getMessage() for r in caplog.records))
 
 
-def test_ctrl_c_while_waiting_for_the_phone_saves_nothing(home: Home) -> None:
-    home.cloud.logins = deque([(False, {}), KeyboardInterrupt()])
+@pytest.mark.parametrize(
+    "msg",
+    ["usercode UC-TEST-0001 is invalid", "token QR-TOKEN-1 is not bound", "invalid usercode: UC-TEST-0001"],
+)
+def test_a_last_answer_that_echoes_a_secret_shows_only_its_code(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, msg: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    login_clock(monkeypatch)
+    home.cloud.logins = deque()
+    home.cloud.waiting = (False, {"success": False, "code": "E0020004", "msg": msg})
+    ui = ScriptedPrompter(["UC-TEST-0001", False])
+    tuya.wizard(ui, home.ctx)
+    assert "Tuya's last answer: E0020004." in ui.text and ui.said[-1] == "Nothing was saved."
+    assert login_warnings(caplog) == [
+        "the Tuya QR login ended without a sign-in (timeout); Tuya's last answer: E0020004"
+    ]
+    assert home.store.secret_keys() == []
+    assert_no_secrets(ui.text, *(r.getMessage() for r in caplog.records))
+
+
+def test_a_wait_that_never_reaches_tuya_says_so(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    login_clock(monkeypatch)
+    home.cloud.logins = deque()
+    # requests' errors carry the URL, and with it the QR token and the User Code.
+    home.cloud.waiting = requests.ConnectionError(
+        "Max retries exceeded with url: /v1.0/m/life/home-assistant/qrcode/tokens/QR-TOKEN-1"
+        "?clientid=HA_3y9q4ak7g4ephrvke&usercode=UC-TEST-0001"
+    )
+    ui = ScriptedPrompter(["UC-TEST-0001", False])
+    tuya.wizard(ui, home.ctx)
+    assert home.cloud.login_checks == 61 and len(ui.qr) == 1
+    assert "Jarvis could not reach Tuya to check the login. Check the internet connection." in ui.text
+    assert "likely causes" not in ui.text and "last answer" not in ui.text and "confirmed login" not in ui.text
+    assert "Show a new QR code to scan?" in ui.asked and ui.said[-1] == "Nothing was saved."
+    assert login_warnings(caplog) == ["the Tuya QR login could not reach Tuya (ConnectionError)"]
+    assert home.store.secret_keys() == []
+    assert_no_secrets(ui.text, *(r.getMessage() for r in caplog.records))
+
+
+def test_an_odd_answer_from_tuya_does_not_end_setup(
+    home: Home, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    login_clock(monkeypatch)
+    home.cloud.logins = deque()
+    home.cloud.waiting = AttributeError("'NoneType' object has no attribute 'get'")
+    ui = ScriptedPrompter(["UC-TEST-0001", False])
+    tuya.wizard(ui, home.ctx)
+    # Tuya did answer, if oddly: not "could not reach".
+    assert "Tuya did not report a confirmed login within 2 minutes." in ui.text and "could not reach" not in ui.text
+    assert "Tuya's last answer: none Jarvis could read (AttributeError)." in ui.text and "NoneType" not in ui.text
+    assert home.store.secret_keys() == []
+
+    home.cloud.waiting = (False, PENDING)
+    home.cloud.logins = deque(
+        [KeyError("result"), (False, None), ValueError("not JSON"), (False, PENDING), (True, LOGIN)]
+    )
+    checks = home.cloud.login_checks
+    ui = link(home)
+    assert home.cloud.login_checks - checks == 5 and "Signed in to your Tuya account." in ui.text
+    assert_no_secrets(ui.text, *(r.getMessage() for r in caplog.records))
+
+
+def test_ctrl_c_while_waiting_for_the_phone_saves_nothing(home: Home, monkeypatch: pytest.MonkeyPatch) -> None:
+    login_clock(monkeypatch)
+    home.cloud.logins = deque([(False, PENDING), KeyboardInterrupt()])
     ui = ScriptedPrompter(["UC-TEST-0001"])
     with pytest.raises(KeyboardInterrupt):
         tuya.wizard(ui, home.ctx)
+    assert home.cloud.login_checks == 2 and "Show a new QR code to scan?" not in ui.asked
     assert home.store.load().devices == [] and home.store.secret_keys() == []
 
 
