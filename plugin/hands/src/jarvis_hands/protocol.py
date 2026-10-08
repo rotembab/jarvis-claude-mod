@@ -15,6 +15,8 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from .settings import KNOBS
+
 if TYPE_CHECKING:
     from .desktop.base import Display
 
@@ -76,13 +78,11 @@ EVENT_DEFS: dict[str, str] = {
     "error": "ErrorEvent",
 }
 
-SCROLL_SPEED_MIN, SCROLL_SPEED_MAX = 0.1, 10.0
-
 _ENGAGE_MODES = frozenset(get_args(EngageMode))
 _HANDS = frozenset(get_args(HandChoice))
 _ANCHORS = frozenset(get_args(AnchorChoice))
 _CALIBRATE_ACTIONS = frozenset(get_args(CalibrateAction))
-_CONFIG_KEYS = ("engage", "displays", "hand", "anchor", "overlay", "scrollSpeed")
+_CONFIG_KEYS = ("engage", "displays", "hand", "anchor", "overlay", *(knob.key for knob in KNOBS))
 
 
 class ValidationError(ValueError):
@@ -228,12 +228,13 @@ def _check_config(body: dict[str, Any]) -> None:
     _check_enum(body, "anchor", _ANCHORS)
     if "overlay" in body and not isinstance(body["overlay"], bool):
         raise ValidationError("$.overlay: expected boolean")
-    if "scrollSpeed" in body:
-        speed = body["scrollSpeed"]
-        if not _is_number(speed):
-            raise ValidationError("$.scrollSpeed: expected number")
-        if not SCROLL_SPEED_MIN <= speed <= SCROLL_SPEED_MAX:
-            raise ValidationError(f"$.scrollSpeed: must be between {SCROLL_SPEED_MIN} and {SCROLL_SPEED_MAX:g}")
+    for knob in KNOBS:
+        if knob.key in body:
+            value = body[knob.key]
+            if not _is_number(value):
+                raise ValidationError(f"$.{knob.key}: expected number")
+            if not knob.low <= value <= knob.high:
+                raise ValidationError(f"$.{knob.key}: must be between {knob.low:g} and {knob.high:g}")
 
 
 def _check_calibrate(body: dict[str, Any]) -> None:

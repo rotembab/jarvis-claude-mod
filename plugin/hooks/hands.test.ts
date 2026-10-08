@@ -1,8 +1,20 @@
 import { describe, expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import type { Engine as TestEngine } from 'claude-code/testing'
 
 import { BACKOFF_MS, HEARTBEAT_MS, ORPHAN_RETRY_MS, STOP_WAIT_MS } from './helper'
-import { describeHandsError, HANDS_TOOL, parseDisplaySelection, parseHandsEvent } from './hands'
+import {
+  changesTuning,
+  describeHandsError,
+  findKnob,
+  HANDS_TOOL,
+  isTuningCall,
+  KNOBS,
+  parseDisplaySelection,
+  parseHandsEvent,
+  parseKnobValue,
+  PRESETS,
+} from './hands'
 import type { Answer, FakeChild, World, WorldOptions } from './test-harness'
 import {
   DATA_DIR,
@@ -1360,11 +1372,764 @@ describe('the hands tool', () => {
     expect(await call('engage')).toBe('Could not take the cursor: boom')
   })
 
-  test('the schema offers the display and the engage actions', () => {
+  test('the schema offers the display, the engage actions and the tuning', () => {
     const { properties } = HANDS_TOOL.inputSchema
     expect(properties.action.enum).toEqual(['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage'])
-    expect(Object.keys(properties)).toEqual(['action', 'display'])
+    expect(Object.keys(properties)).toEqual(['action', 'display', 'setting', 'value', 'preset'])
+    expect(properties.value.type).toEqual(['number', 'string'])
+    expect(properties.preset.enum).toEqual(['precise', 'balanced', 'fast'])
     expect(HANDS_TOOL.inputSchema).not.toHaveProperty('required')
+  })
+})
+
+// ---- Tuning: the sensitivity knobs ----
+
+/** What the helper's KNOBS (settings.py) and the protocol schema say of each knob: [min, max, default]. */
+const CONTRACT: Record<string, [number, number, number]> = {
+  cursorSpeed: [0.7, 3, 1],
+  smoothing: [0.2, 3, 1],
+  pinch: [0.85, 1.15, 1],
+  fist: [0.9, 1.1, 1],
+  engageSeconds: [0.1, 2, 0.5],
+  dragDistance: [0.7, 4, 1],
+  flingSensitivity: [0.5, 2.5, 1],
+  scrollSpeed: [0.1, 10, 1],
+  deadZone: [0, 8, 1],
+}
+
+const TUNING_KEY = 'handsTuning'
+const BAD_REQUEST = { status: 400, body: { ok: false, error: { code: 'bad_request', message: 'cursorSpeed must be between 0.5 and 2.5' } } }
+
+/** The config commands the hand helper got, by body, in order. */
+const configBodies = (w: World): Record<string, unknown>[] => w.handsNamed('config').map(command => command.body)
+
+/** The hand helper refuses every config command (`when` picks which). */
+function refuseConfig(w: World, when: (body: Record<string, unknown>) => boolean = () => true): void {
+  w.respond = command => (command.name === 'config' && when(command.body) ? BAD_REQUEST : { status: 200, body: { ok: true } })
+}
+
+describe('the sensitivity knobs', () => {
+  test('the table says what the helper says, and its words and names do not collide', () => {
+    expect(KNOBS.map(knob => knob.key)).toEqual(Object.keys(CONTRACT))
+    for (const knob of KNOBS) {
+      expect([knob.min, knob.max, knob.default]).toEqual(CONTRACT[knob.key])
+      expect(knob.min).toBeLessThan(knob.max)
+      expect(knob.default).toBeGreaterThanOrEqual(knob.min)
+      expect(knob.default).toBeLessThanOrEqual(knob.max)
+      expect(knob.higher).not.toBe('')
+      expect(knob.label).not.toBe('')
+    }
+    // Every word that names a knob (its name, key, label, aliases) names exactly one.
+    const owners = new Map<string, string>()
+    for (const knob of KNOBS) {
+      for (const word of [knob.name, knob.key, knob.label, ...knob.aliases]) {
+        const found = findKnob(word)
+        expect(found?.key).toBe(knob.key)
+        const norm = word.toLowerCase().replace(/[^a-z0-9]/g, '')
+        const owner = owners.get(norm)
+        expect(owner === undefined || owner === knob.key).toBe(true)
+        owners.set(norm, knob.key)
+      }
+    }
+  })
+
+  test('findKnob takes the natural ways of writing a name', () => {
+    expect(findKnob('speed')?.key).toBe('cursorSpeed')
+    expect(findKnob('Cursor Speed')?.key).toBe('cursorSpeed')
+    expect(findKnob('cursor_speed')?.key).toBe('cursorSpeed')
+    expect(findKnob('CURSORSPEED')?.key).toBe('cursorSpeed')
+    expect(findKnob('cursor-speed')?.key).toBe('cursorSpeed')
+    expect(findKnob('smooth')?.key).toBe('smoothing')
+    expect(findKnob('click')?.key).toBe('pinch')
+    expect(findKnob('grab')?.key).toBe('fist')
+    expect(findKnob('deadzone')?.key).toBe('deadZone')
+    expect(findKnob('scroll')?.key).toBe('scrollSpeed')
+    expect(findKnob('engageSeconds')?.key).toBe('engageSeconds')
+    expect(findKnob('')).toBeUndefined()
+    expect(findKnob('warp')).toBeUndefined()
+    expect(findKnob('cursor speed fast')).toBeUndefined()
+  })
+
+  test('values are plain decimals inside the range; anything else says why', () => {
+    const speed = findKnob('speed')
+    if (speed === undefined) throw new Error('no speed knob')
+    expect(parseKnobValue(speed, '1.5')).toEqual({ ok: true, value: 1.5 })
+    expect(parseKnobValue(speed, ' 2 ')).toEqual({ ok: true, value: 2 })
+    expect(parseKnobValue(speed, '.7')).toEqual({ ok: true, value: 0.7 })
+    expect(parseKnobValue(speed, '3')).toEqual({ ok: true, value: 3 })
+    expect(parseKnobValue(speed, 1.25)).toEqual({ ok: true, value: 1.25 })
+    expect(parseKnobValue(speed, '1.23456')).toEqual({ ok: true, value: 1.235 })
+    expect(parseKnobValue(speed, 'default')).toEqual({ ok: true, value: 'default' })
+    expect(parseKnobValue(speed, 'Default')).toEqual({ ok: true, value: 'default' })
+    for (const text of ['abc', '', '  ', '1e0', '0x10', 'NaN', 'Infinity', '-Infinity', '1.5.2', '1,5', 'true', '--1']) {
+      expect(parseKnobValue(speed, text)).toEqual({ ok: false, why: 'not_number' })
+    }
+    for (const value of [Number.NaN, Number.POSITIVE_INFINITY, true, null, {}, [1]]) {
+      expect(parseKnobValue(speed, value)).toEqual({ ok: false, why: 'not_number' })
+    }
+    for (const value of ['0.69', '3.01', '99', '-1', '0', 0.5, 3.5]) {
+      expect(parseKnobValue(speed, value)).toEqual({ ok: false, why: 'range' })
+    }
+    // A zero is a fine dead zone.
+    const dead = findKnob('dead-zone')
+    if (dead === undefined) throw new Error('no dead zone knob')
+    expect(parseKnobValue(dead, '0')).toEqual({ ok: true, value: 0 })
+    expect(parseKnobValue(dead, '8.01')).toEqual({ ok: false, why: 'range' })
+  })
+
+  test('the presets name known knobs with values in range, and balanced is every default', () => {
+    expect(Object.keys(PRESETS)).toEqual(['precise', 'balanced', 'fast'])
+    expect(PRESETS.balanced).toEqual({})
+    for (const preset of Object.values(PRESETS)) {
+      for (const [key, value] of Object.entries(preset)) {
+        const knob = KNOBS.find(one => one.key === key)
+        expect(knob).toBeDefined()
+        expect(value).toBeGreaterThanOrEqual(knob?.min ?? 0)
+        expect(value).toBeLessThanOrEqual(knob?.max ?? 0)
+      }
+    }
+    expect(PRESETS.precise).toEqual({ cursorSpeed: 0.8, smoothing: 1.8, deadZone: 2, dragDistance: 1.5, pinch: 0.9 })
+    expect(PRESETS.fast).toEqual({ cursorSpeed: 1.6, smoothing: 0.5, deadZone: 0, pinch: 1.1 })
+  })
+
+  test('the everyday knobs are the ones with a plugin setting (plugin.json declares the same four)', () => {
+    // Tests cannot read plugin.json; keep this list and its userConfig in step by hand.
+    const everyday = KNOBS.filter(knob => knob.setting !== undefined)
+    expect(everyday.map(knob => [knob.name, knob.setting])).toEqual([
+      ['speed', 'handCursorSpeed'],
+      ['smoothing', 'handSmoothing'],
+      ['pinch', 'handPinch'],
+      ['scroll-speed', 'handScrollSpeed'],
+    ])
+  })
+})
+
+describe('/jarvis hands tune, set, preset and reset', () => {
+  test('tune lists every knob: value, default, range, what higher does and how to change it', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const text = await jarvis($, 'hands tune')
+    expect(text).toContain('Hand control tuning: balanced (every setting is at its default).')
+    for (const knob of KNOBS) {
+      expect(text).toContain(knob.label)
+      expect(text).toContain(`Higher means ${knob.higher}.`)
+    }
+    expect(text).toContain('Cursor speed (speed)')
+    expect(text).toMatch(/Cursor speed \(speed\)\s+1\s+default 1\s+range 0\.7 to 3\n/)
+    expect(text).toMatch(/Palm hold time \(engage-time\)\s+0\.5 s\s+default 0\.5 s\s+range 0\.1 to 2 s\n/)
+    expect(text).toMatch(/Dead zone \(dead-zone\)\s+1 px\s+default 1 px\s+range 0 to 8 px\n/)
+    expect(text).toContain('Change one: /jarvis hands set <name> <number|default>, for example /jarvis hands set speed 1.5.')
+    expect(text).toContain('/jarvis hands preset <precise|balanced|fast>')
+    expect(text).toContain('/jarvis hands reset')
+    expect(text).toContain('never in the middle of a click, a drag or a grab')
+    expect(text).not.toContain('* ')
+    expect(w.handsNamed('config')).toHaveLength(1) // only the start's
+    expect(await jarvis($, 'hands tuning')).toBe(text)
+    expect(await jarvis($, 'hands sensitivity')).toBe(text)
+  })
+
+  test('tune marks what is changed and says how many', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    await jarvis($, 'hands set speed 1.4')
+    await jarvis($, 'hands set dead-zone 3')
+    const text = await jarvis($, 'hands tune')
+    expect(text).toContain('Hand control tuning: custom, 2 changed.')
+    expect(text).toMatch(/^\* Cursor speed \(speed\)\s+1\.4\s+default 1\s+range 0\.7 to 3\s+changed$/m)
+    expect(text).toMatch(/^\* Dead zone \(dead-zone\)\s+3 px\s+default 1 px\s+range 0 to 8 px\s+changed$/m)
+    expect(text).toMatch(/^ {2}Smoothing \(smoothing\)\s+1\s+default 1\s+range 0\.2 to 3$/m)
+    expect(text.match(/^\* /gm)).toHaveLength(2)
+  })
+
+  test('set changes one setting at once: sent to the helper, kept, and told with the old and the new value', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await jarvis($, 'hands set speed 1.4')).toBe('Cursor speed is now 1.4 (was 1; default 1, range 0.7 to 3).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1.4 })
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 1.4, setting: 1 } })
+    expect(await jarvis($, 'hands set engage-time 0.8')).toBe('Palm hold time is now 0.8 s (was 0.5 s; default 0.5 s, range 0.1 to 2 s).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ engageSeconds: 0.8 })
+    expect(w.store.get(TUNING_KEY)).toEqual({
+      cursorSpeed: { value: 1.4, setting: 1 },
+      engageSeconds: { value: 0.8, setting: 0.5 },
+    })
+    // It does not touch the engage mode, the displays or the pause.
+    expect(w.store.has('handsEngage')).toBe(false)
+    expect(handsSent(w).filter(name => name !== 'config')).toEqual([])
+  })
+
+  test('set takes aliases, any case, a name of several words and "to"', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const sent = async (command: string): Promise<unknown> => {
+      const before = w.handsNamed('config').length
+      await jarvis($, command)
+      return w.handsNamed('config').length === before + 1 ? w.handsNamed('config').at(-1)?.body : 'nothing sent'
+    }
+    expect(await sent('hands set Speed 1.5')).toEqual({ cursorSpeed: 1.5 })
+    expect(await sent('hands set cursor speed to 2')).toEqual({ cursorSpeed: 2 })
+    expect(await sent('hands set cursorSpeed 1.2')).toEqual({ cursorSpeed: 1.2 })
+    expect(await sent('hands set cursor_speed = 1.3')).toEqual({ cursorSpeed: 1.3 })
+    expect(await sent('hands set "speed" "1.1"')).toEqual({ cursorSpeed: 1.1 })
+    expect(await sent('hands set smooth 2')).toEqual({ smoothing: 2 })
+    expect(await sent('hands set click 1.1')).toEqual({ pinch: 1.1 })
+    expect(await sent('hands set grab 0.9')).toEqual({ fist: 0.9 })
+    expect(await sent('hands set deadzone 4')).toEqual({ deadZone: 4 })
+    expect(await sent('hands set drag 2')).toEqual({ dragDistance: 2 })
+    expect(await sent('hands set fling 1.5')).toEqual({ flingSensitivity: 1.5 })
+    expect(await sent('hands set scroll 2.5')).toEqual({ scrollSpeed: 2.5 })
+    expect(await sent('hands set engage 0.7')).toEqual({ engageSeconds: 0.7 })
+  })
+
+  test('set to default puts the setting back and sends its default', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    await jarvis($, 'hands set speed 1.4')
+    expect(await jarvis($, 'hands set speed default')).toBe('Cursor speed is back to its default, 1 (was 1.4).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1 })
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    // Already there: nothing to send.
+    const sent = w.handsNamed('config').length
+    expect(await jarvis($, 'hands set speed default')).toBe('Cursor speed is already 1.')
+    expect(await jarvis($, 'hands set speed 1')).toBe('Cursor speed is already 1.')
+    expect(w.handsNamed('config')).toHaveLength(sent)
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test('set with only a name shows that setting; with nothing it shows the names', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    await jarvis($, 'hands set pinch 1.1')
+    const text = await jarvis($, 'hands set pinch')
+    expect(text).toBe(
+      'Pinch sensitivity is 1.1 (default 1, range 0.85 to 1.15). Higher means a lighter, looser pinch counts as a click. Change it with /jarvis hands set pinch <0.85 to 1.15|default>.',
+    )
+    expect(await jarvis($, 'hands set cursor speed')).toContain('Cursor speed is 1 (default 1, range 0.7 to 3).')
+    const usage = await jarvis($, 'hands set')
+    expect(usage).toContain('Use /jarvis hands set <name> <number|default>, for example /jarvis hands set speed 1.5.')
+    expect(usage).toContain('speed, smoothing, pinch, fist, engage-time, drag-distance, fling, scroll-speed and dead-zone')
+    expect(w.handsNamed('config')).toHaveLength(2) // the start's, and the pinch
+  })
+
+  test('set refuses an unknown setting, a non-number and a value out of range, and says what is allowed', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await jarvis($, 'hands set warp 2')).toBe(
+      'Unknown setting "warp". The settings are speed, smoothing, pinch, fist, engage-time, drag-distance, fling, scroll-speed and dead-zone; /jarvis hands tune shows what each does.',
+    )
+    expect(await jarvis($, 'hands set speed fast')).toBe(
+      '"fast" is not a number. Cursor speed takes a number from 0.7 to 3 (default 1), or "default": /jarvis hands set speed 1.5.',
+    )
+    expect(await jarvis($, 'hands set speed 5')).toBe('5 is outside the range for Cursor speed: 0.7 to 3 (default 1). Nothing was changed.')
+    expect(await jarvis($, 'hands set speed 0')).toBe('0 is outside the range for Cursor speed: 0.7 to 3 (default 1). Nothing was changed.')
+    expect(await jarvis($, 'hands set engage-time 9')).toBe(
+      '9 is outside the range for Palm hold time: 0.1 to 2 s (default 0.5 s). Nothing was changed.',
+    )
+    expect(await jarvis($, 'hands set speed NaN')).toContain('"NaN" is not a number.')
+    expect(await jarvis($, 'hands set speed Infinity')).toContain('"Infinity" is not a number.')
+    expect(await jarvis($, 'hands set speed 1e9')).toContain('"1e9" is not a number.')
+    expect(w.handsNamed('config')).toHaveLength(1)
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test('preset applies a whole profile, the other settings going back to their defaults', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    await jarvis($, 'hands set scroll-speed 2')
+    await jarvis($, 'hands set speed 2')
+    expect(await jarvis($, 'hands preset precise')).toBe(
+      'Preset precise: speed 0.8, smoothing 1.8, pinch 0.9, drag-distance 1.5, dead-zone 2 px (every other setting is at its default).',
+    )
+    // Everything that changed is sent; scroll speed went back to 1.
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({
+      cursorSpeed: 0.8,
+      smoothing: 1.8,
+      pinch: 0.9,
+      dragDistance: 1.5,
+      deadZone: 2,
+      scrollSpeed: 1,
+    })
+    expect(w.store.get(TUNING_KEY)).toEqual({
+      cursorSpeed: { value: 0.8, setting: 1 },
+      smoothing: { value: 1.8, setting: 1 },
+      pinch: { value: 0.9, setting: 1 },
+      dragDistance: { value: 1.5, setting: 1 },
+      deadZone: { value: 2, setting: 1 },
+    })
+    expect(await jarvis($, 'hands preset precise')).toBe('Preset precise is already in place.')
+    expect(await jarvis($, 'hands Preset FAST')).toBe(
+      'Preset fast: speed 1.6, smoothing 0.5, pinch 1.1, dead-zone 0 px (every other setting is at its default).',
+    )
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1.6, smoothing: 0.5, pinch: 1.1, dragDistance: 1, deadZone: 0 })
+    expect(await jarvis($, 'hands preset balanced')).toBe('Preset balanced: every setting is at its default.')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1, smoothing: 1, pinch: 1, deadZone: 1 })
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    expect(await jarvis($, 'hands preset default')).toBe('Preset balanced is already in place.')
+  })
+
+  test('preset with no name lists them; an unknown one says which exist', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const list = await jarvis($, 'hands preset')
+    expect(list).toContain('precise: speed 0.8, smoothing 1.8, pinch 0.9, drag-distance 1.5, dead-zone 2 px')
+    expect(list).toContain('balanced: every setting at its default')
+    expect(list).toContain('fast: speed 1.6, smoothing 0.5, pinch 1.1, dead-zone 0 px')
+    expect(list).toContain('Now: balanced.')
+    expect(list).toContain('/jarvis hands preset <precise|balanced|fast>')
+    expect(await jarvis($, 'hands preset turbo')).toBe(
+      'Unknown preset "turbo". The presets are precise, balanced and fast; /jarvis hands preset shows what each sets.',
+    )
+    expect(w.handsNamed('config')).toHaveLength(1)
+  })
+
+  test('reset puts every setting back and sends what changed; reset with a name resets that one', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await jarvis($, 'hands reset')).toBe('Hand control tuning is already at its defaults.')
+    await jarvis($, 'hands set speed 1.4')
+    await jarvis($, 'hands set fist 0.9')
+    await jarvis($, 'hands set scroll 3')
+    expect(await jarvis($, 'hands reset speed')).toBe('Cursor speed is back to its default, 1 (was 1.4).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1 })
+    expect(await jarvis($, 'hands reset')).toBe('Hand control tuning is back to its defaults.')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ fist: 1, scrollSpeed: 1 })
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    expect(await jarvis($, 'hands reset warp')).toContain('Unknown setting "warp".')
+  })
+
+  test('with no hand helper running a choice is kept and goes out with the next start', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    await startHelper($, w)
+    expect(await jarvis($, 'hands set speed 1.4')).toBe(
+      'Cursor speed is now 1.4 (was 1; default 1, range 0.7 to 3); it applies when hand control starts.',
+    )
+    expect(await jarvis($, 'hands preset fast')).toContain('(every other setting is at its default); it applies when hand control starts.')
+    expect(await jarvis($, 'hands reset')).toBe('Hand control tuning is back to its defaults; it applies when hand control starts.')
+    expect(await jarvis($, 'hands preset precise')).toContain('it applies when hand control starts.')
+    expect(w.handsNamed('config')).toHaveLength(0)
+    expect(w.handsHelpers()).toHaveLength(0)
+    // On at last: the helper's first config carries every changed setting, and only those.
+    await jarvis($, 'hands on')
+    await w.settle()
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([
+      { engage: 'palm', displays: 'all', cursorSpeed: 0.8, smoothing: 1.8, pinch: 0.9, dragDistance: 1.5, deadZone: 2 },
+    ])
+  })
+
+  test('a choice outlives the helper and the session: the next hello sends it again', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    const first = await handsReady(w)
+    await jarvis($, 'hands set smoothing 2.5')
+    await jarvis($, 'hands set fling 2')
+    first.exit(1)
+    await w.settle()
+    await w.clock.advance(BACKOFF_MS[0] ?? 1000)
+    await w.settle()
+    await handsReady(w)
+    expect(configBodies(w).at(-1)).toEqual({ engage: 'palm', displays: 'all', smoothing: 2.5, flingSensitivity: 2 })
+    expect(w.store.get(TUNING_KEY)).toEqual({ smoothing: { value: 2.5, setting: 1 }, flingSensitivity: { value: 2, setting: 1 } })
+  })
+
+  test('a choice kept by an earlier session goes out with this one\'s start', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set(TUNING_KEY, { smoothing: { value: 2.5, setting: 1 }, flingSensitivity: { value: 2, setting: 1 } })
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all', smoothing: 2.5, flingSensitivity: 2 }])
+    expect(await jarvis($, 'hands')).toContain('Tuning: custom, 2 changed (smoothing 2.5, fling 2).')
+  })
+
+  test('a setting the helper refuses is shown, and the stored value is rolled back', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    refuseConfig(w)
+    expect(await jarvis($, 'hands set speed 2.8')).toBe('The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed.')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 2.8 })
+
+    // With an earlier choice: it stays.
+    w.respond = () => ({ status: 200, body: { ok: true } })
+    await jarvis($, 'hands set speed 1.4')
+    refuseConfig(w)
+    expect(await jarvis($, 'hands set speed 2')).toContain('The hand helper refused it:')
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 1.4, setting: 1 } })
+    expect(await jarvis($, 'hands preset fast')).toContain('The hand helper refused it:')
+    expect(await jarvis($, 'hands reset')).toContain('The hand helper refused it:')
+    expect(await jarvis($, 'hands set speed default')).toContain('The hand helper refused it:')
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 1.4, setting: 1 } })
+    expect(await jarvis($, 'hands tune')).toMatch(/^\* Cursor speed \(speed\)\s+1\.4\s/m)
+
+    w.respond = () => ({ status: 200, body: { ok: true } })
+    expect(await jarvis($, 'hands set speed 2')).toBe('Cursor speed is now 2 (was 1.4; default 1, range 0.7 to 3).')
+  })
+
+  test('an answer that is not a refusal also leaves nothing half done', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    answer(w, 'config', { ok: false, error: { code: 'internal', message: 'boom' } })
+    expect(await jarvis($, 'hands set pinch 1.1')).toBe('The hand helper could not apply it: boom. Nothing was changed.')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    w.respond = () => ({ status: 502, body: 'bad gateway' })
+    expect(await jarvis($, 'hands set pinch 1.1')).toBe('The hand helper could not apply it: config: HTTP 502. Nothing was changed.')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test('a refusal from a helper an earlier version installed also says to update it', async ($, on) => {
+    const w = handsWorld(on)
+    w.files.delete(HANDS_INSTALLED)
+    await startHelper($, w)
+    await handsReady(w)
+    refuseConfig(w)
+    expect(await jarvis($, 'hands set speed 2')).toBe(
+      'The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed. The hand helper may be older than this Jarvis: /jarvis setup hands updates it.',
+    )
+  })
+
+  test('a helper that refuses the tuning at its start still gets the engage mode and the displays', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set('handsEngage', 'always')
+    w.store.set(TUNING_KEY, { cursorSpeed: { value: 1.4, setting: 1 } })
+    refuseConfig(w, body => 'cursorSpeed' in body)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([
+      { engage: 'always', displays: 'all', cursorSpeed: 1.4 },
+      { engage: 'always', displays: 'all' },
+    ])
+    const why =
+      'The hand helper refused the tuning settings (cursorSpeed must be between 0.5 and 2.5), so it runs with its defaults. /jarvis setup hands updates an older hand helper; /jarvis hands restart tries again.'
+    expect(w.logs).toContain(why)
+    expect(w.toasts).toContain('Hand control: the hand helper refused the tuning settings, so it runs with its defaults. The transcript says why.')
+    // The tuning table does not claim the settings are in force.
+    expect(await jarvis($, 'hands tune')).toContain(why)
+    expect(await jarvis($, 'hands')).toContain(why)
+  })
+
+  test('a refusal of a start config with nothing to drop is only logged', async ($, on) => {
+    const w = handsWorld(on)
+    refuseConfig(w)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all' }])
+    expect(w.logs.some(line => line.includes('refused the tuning'))).toBe(false)
+  })
+
+  test('the status says the tuning in a line: a preset by name, otherwise custom and how many', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const more = '/jarvis hands tune shows every setting and how to change it.'
+    expect(await jarvis($, 'hands')).toContain(`Tuning: balanced (all defaults). ${more}`)
+    await jarvis($, 'hands preset precise')
+    expect(await jarvis($, 'hands')).toContain(`Tuning: precise preset. ${more}`)
+    await jarvis($, 'hands preset fast')
+    expect(await jarvis($, 'hands status')).toContain(`Tuning: fast preset. ${more}`)
+    await jarvis($, 'hands set speed 1.4')
+    expect(await jarvis($, 'hands')).toContain(`Tuning: custom, 4 changed (speed 1.4, smoothing 0.5, pinch 1.1, dead-zone 0 px). ${more}`)
+    await jarvis($, 'hands reset')
+    expect(await jarvis($, 'hands set scroll 2')).toContain('Scroll speed is now 2')
+    expect(await jarvis($, 'hands')).toContain(`Tuning: custom, 1 changed (scroll-speed 2). ${more}`)
+  })
+
+  test('settings that add up to a preset are that preset', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    for (const [name, value] of [['speed', 0.8], ['smoothing', 1.8], ['pinch', 0.9], ['drag-distance', 1.5]] as const) {
+      await jarvis($, `hands set ${name} ${value}`)
+      expect(await jarvis($, 'hands')).toContain('Tuning: custom')
+    }
+    await jarvis($, 'hands set dead-zone 2')
+    expect(await jarvis($, 'hands')).toContain('Tuning: precise preset.')
+    expect(await jarvis($, 'hands tune')).toContain('Hand control tuning: precise preset.')
+    // One more change and it is custom again; putting it back makes it the preset again.
+    await jarvis($, 'hands set fist 1.1')
+    expect(await jarvis($, 'hands')).toContain('Tuning: custom, 6 changed')
+    await jarvis($, 'hands set fist default')
+    expect(await jarvis($, 'hands')).toContain('Tuning: precise preset.')
+  })
+
+  test('while hand control is off the status stays short, and tune still shows the tuning', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(await jarvis($, 'hands')).not.toContain('Tuning:')
+    await jarvis($, 'hands set fist 0.9')
+    expect(await jarvis($, 'hands tune')).toMatch(/^\* Fist sensitivity \(fist\)\s+0\.9\s+default 1/m)
+    expect(await jarvis($, 'hands')).not.toContain('Tuning:')
+  })
+
+  test('the help lists the sensitivity commands, in the hands help and in /jarvis', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    const help = await jarvis($, 'hands wave')
+    expect(help).toContain('/jarvis hands tune                 every sensitivity setting, its value and what it does')
+    expect(help).toContain('/jarvis hands set <name> <number>  change one setting, such as: set speed 1.5 (or default)')
+    expect(help).toContain('/jarvis hands preset <name>        precise, balanced or fast: a ready-made set of settings')
+    expect(help).toContain('/jarvis hands reset [name]         put every setting (or one) back to its default')
+    expect(await jarvis($, '')).toContain('/jarvis hands tune|preset|set    tune the sensitivity: cursor speed, smoothing, pinch and more')
+    expect(await jarvis($, 'hands help')).toContain('/jarvis hands preset <name>')
+  })
+
+  test('never in a cloud session', async ($, on) => {
+    const w = world(on, { env: { HOME: '/root', CLAUDE_CODE_REMOTE: 'true' } })
+    await startSession($, w)
+    for (const command of ['tune', 'set speed 1.5', 'preset fast', 'reset']) {
+      expect(await jarvis($, `hands ${command}`)).toBe(NOT_LOCAL)
+    }
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+})
+
+describe('tuning and the plugin settings', () => {
+  const SETTINGS = { handCursorSpeed: '1.5', handSmoothing: '2', handPinch: '1.1', handScrollSpeed: '3' }
+
+  test('the plugin settings are the defaults: they go out with the start and tune shows them', { options: SETTINGS }, async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all', cursorSpeed: 1.5, smoothing: 2, pinch: 1.1, scrollSpeed: 3 }])
+    const text = await jarvis($, 'hands tune')
+    expect(text).toMatch(/^\* Cursor speed \(speed\)\s+1\.5\s+default 1 \(handCursorSpeed says 1\.5\)\s+range 0\.7 to 3\s+changed$/m)
+    expect(await jarvis($, 'hands')).toContain('Tuning: custom, 4 changed (speed 1.5, smoothing 2, pinch 1.1, scroll-speed 3).')
+  })
+
+  test('a command overrides the plugin setting and is kept with the value it overrode', { options: SETTINGS }, async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await jarvis($, 'hands set speed 2')).toBe('Cursor speed is now 2 (was 1.5; default 1, range 0.7 to 3).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 2 })
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 2, setting: 1.5 } })
+    // A value equal to the setting is no override.
+    expect(await jarvis($, 'hands set speed 1.5')).toBe('Cursor speed is now 1.5 (was 2; default 1, range 0.7 to 3).')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    // The factory value is a choice against the setting.
+    expect(await jarvis($, 'hands set speed 1')).toBe('Cursor speed is now 1 (was 1.5; default 1, range 0.7 to 3).')
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 1, setting: 1.5 } })
+    // "default" gives the setting its say again.
+    expect(await jarvis($, 'hands set speed default')).toBe(
+      'Cursor speed is back to 1.5, what the handCursorSpeed plugin setting says (was 1).',
+    )
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1.5 })
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test('reset and balanced differ when settings differ: reset gives the settings their say, balanced does not', { options: SETTINGS }, async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    await jarvis($, 'hands set speed 2')
+    expect(await jarvis($, 'hands reset')).toBe(
+      'Hand control tuning is back to its defaults (your plugin settings count as defaults: speed 1.5, smoothing 2, pinch 1.1, scroll-speed 3).',
+    )
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1.5 })
+    expect(await jarvis($, 'hands preset balanced')).toBe('Preset balanced: every setting is at its default.')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1, smoothing: 1, pinch: 1, scrollSpeed: 1 })
+    expect(w.store.get(TUNING_KEY)).toEqual({
+      cursorSpeed: { value: 1, setting: 1.5 },
+      smoothing: { value: 1, setting: 2 },
+      pinch: { value: 1, setting: 1.1 },
+      scrollSpeed: { value: 1, setting: 3 },
+    })
+  })
+
+  test('a choice lapses once its setting changed: the setting has the last word, and the old choice is dropped', { options: { handCursorSpeed: '1.8' } }, async ($, on) => {
+    const w = handsWorld(on)
+    // Chosen while the setting said 1.5, and 2 for the smoothing, which the setting does not name.
+    w.store.set(TUNING_KEY, { cursorSpeed: { value: 2, setting: 1.5 }, smoothing: { value: 2, setting: 1 } })
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all', cursorSpeed: 1.8, smoothing: 2 }])
+    expect(w.store.get(TUNING_KEY)).toEqual({ smoothing: { value: 2, setting: 1 } })
+  })
+
+  test('a choice with no record of the setting it overrode, or a value out of range, is none', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set(TUNING_KEY, {
+      cursorSpeed: 1.4,
+      smoothing: { value: 2 },
+      pinch: { value: 9, setting: 1 },
+      fist: { value: 'tight', setting: 1 },
+      deadZone: { value: 3, setting: 1 },
+      warp: { value: 3, setting: 1 },
+    })
+    await startHelper($, w)
+    await handsReady(w)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all', deadZone: 3 }])
+    expect(w.store.get(TUNING_KEY)).toEqual({ deadZone: { value: 3, setting: 1 } })
+    w.store.set(TUNING_KEY, 'nonsense')
+    expect(await jarvis($, 'hands tune')).toContain('balanced')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test(
+    'settings that are not numbers in range fall back to the defaults and say so once, never stopping the start',
+    { options: { handCursorSpeed: 'fast', handSmoothing: '9', handPinch: ' 1.1 ', handScrollSpeed: '' } },
+    async ($, on) => {
+      const w = handsWorld(on)
+      await startHelper($, w)
+      const first = await handsReady(w)
+      expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all', pinch: 1.1 }])
+      expect(w.logs).toContain('The handCursorSpeed setting "fast" is not a number from 0.7 to 3, so the default, 1, is used.')
+      expect(w.logs).toContain('The handSmoothing setting "9" is not a number from 0.2 to 3, so the default, 1, is used.')
+      expect(w.logs.filter(line => line.includes(' setting "'))).toHaveLength(2)
+      expect(w.toasts).toContain('Hand control: 2 settings are not numbers in range, so their defaults are used. The transcript lists them.')
+      expect(w.status()).toBe(`${VOICE_READY} · hands ready · open palm to start`)
+
+      // Not again when the helper restarts.
+      first.exit(1)
+      await w.settle()
+      await w.clock.advance(BACKOFF_MS[0] ?? 1000)
+      await w.settle()
+      await handsReady(w)
+      expect(w.logs.filter(line => line.includes(' setting "'))).toHaveLength(2)
+      expect(w.toasts.filter(toast => toast.includes('not numbers in range'))).toHaveLength(1)
+      // tune says so too.
+      expect(await jarvis($, 'hands tune')).toContain('The handCursorSpeed setting "fast" is not a number from 0.7 to 3, so the default, 1, is used.')
+    },
+  )
+
+  test('one bad setting is toasted by itself', { options: { handPinch: 'loose' } }, async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(w.toasts).toContain('Hand control: the handPinch setting "loose" is not a number from 0.85 to 1.15, so the default, 1, is used.')
+  })
+
+  test('without a bad setting there is nothing to say', { options: { handCursorSpeed: '1', handSmoothing: ' ' } }, async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(w.logs.some(line => line.includes(' setting "'))).toBe(false)
+    expect(configBodies(w)).toEqual([{ engage: 'palm', displays: 'all' }])
+  })
+})
+
+describe('the hands tool: tuning', () => {
+  const call = async ($: TestEngine, input: Record<string, unknown>): Promise<string> =>
+    String((await $.tool.call({ tool: 'mcp__jarvis__hands', ...input })).result)
+
+  test('the description names the settings with their ranges and asks for modest steps and a report', () => {
+    const { description } = HANDS_TOOL
+    for (const knob of KNOBS) expect(description).toContain(`${knob.name} ${knob.min} to ${knob.max}`)
+    expect(description).toContain('modest')
+    expect(description).toContain('report')
+    expect(description).toContain('preset')
+    expect(description).toContain('precise, balanced or fast')
+    expect(description.length).toBeLessThan(5000)
+    const { properties } = HANDS_TOOL.inputSchema
+    expect(properties.setting.description).toContain('speed')
+    expect(properties.preset.enum).toEqual(Object.keys(PRESETS))
+  })
+
+  test('setting and value change a setting as /jarvis hands set does: "Jarvis, make the cursor faster"', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await call($, { setting: 'speed' })).toBe(
+      'Cursor speed is 1 (default 1, range 0.7 to 3). Higher means a faster cursor, with less hand travel to cross the screen. Change it with /jarvis hands set speed <0.7 to 3|default>.',
+    )
+    expect(await call($, { setting: 'speed', value: 1.3 })).toBe('Cursor speed is now 1.3 (was 1; default 1, range 0.7 to 3).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 1.3 })
+    expect(w.store.get(TUNING_KEY)).toEqual({ cursorSpeed: { value: 1.3, setting: 1 } })
+    expect(await call($, { setting: 'cursorSpeed', value: '1.6' })).toBe('Cursor speed is now 1.6 (was 1.3; default 1, range 0.7 to 3).')
+    expect(await call($, { setting: 'smoothing', value: 'default' })).toBe('Smoothing is already 1.')
+    expect(await call($, { setting: 'speed', value: 'default' })).toBe('Cursor speed is back to its default, 1 (was 1.6).')
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    // Zero is a value, not an absence.
+    expect(await call($, { setting: 'dead-zone', value: 0 })).toBe('Dead zone is now 0 px (was 1 px; default 1 px, range 0 to 8 px).')
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ deadZone: 0 })
+    expect(w.store.get(TUNING_KEY)).toEqual({ deadZone: { value: 0, setting: 1 } })
+  })
+
+  test('preset applies a preset', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await call($, { preset: 'precise' })).toBe(
+      'Preset precise: speed 0.8, smoothing 1.8, pinch 0.9, drag-distance 1.5, dead-zone 2 px (every other setting is at its default).',
+    )
+    expect(w.handsNamed('config').at(-1)?.body).toEqual({ cursorSpeed: 0.8, smoothing: 1.8, pinch: 0.9, dragDistance: 1.5, deadZone: 2 })
+    expect(await call($, { preset: 'Balanced' })).toBe('Preset balanced: every setting is at its default.')
+    expect(await call($, { preset: 'turbo' })).toBe(await jarvis($, 'hands preset turbo'))
+  })
+
+  test('a call is a tuning change when it carries a value or a preset; a setting alone only reports', () => {
+    expect(isTuningCall({ setting: 'speed' })).toBe(true)
+    expect(isTuningCall({ value: 1 })).toBe(true)
+    expect(isTuningCall({ preset: 'fast' })).toBe(true)
+    expect(isTuningCall({ action: 'status', display: '1' })).toBe(false)
+    expect(changesTuning({ setting: 'speed' })).toBe(false)
+    expect(changesTuning({ setting: 'speed', value: 'default' })).toBe(true)
+    expect(changesTuning({ preset: 'balanced' })).toBe(true)
+    expect(changesTuning({ action: 'on' })).toBe(false)
+  })
+
+  test('arguments the model must fix are answered in words, and nothing changes', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    expect(await call($, { value: 1.5 })).toBe('Say which setting the value is for, such as setting "speed" with value 1.5.')
+    expect(await call($, { setting: 5, value: 1 })).toBe('The setting must be a name, such as "speed"; /jarvis hands tune lists them.')
+    expect(await call($, { setting: 'speed', value: true })).toBe('The value must be a number, or "default".')
+    expect(await call($, { setting: 'speed', value: [1] })).toBe('The value must be a number, or "default".')
+    expect(await call($, { setting: 'speed', value: 99 })).toBe('99 is outside the range for Cursor speed: 0.7 to 3 (default 1). Nothing was changed.')
+    expect(await call($, { setting: 'speed', value: 'fast' })).toContain('"fast" is not a number.')
+    expect(await call($, { setting: 'warp', value: 1 })).toContain('Unknown setting "warp".')
+    expect(await call($, { preset: 'fast', setting: 'speed' })).toBe('Give either a preset or a setting, not both.')
+    expect(await call($, { preset: 'fast', value: 2 })).toBe('Give either a preset or a setting, not both.')
+    expect(await call($, { preset: 5 })).toBe('The preset must be one of precise, balanced or fast.')
+    expect(w.handsNamed('config')).toHaveLength(1)
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    expect(await call($, {})).toBe('Give an action, a display, or both.')
+  })
+
+  test('it comes alone or with an action, applies after the display and before the action', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    const both = await call($, { display: '2', setting: 'pinch', value: 1.1, action: 'status' })
+    const parts = both.split('\n\n')
+    expect(parts[0]).toBe('Hand control now reaches display 2 (EPSON Projector).')
+    expect(parts[1]).toBe('Pinch sensitivity is now 1.1 (was 1; default 1, range 0.85 to 1.15).')
+    expect(parts[2]).toContain('Hand control: ready')
+    expect(both).toContain('Tuning: custom, 1 changed (pinch 1.1).')
+  })
+
+  test('a refusal by the helper reaches the model, with the value rolled back', async ($, on) => {
+    const w = handsWorld(on)
+    await startHelper($, w)
+    await handsReady(w)
+    refuseConfig(w)
+    expect(await call($, { setting: 'speed', value: 2.8 })).toBe(
+      'The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed.',
+    )
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+  })
+
+  test('it works while hand control is off: the choice waits for the start', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    expect(w.tools).toEqual(['home_control', 'hands'])
+    expect(await call($, { setting: 'fist', value: 0.9 })).toBe(
+      'Fist sensitivity is now 0.9 (was 1; default 1, range 0.9 to 1.1); it applies when hand control starts.',
+    )
+    expect(w.store.get(TUNING_KEY)).toEqual({ fist: { value: 0.9, setting: 1 } })
   })
 })
 
@@ -1403,5 +2168,72 @@ describe('hands protocol parsing', () => {
     expect(parseDisplaySelection('0')).toBeUndefined()
     expect(parseDisplaySelection('all,2')).toBeUndefined()
     expect(parseDisplaySelection('')).toBeUndefined()
+  })
+})
+
+describe('the palm hold time in the instructions', () => {
+  const held = (seconds: number): Record<string, unknown> => ({ engageSeconds: { value: seconds, setting: 0.5 } })
+  const call = async ($: TestEngine, input: Record<string, unknown>): Promise<string> =>
+    String((await $.tool.call({ tool: 'mcp__jarvis__hands', ...input })).result)
+
+  test('the start reply says the hold time that is set, in the command and in the tool', async ($, on) => {
+    const w = world(on)
+    w.existing.add(HANDS_PYTHON)
+    w.store.set(TUNING_KEY, held(1.5))
+    await startHelper($, w)
+    exitOnShutdown(w)
+    const reply = 'Hand control is on. The camera starts in a moment; then hold an open palm toward the camera for 1.5 seconds to take the cursor. Nothing leaves this computer.'
+    expect(await jarvis($, 'hands on')).toBe(reply)
+    await w.settle()
+    await handsReady(w)
+    await jarvis($, 'hands off')
+    expect(await call($, { action: 'on' })).toBe(reply)
+  })
+
+  test('the status, the help and the engage reply say it too, and follow a change at once', async ($, on) => {
+    const w = handsWorld(on)
+    w.store.set(TUNING_KEY, held(1.5))
+    await startHelper($, w)
+    await handsReady(w)
+    const status = await jarvis($, 'hands')
+    expect(status).toContain('Hand control starts when you hold an open palm toward the camera for 1.5 seconds (/jarvis hands engage always switches).')
+    expect(status).toContain('Open palm toward the camera, still for 1.5 seconds: start (the cursor follows your hand)')
+    expect(status).not.toContain('half a second')
+    const help = await jarvis($, 'hands help')
+    expect(help).toContain('Open palm toward the camera, still for 1.5 seconds: start (the cursor follows your hand)')
+    expect(help).not.toContain('half a second')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for 1.5 seconds.')
+    expect(await jarvis($, 'hands engage')).toContain('toward the camera for 1.5 seconds. Switch with')
+    expect(await call($, { action: 'status' })).toContain('still for 1.5 seconds: start')
+
+    // A change shows at once, and the default keeps its old words.
+    await jarvis($, 'hands set engage-time 1')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for one second.')
+    await jarvis($, 'hands set engage-time 2')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for 2 seconds.')
+    await jarvis($, 'hands set engage-time 0.1')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for 0.1 seconds.')
+    await jarvis($, 'hands set engage-time 1.25')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for 1.25 seconds.')
+    await jarvis($, 'hands set engage-time default')
+    expect(await jarvis($, 'hands engage palm')).toBe('Hand control starts when you hold an open palm toward the camera for half a second.')
+    expect(await jarvis($, 'hands help')).toContain('Open palm toward the camera, still for half a second: start')
+  })
+})
+
+describe('a helper that does not know the settings', () => {
+  test('a refusal naming an unknown property says to update it, even when the versions look equal', async ($, on) => {
+    const w = handsWorld(on) // installed by this version: no update notice
+    await startHelper($, w)
+    await handsReady(w)
+    const unknown = { status: 400, body: { ok: false, error: { code: 'bad_request', message: "$: unexpected property 'cursorSpeed'" } } }
+    w.respond = command => (command.name === 'config' ? unknown : { status: 200, body: { ok: true } })
+    const hint = 'The hand helper may be older than this Jarvis: /jarvis setup hands updates it.'
+    expect(await jarvis($, 'hands set speed 2')).toBe(`The hand helper refused it: $: unexpected property 'cursorSpeed'. Nothing was changed. ${hint}`)
+    expect(await jarvis($, 'hands preset fast')).toContain(hint)
+    expect(w.store.has(TUNING_KEY)).toBe(false)
+    // Any other refusal gets no such hint (and no second one when the notice already says it).
+    refuseConfig(w)
+    expect(await jarvis($, 'hands set speed 2')).toBe('The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed.')
   })
 })

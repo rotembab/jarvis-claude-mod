@@ -365,7 +365,15 @@ def test_status_answers_before_start_and_while_running(make_rig: Callable[..., R
         "hand": "any",
         "anchor": "knuckles",
         "overlay": True,
+        "cursorSpeed": 1,
+        "smoothing": 1,
+        "pinch": 1,
+        "fist": 1,
+        "engageSeconds": 0.5,
+        "dragDistance": 1,
+        "flingSensitivity": 1,
         "scrollSpeed": 1,
+        "deadZone": 1,
     }
 
     rig.started().engaged()
@@ -405,6 +413,106 @@ def test_a_config_value_the_settings_refuse_is_a_bad_request(make_rig: Callable[
     response = rig.command("config", {"scrollSpeed": 50})
     assert response["ok"] is False and response["error"]["code"] == "bad_request"
     assert rig.command("status")["settings"]["scrollSpeed"] == 1
+
+
+ALL_KNOBS = {
+    "cursorSpeed": 1.5,
+    "smoothing": 1.25,
+    "pinch": 1.1,
+    "fist": 1.05,
+    "engageSeconds": 0.75,
+    "dragDistance": 2.0,
+    "flingSensitivity": 1.5,
+    "scrollSpeed": 3.0,
+    "deadZone": 3.0,
+}
+
+
+def test_every_sensitivity_knob_is_set_by_config_and_reported_by_status(make_rig: Callable[..., Rig]) -> None:
+    rig = make_rig()
+    assert rig.command("config", ALL_KNOBS) == {"ok": True}
+    status = rig.command("status")
+    validate(status, "StatusResponse")
+    assert {key: status["settings"][key] for key in ALL_KNOBS} == ALL_KNOBS
+    assert rig.command("config", {"cursorSpeed": 2.0}) == {"ok": True}  # the rest keep their values
+    assert rig.command("status")["settings"] == status["settings"] | {"cursorSpeed": 2.0}
+    rig.started()
+    during = rig.command("status")
+    validate(during, "StatusResponse")
+    assert during["settings"] == status["settings"] | {"cursorSpeed": 2.0}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"cursorSpeed": 99},
+        {"smoothing": 0},
+        {"pinch": True},
+        {"fist": "1"},
+        {"engageSeconds": float("nan")},
+        {"dragDistance": -1},
+        {"flingSensitivity": None},
+        {"scrollSpeed": 50},
+        {"deadZone": 9},
+        {"cursorSpeed": 2.0, "engage": "always", "deadZone": 99},  # one bad knob: the good ones wait too
+    ],
+    ids=repr,
+)
+def test_a_config_with_a_knob_out_of_range_applies_nothing(make_rig: Callable[..., Rig], body: dict[str, Any]) -> None:
+    rig = make_rig()
+    before = rig.command("status")["settings"]
+    response = rig.command("config", body)
+    assert response["ok"] is False and response["error"]["code"] == "bad_request"
+    assert rig.command("status")["settings"] == before
+
+
+def test_config_sent_before_start_sets_the_cursor_gain_of_the_first_engagement(make_rig: Callable[..., Rig]) -> None:
+    rig = make_rig()
+    assert rig.command("config", {"cursorSpeed": 2.0}) == {"ok": True}
+    rig.started().engaged(at=(0.55, 0.45))
+    # 0.05 frame widths right of the centre, twice as far as at a gain of 1 (960 + 160)
+    eventually(lambda: abs(rig.desktop.cursor_pos[0] - (960 + 2 * 160)) <= 2, what="the cursor at the doubled distance")
+
+
+def test_config_while_running_glides_the_cursor_to_the_new_gain(make_rig: Callable[..., Rig]) -> None:
+    rig = make_rig().started().engaged(at=(0.55, 0.45))
+    eventually(lambda: abs(rig.desktop.cursor_pos[0] - 1120) <= 2, what="the cursor at the default distance")
+    assert rig.command("config", {"cursorSpeed": 2.0}) == {"ok": True}
+    eventually(lambda: abs(rig.desktop.cursor_pos[0] - 1280) <= 2, what="the cursor at the doubled distance")
+
+
+def test_a_config_during_a_press_does_not_release_it_or_move_the_cursor(make_rig: Callable[..., Rig]) -> None:
+    rig = make_rig().started().engaged()
+    rig.pressed()
+    held_at = rig.desktop.cursor_pos
+    assert rig.command(
+        "config", {"cursorSpeed": 3.0, "pinch": 0.85, "smoothing": 3.0, "deadZone": 8, "dragDistance": 0.7}
+    ) == {"ok": True}
+    frames = rig.tracker.calls
+    eventually(lambda: rig.tracker.calls >= frames + 10, what="ten more frames of the still, pinching hand")
+    assert "left" in rig.desktop.buttons_down and rig.desktop.cursor_pos == held_at
+    rig.puppet.set({"pose": "palm"})
+    rig.writer.wait_for("gesture", name="click")
+    eventually(lambda: not rig.desktop.buttons_down, what="the button to come up")
+
+
+def test_the_cursor_speed_widens_the_drag_that_restores_a_maximized_window(make_rig: Callable[..., Rig]) -> None:
+    """A small wander of a held fist moves the cursor 3 times as far at a cursor speed of 3 (19 px, more than the
+    8 px that restore a window at the default): the executor must know the gain, as the runtime wires it."""
+    window = FakeWindow(
+        1, "Maximized", Rect(0, 0, 1920, 1040), state="maximized", normal_rect=Rect(300, 200, 1000, 700)
+    )
+    rig = make_rig(desktop=FakeDesktop(windows=[window]))
+    assert rig.command("config", {"cursorSpeed": 3.0}) == {"ok": True}
+    rig.started().engaged()
+    rig.puppet.set({"pose": "fist", "at": [0.5, 0.45]})
+    rig.writer.wait_for("gesture", name="grab")
+    rig.puppet.set({"pose": "fist", "at": [0.502, 0.45]})  # 0.002 frame widths: 6 px at a gain of 1, 19 at 3
+    frames = rig.tracker.calls
+    eventually(lambda: rig.tracker.calls >= frames + 20, what="twenty frames of the fist after its small wander")
+    assert window.state == "maximized"
+    rig.puppet.set({"pose": "fist", "at": [0.52, 0.45]})  # a real drag
+    eventually(lambda: window.state != "maximized", what="the window to be restored by a real drag")
 
 
 def test_unknown_commands_are_bad_requests(make_rig: Callable[..., Rig]) -> None:

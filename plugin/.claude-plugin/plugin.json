@@ -110,9 +110,33 @@
     "handEngage": {
       "type": "string",
       "title": "Starting hand control",
-      "description": "palm: hold an open palm toward the camera for half a second to take the cursor, so a hand passing by does nothing. always: any hand in view takes it at once (for a projector room). /jarvis hands engage palm|always switches it.",
+      "description": "palm: hold an open palm toward the camera to take the cursor (for half a second by default; /jarvis hands set engage-time changes it), so a hand passing by does nothing. always: any hand in view takes it at once (for a projector room). /jarvis hands engage palm|always switches it.",
       "options": ["palm", "always"],
       "default": "palm"
+    },
+    "handCursorSpeed": {
+      "type": "string",
+      "title": "Hand cursor speed",
+      "description": "How fast the cursor follows your hand, from 0.7 to 3. Higher is faster, with less hand travel to cross the screen; lower is steadier for small targets. /jarvis hands set speed overrides it until this setting is changed; /jarvis hands tune shows every sensitivity setting.",
+      "default": "1"
+    },
+    "handSmoothing": {
+      "type": "string",
+      "title": "Hand cursor smoothing",
+      "description": "How much the cursor is smoothed, from 0.2 to 3. Higher is steadier at rest but lags more when you move; lower is snappier but jitters more. /jarvis hands set smoothing overrides it until this setting is changed.",
+      "default": "1"
+    },
+    "handPinch": {
+      "type": "string",
+      "title": "Hand pinch sensitivity",
+      "description": "How close your thumb and finger must be for a pinch click, from 0.85 to 1.15. Higher counts a lighter, looser pinch as a click (and may click by accident); lower needs a firmer pinch. /jarvis hands set pinch overrides it until this setting is changed.",
+      "default": "1"
+    },
+    "handScrollSpeed": {
+      "type": "string",
+      "title": "Hand scroll speed",
+      "description": "How far a scroll gesture scrolls, from 0.1 to 10. Higher scrolls faster. /jarvis hands set scroll-speed overrides it until this setting is changed.",
+      "default": "1"
     }
   }
 }

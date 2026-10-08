@@ -296,7 +296,21 @@ def test_status_matches_the_protocol_schema() -> None:
     settings.apply_config({"engage": "always", "scrollSpeed": 3})
     status = settings.status()
     jsonschema.Draft202012Validator({**schema, "$defs": document["$defs"]}).validate(status)
-    assert status == {"engage": "always", "hand": "any", "anchor": "knuckles", "overlay": True, "scrollSpeed": 3.0}
+    assert status == {
+        "engage": "always",
+        "hand": "any",
+        "anchor": "knuckles",
+        "overlay": True,
+        "cursorSpeed": 1.0,
+        "smoothing": 1.0,
+        "pinch": 1.0,
+        "fist": 1.0,
+        "engageSeconds": 0.5,
+        "dragDistance": 1.0,
+        "flingSensitivity": 1.0,
+        "scrollSpeed": 3.0,
+        "deadZone": 1.0,
+    }
 
 
 def test_config_selection_reaches_the_mapper() -> None:
