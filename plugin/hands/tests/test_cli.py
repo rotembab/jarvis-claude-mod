@@ -214,7 +214,18 @@ def test_bad_command_lines_exit_2(argv: list[str], capsys: pytest.CaptureFixture
 
 
 def test_capabilities() -> None:
-    caps = ["heartbeat", "status", "config", "pause", "resume", "engage", "disengage", "calibrate", "shutdown"]
+    caps = [
+        "heartbeat",
+        "status",
+        "config",
+        "pause",
+        "resume",
+        "engage",
+        "disengage",
+        "calibrate",
+        "shutdown",
+        "keyboard",
+    ]
     assert cli.capabilities(False) == caps
     assert cli.capabilities(True) == [*caps, "fake"]
     assert set(caps) == protocol.COMMAND_NAMES

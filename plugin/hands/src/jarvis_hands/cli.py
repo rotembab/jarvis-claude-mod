@@ -132,7 +132,18 @@ class _NoLock:
 
 
 def capabilities(fake: bool) -> list[str]:
-    caps = ["heartbeat", "status", "config", "pause", "resume", "engage", "disengage", "calibrate", "shutdown"]
+    caps = [
+        "heartbeat",
+        "status",
+        "config",
+        "pause",
+        "resume",
+        "engage",
+        "disengage",
+        "calibrate",
+        "shutdown",
+        "keyboard",
+    ]
     return [*caps, "fake"] if fake else caps
 
 
