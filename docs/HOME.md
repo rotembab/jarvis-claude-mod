@@ -214,7 +214,7 @@ In the setup window, **Ask before Jarvis uses a device** sets any device you add
 - **Ask me on screen first**: for example, a plug that powers a heater.
 - **Never**: Jarvis may only read its state.
 
-In plan mode, Jarvis only looks at devices and doesn't change them. Until Jarvis has seen your first prompt, it can't tell whether plan mode is on, so it changes nothing until then.
+In plan mode, Jarvis only looks at devices and doesn't change them. If Jarvis doesn't know the mode at all (right after the plugin reloads, before your next prompt), it changes nothing; in a turn that didn't start from a prompt Jarvis saw, a change asks you first.
 
 While Claude Code runs as administrator, or before Jarvis's check for that has passed, home control does nothing, from Claude or from `/jarvis home`. See [Never as administrator](PC-CONTROL.md#never-as-administrator).
 
