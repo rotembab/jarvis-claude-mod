@@ -45,6 +45,16 @@ How a frame flows:
 A pose that ends an interaction abnormally (hand lost, calibration) is
 latched: it must be let go before it can start the same interaction again,
 so a fist that comes back into view does not grab whatever is under it.
+
+**Live settings.** The sensitivity knobs (``settings.KNOBS``) are read every
+frame, so a ``config`` applies on the next one, but a change never moves,
+releases or jumps what is held. What would is applied only while the engine is
+not busy (``_mode`` is ``point``): the pose thresholds of every tracked hand
+(a held pinch must not let go because the pinch got stricter), the cursor's
+smoothing and dead zone, and the cursor's gain, which also glides to its new
+value instead of jumping (``TUNE_TAU_S``). A press keeps the slop it began
+with; the engagement hold, the scroll speed and the throw threshold are read
+where they are used and move nothing.
 """
 
 from __future__ import annotations
@@ -77,7 +87,7 @@ from .filters import OneEuroFilter2D
 from .geometry import Point
 from .landmarks import Frame, HandObservation
 from .mapping import ScreenMapper
-from .poses import HandPose, PoseName, PoseTracker, anchor_point
+from .poses import HandPose, PoseName, PoseThresholds, PoseTracker, anchor_point, thresholds_for
 from .settings import HandsSettings
 
 log = logging.getLogger(__name__)
@@ -137,6 +147,12 @@ OPENING_LATCH_S = 0.2
 #: much (reach units) the index must have straightened again, going back, to mark that start.
 BEND_LOOKBACK_S = 0.8
 BEND_TOLERANCE = 0.03
+#: A new cursor gain glides in with this time constant (s), so the cursor under a still hand does not jump.
+TUNE_TAU_S = 0.12
+#: The glide ends (the gain is set to its target) when it is this close.
+TUNE_EPSILON = 1e-3
+#: A frame that comes late (a stalled camera) glides no further than this much time.
+TUNE_MAX_DT_S = 0.1
 #: Wheel units per desktop pixel of hand motion, before ``scroll_speed``.
 SCROLL_UNITS_PER_PX = 2.4
 #: A throw (and a scroll axis) must be this much more along one axis than the other.
@@ -340,6 +356,9 @@ class _Press:
     down: bool = False
     #: When a pinch that never went down ended in a pose that is no action, while its tap waits (``TAP_WAIT_S``).
     ended: float | None = None
+    #: Frame widths the knuckles may move before the press is a drag: taken when the press began, so a change of
+    #: ``drag_distance`` meanwhile does not turn a press into a drag.
+    slop: float = 0.015
 
 
 @dataclass(frozen=True)
@@ -382,8 +401,17 @@ class GestureEngine:
         self._engage_floor = -math.inf
         self._last_hand_t = -math.inf
         self._hand_visible = False
+        #: The live settings as applied (see the module docstring): what the filters, the mapper and the tracks'
+        #: poses use now, which follows ``settings`` once nothing is held.
+        self._pose_key = (settings.pinch_sensitivity, settings.fist_sensitivity)
+        self._thresholds: PoseThresholds = thresholds_for(*self._pose_key)
+        self._gain = float(settings.cursor_speed)
+        self._smoothing = float(settings.smoothing)
+        self._dead_zone = float(settings.dead_zone_px)
+        self._tuned_t = 0.0
+        mapper.set_cursor_gain(self._gain)
         self._cursor_filter = self._new_filter()
-        self._motion_filter = self._new_filter()
+        self._motion_filter = self._new_filter(steered=False)
         self._helper_filter = self._new_filter()
         self._cursor: Point | None = None
         self._cursor_hist: deque[tuple[float, Point]] = deque()
@@ -434,7 +462,9 @@ class GestureEngine:
             now = frame.t if now is None else now
             previous, self._now = self._now, now
             actions, self._pending = self._pending, []
+            self._sync_poses()
             self._associate(frame, now, previous)
+            self._sync_cursor(now)
             if self._calibration.active:
                 self._calibration_frame(now)
             elif self._engaged:
@@ -603,6 +633,7 @@ class GestureEngine:
                 track.palm_since += missed
             hand, anchor_fw, knuckles = observed[i]
             track.seen, track.last_seen, track.handedness = True, now, hand.handedness
+            track.poses.thresholds = self._thresholds
             pose = track.poses.classify(hand, self.settings.anchor, aspect)
             track.observe(pose, now, knuckles, anchor_fw, confirm)
 
@@ -710,7 +741,7 @@ class GestureEngine:
     def _restart_cursor(self, track: _Track, now: float) -> None:
         """Start the filters at the hand's current point, so nothing glides in from a stale position."""
         self._cursor_filter = self._new_filter()
-        self._motion_filter = self._new_filter()
+        self._motion_filter = self._new_filter(steered=False)
         self._knuckle_filter = self._new_filter()
         self._cursor = self._cursor_filter.filter(self.mapper.to_desktop(track.anchor), now)
         self._motion = self._motion_filter.filter(self.mapper.to_region(track.anchor), now)
@@ -768,7 +799,7 @@ class GestureEngine:
             self._knuckle = self._knuckle_filter.filter(self.mapper.to_desktop(ptr.knuckles), now)
             if self._holding() and self._held_offset is not None:
                 filtered = self._knuckle + self._held_offset
-        target = self._cursor if filtered.distance(self._cursor) <= self.settings.dead_zone_px else filtered
+        target = self._cursor if filtered.distance(self._cursor) <= self._dead_zone else filtered
 
         if (
             self._latched
@@ -800,7 +831,7 @@ class GestureEngine:
             assert press is not None
             if pose == press.pose and press.ended is None:
                 if ptr.raw == press.pose and (press.down or self._press_down(ptr, actions)):
-                    if mode == "press" and ptr.anchor_fw.distance(press.anchor) > self.settings.slop:
+                    if mode == "press" and ptr.anchor_fw.distance(press.anchor) > press.slop:
                         self._mode = "drag"
                         self._emit("gesture", "drag_start")
                     if self._mode == "drag":
@@ -846,15 +877,28 @@ class GestureEngine:
             double = False
             last = self._last_click
             limit, width, height = self.double_click
+            # The system's rectangle is in cursor pixels, which the cursor speed stretches: the same hand drift moves
+            # the cursor that many times as far, so the rectangle (and the 50% slack on it) widens by the gain and the
+            # merge asks the same of the hand at any speed. The second press still snaps to the first click's pixel.
+            reach = 1.5 * max(1.0, self._gain)
             if (
                 last is not None
                 and last.button == button
                 and now - last.t <= limit
-                and abs(point.x - last.point.x) <= 1.5 * width
-                and abs(point.y - last.point.y) <= 1.5 * height
+                and abs(point.x - last.point.x) <= reach * width
+                and abs(point.y - last.point.y) <= reach * height
             ):
                 point, double = last.point, True
-            self._press = _Press(button, pose, point, ptr.confirmed_anchor, now, double, ptr.confirmed_t)
+            self._press = _Press(
+                button,
+                pose,
+                point,
+                ptr.confirmed_anchor,
+                now,
+                double,
+                ptr.confirmed_t,
+                slop=self.settings.slop * self.settings.drag_distance,
+            )
             self._mode = "press"
             self._cursor = point
             self._hold_from(point, rewind_to)
@@ -1019,7 +1063,7 @@ class GestureEngine:
             width = self.mapper.display_at(self._cursor).rect.width
         except LookupError:  # every display went away mid-grab: nowhere to throw to
             return None
-        if v.length() <= self.settings.throw_speed * width:
+        if v.length() <= self.settings.throw_speed / self.settings.fling_sensitivity * width:
             return None
         if abs(v.x) >= AXIS_DOMINANCE * abs(v.y):
             return "right" if v.x > 0 else "left"
@@ -1134,9 +1178,48 @@ class GestureEngine:
 
     # -- plumbing -----------------------------------------------------------------------
 
-    def _new_filter(self) -> OneEuroFilter2D:
+    def _sync_cursor(self, now: float) -> None:
+        """Cursor speed, smoothing and dead zone follow the settings, without a jump and never under a hold.
+
+        Disengaged (or calibrating) nothing is steered, so they are taken at
+        once; the filters that start with the next engagement read them. When
+        engaged they wait while anything is going on (a press, a scroll, a
+        grab). The cursor's gain and the smoothing then glide to their new
+        values, so a hand that is still does not see the cursor jump, and one
+        that moves does not see it speed up or fall behind all at once.
+        """
         s = self.settings
-        return OneEuroFilter2D(s.min_cutoff, s.beta, s.d_cutoff)
+        dt, self._tuned_t = min(now - self._tuned_t, TUNE_MAX_DT_S), now
+        glide = self._engaged and not self._calibration.active
+        if glide and self._mode != "point":
+            return
+        step = 1.0 - math.exp(-max(0.0, dt) / TUNE_TAU_S)
+        gain = float(s.cursor_speed)
+        if gain != self._gain:
+            snap = not glide or abs(gain - self._gain) <= TUNE_EPSILON
+            self._gain = gain if snap else self._gain + (gain - self._gain) * step
+            self.mapper.set_cursor_gain(self._gain)
+        smoothing = float(s.smoothing)
+        if smoothing != self._smoothing:
+            ratio = smoothing / self._smoothing
+            snap = not glide or abs(math.log(ratio)) <= TUNE_EPSILON
+            self._smoothing = smoothing if snap else self._smoothing * ratio**step
+            for steered in (self._cursor_filter, self._knuckle_filter, self._helper_filter):
+                steered.min_cutoff = s.min_cutoff / self._smoothing
+        self._dead_zone = float(s.dead_zone_px)
+
+    def _new_filter(self, *, steered: bool = True) -> OneEuroFilter2D:
+        """A cursor filter; ``steered=False`` is the plain one that measures motion (scrolling, throws)."""
+        s = self.settings
+        return OneEuroFilter2D(s.min_cutoff / self._smoothing if steered else s.min_cutoff, s.beta, s.d_cutoff)
+
+    def _sync_poses(self) -> None:
+        """The pinch and fist sensitivities reach every track's classifier, once nothing is held."""
+        s = self.settings
+        key = (s.pinch_sensitivity, s.fist_sensitivity)
+        if key != self._pose_key and self._mode == "point":
+            self._pose_key = key
+            self._thresholds = thresholds_for(*key)
 
     def _emit(self, kind: EventKind, value: str) -> None:
         self._events.append(EngineEvent(kind, value))

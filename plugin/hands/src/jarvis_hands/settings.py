@@ -32,7 +32,65 @@ AnchorChoice = Literal["knuckles", "index"]
 DisplaySelection = Literal["all"] | tuple[int, ...]
 
 CALIBRATION_VERSION = 1
-SCROLL_SPEED_RANGE = (0.1, 10.0)
+
+
+@dataclass(frozen=True)
+class Knob:
+    """One sensitivity knob of the protocol's ``config`` command: its wire key, attribute, range and default."""
+
+    key: str
+    attr: str
+    low: float
+    high: float
+    default: float
+
+    def check(self, value: Any) -> float:
+        """``value`` as a float, or ValueError naming the key and the range.
+
+        A bool is not a number in JSON, NaN and the infinities are not numbers
+        at all (they fail the range test), and an int is compared as it is, so
+        one with hundreds of digits is refused instead of overflowing.
+        """
+        if isinstance(value, bool) or not isinstance(value, int | float) or not self.low <= value <= self.high:
+            raise ValueError(f"{self.key} must be a number from {self.low:g} to {self.high:g}")
+        return float(value)
+
+
+#: The sensitivity knobs, in the order the status reports them. ``default`` is today's behaviour: each knob scales or
+#: replaces a tuning value of ``HandsSettings`` (below), and its default leaves that value as it was.
+#: The ranges are what stays usable, measured on the real model's test photos (with rotated, scaled, dimmed and noisy
+#: variants) and on synthetic hands, so each end is a number and not a guess: below 0.85 an OK-sign pinch fires on
+#: barely half of the variants, and above 1.15 the close threshold's margin to the closest hand that is not pinching
+#: (woman_hands' relaxed palms, which rest the thumb against the index at 0.39 and 0.47 palm sizes) falls under 18%:
+#: at 1.4 it is 0.5%, and with the noise of a live hand that palm reads as a pinch in every run from 1.35 and in one
+#: run in nine at 1.3, which presses the button or keeps the hand from engaging (``pinch``); below 0.85 (0.9 keeps a
+#: margin) the loosest real fist stops counting and above 1.1 a relaxed, jittering hand starts to grab (``fist``);
+#: under 0.7 a click turns into a drag on a pinch that only drifts by landmark noise (``dragDistance``); under 0.7
+#: the screen edges leave the camera frame (``cursorSpeed``); above 3 the cursor needs close to a second to settle after
+#: a slow stop (``smoothing``); above 2.5 a hand that counts as still throws the window (``flingSensitivity``).
+#: ``tests/test_poses_real.py`` pins the pinch and fist margins on the photos.
+KNOBS: tuple[Knob, ...] = (
+    #: Gain on the cursor around the centre of the target region: the hand travel that crosses the screen is divided
+    #: by it.
+    Knob("cursorSpeed", "cursor_speed", 0.7, 3.0, 1.0),
+    #: Steadiness against lag: the One Euro filter's ``min_cutoff`` is divided by it.
+    Knob("smoothing", "smoothing", 0.2, 3.0, 1.0),
+    #: How close thumb and finger must be for a pinch: scales ``pinch_close`` (``pinch_open`` only follows it down).
+    Knob("pinch", "pinch_sensitivity", 0.85, 1.15, 1.0),
+    #: How tightly the fingers must curl for a fist: scales what counts as one (``poses.thresholds_for``).
+    Knob("fist", "fist_sensitivity", 0.9, 1.1, 1.0),
+    #: Seconds an open palm is held still to take the cursor.
+    Knob("engageSeconds", "engage_s", 0.1, 2.0, 0.5),
+    #: Multiplier on ``slop``: how far the hand may drift during a pinch before it becomes a drag.
+    Knob("dragDistance", "drag_distance", 0.7, 4.0, 1.0),
+    #: How light a flick throws a grabbed window: ``throw_speed`` is divided by it.
+    Knob("flingSensitivity", "fling_sensitivity", 0.5, 2.5, 1.0),
+    #: Multiplier on the scroll distance per hand movement.
+    Knob("scrollSpeed", "scroll_speed", 0.1, 10.0, 1.0),
+    #: Pixels the filtered cursor must move before the cursor follows.
+    Knob("deadZone", "dead_zone_px", 0.0, 8.0, 1.0),
+)
+KNOB_BY_KEY: dict[str, Knob] = {knob.key: knob for knob in KNOBS}
 
 
 @dataclass
@@ -43,6 +101,21 @@ class HandsSettings:
     overlay: bool = True
     scroll_speed: float = 1.0
     displays: DisplaySelection = "all"
+
+    # The sensitivity knobs (``KNOBS``): the mod sends them, ``status()`` reports them, and the engine and the
+    # mapper read them every frame (where a change would move something that is held, they wait; see the engine).
+    #: Gain on the cursor around the centre of the target region (higher: less hand travel crosses the screen).
+    cursor_speed: float = 1.0
+    #: Divides the cursor filter's ``min_cutoff`` (higher: steadier at rest, more lag).
+    smoothing: float = 1.0
+    #: Scales ``PoseThresholds.pinch_close``, and ``pinch_open`` below 1.0 (higher: a looser pinch counts).
+    pinch_sensitivity: float = 1.0
+    #: Scales what counts as a fist (higher: a looser fist counts); below 1.0 it asks more of the fist and nothing else.
+    fist_sensitivity: float = 1.0
+    #: Multiplies ``slop`` (higher: the hand may drift further during a pinch before it is a drag).
+    drag_distance: float = 1.0
+    #: Divides ``throw_speed`` (higher: a lighter flick throws the window).
+    fling_sensitivity: float = 1.0
 
     # Tuning (SPEC-hands.md); not part of the protocol.
     #: Frames a raw pose must hold before the engine acts on it (entering and leaving).
@@ -87,14 +160,12 @@ class HandsSettings:
             if not isinstance(body["overlay"], bool):
                 raise ValueError("overlay must be true or false")
             changes["overlay"] = body["overlay"]
-        if "scrollSpeed" in body:
-            speed = body["scrollSpeed"]
-            low, high = SCROLL_SPEED_RANGE
-            if isinstance(speed, bool) or not isinstance(speed, int | float) or not low <= speed <= high:
-                raise ValueError(f"scrollSpeed must be a number from {low} to {high}")
-            changes["scroll_speed"] = float(speed)
+        for knob in KNOBS:
+            if knob.key in body:
+                changes[knob.attr] = knob.check(body[knob.key])
         if "displays" in body:
             changes["displays"] = parse_displays(body["displays"])
+        # Everything was checked above: the engine thread never sees a half-valid command.
         for name, value in changes.items():
             setattr(self, name, value)
 
@@ -105,7 +176,7 @@ class HandsSettings:
             "hand": self.hand,
             "anchor": self.anchor,
             "overlay": self.overlay,
-            "scrollSpeed": self.scroll_speed,
+            **{knob.key: getattr(self, knob.attr) for knob in KNOBS},
         }
 
 

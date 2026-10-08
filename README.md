@@ -197,13 +197,59 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 
 - Sit so the camera sees your hand at chest height with your elbow down; small movements cover the whole screen.
 - `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
+- Cursor too fast, too jumpy, or pinches missed? `/jarvis hands tune` and the presets change how it feels ([Tuning the feel](#tuning-the-feel)).
 - `/jarvis hands pause` turns the camera off without turning hand control off. It stays paused when the helper restarts and in new sessions, until `/jarvis hands resume`, `on` or `off`.
 - Some webcams take up to about 20 seconds to open. If the camera is still opening when `/jarvis hands resume` answers, it says so, and a message follows when the camera is on or why it could not open.
-- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand". Jarvis asks you first (a spoken yes when you talk, else a click) unless your own permission rules allow `mcp__jarvis__hands`, and a deny rule refuses it. In plan mode Claude can only check its status. [docs/PC-CONTROL.md](docs/PC-CONTROL.md#hand-controls-tool) has the details.
+- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand", "make the cursor faster" or "use the precise preset". Jarvis asks you first (a spoken yes when you talk, else a click) unless your own permission rules allow `mcp__jarvis__hands`, and a deny rule refuses it. In plan mode Claude can only check its status. [docs/PC-CONTROL.md](docs/PC-CONTROL.md#hand-controls-tool) has the details.
 - Hand control runs in one Claude Code window at a time, since one camera can serve only one. In another window `/jarvis hands` says where it runs; turning it off there and running `/jarvis hands restart` brings it to this window.
 - Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays (virtual display drivers and streaming dummies) are left out; USB display adapters count as real displays. `/jarvis hands display 1` keeps your hand on one display, and a display you leave out takes none of your reach.
 - Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.
-- `/jarvis hands` shows the camera, the displays and the gestures. The camera picture never leaves your computer.
+- `/jarvis hands` shows the camera, the displays, how the feel is tuned and the gestures. The camera picture never leaves your computer.
+
+### Tuning the feel
+
+The defaults suit most hands and rooms. Nine settings change how hand control feels:
+
+- `/jarvis hands tune` lists them with their value, default and range.
+- `/jarvis hands set <name> <number>` changes one, for example `/jarvis hands set speed 1.4`. A name alone (`/jarvis hands set speed`) shows it.
+- `/jarvis hands set <name> default` puts one back, and `/jarvis hands reset` puts them all back.
+- A change applies at once, but never moves what you are holding: a click, a drag or a grab goes on as it was, and the new value takes over when you let go. A change is remembered for new sessions.
+- A number outside the range is refused, not trimmed, and nothing changes.
+
+You can ask Claude instead: "make the cursor faster", "my clicks turn into drags". It reads the setting, changes it by a small step and tells you the new value. Four settings are also plugin settings (`handCursorSpeed`, `handSmoothing`, `handPinch`, `handScrollSpeed`; see [Settings](#settings)). They give the default, and `/jarvis hands set` overrides one until that plugin setting is changed.
+
+| Setting | What it changes | Range | Default |
+| --- | --- | --- | --- |
+| `speed` | How far the cursor goes for a hand movement. Higher: less hand travel crosses the screen. | 0.7 to 3 | 1 |
+| `smoothing` | Steadiness against lag. Higher: steadier at rest, more lag when you move. | 0.2 to 3 | 1 |
+| `dead-zone` | Pixels the cursor must move before it follows. Higher: steadier at rest, coarser small moves. | 0 to 8 px | 1 px |
+| `pinch` | How close thumb and finger must be to click. Higher: a lighter, looser pinch counts, and may click by accident. | 0.85 to 1.15 | 1 |
+| `drag-distance` | How far your hand may drift during a pinch before it becomes a drag. Higher: steadier clicks, and a drag starts later. | 0.7 to 4 | 1 |
+| `fist` | How tightly your fingers must curl to grab a window. Higher: a looser fist counts. | 0.9 to 1.1 | 1 |
+| `fling` | How light a flick throws a grabbed window. Higher: a lighter flick throws it. | 0.5 to 2.5 | 1 |
+| `scroll-speed` | How far a scroll gesture scrolls. Higher: faster. | 0.1 to 10 | 1 |
+| `engage-time` | Seconds an open palm is held still to take the cursor. Higher: slower to start. | 0.1 to 2 s | 0.5 s |
+
+The ranges end where hand control stops working well. A pinch looser than 1.15, for example, starts to read a relaxed open palm as a pinch. Change one setting at a time, in small steps, and try it before you change the next.
+
+**Presets.** `/jarvis hands preset <name>` sets several at once; with no name it lists them. A preset is a whole profile: a setting it does not name goes back to its default. `/jarvis hands` shows which preset is in force, or "custom" when you changed settings one by one.
+
+| Preset | Sets | Feels like |
+| --- | --- | --- |
+| `precise` | speed 0.8, smoothing 1.8, dead-zone 2, drag-distance 1.5, pinch 0.9 | Slower and steadier, for small targets. It needs a firmer pinch and a drag starts later. |
+| `balanced` | Every setting at its default | The behaviour you start with. |
+| `fast` | speed 1.6, smoothing 0.5, dead-zone 0, pinch 1.1 | Less hand travel and little lag. The cursor is jumpier at rest, so raise smoothing or dead-zone if it twitches. |
+
+Some things to try:
+
+- **The cursor is jumpy when your hand rests.** Raise smoothing a step (`/jarvis hands set smoothing 1.5`). If it still twitches, raise the dead zone (`/jarvis hands set dead-zone 3`).
+- **The cursor lags behind your hand.** Lower smoothing (`0.6`), and the dead zone if you raised it.
+- **Your hand has to travel too far, or the cursor is too touchy for small targets.** Raise speed (`1.4`) for less travel; lower it (`0.8`) for finer control.
+- **Pinches are missed.** Raise pinch (`1.1`). Clicks that happen by accident: lower it (`0.9`).
+- **Clicks turn into small drags.** Raise drag-distance (`1.5`).
+- **A palm takes the cursor too slowly or too easily.** Lower engage-time (`0.3`) or raise it (`1`).
+- **Windows fly off when you let go of a fist, or do not fly when you flick.** Lower fling (`0.7`) or raise it (`1.5`).
+- **Scrolling is too slow or too fast.** Raise scroll-speed (`2`) or lower it (`0.5`).
 
 ## Home devices
 
@@ -255,6 +301,10 @@ Jarvis can work your Windows PC from a spoken request: "open Spotify and play my
 | `/jarvis hands display <n\|all>` | The displays your hand reaches (a list such as `1,2` works). |
 | `/jarvis hands engage <palm\|always>` | Start with an open palm (default), or let any hand take the cursor at once. |
 | `/jarvis hands camera <n\|name>` | The camera to use: its number or part of its name. |
+| `/jarvis hands tune` | Every hand control setting with its value, default and range, and what a higher value does ([Tuning the feel](#tuning-the-feel)). |
+| `/jarvis hands set <name> <number\|default>` | Change one setting: `speed`, `smoothing`, `dead-zone`, `pinch`, `drag-distance`, `fist`, `fling`, `scroll-speed` or `engage-time`. A name alone shows it. |
+| `/jarvis hands preset [precise\|balanced\|fast]` | Set several at once; the settings a preset does not name go back to their defaults. With no name, lists the presets. |
+| `/jarvis hands reset [name]` | Put every setting (or one) back to its default. |
 | `/jarvis hands pause\|resume\|restart` | Turn the camera off and on, or restart the hand helper. |
 
 ## Settings
@@ -278,7 +328,11 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |
 | `handControl` | `off` | `on` watches your hands through the webcam (after `/jarvis setup hands`). `/jarvis hands on\|off` changes it too. |
 | `handCamera` | empty | The webcam for hand control: its number or part of its name, such as `UGREEN`. Empty means the first camera. |
-| `handEngage` | `palm` | `palm`: hold an open palm still to take the cursor. `always`: any hand in view takes it at once. |
+| `handEngage` | `palm` | `palm`: hold an open palm still to take the cursor (half a second by default; `/jarvis hands set engage-time` changes it). `always`: any hand in view takes it at once. |
+| `handCursorSpeed` | `1` | How fast the cursor follows your hand, from 0.7 to 3. Higher is faster, with less hand travel to cross the screen. `/jarvis hands set speed` overrides it until this setting is changed. |
+| `handSmoothing` | `1` | How much the cursor is smoothed, from 0.2 to 3. Higher is steadier at rest but lags more when you move; lower is snappier but jitters more. `/jarvis hands set smoothing` overrides it until this setting is changed. |
+| `handPinch` | `1` | How close thumb and finger must be for a pinch click, from 0.85 to 1.15. Higher counts a lighter, looser pinch (and may click by accident); lower needs a firmer pinch. `/jarvis hands set pinch` overrides it until this setting is changed. |
+| `handScrollSpeed` | `1` | How far a scroll gesture scrolls, from 0.1 to 10. Higher scrolls faster. `/jarvis hands set scroll-speed` overrides it until this setting is changed. |
 
 ## How it works
 
@@ -339,7 +393,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | `JARVIS · active in another window` | Another Claude Code window has the helper. Close that window, then run `/jarvis` here. |
 | Hand control: "camera blocked" | Settings > Privacy & security > Camera: turn on **Camera access** and **Let desktop apps access your camera**, then `/jarvis hands restart`. |
 | Hand control: "camera in use" | Another app (Teams, Zoom, the Camera app, OBS) has the webcam. Close it, then `/jarvis hands restart`. |
-| Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. |
+| Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. Then tune it: raise `pinch` for missed pinches, raise `smoothing` and then `dead-zone` for a jittery cursor ([Tuning the feel](#tuning-the-feel)). |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
 
 More detail, including logs and running the helper by hand, is in [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -360,7 +414,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 (now) | Hands | Now: a guard on Claude's commands and edits, with spoken and on-screen confirmations, and the desktop tool ([docs/PC-CONTROL.md](docs/PC-CONTROL.md)). Next: checking it on real PCs. |
-| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview). Next: tuning on a real desk, then a projector wall mode. |
+| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview), with settings for how it feels. Next: tuning on a real desk, then a projector wall mode. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).
 

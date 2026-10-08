@@ -217,6 +217,7 @@ $hands = @{ Method = 'Post'; ContentType = 'application/json'; Headers = @{ Auth
 
 Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/status" -Body '{}'
 Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/config" -Body '{"engage":"palm","displays":"all"}'
+Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/config" -Body '{"cursorSpeed":1.4,"smoothing":1.5,"deadZone":2}'
 Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/engage" -Body '{}'
 Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/calibrate" -Body '{"action":"start"}'
 Invoke-RestMethod @hands -Uri "http://127.0.0.1:$port/v1/pause" -Body '{}'
@@ -232,6 +233,8 @@ $env:JARVIS_TOKEN = 'dev-token'
 
 It really moves the mouse once you engage. Moving the real mouse takes over at once, and `Ctrl+C` in that terminal stops it and lets go of every button.
 
+The `config` call is also the quickest way to feel a sensitivity setting while the helper runs: the keys, ranges and defaults are in [SPEC-hands.md](SPEC-hands.md#sensitivity-settings), `status` reports the values in force, and a value that is not a number or is out of range answers `bad_request` and applies nothing of that call.
+
 Two more commands help while tuning:
 
 ```powershell
@@ -240,6 +243,17 @@ Two more commands help while tuning:
 ```
 
 The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. The names are the ones the gesture engine works from: `hover` (pointing, or a relaxed hand), `palm`, `pinch` (thumb and index), `pinch_middle` (thumb and middle), `fist` and `two` (index and middle up: scroll). `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
+
+## Hand control settings
+
+The sensitivity settings behind `/jarvis hands tune` and `set` are table-driven. To add one:
+
+1. **Helper.** Add `Knob(wire key, attribute, low, high, default)` to `KNOBS` in `plugin\hands\src\jarvis_hands\settings.py`, and the matching field on `HandsSettings`; its default is the value that leaves today's behaviour exactly as it is. `apply_config`, `status()` and the validator in `protocol.py` are built from the table, so nothing else lists the keys.
+2. **Engine.** Read the field from `self.settings` where it is used, every frame. If a change could move something that is held (the cursor under a press or a grab, a drag, a button), follow the live-apply rule in [SPEC-hands.md](SPEC-hands.md#live-apply): wait for the engine to be back in `point` mode, or take the value when the press begins.
+3. **Schema.** Add the key, with the same range, to `ConfigCommand` and to `StatusResponse` (its `settings` properties and `required` list) in `plugin\protocol\hands.schema.json`.
+4. **Mod.** Add one line to `ROWS` in `plugin\hooks\hands.ts`: the wire key, the name the commands use, a label, the range and default, the words for "higher means" and aliases. `tune`, `set`, `reset`, the status, the presets and the tool all read that table. An everyday setting also gets a `setting` name there and a `userConfig` entry of that name in `plugin.json`; no test reads `plugin.json`, so check its range and wording against the table yourself.
+5. **Tests.** Add the setting to `CONTRACT` in `tests\test_knobs.py` and in `hands.test.ts` (both write the numbers out on purpose: they are the contract between the helper and the mod), and test its effect and a live change in the middle of a press in `tests\test_sensitivity.py`. Timing tests run on scripted frames or an injected clock and compare times from `jarvis_hands.clock.now`, never real sleeps: a CI runner can oversleep by tens of milliseconds.
+6. **Range and docs.** Set each end of the range from a measurement, not a guess, and add it to the SPEC's "Where each range ends" table. Add the setting to the tables in SPEC-hands.md and in the README's "Tuning the feel" (and its Settings table for an everyday one).
 
 ## Home control
 
