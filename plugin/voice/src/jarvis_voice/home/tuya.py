@@ -3,7 +3,9 @@
 Setup (``wizard``) signs in to the user's Tuya account the way Home Assistant's
 Tuya integration does: the user types the User Code shown in the app (Tuya
 Smart or Smart Life: separate accounts, so the same app throughout), Jarvis
-shows a QR code, and the app scans and confirms it. tuya_sharing
+shows a QR code, and the app scans and confirms it. Brand apps built on Tuya
+(MOES, Lidl Home, ...) keep accounts of their own that this sign-in never
+accepts, so their devices must be moved to Smart Life first. tuya_sharing
 then lists the homes, the devices (each with its local key and data-point map)
 and the tap-to-run scenes. A UDP scan (tinytuya's scanner) finds each device's
 address and protocol version on the home network, which the cloud does not know.
@@ -58,12 +60,17 @@ FALLBACK = "cloud_fallback"
 
 # Tuya cloud calls: requests' (connect, read) timeouts instead of the SDK's 60 s.
 CLOUD_TIMEOUT_S = (3.5, 5.0)
+# The QR login: how long setup waits for the phone, how often it asks Tuya, and how often it says it still waits.
 LOGIN_WAIT_S = 180.0
 LOGIN_POLL_S = 2.0
-# login_result's failure codes that end the wait at once (seen in user reports, not documented): the QR
-# code expired, or the phone refused the login ("use the designated APP": the code came from the other app).
+LOGIN_PROGRESS_S = 30.0
+# login_result answers {"success": false, "code", "msg"} until the phone confirms (not documented; seen in user
+# reports and other tools): E0020003 "Login failed, please scan and try again!" while the code is not scanned or
+# confirmed yet, and the same when the phone refuses it ("use the designated APP" never reaches Jarvis). So only an
+# expired code ends the wait early: E0020002, or "expired" in msg (older answers had no code).
 QR_EXPIRED = "E0020002"
-LOGIN_REFUSED = "E0020003"
+# The longest piece of Tuya's msg that setup shows and logs.
+LOGIN_MSG_MAX = 120
 # How long the setup scan listens (tinytuya's own default; it stops early once every device answered).
 SCAN_S = 18.0
 # A short scan from the helper when a device stops answering at its saved address, at most once per gap;
@@ -132,9 +139,12 @@ CLOUD_EXPLAINED = (
 )
 
 LINK_STEPS = """\
-Jarvis signs in once to the app your Tuya devices are in, Tuya Smart or Smart Life, to read
-each device's local key and its scenes. After that it controls the devices directly over your
-home network. Use the same app for every step: the two apps have separate accounts.
+Jarvis signs in once to the app your Tuya devices are in, to read each device's local key
+and its scenes. After that it controls the devices directly over your home network.
+
+Only the Smart Life and Tuya Smart apps work. If your devices are in a brand's app, such as
+MOES, Lidl Home or Gosund, move them to Smart Life first (docs/HOME.md says how).
+Use the same app for every step: Smart Life and Tuya Smart have separate accounts.
 
 1. In the app, open Me > the gear (top right) > Account and Security. Your User Code is
    at the bottom. It is case-sensitive.
@@ -142,7 +152,21 @@ home network. Use the same app for every step: the two apps have separate accoun
 3. In the same app, go to the Home tab and tap + (top right) > Scan. Scan the code, then
    tap Confirm login. Use the app's scanner, not the phone's camera.
    Your phone may say the login is for Home Assistant: Jarvis signs in the same way
-   Home Assistant's Tuya integration does."""
+   Home Assistant's Tuya integration does.
+4. Then come back to this window. Jarvis notices the login by itself within a few seconds."""
+USER_CODE_QUESTION = (
+    "Your User Code from Smart Life or Tuya Smart (case-sensitive; MOES and other brand apps need the devices moved "
+    "first)"
+)
+# Why a QR login that ran out or expired never signed in, most likely.
+LOGIN_HINTS = """\
+If you scanned the code and tapped Confirm login, the likely causes are:
+- Only the Smart Life and Tuya Smart apps work. Brand apps such as MOES, Lidl Home, LSC Smart Connect
+  or Gosund do not: Tuya keeps their accounts separate. Move your devices to Smart Life first
+  (docs/HOME.md says how).
+- The User Code must come from the same app that scans the code.
+- If the phone said to "use the designated APP", try the other official app: since 2026 Tuya has
+  sometimes accepted only one of them."""
 
 IR_ADVICE = (
     "Jarvis cannot drive an air conditioner or TV through an IR blaster directly. In the Tuya Smart or Smart "
@@ -1917,7 +1941,7 @@ def _cloud_problem(exc: Exception) -> str:
 
 def _link_flow(ui: Prompter, ctx: DriverContext) -> None:
     ui.say(LINK_STEPS)
-    user_code = ui.ask("Your User Code (from the Tuya Smart or Smart Life app; it is case-sensitive)").strip()
+    user_code = ui.ask(USER_CODE_QUESTION).strip()
     if not user_code:
         ui.say("Nothing was saved.")
         return
@@ -1929,25 +1953,17 @@ def _link_flow(ui: Prompter, ctx: DriverContext) -> None:
             return
         ui.show_qr(
             QR_PREFIX + token,
-            "Scan this with the same app (Tuya Smart or Smart Life): Home tab > + (top right) > Scan, then tap "
-            "Confirm login on the phone.",
+            "Scan this with the same app (Smart Life or Tuya Smart): Home tab > + (top right) > Scan, then tap "
+            "Confirm login on the phone and come back to this window.",
         )
-        ui.say(f"Waiting for you to confirm on the phone (up to {int(LOGIN_WAIT_S // 60)} minutes; Ctrl+C stops)...")
-        info = _wait_for_login(control, token, user_code)
+        ui.say(
+            f"Waiting for you to confirm on the phone (up to {int(LOGIN_WAIT_S // 60)} minutes; Ctrl+C stops). "
+            "After you tap Confirm login, come back to this window: Jarvis notices by itself within a few seconds."
+        )
+        info = _wait_for_login(ui, control, token, user_code)
         if isinstance(info, dict):
             break
-        if info is None:
-            ui.say(
-                "The code was not confirmed in time. Nothing was saved; choose Link your Tuya account for a new code."
-            )
-            return
-        if info == QR_EXPIRED:
-            ui.say("The QR code expired before the phone confirmed it.")
-        else:
-            ui.say(
-                "The phone refused the login. Scan with the same app you took the User Code from (Tuya Smart or "
-                "Smart Life): the two apps have separate accounts."
-            )
+        _say_no_login(ui, info)
         if not ui.confirm("Show a new QR code to scan?", default=True):
             ui.say("Nothing was saved.")
             return
@@ -1984,20 +2000,34 @@ def _qr_token(ui: Prompter, control: Any, user_code: str) -> str | None:
     return token
 
 
-def _wait_for_login(control: Any, token: str, user_code: str) -> dict[str, Any] | str | None:
-    """Asks every couple of seconds whether the phone confirmed: the sign-in when it did, QR_EXPIRED or
-    LOGIN_REFUSED as soon as Tuya answers with one, None after LOGIN_WAIT_S. Ctrl+C goes through."""
-    deadline = time.monotonic() + LOGIN_WAIT_S
+@dataclass(frozen=True)
+class _LoginEnd:
+    """A QR login wait that ended without a sign-in: why (expired, timeout, or unreachable when no check reached
+    Tuya), and Tuya's last answer as its code and msg (never the reply), or the last check's exception type."""
+
+    why: str
+    code: str = ""
+    msg: str = ""
+    error: str = ""
+
+
+def _wait_for_login(ui: Prompter, control: Any, token: str, user_code: str) -> dict[str, Any] | _LoginEnd:
+    """Asks Tuya every LOGIN_POLL_S whether the phone confirmed, and says every LOGIN_PROGRESS_S that it is still
+    waiting: the sign-in when the phone confirmed; a _LoginEnd when the code expired or after LOGIN_WAIT_S. Any
+    other answer (E0020003 above all) or failed check means not confirmed yet. Ctrl+C goes through."""
+    started = time.monotonic()
+    deadline, progress = started + LOGIN_WAIT_S, started + LOGIN_PROGRESS_S
+    code = msg = error = ""
+    reached = False
     while True:
         try:
             ok, info = control.login_result(token, CLIENT_ID, user_code)
-        except (OSError, ValueError) as exc:  # a network hiccup or a non-JSON reply: keep waiting
-            log.debug("Tuya login check: %s", type(exc).__name__)
-            ok, info = False, None
-        code = _text(info.get("code")) if not ok and isinstance(info, Mapping) else ""
-        if code in (QR_EXPIRED, LOGIN_REFUSED):
-            log.info("the Tuya QR login ended (error %s)", code)
-            return code
+        except Exception as exc:  # noqa: BLE001 - a network hiccup or an odd reply must not end setup: keep waiting
+            log.debug("Tuya login check: %s", type(exc).__name__)  # never its text: the URL has the token and code
+            ok, info, error = False, None, type(exc).__name__
+            reached = reached or not isinstance(exc, OSError)  # requests' errors are OSErrors
+        else:
+            reached, error = True, ""
         if (
             ok
             and isinstance(info, dict)
@@ -2006,9 +2036,41 @@ def _wait_for_login(control: Any, token: str, user_code: str) -> dict[str, Any] 
             and info.get("refresh_token")
         ):
             return info
-        if time.monotonic() >= deadline:
-            return None
+        if not ok and isinstance(info, Mapping):
+            code, said = _text(info.get("code")), " ".join(_text(info.get("msg")).split())
+            # Tuya's own words, shown and logged at the end; never anything that carries the token or the code.
+            msg = "" if token in said or user_code in said else said[:LOGIN_MSG_MAX]
+            if code == QR_EXPIRED or "expired" in said.lower():
+                return _LoginEnd("expired", code, msg)
+        now = time.monotonic()
+        if now >= deadline:
+            return _LoginEnd("timeout" if reached else "unreachable", code, msg, error)
+        if now >= progress:
+            minutes = max(1, round((deadline - now) / 60))
+            ui.say(f"Still waiting for the phone (about {minutes} minute{'s' if minutes > 1 else ''} left)...")
+            progress = now + LOGIN_PROGRESS_S
         time.sleep(LOGIN_POLL_S)
+
+
+def _say_no_login(ui: Prompter, end: _LoginEnd) -> None:
+    """Why the wait ended without a sign-in and what usually causes it; Tuya's last answer goes to the log too."""
+    if end.why == "unreachable":
+        log.warning("the Tuya QR login could not reach Tuya (%s)", end.error or "no answer")
+        ui.say("Jarvis could not reach Tuya to check the login. Check the internet connection.")
+        return
+    if end.code or end.msg:
+        answer = f"{end.code or 'no code'}{f' ({end.msg})' if end.msg else ''}"
+    else:
+        answer = f"none Jarvis could read{f' ({end.error})' if end.error else ''}"
+    log.warning("the Tuya QR login ended without a sign-in (%s); Tuya's last answer: %s", end.why, answer)
+    # What Jarvis saw, not what the phone did: a brand app's phone may well have confirmed, and Tuya said nothing.
+    if end.why == "expired":
+        ui.say("The QR code expired before Tuya reported a confirmed login.")
+    else:
+        minutes = max(1, round(LOGIN_WAIT_S / 60))
+        ui.say(f"Tuya did not report a confirmed login within {minutes} minute{'s' if minutes > 1 else ''}.")
+    ui.say(LOGIN_HINTS)
+    ui.say(f"Tuya's last answer: {answer}.")
 
 
 def _fallback_flow(ui: Prompter, ctx: DriverContext) -> None:
