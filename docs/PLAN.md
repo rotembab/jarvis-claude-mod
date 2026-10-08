@@ -274,7 +274,7 @@ Five phases, each ending in something you can try on your PC.
 
 **Alongside the phases: hand control**, in its own stages (see [Hand control](#hand-control-gestures)).
 
-**Alongside the phases: home devices.** Jarvis controls the Apple TV, the Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant over the home network, through a `home_control` tool and a setup window that keeps keys out of the chat. Unlocking, disarming and opening a garage door ask on screen, like the Ask on screen tier above. Guide: [HOME.md](HOME.md).
+**Alongside the phases: home devices.** Jarvis controls the Apple TV, the Sony Bravia TV, Smart Life (Tuya) devices and Home Assistant over the home network, and finds a title on your Plex server to open on the Apple TV, through a `home_control` tool and a setup window that keeps keys out of the chat. Unlocking, disarming and opening a garage door ask on screen, like the Ask on screen tier above. Guide: [HOME.md](HOME.md).
 
 **Then the Mac port.** Most of it is new helper backend files plus Mac permission setup; the mod and the action list carry over (see Windows now, Mac later).
 

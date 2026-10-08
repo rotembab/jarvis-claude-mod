@@ -50,6 +50,7 @@ SETUP_HINT = "Run /jarvis home setup, or ask me to open home setup, to add devic
 KIND_WORDS: dict[str, tuple[str, ...]] = {
     "tv": ("tv", "television", "telly"),
     "media_player": ("media player", "streamer", "player"),
+    "media_server": ("media server", "plex", "plex server", "server", "library"),
     "speaker": ("speaker",),
     "light": ("light", "lamp", "bulb"),
     "plug": ("plug", "socket", "outlet"),

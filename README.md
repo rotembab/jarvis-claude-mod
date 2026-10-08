@@ -6,7 +6,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - **Fish Audio voice.** Replies are spoken sentence by sentence as Claude writes them, through Fish Audio's streaming text-to-speech, in the voice you pick.
 - **Hands-free.** Say "Hey Jarvis" (or just "Jarvis", once you switch it on) and talk; talk over him to interrupt.
 - **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
-- **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Tuya devices (Tuya Smart or Smart Life app) and Home Assistant, over your home network. See [docs/HOME.md](docs/HOME.md).
+- **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Tuya devices (Tuya Smart or Smart Life app) and Home Assistant, over your home network, or to find a movie or the next episode on your Plex server and open it on the Apple TV. See [docs/HOME.md](docs/HOME.md).
 - **Later:** control of your PC with permission tiers.
 
 > **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. Expect rough edges; see the [roadmap](#roadmap).
@@ -206,7 +206,7 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 
 ## Home devices
 
-Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Tuya devices from the Tuya Smart or Smart Life app (Fingerbots too, through a Tuya gateway), and anything Home Assistant controls, and talks to them directly on your home network. It can't reach Apple Home from Windows; see [Siri and Apple Home](docs/HOME.md#siri-and-apple-home).
+Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Tuya devices from the Tuya Smart or Smart Life app (Fingerbots too, through a Tuya gateway), and anything Home Assistant controls, and talks to them directly on your home network. It can also look up a title on your own Plex Media Server and have the Apple TV open it. It can't reach Apple Home from Windows; see [Siri and Apple Home](docs/HOME.md#siri-and-apple-home).
 
 Run `/jarvis home setup`, or say "open home setup". A setup window opens where you add each device. PINs, keys and tokens are typed there, never into the chat, and are kept encrypted for your Windows account. Unlocking a lock, disarming an alarm and opening a garage door need your OK on screen first.
 

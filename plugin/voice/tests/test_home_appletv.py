@@ -745,6 +745,13 @@ def test_a_link_without_a_scheme_gets_one_so_it_is_not_sent_as_a_bundle_id(rig: 
     assert world.connected[0].calls[-1] == ("launch_app", "https://youtube.com/watch?v=abc")
 
 
+def test_a_plex_link_reaches_the_apple_tv_unchanged(rig: Rig, world: FakePyatv) -> None:
+    link = "plex://preplay/?metadataKey=%2Flibrary%2Fmetadata%2F14779&server=43d8ddccab40252739e7f4ecc6d134c679888c13"
+    assert rig.run("launch_app", link) == Outcome.done("Asked the Apple TV to open that link.")
+    assert world.calls == ["launch_app"]  # no app list is needed: the scheme says which app
+    assert world.connected[0].calls[-1] == ("launch_app", link)
+
+
 def test_a_kick_link_opens_the_channel_and_says_it_only_asked(rig: Rig, world: FakePyatv) -> None:
     world.apps.append(KICK)
     assert rig.run("launch_app", "kick.com/xQc") == Outcome.done(KICK_CHANNEL)
