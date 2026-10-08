@@ -90,8 +90,10 @@ REQUEST_TIMEOUT_S = 5.0
 PLEX_TV_TIMEOUT_S = 8.0
 MIN_REQUEST_S = 0.2
 REFRESH_MIN_S = 4.0  # asking plex.tv for new addresses needs at least this much of the call left
-# How long each kind of address gets to answer /identity: close by is quick, far away is not.
-PROBE_S = {"local": 1.5, "remote": 4.0, "relay": 6.0}
+# How long each kind of address gets to answer /identity: close by is quick, far away is not. Local gets
+# 2.5 s because Windows takes about 2 s to refuse a connection to a port nobody listens on (a Plex server on
+# this PC that is off), and a refusal should read as "not answering", not as a timeout.
+PROBE_S = {"local": 2.5, "remote": 4.0, "relay": 6.0}
 MAX_ROUTES = {"local": 8, "remote": 4, "relay": 2}  # per kind: many home adapters must not push out the rest
 HITS = 10  # search results asked for
 PAGE = 1000  # episodes asked for at a time
