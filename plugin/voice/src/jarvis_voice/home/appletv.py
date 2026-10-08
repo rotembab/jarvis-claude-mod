@@ -13,7 +13,9 @@ request wakes it and, over HDMI-CEC, the TV with it.
 
 pyatv logs credentials at DEBUG and puts them in ``str(config)`` and in some
 exception messages, so this module never formats a pyatv config or a pyatv
-exception's message: texts and log lines name the exception's type only.
+exception's message: texts and log lines name the exception's type only. The
+one exception is the reason the Apple TV itself gives when it turns a command
+down (see ``_refusal_detail``).
 """
 
 from __future__ import annotations
@@ -158,7 +160,8 @@ def _unreachable(device: DeviceRecord, command: str) -> Outcome:
 
 
 def _failure(exc: BaseException, device: DeviceRecord, command: str) -> Outcome:
-    """A spoken failure for ``exc``. Never uses its message: pyatv can put credentials in it."""
+    """A spoken failure for ``exc``. Never uses its message (pyatv can put credentials in it), except the
+    Apple TV's own reason for turning a command down."""
     name = device.name
     if isinstance(exc, _NotFound):
         return _unreachable(device, command)
@@ -191,10 +194,34 @@ def _failure(exc: BaseException, device: DeviceRecord, command: str) -> Outcome:
             return Outcome.fail("unreachable", f"The {name} stopped answering. Try again in a moment.")
         return _unreachable(device, command)
     if isinstance(exc, atv_errors.ProtocolError):
+        detail = _refusal_detail(exc)
+        if detail:
+            log.warning("apple tv %s: %s was refused:%s", device.id, command, detail)
         if command in ("play", "pause", "next", "previous"):
-            return Outcome.fail("failed", f"The {name} didn't accept that; nothing may be playing.")
-        return Outcome.fail("failed", f"The {name} didn't accept that command.")
+            return Outcome.fail("failed", f"The {name} didn't accept that; nothing may be playing.{detail}")
+        return Outcome.fail("failed", f"The {name} didn't accept that command.{detail}")
     return Outcome.fail("failed", f"Controlling the {name} failed ({type(exc).__name__}).")
+
+
+# pyatv builds this message in exactly one place (Companion's reply handling), from the Apple TV's
+# own error text and nothing else, so the part after it is the one pyatv message that is safe to show.
+_DEVICE_SAID = "Command failed: "
+_SAID_MAX = 120
+# A run this long of key-like characters is never a sentence: drop the text rather than show it.
+_KEY_LIKE = re.compile(r"[A-Za-z0-9+/=_-]{32,}")
+
+
+def _refusal_detail(exc: BaseException) -> str:
+    """`` It said: '...'.`` when the Apple TV gave a reason, else what kind of error sat under pyatv's, else nothing."""
+    text = str(exc)
+    if text.startswith(_DEVICE_SAID):
+        said = "".join(c if c.isprintable() else " " for c in text[len(_DEVICE_SAID) :]).replace('"', "'")
+        said = " ".join(said.split())
+        if said and not _KEY_LIKE.search(said):
+            return f' It said: "{said[: _SAID_MAX - 3] + "..." if len(said) > _SAID_MAX else said}".'
+        return ""
+    cause = exc.__cause__
+    return f" (The error underneath was a {type(cause).__name__}.)" if cause is not None else ""
 
 
 # --------------------------------------------------------------------------- one connection
