@@ -503,10 +503,10 @@ def test_relative_commands_are_never_retried(rig: Rig, world: FakePyatv, command
 def test_a_refusal_is_not_mistaken_for_a_lost_connection(rig: Rig, world: FakePyatv) -> None:
     world.failures["launch_app"] = [refused()]
     out = rig.run("launch_app", "Netflix")
-    assert out == Outcome.fail("failed", "The Apple TV didn't accept that command.")
+    assert out == Outcome.fail("failed", 'The Apple TV didn\'t accept that command. It said: "not now".')
     assert world.calls.count("launch_app") == 1
     world.failures["play"] = [refused()]
-    assert rig.run("play").text == "The Apple TV didn't accept that; nothing may be playing."
+    assert rig.run("play").text == 'The Apple TV didn\'t accept that; nothing may be playing. It said: "not now".'
     assert world.connects == 1 and not world.connected[0].closed
 
 
@@ -799,8 +799,54 @@ def test_a_refused_link_is_reported_and_not_sent_again(rig: Rig, world: FakePyat
     world.apps.append(KICK)
     world.failures["launch_app"] = [refused()]
     out = rig.run("launch_app", "kick.com/xqc")
-    assert out == Outcome.fail("failed", "The Apple TV didn't accept that command.")
+    assert out == Outcome.fail("failed", 'The Apple TV didn\'t accept that command. It said: "not now".')
     assert world.calls.count("launch_app") == 1
+
+
+def device_said(text: str) -> atv_errors.ProtocolError:
+    return atv_errors.ProtocolError(f"Command failed: {text}")
+
+
+@pytest.mark.parametrize(
+    ("error", "detail"),
+    [
+        (
+            device_said("The operation couldn't be completed.\n\t(FBSOpenApplicationErrorDomain error 4.)"),
+            ' It said: "The operation couldn\'t be completed. (FBSOpenApplicationErrorDomain error 4.)".',
+        ),
+        (device_said('He said "no"'), " It said: \"He said 'no'\"."),
+        (device_said("word " * 60), f' It said: "{("word " * 60)[:117]}...".'),
+        # Nothing readable, or something shaped like a key: no reason is shown.
+        (device_said(""), ""),
+        (device_said("   "), ""),
+        (device_said("token " + "A1b2C3d4" * 5), ""),
+        # Every other pyatv message may carry a credential, so only the kind of error underneath is named.
+        (atv_errors.ProtocolError(f"Command _launchApp failed {CREDS}"), ""),
+        (atv_errors.ProtocolError(f"Received unexpected type {CREDS}"), ""),
+    ],
+)
+def test_a_refusal_says_only_what_the_apple_tv_itself_said(
+    rig: Rig, world: FakePyatv, caplog: pytest.LogCaptureFixture, error: Exception, detail: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    world.failures["launch_app"] = [error]
+    out = rig.run("launch_app", "Netflix")
+    assert out == Outcome.fail("failed", f"The Apple TV didn't accept that command.{detail}")
+    assert CREDS not in out.text and CREDS not in caplog.text
+    assert ("It said" in caplog.text) == ("It said" in detail)
+
+
+def test_a_refusal_names_the_kind_of_error_underneath_when_the_apple_tv_gave_no_reason(
+    rig: Rig, world: FakePyatv
+) -> None:
+    error = atv_errors.ProtocolError(f"Command _launchApp failed {CREDS}")
+    error.__cause__ = KeyError(CREDS)
+    world.failures["launch_app"] = [error]
+    out = rig.run("launch_app", "Netflix")
+    assert out == Outcome.fail(
+        "failed", "The Apple TV didn't accept that command. (The error underneath was a KeyError.)"
+    )
+    assert CREDS not in out.text
 
 
 def test_list_apps_names_them_in_order_and_asks_afresh(rig: Rig, world: FakePyatv) -> None:
