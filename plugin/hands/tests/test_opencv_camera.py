@@ -829,15 +829,16 @@ def test_the_frame_rate_is_measured_over_its_window() -> None:
 
 
 class FakeClock:
-    """``clock.now`` for the camera module: each call is one 30 fps frame interval later, from 5000 s."""
+    """``clock.now`` for the camera module: each call is one frame interval at ``fps`` later, from 5000 s."""
 
-    def __init__(self) -> None:
+    def __init__(self, fps: float = 30) -> None:
+        self.fps = fps
         self._lock = threading.Lock()
         self.given: list[float] = []
 
     def __call__(self) -> float:
         with self._lock:
-            self.given.append(5000.0 + len(self.given) / 30)
+            self.given.append(5000.0 + len(self.given) / self.fps)
             return self.given[-1]
 
 
@@ -856,13 +857,22 @@ def test_frames_are_stamped_with_the_helpers_clock(
     assert info is not None and info.fps == pytest.approx(30.0)
 
 
-def test_info_reports_the_requested_rate_until_it_is_measured(cameras: list[OpenCVCamera]) -> None:
-    camera = make_camera(FakeFactory([FakeCapture(delay=0.004)]), fps_window=0.3)
+def test_info_reports_the_requested_rate_until_it_is_measured(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    # Frames are stamped by a simulated 120 fps clock, so the measured rate is exact however slowly the runner
+    # reads: a macOS runner oversleeps the fake's 4 ms read by 20-30 ms, which a wall clock measures as ~36 fps.
+    monkeypatch.setattr(oc, "clock_now", FakeClock(fps=120))
+    more = threading.Event()  # only the first picture until open() has answered: nothing measured yet
+    capture = FakeCapture(frames=lambda n: picture(n) if n == 0 or more.wait(10.0) else None, delay=0.004)
+    camera = make_camera(FakeFactory([capture]), fps_window=0.3)
     cameras.append(camera)
     assert camera.open().fps == 30.0
-    time.sleep(0.5)
-    info = camera.info
-    assert info is not None and info.fps != 30.0 and 40.0 < info.fps < 1000.0
+    more.set()
+    deadline = time.monotonic() + 10.0  # measured once about 20 frames span half the window
+    while (info := camera.info) is not None and info.fps == 30.0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert info is not None and info.fps == 120.0
 
 
 # --------------------------------------------------------------------------- failures
@@ -880,14 +890,41 @@ def test_no_picture_in_time_means_the_camera_is_in_use() -> None:
     camera.close()
 
 
-def test_two_silent_backends_mean_the_camera_is_in_use() -> None:
-    msmf, dshow = FakeCapture(frames=lambda n: None, delay=0.01), FakeCapture(frames=lambda n: None, delay=0.01)
+class ReadClock:
+    """``time`` for the camera module: its clock moves only when a fake read takes ``step`` seconds.
+
+    Deadlines are then counted in reads, so a reader thread the machine
+    schedules late still gets every read of its first-frame wait, and the
+    caller's safety net (twice that wait) is never reached by a reader that
+    is merely slow. It starts up to a second ahead of the real ``monotonic``
+    that ``_Session.phase_started`` still defaults to (bound at import), so an
+    opening deadline counted from that default is still ahead of it.
+    """
+
+    def __init__(self, step: float) -> None:
+        self.step = step
+        self.now = float(int(time.monotonic()) + 1)
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def silent_read(self, n: int) -> None:
+        self.now += self.step
+
+
+def test_two_silent_backends_mean_the_camera_is_in_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    # On simulated time: a macOS runner can wake the reader hundreds of ms late, and on a wall clock that left it
+    # still waiting on MSMF when the caller's safety net (twice the wait) gave up, before DirectShow was tried.
+    clock = ReadClock(step=1 / 16)  # exact in binary: a 0.25 s wait is exactly four reads
+    monkeypatch.setattr(oc, "time", clock)
+    msmf, dshow = FakeCapture(frames=clock.silent_read, delay=0), FakeCapture(frames=clock.silent_read, delay=0)
     factory = FakeFactory([msmf, dshow])
-    camera = make_camera(factory, first_frame_timeout=0.2)
+    camera = make_camera(factory, first_frame_timeout=0.25)
     with pytest.raises(CameraError) as error:
         camera.open()
     assert error.value.code == "camera_in_use" and "msmf" in error.value.message and "dshow" in error.value.message
     assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF, cv2.CAP_DSHOW]
+    assert msmf.reads == dshow.reads == 4  # each backend had its whole first_frame_timeout
     assert msmf.released == 1 and dshow.released == 1
     camera.close()
 

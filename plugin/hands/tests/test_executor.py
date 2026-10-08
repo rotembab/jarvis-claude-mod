@@ -116,13 +116,12 @@ def test_stop_releases_and_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(executor_module.atexit, "register", registered.append)
     monkeypatch.setattr(executor_module.atexit, "unregister", unregistered.append)
     h = Harness()
+    # Pressed on simulated time, not by the thread: a press the thread reaches more than two frame intervals
+    # after it was queued is stale and dropped by design, and one oversleep of a macOS runner is that long.
+    h.do(Button("left", True, 5, 5))
+    assert h.desktop.buttons_down == {"left"}
     h.ex.start()
     assert registered == [h.ex.stop]
-    h.ex.submit([Button("left", True, 5, 5)])
-    deadline = time.monotonic() + 2
-    while h.ex.held != {"left"} and time.monotonic() < deadline:
-        time.sleep(0.005)
-    assert h.desktop.buttons_down == {"left"}
     h.ex.stop()
     assert h.desktop.buttons_down == set()
     assert unregistered == [h.ex.stop]
