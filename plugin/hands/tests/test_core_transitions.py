@@ -24,12 +24,22 @@ from jarvis_hands.actions import Button, GrabWindow, ReleaseWindow, ThrowWindow
 from jarvis_hands.desktop.fake import FakeWindow
 from jarvis_hands.geometry import Rect
 from jarvis_hands.landmarks import Frame
-from jarvis_hands.poses import PoseTracker
-from jarvis_hands.settings import HandsSettings
+from jarvis_hands.poses import PoseTracker, thresholds_for
+from jarvis_hands.settings import KNOB_BY_KEY, HandsSettings
 
 from scripted import HEIGHT, WIDTH, Blend, H, Rig, Script, SyntheticPose, camera_point, display
 
 A = (0.5, 0.45)
+
+#: The fist sensitivity at its default and at the two ends of its range.
+FISTS = [1.0, KNOB_BY_KEY["fist"].low, KNOB_BY_KEY["fist"].high]
+
+
+def fist_settings(fist: float) -> HandsSettings:
+    settings = HandsSettings()
+    settings.apply_config({"fist": fist})
+    return settings
+
 
 #: The thumb's progress as a function of the fingers' (closing); the mirror image when opening.
 THUMB_PROFILES: dict[str, Callable[[float], float] | None] = {
@@ -395,9 +405,9 @@ def test_one_noisy_frame_inside_the_pinch_a_closing_hand_passes_through_clicks_n
     assert rig.gestures == ["engage", "grab", "release"]
 
 
-def raw_poses(blends: list[Blend]) -> list[str]:
+def raw_poses(blends: list[Blend], fist: float = 1.0) -> list[str]:
     """What one hand's tracker (hysteresis and all) reads for ``blends`` in a row."""
-    tracker = PoseTracker()
+    tracker = PoseTracker(thresholds_for(1.0, fist))
     script = Script()
     return [tracker.classify(b.observe((script.width, script.height)), "knuckles", HEIGHT / WIDTH).pose for b in blends]
 
@@ -438,24 +448,33 @@ def test_a_hand_engaged_while_it_makes_a_fist_does_not_click_as_the_fist_opens()
     assert rig.gestures == ["engage"]
 
 
-def flick(frames: int) -> list[Blend]:
+def flick(frames: int, fist: float = 1.0) -> list[Blend]:
     """A palm closing over ``frames`` frames up to the first one that reads as a fist, and straight back open."""
     closing = [Blend("palm", "fist", i / frames, A) for i in range(1, frames + 1)]
-    shut = raw_poses(closing).index("fist")
+    shut = raw_poses(closing, fist).index("fist")
     return closing[: shut + 1] + closing[shut - 1 :: -1]
 
 
+#: (the fist sensitivity the flick is built for, the one the engine runs at): a looser fist stays closed longer on the
+#: way back, which makes it no flick.
+FLICKS = [(1.0, 1.0), (FISTS[1], FISTS[1]), (1.0, FISTS[1])]
+
+
+@pytest.mark.parametrize(("built_for", "fist"), FLICKS)
 @pytest.mark.parametrize(("fps", "frames", "confirm"), [(30.0, 12, 2), (60.0, 24, 3)])
-def test_a_fist_too_quick_to_grab_clicks_nothing_on_its_way_back_open(fps: float, frames: int, confirm: int) -> None:
+def test_a_fist_too_quick_to_grab_clicks_nothing_on_its_way_back_open(
+    fps: float, frames: int, confirm: int, built_for: float, fist: float
+) -> None:
     """The fist shows on too few frames to be confirmed, so the pinch on either side of it is one long pinch.
 
-    Its way down and back up must not average out to fingers holding still either.
+    Its way down and back up must not average out to fingers holding still either; the fist sensitivity, which
+    only decides what counts as a fist, must not change that.
     """
-    settings = HandsSettings()
+    settings = fist_settings(fist)
     settings.confirm_frames = confirm
     rig, script = engaged(fps, settings=settings, windows=[FakeWindow(1, "Explorer", Rect(500, 300, 900, 600))])
-    blends = flick(frames)
-    raws = raw_poses(blends)
+    blends = flick(frames, built_for)
+    raws = raw_poses(blends, built_for)
     shut = raws.index("fist")
     assert raws.count("fist") < confirm and "pinch" in raws[:shut] and "pinch" in raws[shut:]
     rig.feed([script.frame(b) for b in blends])
@@ -512,22 +531,70 @@ def test_noisy_hands_closing_into_a_fist_and_opening_again_click_nothing(
     assert clicked == []
 
 
-@pytest.mark.parametrize("fps", [30.0, 60.0])
-def test_a_noisy_relaxed_hand_closing_slowly_into_a_fist_clicks_nothing(fps: float) -> None:
-    """Slow closings move the other fingers barely faster than a still hand's noise: the settle window must
-    take in the frames before the pinch, not just its first two or three."""
-    clicked = []
+def slow_closing_clicks(fps: float, closing: float, fist: float) -> set[int]:
+    """The seeds (of ten) in which a noisy relaxed hand, closing into a fist over ``closing`` seconds, clicked."""
+    clicked = set()
     for seed in range(10):
         noise = jittered(0.0015, seed)
-        rig = Rig(windows=[FakeWindow(1, "Explorer", Rect(500, 300, 900, 600))])
+        rig = Rig(settings=fist_settings(fist), windows=[FakeWindow(1, "Explorer", Rect(500, 300, 900, 600))])
         script = Script(fps=fps)
         rig.feed(script.hold(H("palm", A, options=noise), seconds=1.0))
         rig.feed(script.transition("palm", "hover", A, seconds=0.3, options=noise))
         rig.feed(script.hold(H("hover", A, options=noise), seconds=0.4))
-        rig.feed(script.transition("hover", "fist", A, seconds=0.8, thumb=THUMB_PROFILES["first"], options=noise))
+        rig.feed(script.transition("hover", "fist", A, seconds=closing, thumb=THUMB_PROFILES["first"], options=noise))
         rig.feed(script.hold(H("fist", A, options=noise), seconds=0.3))
         if buttons(rig):
-            clicked.append((seed, rig.gestures))
+            clicked.add(seed)
+    return clicked
+
+
+@pytest.mark.parametrize("fist", FISTS)
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+def test_a_noisy_relaxed_hand_closing_slowly_into_a_fist_clicks_nothing(fps: float, fist: float) -> None:
+    """Slow closings move the other fingers barely faster than a still hand's noise: the settle window must
+    take in the frames before the pinch, not just its first two or three."""
+    assert slow_closing_clicks(fps, 0.8, fist) == set()
+
+
+@pytest.mark.parametrize("fist", FISTS[1:])
+@pytest.mark.parametrize("closing", [0.8, 1.0, 1.2])
+@pytest.mark.parametrize("fps", [30.0, 60.0])
+def test_the_fist_sensitivity_adds_no_clicks_to_a_slow_closing(fps: float, closing: float, fist: float) -> None:
+    """The fist sensitivity decides what counts as a fist, not how the pinch before it is judged: a closing slower
+    than a second clicks at the default too (the settle window is a second wide), and must click no more
+    (a fist of 0.9 once pressed in 8 of 10 seeds a closing of 1.0 s at 30 fps, the default in none)."""
+    assert slow_closing_clicks(fps, closing, fist) <= slow_closing_clicks(fps, closing, 1.0)
+
+
+def closing_frame(script: Script, k: float, profile: Callable[[float], float] | None, noise: dict) -> Frame:
+    thumb = None if profile is None else profile(k)
+    return script.frame(Blend("hover", "fist", k, A, "right", thumb, dict(noise)))
+
+
+@pytest.mark.parametrize("fist", FISTS[:2])
+@pytest.mark.parametrize("halfway", [0.6, 0.8])
+def test_a_noisy_hand_that_hesitates_halfway_into_a_fist_clicks_nothing(halfway: float, fist: float) -> None:
+    """Closing, a pause with the fingers half curled (0.4 s), closing on: the fingers rest long enough to count as
+    settled, but a pinch under a stricter fist sensitivity must be judged as at the default (it once pressed in a
+    third of the runs at 0.9)."""
+    clicked = []
+    for thumb, profile in THUMB_PROFILES.items():
+        for seed in range(6):
+            noise = jittered(0.001, seed)
+            rig = Rig(settings=fist_settings(fist), windows=[FakeWindow(1, "Explorer", Rect(500, 300, 900, 600))])
+            script = Script(fps=30.0)
+            rig.feed(script.hold(H("palm", A, options=noise), seconds=1.0))
+            rig.feed(script.transition("palm", "hover", A, seconds=0.3, options=noise))
+            rig.feed(script.hold(H("hover", A, options=noise), seconds=0.4))
+
+            closing = script.count(0.3)
+            ks = [halfway * i / closing for i in range(1, closing + 1)]
+            ks += [halfway] * script.count(0.4)
+            ks += [halfway + (1 - halfway) * i / closing for i in range(1, closing + 1)]
+            rig.feed([closing_frame(script, k, profile, noise) for k in ks])
+            rig.feed(script.hold(H("fist", A, options=noise), seconds=0.3))
+            if buttons(rig):
+                clicked.append((thumb, seed, rig.gestures))
     assert clicked == []
 
 

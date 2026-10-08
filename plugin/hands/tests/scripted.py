@@ -219,6 +219,7 @@ class Rig:
         self.executor = Executor(
             self.desktop,
             displays=lambda: self.mapper.used,
+            cursor_gain=lambda: self.mapper.cursor_gain,
             on_user_input=self._user_input,
             on_error=lambda code, message: self.errors.append((code, message)),
         )

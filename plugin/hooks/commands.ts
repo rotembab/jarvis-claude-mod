@@ -32,6 +32,7 @@ const HELP = [
   '/jarvis hud [on|off]             show the HUD now; on or off: whether it opens with each session',
   '/jarvis focus [on|off]           focus mode: while Jarvis runs, only the HUD and the prompt show',
   '/jarvis hands [on|off]           hand control: your webcam drives the mouse and windows',
+  '/jarvis hands tune|preset|set    tune the sensitivity: cursor speed, smoothing, pinch and more',
   '/jarvis setup hands              install hand control (about 500 MB)',
   HOME_HELP,
 ].join('\n')

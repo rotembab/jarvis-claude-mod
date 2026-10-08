@@ -5,6 +5,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -34,7 +35,12 @@ PROJECTOR = display(2, 1920, 0, 1280, 720)
 
 
 class Harness:
-    def __init__(self, displays: list[Display] | None = None, windows: list[FakeWindow] | None = None) -> None:
+    def __init__(
+        self,
+        displays: list[Display] | None = None,
+        windows: list[FakeWindow] | None = None,
+        **executor_options: Any,
+    ) -> None:
         self.desktop = FakeDesktop(displays, windows, cursor=(0, 0))
         self.user_inputs = 0
         self.errors: list[tuple[str, str]] = []
@@ -43,6 +49,7 @@ class Harness:
             displays=self.desktop.displays,
             on_user_input=self._user_input,
             on_error=lambda code, message: self.errors.append((code, message)),
+            **executor_options,
         )
 
     def _user_input(self) -> None:
@@ -439,6 +446,29 @@ def test_a_maximized_window_is_restored_on_the_first_real_drag_like_windows_does
     assert w.rect == Rect(1460 - 750, 320 - 40, 1000, 700)
     h.do(DragWindow(1500, 340))
     assert w.rect == Rect(750, 300, 1000, 700)
+
+
+def test_the_drag_that_restores_a_maximized_window_grows_with_the_cursor_gain() -> None:
+    """The cursor moves ``gain`` times as far for the same landmark jitter, so a still fist must be allowed to
+    wander that much more before it counts as a drag: 8 px at a gain of 1, 24 at 3, never less than 8."""
+    for gain, tremor, drag in ((1.0, 6, 10), (3.0, 20, 26), (0.7, 6, 10), (2.0, 14, 18)):
+        w = FakeWindow(1, rect=PRIMARY.work, state="maximized", normal_rect=Rect(300, 200, 1000, 700))
+        h = Harness([PRIMARY], [w], cursor_gain=lambda g=gain: g)
+        h.do(GrabWindow(1000, 500))
+        h.do(DragWindow(1000 + tremor, 500))
+        assert w.state == "maximized", gain
+        h.do(DragWindow(1000 + drag, 500))
+        assert w.state == "normal", gain
+
+
+def test_the_restore_distance_is_the_one_in_force_when_the_window_was_grabbed() -> None:
+    gain = [1.0]
+    w = FakeWindow(1, rect=PRIMARY.work, state="maximized", normal_rect=Rect(300, 200, 1000, 700))
+    h = Harness([PRIMARY], [w], cursor_gain=lambda: gain[0])
+    h.do(GrabWindow(1000, 500))
+    gain[0] = 3.0  # (the engine never changes it during a grab; the executor does not rely on that)
+    h.do(DragWindow(1010, 500))
+    assert w.state == "normal"
 
 
 def test_releasing_a_maximized_window_without_moving_changes_nothing() -> None:
