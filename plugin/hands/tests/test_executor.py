@@ -3,8 +3,10 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -34,7 +36,12 @@ PROJECTOR = display(2, 1920, 0, 1280, 720)
 
 
 class Harness:
-    def __init__(self, displays: list[Display] | None = None, windows: list[FakeWindow] | None = None) -> None:
+    def __init__(
+        self,
+        displays: list[Display] | None = None,
+        windows: list[FakeWindow] | None = None,
+        **options: Any,
+    ) -> None:
         self.desktop = FakeDesktop(displays, windows, cursor=(0, 0))
         self.user_inputs = 0
         self.errors: list[tuple[str, str]] = []
@@ -43,6 +50,7 @@ class Harness:
             displays=self.desktop.displays,
             on_user_input=self._user_input,
             on_error=lambda code, message: self.errors.append((code, message)),
+            **options,
         )
 
     def _user_input(self) -> None:
@@ -116,13 +124,12 @@ def test_stop_releases_and_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(executor_module.atexit, "register", registered.append)
     monkeypatch.setattr(executor_module.atexit, "unregister", unregistered.append)
     h = Harness()
+    # Pressed on simulated time, not by the thread: a press the thread reaches more than two frame intervals
+    # after it was queued is stale and dropped by design, and one oversleep of a macOS runner is that long.
+    h.do(Button("left", True, 5, 5))
+    assert h.desktop.buttons_down == {"left"}
     h.ex.start()
     assert registered == [h.ex.stop]
-    h.ex.submit([Button("left", True, 5, 5)])
-    deadline = time.monotonic() + 2
-    while h.ex.held != {"left"} and time.monotonic() < deadline:
-        time.sleep(0.005)
-    assert h.desktop.buttons_down == {"left"}
     h.ex.stop()
     assert h.desktop.buttons_down == set()
     assert unregistered == [h.ex.stop]
@@ -130,14 +137,17 @@ def test_stop_releases_and_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert h.desktop.calls_named("button") == [("button", "left", True), ("button", "left", False)]
 
 
-def test_the_thread_glides_the_cursor_in_real_time() -> None:
-    h = Harness()
-    h.ex.frame_interval = 0.4  # long enough for several ticks even where sleeps overshoot by tens of ms
+def test_the_thread_glides_the_cursor_to_the_target() -> None:
+    # The thread runs on simulated time: a sleep that returns when the clock has moved by what was asked. On the
+    # wall clock one oversleep of a macOS runner longer than the glide put the cursor on the target in one jump,
+    # which is exactly what the glide is there to prevent.
+    sim = SimulatedTime()
+    h = Harness(clock=sim.clock, sleep=sim.sleep)
+    h.ex.submit([MoveCursor(400, 300)])  # at simulated second 0, before the thread starts
     h.ex.start()
     try:
-        h.ex.submit([MoveCursor(400, 300)])
-        deadline = time.perf_counter() + 3
-        while h.desktop.cursor() != (400, 300) and time.perf_counter() < deadline:
+        deadline = time.monotonic() + 10
+        while h.desktop.cursor() != (400, 300) and time.monotonic() < deadline:
             time.sleep(0.005)
         assert h.desktop.cursor() == (400, 300)
         assert len(h.desktop.calls_named("move_cursor")) >= 2  # interpolated, not one jump
@@ -360,20 +370,22 @@ def test_the_thread_waits_with_sleep_not_a_timed_event_wait(monkeypatch: pytest.
     monkeypatch.setattr(stop_event, "wait", wait)
     ticks: list[float] = []
     real_tick = h.ex.tick
+    five = threading.Event()
 
     def counting_tick(now: float | None = None) -> None:
         ticks.append(time.perf_counter())
+        if len(ticks) == 5:
+            five.set()
         real_tick(now)
 
     monkeypatch.setattr(h.ex, "tick", counting_tick)
     h.ex.start()
-    try:
-        time.sleep(0.5)
+    try:  # five ticks, however long the runner takes over them
+        assert five.wait(30), "the thread did not tick five times"
     finally:
         h.ex.stop()
     assert timed_waits == []
-    assert len(ticks) >= 5  # loose: CI machines oversleep by tens of ms; the rate itself is tested above
-    assert min(gaps_of(ticks)) > PERIOD / 4  # never back to back
+    assert min(gaps_of(ticks)) > PERIOD / 4  # never back to back; the rate itself is tested above
 
 
 def test_the_clock_is_fine_grained() -> None:
