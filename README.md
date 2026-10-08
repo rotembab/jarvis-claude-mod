@@ -7,9 +7,9 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - **Hands-free.** Say "Hey Jarvis" (or just "Jarvis", once you switch it on) and talk; talk over him to interrupt.
 - **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
 - **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Tuya devices (Tuya Smart or Smart Life app) and Home Assistant, over your home network. See [docs/HOME.md](docs/HOME.md).
-- **Later:** control of your PC with permission tiers.
+- **PC control.** Ask Jarvis to open an app, a folder or a link, press the media keys, set the volume or a timer. A guard reads every command Claude runs: it asks you before risky ones and blocks the worst. See [docs/PC-CONTROL.md](docs/PC-CONTROL.md).
 
-> **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. Expect rough edges; see the [roadmap](#roadmap).
+> **Status: phase 4 of 4 ("Hands").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. PC control is new and still being checked on real PCs. Expect rough edges; see the [roadmap](#roadmap).
 
 ## Contents
 
@@ -20,6 +20,7 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - [Using Jarvis](#using-jarvis)
 - [Hand control (preview)](#hand-control-preview)
 - [Home devices](#home-devices)
+- [PC control](#pc-control)
 - [Commands](#commands)
 - [Settings](#settings)
 - [How it works](#how-it-works)
@@ -210,9 +211,22 @@ Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on 
 
 Run `/jarvis home setup`, or say "open home setup". A setup window opens where you add each device. PINs, keys and tokens are typed there, never into the chat, and are kept encrypted for your Windows account. Unlocking a lock, disarming an alarm and opening a garage door need your OK on screen first.
 
+Jarvis asks on screen before Claude changes a device, unless your own Claude Code rules allow `mcp__jarvis__home_control`; by default, reading your devices needs no question. See [What Jarvis asks you first](docs/HOME.md#what-jarvis-asks-you-first).
+
 To see which smart devices are on your network and which ones Jarvis can control, run `/jarvis home scan` or ask "what smart devices are on my network?"
 
 [docs/HOME.md](docs/HOME.md) has the one-time steps for each kind of device, where everything is stored, and troubleshooting.
+
+## PC control
+
+Jarvis can work your Windows PC from a spoken request: "open Spotify and play my focus playlist", "turn the volume down", "set a tea timer for 4 minutes". Claude gets a desktop tool with a few narrow actions (open an app, a folder or a link, bring a window to the front, the media and volume keys, a screenshot, locking the PC, the clipboard, timers); for anything else it uses PowerShell.
+
+- **The guard.** Every PowerShell, Bash and Monitor command Claude runs, and every edit to Claude Code's own settings, passes Jarvis's guard first. Risky commands wait for your OK: a click on screen or, for some, a spoken yes in a voice conversation. A short list is blocked outright, such as turning off Windows Defender or formatting a disk. The guard only ever makes Claude Code stricter: Claude Code's own rules and prompts still apply after it.
+- **The desktop tool** asks you on screen before each action unless your own rules allow `mcp__jarvis__desktop`, and always asks before reading the clipboard or taking a screenshot.
+- **Never as administrator.** Jarvis stays off while Claude Code runs as administrator.
+- `/jarvis pc stop`, or saying "Jarvis, stand down", stops speech, the running turn and the background commands Jarvis saw start.
+
+[docs/PC-CONTROL.md](docs/PC-CONTROL.md) has the tiers, what the guard is and isn't, the rules to paste into your settings, and what to check on your PC.
 
 ## Commands
 
@@ -233,6 +247,7 @@ To see which smart devices are on your network and which ones Jarvis can control
 | `/jarvis focus [on\|off]` | Focus mode: while Jarvis runs, only the HUD and the prompt show. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis home [setup\|list\|status\|do\|scan]` | Home devices: what is set up, open the setup window, list devices, show one device's state, run one command, or search your network for smart devices. See [docs/HOME.md](docs/HOME.md#commands). |
+| `/jarvis pc [check <command>\|rules\|stop]` | PC control: the guard's state, which tier a command falls in, permission rules to paste into your settings, or stand down. See [docs/PC-CONTROL.md](docs/PC-CONTROL.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
 | `/jarvis setup hands` | Install hand control (MediaPipe, OpenCV and the hand model). |
 | `/jarvis hands [on\|off]` | Hand control status, or turn it (and the camera) on or off. |
@@ -344,7 +359,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
-| 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
+| 4 (now) | Hands | Now: a guard on Claude's commands and edits, with spoken and on-screen confirmations, and the desktop tool ([docs/PC-CONTROL.md](docs/PC-CONTROL.md)). Next: checking it on real PCs. |
 | Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview). Next: tuning on a real desk, then a projector wall mode. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).

@@ -17,8 +17,9 @@ plugin/                           the plugin, the only folder that ships
   protocol/hands.schema.json      hand helper <-> mod messages (authoritative)
   voice/                          the voice helper: Python package jarvis_voice (uv project)
     src/jarvis_voice/home/        home control: device list, credential store, drivers, setup wizard, network scan
+    src/jarvis_voice/desktop/     the desktop tool's actions (open, focus, media, volume, screenshot, lock, clipboard)
   hands/                          the hand helper: Python package jarvis_hands (its own uv project and venv)
-docs/                             the specs, the plan, the home-control guide (HOME.md) and this file
+docs/                             the specs, the plan, the home-control guide (HOME.md), the PC-control guide (PC-CONTROL.md) and this file
 ```
 
 ## Prerequisites
@@ -150,7 +151,7 @@ uv run --project plugin\voice python -m jarvis_voice run --data-dir "$env:TEMP\j
 - The two heartbeat flags stretch the watchdog to 10 minutes, so it does not exit while you type. Without them it exits when no heartbeat has arrived for 15 seconds (60 before the first).
 - With no `JARVIS_TOKEN` set, fake mode accepts the token `jarvis-fake-token`.
 
-Its first stdout line is `hello`, carrying the port; every other stdout line is an event (one JSON object per line). Its log goes to stderr and to `logs\voice.log` in the data folder. From a second terminal:
+Its first stdout line is `hello`, carrying the port; every other stdout line is an event (one JSON object per line). Its log goes to stderr and to `logs\voice.log` in the data folder. From a second terminal of your own (with the mod loaded, Jarvis's guard blocks these requests when Claude runs them, so don't ask Claude to):
 
 ```powershell
 $port = 53124   # the port from the hello line
@@ -260,7 +261,7 @@ plugin/voice/src/jarvis_voice/home/
   appletv.py, bravia.py, tuya*.py, homeassistant.py   the drivers and their setup steps
 ```
 
-**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode without checking permission rules, as it does `list` and `status`.
+**Safety rules.** Plugin-answered tools skip Claude Code's permission prompts, so the tiers are enforced here: the service returns `confirm` for a `screen` command until the mod sends `confirmed: true` after the user clicked yes in `$.ui.ask`, refuses `never` commands, and the mod refuses `do` and `setup` in plan mode. `jarvis_voice home call` (the mod's fallback when the helper is not running) strips `confirmed`, and `home do` asks only in an interactive console, so nothing reachable through Claude's shell can confirm a `screen` command. The mod applies the user's own rules for the tool to every call, as it does for the desktop and hands tools (`desktop.ts` `checkRules`, through `$.tool.check`, with the plan-mode state `pc.ts` keeps for all three): a deny or a failed check refuses any action; `do` and `setup` ask on screen unless the user's own allow rule covers the tool, no settings hook could match it and the turn's mode is known. `scan` is read-only: it needs no tier, and the mod lets it through in plan mode, as it does `list` and `status`; these three also run on the engine's own verdict with no rule behind it (`isRead`), but never past an ask rule, a deny or dontAsk.
 
 **Credentials** go only through `HomeStore.set_secret`, are typed only in the setup window, and never appear in `devices.json`, tool results, logs, argv or test fixtures. Driver loggers are clamped in `base.QUIET_LOGGERS`.
 

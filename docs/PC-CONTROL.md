@@ -2,7 +2,7 @@
 
 Phase 4 lets Claude work the PC from a spoken request: open apps, press the media keys, set a timer, run PowerShell. This page covers what Jarvis lets through, what it asks about, what it blocks, and what to check on the PC.
 
-Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse. Jarvis's own tools, the desktop tool, hand control's tool and home control's tool, are answered by Jarvis, so Claude Code's permission path never sees them. For each, Jarvis asks Claude Code for its verdict on your rules and applies it itself. The desktop and hands tools ask you wherever that verdict isn't your own allow (see each tool below); home control's tool is covered in [HOME.md](HOME.md#what-jarvis-asks-you-first).
+Jarvis only ever makes Claude Code stricter. It never answers a permission decision, never writes Claude Code's settings or rules, and never touches Claude Code's own permission dialogs. When Jarvis says yes to a command, Claude Code's own rules, permission mode and dialogs still decide after it. So in default mode Claude Code may show its own dialog after Jarvis's question, and in plan, dontAsk or auto mode Claude Code can still refuse. Jarvis's own tools, the desktop tool, hand control's tool and home control's tool, are answered by Jarvis, so Claude Code's permission path never sees them. For each, Jarvis asks Claude Code for its verdict on your rules and applies it itself. The desktop and hands tools ask you wherever that verdict isn't your own allow (see each tool below). Home control's tool does the same before it changes a device or opens its setup window, and lets reading your devices run on Claude Code's default too; see [HOME.md](HOME.md#what-jarvis-asks-you-first).
 
 ## The guard
 
@@ -30,8 +30,8 @@ Python, JavaScript and other interpreters' files are only checked for a few sign
 
 | Tier | What happens | Examples |
 | --- | --- | --- |
-| never | Blocked. Claude is told not to retry or work around it; you can still run it yourself. | `Set-MpPreference -DisableRealtimeMonitoring $true` (turns off Windows Defender), `Format-Volume -DriveLetter D`, `bcdedit /set safeboot minimal`, `vssadmin delete shadows /all`, `New-LocalUser bob`, SendKeys or `xdotool type` (types keystrokes into a window), `claude mcp add ...`, writing `~/.claude/settings.json` or Jarvis's credentials (its 8.3 short name such as `.claude\SETTIN~1.JSO` too, a path with `..` in it, or a relative path after a `cd`; with Write and Edit, through a link or junction as well) |
-| screen | A question on screen. Nothing runs until you click "Run it". | `Remove-Item -Recurse -Force $env:USERPROFILE\Downloads`, `git reset --hard`, `git push --force`, `Stop-Computer`, `logoff`, `Set-ItemProperty HKCU:\...`, `Restart-Service Spooler`, `schtasks /create ...`, `iwr ... \| iex`, `Start-Process powershell -Verb RunAs`, `Send-MailMessage`, `Set-ExecutionPolicy`, `icacls ... /grant`, `manage-bde -off C:`, writing a skill, agent, command, hook or `.mcp.json` under `.claude`, writing into a startup location, `.\x.vbs`, `New-Item -ItemType Junction ... -Target $HOME\.claude` |
+| never | Blocked. Claude is told not to retry or work around it; you can still run it yourself. | `Set-MpPreference -DisableRealtimeMonitoring $true` (turns off Windows Defender), `Format-Volume -DriveLetter D`, `bcdedit /set safeboot minimal`, `vssadmin delete shadows /all`, `New-LocalUser bob`, SendKeys or `xdotool type` (types keystrokes into a window), `claude mcp add ...`, writing `~/.claude/settings.json` or Jarvis's credentials (its 8.3 short name such as `.claude\SETTIN~1.JSO` too, a path with `..` in it, or a relative path after a `cd`; with Write and Edit, through a link or junction as well), a request to the Jarvis helper's port on `127.0.0.1` (`/v1/...`) |
+| screen | A question on screen. Nothing runs until you click "Run it". | `Remove-Item -Recurse -Force $env:USERPROFILE\Downloads`, `git reset --hard`, `git push --force`, `Stop-Computer`, `logoff`, `Set-ItemProperty HKCU:\...`, `Restart-Service Spooler`, `schtasks /create ...`, `iwr ... \| iex`, `Start-Process powershell -Verb RunAs`, `Send-MailMessage`, `Set-ExecutionPolicy`, `icacls ... /grant`, `manage-bde -off C:`, writing a skill, agent, command, hook or `.mcp.json` under `.claude`, writing into a startup location, `.\x.vbs`, `New-Item -ItemType Junction ... -Target $HOME\.claude`, running Jarvis's own helper (`...\.jarvis\venv\Scripts\python.exe -m jarvis_voice ...`) |
 | voice | In a voice conversation, a spoken yes. Otherwise the same on-screen question. | `git push`, `gh pr create`, `npm publish`, `winget install Spotify.Spotify`, `npm install -g typescript`, `Stop-Process -Name notepad`, `Move-Item *.jpg ~\Pictures`, `Get-Clipboard` (or `cat /dev/clipboard` in Git Bash), `git diff --output=changes.diff`, `shutdown /h` (sleep), `curl.exe -X POST -d @notes.txt https://...` |
 | pass | Runs without a question from Jarvis. Claude Code's own rules still apply. | `Get-ChildItem`, `git status`, `npm test`, `New-Item notes.md`, `Rename-Item a.txt b.txt`, `Start-Process spotify`, a script whose contents are all pass |
 
@@ -81,7 +81,7 @@ The yes answers Jarvis's line, which names the command whatever Claude said befo
 Jarvis writes no settings. `/jarvis pc rules` prints a snippet built from the same table the guard uses, for you to merge into `permissions` (and `env`) in your user settings (`.claude\settings.json` in your user folder). Claude can't do it for you: the guard blocks edits to Claude Code's settings.
 
 - **deny rules** keep the never list blocked even when Jarvis is off or not installed.
-- There are **no allow rules**. Jarvis only makes Claude Code stricter, so it suggests nothing that would skip Claude Code's own dialog. The text above the snippet says how to allow the desktop tool and hand control's tool yourself, if you want their actions to run without Jarvis's question.
+- There are **no allow rules**. Jarvis only makes Claude Code stricter, so it suggests nothing that would skip Claude Code's own dialog. The text above the snippet says how to allow the desktop tool, hand control's tool and home control's tool yourself, if you want their actions to run without Jarvis's question.
 - There are **no ask rules**. Jarvis asks for itself, and an ask rule would add a second dialog.
 - The **env line** turns on the PowerShell tool.
 
@@ -191,7 +191,7 @@ Say "Jarvis, stand down" or "Abort that" on its own, or type `/jarvis pc stop`. 
 
 ## Never as administrator
 
-At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`, or `/bin/id` where there is none). Until the check has finished, the voice helper, the hand helper, their setups and home control wait. If it does run as administrator, Jarvis stays off:
+At the start of each session, Jarvis checks whether Claude Code runs as administrator (with Windows's own `whoami` and `reg` from System32, so another `whoami` on the PATH, such as Git's, can't answer; on macOS and Linux with `/usr/bin/id`, or `/bin/id` where there is none). Until the check has finished, the voice helper, the hand helper and their setups wait, and home control refuses at once (it says to try again in a few seconds). If it does run as administrator, Jarvis stays off:
 
 - no voice helper, and no hand helper (so no camera), even with hand control turned on;
 - an error on the HUD;
@@ -211,7 +211,7 @@ Jarvis also reads the UAC level. If it is below "Always notify", you see a one-t
 
 ## Bypass mode
 
-If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it. The desktop tool and hand control's tool still ask before each action unless your own allow rule covers them, since the mode's allow is not yours.
+If a session starts in bypassPermissions mode, Jarvis shows a warning. In that mode Claude Code skips its own rules and dialogs. Jarvis's guard still asks before risky commands and still blocks the never list, but nothing checks beneath it. The desktop tool and hand control's tool still ask before each action, and home control's tool before each change, unless your own allow rule covers them, since the mode's allow is not yours.
 
 ## Check on the PC
 

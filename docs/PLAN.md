@@ -138,7 +138,7 @@ Shutdown and restart count down 60 seconds so you can say "cancel". Windows then
 
 The tiers are enforced in two layers:
 
-- **Permission rules** in Claude Code's settings (allow, ask and deny lists) are the hard floor. Jarvis ships them for each shell, for example `PowerShell(Remove-Item *)` beside `Bash(rm *)`, and `/jarvis install-rules` merges them into your settings. It also sets `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`, because on Windows any Bash deny rule otherwise switches the PowerShell tool off.
+- **Permission rules** in Claude Code's settings (allow, ask and deny lists) are the hard floor. `/jarvis pc rules` prints deny rules for the Never tier, for each shell (for example `PowerShell(Format-Volume *)` beside `Bash(diskpart *)`), and the `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` env line (on Windows any Bash deny rule otherwise switches the PowerShell tool off), for you to paste into your settings. Jarvis never writes Claude Code's settings itself.
 - **The mod's guard** reads every PowerShell, Bash and Monitor command before it runs and sorts it into a tier. It catches tricks that text rules miss, such as shortened parameters, full program paths and nested shells. It only ever makes a decision stricter, never approves anything on its own, and blocks if it crashes.
 
 For the two Ask tiers, Jarvis asks you itself, by voice or with an on-screen button. Claude Code's own prompt is not enough, because in auto mode a classifier may answer it instead of you. Claude Code already refuses deletions of drive roots, the Windows folder and your home folder; Jarvis relies on that rather than repeating it.
