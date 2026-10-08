@@ -2049,6 +2049,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { setting: 'speed' })).toBe(
       'Cursor speed is 1 (default 1, range 0.7 to 3). Higher means a faster cursor, with less hand travel to cross the screen. Change it with /jarvis hands set speed <0.7 to 3|default>.',
     )
@@ -2069,6 +2070,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { preset: 'precise' })).toBe(
       'Preset precise: speed 0.8, smoothing 1.8, pinch 0.9, drag-distance 1.5, dead-zone 2 px (every other setting is at its default).',
     )
@@ -2124,6 +2126,7 @@ describe('the hands tool: tuning', () => {
     const w = handsWorld(on)
     await startHelper($, w)
     await handsReady(w)
+    await allowedTurn($, w, HANDS_TOOL_ID)
     refuseConfig(w)
     expect(await call($, { setting: 'speed', value: 2.8 })).toBe(
       'The hand helper refused it: cursorSpeed must be between 0.5 and 2.5. Nothing was changed.',
@@ -2135,6 +2138,7 @@ describe('the hands tool: tuning', () => {
     const w = world(on)
     await startHelper($, w)
     expect(w.tools).toEqual(['desktop', 'home_control', 'hands'])
+    await allowedTurn($, w, HANDS_TOOL_ID)
     expect(await call($, { setting: 'fist', value: 0.9 })).toBe(
       'Fist sensitivity is now 0.9 (was 1; default 1, range 0.9 to 1.1); it applies when hand control starts.',
     )

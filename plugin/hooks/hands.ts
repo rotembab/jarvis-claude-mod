@@ -283,6 +283,12 @@ export type TuningValues = Record<KnobKey, number>
 export const PRESET_NAMES = ['precise', 'balanced', 'fast'] as const
 export type PresetName = (typeof PRESET_NAMES)[number]
 
+/** The preset a word names, in any case ("default" is balanced); undefined for any other word. */
+export function presetNamed(word: string): PresetName | undefined {
+  const lower = word.toLowerCase()
+  return lower === 'default' ? 'balanced' : PRESET_NAMES.find(one => one === lower)
+}
+
 /**
  * Ready-made sets of values. A preset is a whole profile: the knobs it does
  * not name are at their defaults, so the tuning is either one of these or custom.
@@ -1657,8 +1663,7 @@ export class Hands {
       const now = presetOf(values) ?? 'custom'
       return `${['The presets:', ...lines].join('\n')}\nNow: ${now}. Apply one with /jarvis hands preset <${PRESET_NAMES.join('|')}>; the settings it does not name go back to their defaults.`
     }
-    const word = choice.toLowerCase()
-    const name = word === 'default' ? 'balanced' : PRESET_NAMES.find(one => one === word)
+    const name = presetNamed(choice)
     if (name === undefined) {
       return `Unknown preset "${choice.slice(0, 40)}". The presets are ${listWords(PRESET_NAMES)}; /jarvis hands preset shows what each sets.`
     }
@@ -2269,6 +2274,36 @@ export async function runHandsTool(hands: Hands | undefined, input: Record<strin
     texts.push(`Hand control ${action ?? (isTuning ? 'tuning' : 'display')} failed: ${describeError(error)}`)
   }
   return texts.join('\n\n')
+}
+
+/** What a tool call's tuning arguments ask for. */
+export type ToolTuning =
+  | { kind: 'read'; knob: Knob }
+  | { kind: 'set'; knob: Knob; value: number | 'default' }
+  | { kind: 'preset'; name: PresetName }
+
+/**
+ * The tuning a call asks for, read exactly as runToolTuning reads it (keep the
+ * two in step; hands-gate.ts asks before a change): a setting alone is read,
+ * with a value inside its range it is set, a preset names a profile. Undefined
+ * when the call carries no tuning, or runToolTuning would only answer with what
+ * to fix and change nothing (an unknown setting, a value outside the range, a
+ * preset together with a setting or a value, a wrong type).
+ */
+export function toolTuning(input: Record<string, unknown>): ToolTuning | undefined {
+  const { setting, value, preset } = input
+  if (preset !== undefined) {
+    if (setting !== undefined || value !== undefined || typeof preset !== 'string') return undefined
+    const name = presetNamed(preset)
+    return name === undefined ? undefined : { kind: 'preset', name }
+  }
+  if (typeof setting !== 'string') return undefined
+  const knob = findKnob(setting)
+  if (knob === undefined) return undefined
+  if (value === undefined) return { kind: 'read', knob }
+  if (typeof value !== 'number' && typeof value !== 'string') return undefined
+  const parsed = parseKnobValue(knob, value)
+  return parsed.ok ? { kind: 'set', knob, value: parsed.value } : undefined
 }
 
 /** The tool's setting, value and preset: the text the matching /jarvis hands set or preset prints. */

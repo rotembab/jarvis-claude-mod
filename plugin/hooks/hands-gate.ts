@@ -7,13 +7,17 @@
 // PermissionRequest hook in their settings could match the tool, nor when the
 // turn's mode is not known; every other verdict asks, a spoken yes in a voice
 // turn, else a click, pc.ts confirm), and plan mode keeps it read-only: only
-// its status is read then. Then hands.ts runs the call as before.
+// its status, and a sensitivity setting read by name, are read then. Then
+// hands.ts runs the call as before. A call changes something when it carries a
+// display, an action but status, or a sensitivity setting's value or a preset
+// (hands.ts toolTuning reads the last as the tool does); only a call the tool
+// would answer with what to fix, doing nothing, runs unasked.
 
 import type { Jarvis } from './app'
 import type { OwnToolCall } from './desktop'
 import { checkRules } from './desktop'
-import type { DisplaySelection } from './hands'
-import { HANDS_TOOL, parseDisplaySelection, runHandsTool } from './hands'
+import type { DisplaySelection, ToolTuning } from './hands'
+import { HANDS_TOOL, parseDisplaySelection, runHandsTool, toolTuning } from './hands'
 import type { AskPorts } from './pc'
 
 /** The name the model calls it by (`jarvis` is the plugin's name, plugin.json). */
@@ -38,9 +42,9 @@ const ACTION_WORDS: Record<HandsToolAction, { what: string; more?: string }> = {
 
 const NOTHING_DONE = 'nothing was done'
 const PLAN_MODE =
-  "Plan mode is on, so Jarvis does not change hand control now. Describe what you would do in the plan instead; reading hand control's status still works, and the user can change it themselves with /jarvis hands."
+  "Plan mode is on, so Jarvis does not change hand control now. Describe what you would do in the plan instead; reading hand control's status or one of its sensitivity settings still works, and the user can change it themselves with /jarvis hands."
 const MODE_UNKNOWN =
-  "Jarvis cannot tell yet whether plan mode is on (it has not seen a prompt since it started), so it does not change hand control until the user's next message. Reading hand control's status still works."
+  "Jarvis cannot tell yet whether plan mode is on (it has not seen a prompt since it started), so it does not change hand control until the user's next message. Reading hand control's status or one of its sensitivity settings still works."
 
 /**
  * The displays a call's `display` chooses, read as /jarvis hands display
@@ -60,6 +64,25 @@ function displayWords(selection: DisplaySelection): string {
   return `make hand control reach displays ${selection.slice(0, -1).join(', ')} and ${selection.at(-1)}`
 }
 
+/** What a unit is called aloud (a spoken question says "1.5 seconds", not "1.5 s"). */
+const UNIT_WORDS: Record<string, string> = { s: ' seconds', px: ' pixels' }
+
+/** The sensitivity change a call makes, in a few words ("set the hand control cursor speed setting to 1.5"). */
+function tuningWords(tuning: ToolTuning): { what: string; more?: string } {
+  if (tuning.kind === 'preset') return { what: `apply the ${tuning.name} hand control preset`, more: ', which sets every sensitivity setting' }
+  const setting = `the hand control ${tuning.knob.label.toLowerCase()} setting`
+  if (tuning.kind === 'read') return { what: `read ${setting}` }
+  if (tuning.value === 'default') return { what: `put ${setting} back to its default` }
+  return { what: `set ${setting} to ${tuning.value}${UNIT_WORDS[tuning.knob.unit ?? ''] ?? ''}` }
+}
+
+/** What a spoken yes must match, exactly: the setting by its wire key, the value as hands.ts reads it. */
+function tuningKey(tuning: ToolTuning | undefined): string {
+  if (tuning === undefined) return ''
+  if (tuning.kind === 'preset') return `preset ${tuning.name}`
+  return tuning.kind === 'read' ? `read ${tuning.knob.key}` : `set ${tuning.knob.key} ${tuning.value}`
+}
+
 /**
  * The model's call of the hands tool: `{ result }` in words (hands.ts's, or
  * why nothing was done), or `{ deny }` when the user's rules refuse it. A
@@ -70,12 +93,14 @@ function displayWords(selection: DisplaySelection): string {
 export async function callHandsTool(app: Jarvis, input: Record<string, unknown>, ports: AskPorts, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
   const action = isAction(input.action) ? input.action : undefined
   const display = displayChoice(input.display)
+  const tuning = toolTuning(input)
   const hands = app.hands
-  // Nothing to ask about: arguments to fix (a display hand control does not know only says so), or a session where it cannot run.
-  const isNoOp = (input.action !== undefined && action === undefined) || (action === undefined && display === undefined)
+  // Nothing to ask about: arguments to fix (a display or a setting hand control does not know only says so), or a session where it cannot run.
+  const isNoOp = (input.action !== undefined && action === undefined) || (action === undefined && display === undefined && tuning === undefined)
   if (isNoOp || hands === undefined || !hands.isLocal) return { result: await runHandsTool(hands, input) }
   const pc = app.pc
-  const isReadOnly = action === 'status' && display === undefined
+  // The status and a setting read by name change nothing; every other part of a call does.
+  const isReadOnly = (action === undefined || action === 'status') && display === undefined && (tuning === undefined || tuning.kind === 'read')
   if (!isReadOnly) {
     // Plan mode reads only: the engine's own plan-mode block never sees this tool.
     const mode = pc.permissionMode
@@ -83,10 +108,13 @@ export async function callHandsTool(app: Jarvis, input: Record<string, unknown>,
     if (mode === 'plan') return { result: PLAN_MODE }
   }
   const agentId = typeof input.agentId === 'string' ? input.agentId : undefined
-  const words = action === undefined ? undefined : ACTION_WORDS[action]
-  const parts = [display === undefined ? '' : displayWords(display), words?.what ?? '']
-  const what = parts.filter(part => part !== '').join(', then ')
-  const described = `${what}${words?.more ?? ''}`
+  // In the order hands.ts does them: the displays, the sensitivity, then the action.
+  const parts: { what: string; more?: string }[] = []
+  if (display !== undefined) parts.push({ what: displayWords(display) })
+  if (tuning !== undefined) parts.push(tuningWords(tuning))
+  if (action !== undefined) parts.push(ACTION_WORDS[action])
+  const what = parts.map(part => part.what).join(', then ')
+  const described = parts.map(part => `${part.what}${part.more ?? ''}`).join(', then ')
   const call: OwnToolCall = { tool: HANDS_TOOL_ID, name: HANDS_TOOL.name, what, input }
   // A change needs the mode known for this very turn: a Shift+Tab into plan mode may have come since.
   const gate = await checkRules(app, pc, call, ports, !isReadOnly && !pc.isModeKnownForTurn(agentId))
@@ -95,7 +123,7 @@ export async function callHandsTool(app: Jarvis, input: Record<string, unknown>,
     // A spoken yes in a voice turn, else a click.
     const refused = await pc.confirm(
       {
-        key: `${HANDS_TOOL_ID}\n${action ?? ''}\n${display === undefined ? '' : String(display)}`,
+        key: `${HANDS_TOOL_ID}\n${action ?? ''}\n${display === undefined ? '' : String(display)}\n${tuningKey(tuning)}`,
         reason: `uses the hands tool to ${what}`,
         again: 'call the hands tool with the same arguments again',
         spoken: `Claude wants to ${described}. Say yes to let it, sir.`,
