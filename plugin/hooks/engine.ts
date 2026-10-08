@@ -100,12 +100,6 @@ export type Engine = {
    * dismissed, and in a `-p` run (nobody to ask).
    */
   ask: (question: string, options: readonly string[] | AskOptions) => Promise<string>
-  /**
-   * The session's permission decision for a call of `tool` now (its rules and
-   * mode): nothing runs, no dialog opens. A tool the mod answers itself never
-   * meets these rules otherwise.
-   */
-  checkTool: (tool: string, input: Record<string, unknown>) => Promise<ToolVerdict>
 
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>

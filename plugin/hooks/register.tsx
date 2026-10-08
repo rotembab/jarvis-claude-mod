@@ -14,7 +14,7 @@ import type { HandsEngine } from './hands'
 import { HANDS_TOOL } from './hands'
 import { callHandsTool, HANDS_TOOL_ID } from './hands-gate'
 import { HOME_TOOL, HOME_TOOL_SPEC } from './home'
-import { actionLabel, HUD_PANE, hudLayout, hudMode, PANE_START } from './hud'
+import { actionLabel, HUD_PANE, hudLayout, hudMode, logOwnTool, PANE_START } from './hud'
 import { isRemoteSession } from './platform'
 import { bandTree, foldedRow, hudSvgTree, hudTerminalTree, isBandShown } from './ui'
 
@@ -31,7 +31,7 @@ const HUD_OPEN = { id: HUD_PANE, title: 'JARVIS', ...PANE_START }
 const REAL_PATH_DEPTH = 64
 
 /**
- * A tool this plugin answers itself (the desktop and hands tools), through its
+ * A tool this plugin answers itself (the desktop, hands and home control tools), through its
  * hook's own `$`: the question dialog, the engine's verdict on the user's
  * rules for `tool`, and each settings source as loaded (only the hooks'
  * matchers are read there, and nothing of it is logged).
@@ -135,7 +135,6 @@ export const register: Register = (on, options) => {
       log: text => $.ui.log(text),
       debug: text => $.ui.log(text, { to: 'debug' }),
       ask: (question, askOptions) => $.ui.ask(question, askOptions),
-      checkTool: (tool, input) => $.tool.check({ tool, input }),
       openPane: size => $.ui.open({ ...HUD_OPEN, ...size }),
       closePane: () => $.ui.close({ id: HUD_PANE }),
       blit: args => $.ui.blit(args),
@@ -156,8 +155,8 @@ export const register: Register = (on, options) => {
     }
     await $.command.register({
       name: 'jarvis',
-      description: 'Jarvis voice and hand control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, hands, home',
-      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|hands|home]',
+      description: 'Jarvis voice, hand, home and PC control: status and help; setup, stop, talk, test, restart, voice <id>, routing, devices, hud, hands, home, pc',
+      argumentHint: '[setup|stop|talk|test|restart|voice <id>|routing|devices|hud|hands|home|pc]',
       immediate: true,
     })
     // The home_control tool. A refused registration (a managed policy, a
@@ -187,13 +186,13 @@ export const register: Register = (on, options) => {
     return started
   })
 
-  // The engine runs no permission check, schema check or plan-mode block for a
-  // tool its plugin answers: HomeControl does all of that itself. A failure
-  // here refuses the call rather than falling through to the engine. The
-  // call's signal goes along: a call abandoned while its dialog is open
-  // (Esc, a spoken stop) confirms nothing, whatever is clicked later.
-  on('tool.call', { tool: 'mcp__jarvis__home_control' }, ($, e, next) => app.home.tool(e, next.signal)).catch(($, e, next) =>
-    next.called ? next(e) : { deny: `home_control failed: ${next.error.message ?? next.error.kind}` },
+  // The engine runs no permission check, schema check, plan-mode block or settings hook for a
+  // tool its plugin answers: HomeControl does all of that itself, applying the user's own rules for
+  // it ($.tool.check) as the desktop and hands tools do. A failure here refuses the call rather than
+  // falling through to the engine. The call's signal goes along: a call abandoned while its dialog
+  // is open (Esc, a spoken stop) confirms nothing, whatever is clicked later.
+  on('tool.call', { tool: 'mcp__jarvis__home_control' }, ($, e, next) => app.home.tool(e, ownToolPorts($, HOME_TOOL), next.signal)).catch(
+    ($, e, next) => (next.called ? next(e) : { deny: `home_control failed: ${next.error.message ?? next.error.kind}` }),
   )
 
   // Kept in the prompt rather than behind ToolSearch, so a spoken request
@@ -217,7 +216,10 @@ export const register: Register = (on, options) => {
 
   // The hands tool: answered here like the desktop tool, so hands-gate.ts applies the user's own
   // rules for it ($.tool.check), asks when a settings hook could match it, and keeps plan mode read-only.
-  on('tool.call', { tool: 'mcp__jarvis__hands' }, ($, e, next) => callHandsTool(app, e, ownToolPorts($, HANDS_TOOL_ID), next.signal)).catch(() => ({
+  // On the HUD's action log as its own hook would put it (that hook sits beneath and never sees the call).
+  on('tool.call', { tool: 'mcp__jarvis__hands' }, ($, e, next) =>
+    logOwnTool(app.hud, actionLabel({ ...e, tool: HANDS_TOOL_ID }), () => callHandsTool(app, e, ownToolPorts($, HANDS_TOOL_ID), next.signal)),
+  ).catch(() => ({
     result: 'Hand control did not answer in time; /jarvis hands shows its state.',
   }))
 
@@ -301,8 +303,9 @@ export const register: Register = (on, options) => {
     return result
   }).catch(($, e, next) => next(e))
 
-  // The permission mode, for the desktop tool's plan-mode hold: each prompt's, and a change
-  // mid-turn (Shift+Tab, EnterPlanMode, ExitPlanMode) that the next tool's PostToolUse reports.
+  // The permission mode, for the plan-mode hold of the desktop, hands and home control tools: each
+  // prompt's, and a change mid-turn (Shift+Tab, EnterPlanMode, ExitPlanMode) that the next tool's
+  // PostToolUse reports. One tracker for all three, so they agree on the turn's mode.
   // Matched (on a field every input has) so another hook of the same event may stand beside them.
   on('classic.UserPromptSubmit', { hook_event_name: 'UserPromptSubmit' }, ($, e, next) => {
     app.pc.notePermissionMode(e.permission_mode, e.prompt, e.agent_id)
@@ -323,9 +326,7 @@ export const register: Register = (on, options) => {
   // A voice prompt carries a note the persona keys on, so the system prompt
   // stays the same between typed and spoken turns (cache friendly). Fails open.
   // (Not at prompt.submit: a plugin's own hooks there skip its own prompts.)
-  // It also records the permission mode the turn runs in: home control keeps plan mode read-only.
   on('classic.UserPromptSubmit', async ($, e, next) => {
-    app.home.notePermissionMode(e.permission_mode, e.agent_id)
     const result = await next(e)
     return app.voice?.markPrompt(e.prompt, result) ?? result
   }).catch(($, e, next) => next(e))
@@ -353,13 +354,6 @@ export const register: Register = (on, options) => {
 
   on('ui.close', ($, e, next) => {
     if (e.id === HUD_PANE) app.hud?.onClosed()
-    return next(e)
-  }).catch(($, e, next) => next(e))
-
-  // The mode can also change mid-turn: EnterPlanMode, ExitPlanMode, or a
-  // Shift+Tab that the next tool's PostToolUse reports (main loop only).
-  on('classic.PostToolUse', ($, e, next) => {
-    app.home.noteToolUse(e.tool_name, e.permission_mode, e.agent_id)
     return next(e)
   }).catch(($, e, next) => next(e))
 

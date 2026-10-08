@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine as TestEngine } from 'claude-code/testing'
 
+import type { JarvisHud } from '../types'
 import type { RuleVerdict } from './pc'
 import type { World } from './test-harness'
 import {
@@ -190,6 +191,22 @@ describe('the hands tool: the user\'s rules', () => {
     expect(w.asked).toEqual([])
     expect(w.checks).toEqual([])
     expect(w.handsHelpers()).toHaveLength(0)
+  })
+
+  test("its calls are on the HUD's action log, a refused one as failed", async ($, on) => {
+    const w = handsWorld(on, false)
+    await startHelper($, w)
+    w.toolCheck = ALLOWED
+    await promptTurn($)
+    expect((await hands($, { action: 'status' })).result).toMatch(/^Hand control is off\./)
+    w.toolCheck = () => ({ decision: 'deny', rule: HANDS })
+    expect(await hands($, { action: 'on' })).toEqual({ deny: expect.stringMatching(REFUSED) })
+    await w.settle()
+    const hud = w.state.get('jarvis.hud') as JarvisHud
+    expect(hud.actions.map(action => [action.label, action.status])).toEqual([
+      [HANDS, 'failed'],
+      [HANDS, 'done'],
+    ])
   })
 })
 

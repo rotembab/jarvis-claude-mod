@@ -14,7 +14,8 @@ import type { Resolved, Verdict } from './guard'
 import { judge, rulesSnippet } from './guard'
 import { DESKTOP_TOOL, DesktopTool, textLines, visibleText } from './desktop'
 import { HANDS_TOOL_ID } from './hands-gate'
-import { actionLabel } from './hud'
+import { HOME_TOOL } from './home'
+import { actionLabel, logOwnTool } from './hud'
 import type { AdminFacts, UacLevel } from './platform'
 import { probeAdmin } from './platform'
 import { hasNonLatinLetters, isYesPhrase, phraseWords } from './voice'
@@ -887,16 +888,7 @@ export class PcControl {
 
   /** The desktop tool's call (its hook's closures over its own `$`), on the HUD's log as the HUD's own hook would put it. */
   async desktop(e: Record<string, unknown>, ports: AskPorts, signal?: AbortSignal): Promise<{ result: string } | { deny: string }> {
-    const hud = this.app.hud
-    const id = hud?.onToolStart(actionLabel({ ...e, tool: String(e.tool) }))
-    let isOk = false
-    try {
-      const answer = await this.desktopTool.call(e, ports, signal)
-      isOk = !('deny' in answer)
-      return answer
-    } finally {
-      if (id !== undefined) hud?.onToolEnd(id, isOk)
-    }
+    return await logOwnTool(this.app.hud, actionLabel({ ...e, tool: String(e.tool) }), () => this.desktopTool.call(e, ports, signal))
   }
 
   /** `/jarvis pc [check <command>|rules|stop]`, the words after `pc`. */
@@ -914,6 +906,7 @@ export class PcControl {
           'The deny rules keep the never list blocked even without Jarvis. There are no allow rules (Jarvis only makes Claude Code stricter) and no ask rules (Jarvis asks itself; an ask rule would add a second dialog). The env line turns on the PowerShell tool.',
           `The desktop tool asks on screen before each action unless your rules allow it. To let its actions run without that question, add "${DESKTOP_TOOL}" to "allow" yourself. Even then Jarvis asks before reading the clipboard or taking a screenshot (a spoken yes in a voice conversation, else a click), and asks on screen when: a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it, PostToolUse ones included), the permission mode is not known for the turn (a subagent's call, a turn Jarvis did not see a prompt start, or one whose prompt was typed while another turn ran), or the allow comes from the mode alone (bypassPermissions) rather than your rule. If your rules or settings cannot be read, nothing is done.`,
           `The hands tool (hand control) follows your rules the same way: it asks before each action (a spoken yes in a voice conversation, else a click) unless you add "${HANDS_TOOL_ID}" to "allow" yourself, and in plan mode it only reads hand control's status.`,
+          `The home control tool follows them too: it asks on screen before each change to a device, and before opening its setup window, unless you add "${HOME_TOOL}" to "allow" yourself (a device that needs your OK still asks, never by voice). Listing devices, reading a device's state and searching the network run without that question unless an ask rule or a settings hook could cover the tool; a deny rule, or dontAsk without your allow rule, refuses them too.`,
           '',
           rulesSnippet(),
         ].join('\n')
@@ -963,7 +956,7 @@ export class PcControl {
     const mode = this.permissionMode
     lines.push(
       mode === undefined
-        ? 'Permission mode: not known yet (the desktop and hands tools change nothing until the next prompt).'
+        ? 'Permission mode: not known yet (the desktop, hands and home control tools change nothing until the next prompt).'
         : `Permission mode: ${mode}.${mode === 'bypassPermissions' ? ' Claude Code\'s own rules are skipped; the guard still asks.' : ''}`,
     )
     const timers = this.desktopTool.timerLabels

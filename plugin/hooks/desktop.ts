@@ -12,7 +12,8 @@
 // match the tool, nor when the turn's mode is not known), keeps plan mode
 // read-only, and asks before the clipboard is read or the screen is captured
 // (a spoken yes in a voice turn, else a click; pc.ts). The hands tool
-// (hands-gate.ts) applies the user's rules through the same checkRules.
+// (hands-gate.ts) and the home_control tool (home.ts) apply the user's rules
+// through the same checkRules.
 
 import type { Timer, ToolSpec } from 'claude-code'
 
@@ -360,7 +361,7 @@ const ASK_FIRST: Partial<Record<DesktopAction, Omit<Consent, 'agentId'>>> = {
   },
 }
 
-/** A call of a tool this plugin answers itself (the desktop tool, the hands tool), as checkRules judges it. */
+/** A call of a tool this plugin answers itself (the desktop, hands and home control tools), as checkRules judges it. */
 export type OwnToolCall = {
   /** The name the model calls it by (`mcp__jarvis__desktop`). */
   tool: string
@@ -370,6 +371,12 @@ export type OwnToolCall = {
   what: string
   /** The call as `tool.call` carries it; its own keys (`tool`, `tool_use_id`, `agentId`) are not asked about. */
   input: Record<string, unknown>
+  /**
+   * A read that changes nothing and shows Claude nothing private (home
+   * control's list, status and scan): the engine's own verdict with no rule
+   * behind it (its default ask, a mode's allow) lets it run unasked too.
+   */
+  isRead?: boolean
 }
 
 /**
@@ -380,8 +387,10 @@ export type OwnToolCall = {
  * allows yet) needs a yes first. Only an allow by the user's own rule (one
  * the verdict names, not a mode's) runs unasked, and only while no hook in
  * their settings could decide about the call (the engine runs none for this
- * tool) and the turn's mode is known (`isModeStale` false). Rules or
- * settings that cannot be read refuse.
+ * tool) and the turn's mode is known (`isModeStale` false). A read
+ * (`call.isRead`) also runs unasked on the engine's own verdict with no rule
+ * behind it, under the same settings check; never past an ask rule or an
+ * `ask` ceiling, nor in dontAsk. Rules or settings that cannot be read refuse.
  */
 export async function checkRules(
   app: Jarvis,
@@ -403,8 +412,10 @@ export async function checkRules(
   const why = verdict.reason === undefined || verdict.reason === '' ? '' : ` (${clip(verdict.reason, 200)})`
   const refused = { deny: `The user's permission settings do not let the ${call.name} tool ${call.what} here${why}.` }
   if (verdict.decision === 'deny' || verdict.ceiling === 'deny') return refused
-  const isUsersAllow = verdict.decision === 'allow' && typeof verdict.rule === 'string' && verdict.rule !== '' && verdict.ceiling !== 'ask'
-  const gate = isUsersAllow && !isModeStale ? await settingsGate(app, call.tool, ports) : 'ask'
+  const hasRule = typeof verdict.rule === 'string' && verdict.rule !== ''
+  const isUsersAllow = verdict.decision === 'allow' && hasRule && verdict.ceiling !== 'ask'
+  const isReadByDefault = call.isRead === true && !hasRule && verdict.ceiling !== 'ask' && pc.permissionMode !== 'dontAsk'
+  const gate = (isUsersAllow || isReadByDefault) && !isModeStale ? await settingsGate(app, call.tool, ports) : 'ask'
   if (typeof gate === 'object') return gate
   // dontAsk: what is not allowed beforehand is refused, never asked.
   if (gate === 'ask' && pc.permissionMode === 'dontAsk') return refused
