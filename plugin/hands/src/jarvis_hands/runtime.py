@@ -464,6 +464,7 @@ class HandsRuntime:
         executor = Executor(
             desktop,
             displays=lambda: mapper.used,
+            cursor_gain=lambda: mapper.cursor_gain,
             on_user_input=self._on_user_input,
             on_error=self._on_executor_error,
             frame_interval=1.0 / fps,
