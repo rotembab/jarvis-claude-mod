@@ -953,7 +953,8 @@ def test_each_frame_is_returned_once_and_a_read_times_out(
     # watching() wakes the read at every moment a read ends at, so the simulated deadline alone ends it whatever the
     # read waits for. What it waits for must itself be the time it has left: a wait with no timeout, or a hundred
     # times too long, would keep a read waiting on a reader that has gone quiet instead of ending it on its timeout.
-    assert all(t is not None and math.isfinite(t) and t <= 0.05 + read_clock.step for t in waits), waits
+    # Never above the time left (0.05 s): a read that waits 1.5 or twice that long is as wrong as one with no timeout.
+    assert waits and all(t is not None and math.isfinite(t) and t <= 0.05 + 1e-6 for t in waits), waits
 
 
 def test_frames_are_contiguous_bgr_uint8(cameras: list[OpenCVCamera]) -> None:
