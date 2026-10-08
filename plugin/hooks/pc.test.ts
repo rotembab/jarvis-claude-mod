@@ -182,6 +182,16 @@ describe('the guard hook', () => {
     expect(await bash($, 'rm old.log')).toEqual({ deny: COULD_NOT_ASK })
   })
 
+  test('a request to talk it over first is a no, with its own words', async ($, on) => {
+    const w = world(on)
+    await startHelper($, w)
+    w.askAnswer = 'Run it'
+    w.askFollowUp = true
+    expect(await bash($, 'rm old.log')).toEqual({ deny: 'The user wants to talk it over first, so nothing ran. Ask them what they want.' })
+    w.askFollowUp = false
+    expect(await bash($, 'rm old.log')).toMatchObject({ result: 'ok' })
+  })
+
   test('the never list is refused with no question; a harmless command asks nothing', async ($, on) => {
     const w = world(on)
     await startHelper($, w)

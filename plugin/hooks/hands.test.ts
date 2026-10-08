@@ -1485,6 +1485,15 @@ describe('the sensitivity knobs', () => {
     expect(parseKnobValue(dead, '8.01')).toEqual({ ok: false, why: 'range' })
   })
 
+  test('a very long value is answered at once, not matched in quadratic time', () => {
+    const speed = findKnob('speed')
+    if (speed === undefined) throw new Error('no speed knob')
+    // A pattern that backtracks takes seconds on this (8 s for 100,000 digits), before any permission check.
+    expect(parseKnobValue(speed, `${'9'.repeat(200_000)}x`)).toEqual({ ok: false, why: 'not_number' })
+    expect(parseKnobValue(speed, `${'1'.repeat(200_000)}.${'1'.repeat(200_000)}x`)).toEqual({ ok: false, why: 'not_number' })
+    expect(parseKnobValue(speed, `2.${'0'.repeat(200_000)}`)).toEqual({ ok: true, value: 2 })
+  })
+
   test('the presets name known knobs with values in range, and balanced is every default', () => {
     expect(Object.keys(PRESETS)).toEqual(['precise', 'balanced', 'fast'])
     expect(PRESETS.balanced).toEqual({})

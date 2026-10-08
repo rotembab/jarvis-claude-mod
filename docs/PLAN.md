@@ -128,7 +128,7 @@ Jarvis can do anything Claude Code can do on your PC, so the plan is full automa
 
 | Tier | Examples on Windows | How it's handled |
 | --- | --- | --- |
-| Just do it | Open apps, media, volume, timers, lock the screen, read files, search, system info, save a screenshot for you | Allowed in settings, no prompt |
+| Just do it | Open apps, media, volume, timers, lock the screen, read files, search, system info, save a screenshot for you | Runs when your own permission rules allow the tool; otherwise Jarvis asks on screen (it never writes your settings) |
 | Do it, then tell you | Create or edit files in your projects, run scripts you've run before | Allowed for chosen folders; each action is logged in the HUD |
 | Ask by voice | Move or rename many files, install software with winget, change a setting, git push, put the PC to sleep, send the clipboard or a screenshot to Claude | Jarvis says what it's about to do and waits for "yes" or "go ahead". It ignores any "yes" heard while it is still talking. |
 | Ask on screen | Delete files, send email or messages, anything involving money, admin rights, shutdown or restart, services, scheduled tasks, registry edits | Needs a click or a typed yes, because a voice from a TV or video could say "yes" too. Admin actions also need your click on the Windows UAC prompt. |

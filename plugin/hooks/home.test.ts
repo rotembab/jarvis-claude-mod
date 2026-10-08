@@ -414,6 +414,39 @@ describe('home_control: confirming on screen', () => {
     expect(homeBodies(w)).toEqual([{ action: 'do', device: 'front door', command: 'unlock' }])
   })
 
+  test('a dialog that closed by itself while the user was away, or to talk it over first, is no yes, whichever option it picked', async ($, on) => {
+    const w = world(on)
+    guardedDoor(w)
+    await startHome($, w)
+    w.askAnswer = 'Yes, do it'
+    w.askIdleMs = 60_000
+    expect(await homeTool($, { action: 'do', device: 'front door', command: 'unlock' })).toEqual({
+      result: "Jarvis's on-screen question closed while the user was away, so nothing was done. Ask them again when they are back.",
+    })
+    // The same under an ask rule: the dialog is the user's one yes there too.
+    w.toolCheck = () => ({ decision: 'ask', reason: 'Permission rule asks', rule: 'mcp__jarvis__home_control' })
+    expect(await homeTool($, { action: 'do', device: 'front door', command: 'unlock' })).toEqual({
+      result: "Jarvis's on-screen question closed while the user was away, so nothing was done. Ask them again when they are back.",
+    })
+    w.toolCheck = () => ({ decision: 'ask' })
+    w.askIdleMs = undefined
+    w.askFollowUp = true
+    expect(await homeTool($, { action: 'do', device: 'front door', command: 'unlock' })).toEqual({
+      result: 'The user wants to talk it over first, so nothing was done. Ask them what they want.',
+    })
+    // What the user types gets the short answers.
+    expect(await jarvis($, 'home do Front door -- unlock')).toBe('Nothing was done.')
+    w.askFollowUp = false
+    w.askIdleMs = 60_000
+    expect(await jarvis($, 'home do Front door -- unlock')).toBe('The question closed while you were away, so nothing was done.')
+    expect(w.asked).toHaveLength(5)
+    expect(homeBodies(w).filter(body => body.confirmed !== undefined)).toEqual([])
+    // A later click is the user's own again.
+    w.askIdleMs = undefined
+    w.askAnswer = 'Yes, do it'
+    expect(await homeTool($, { action: 'do', device: 'front door', command: 'unlock' })).toEqual({ result: 'The front door is unlocked.' })
+  })
+
   test('no, a typed answer, or a dismissed dialog does nothing', async ($, on) => {
     const w = world(on)
     guardedDoor(w)

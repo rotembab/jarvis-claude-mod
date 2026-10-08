@@ -223,6 +223,8 @@ export type World = {
   askDelayMs: number | undefined
   /** When set, the dialog auto-resolved to `askAnswer` after this long idle (the user was away). */
   askIdleMs: number | undefined
+  /** When set, the dialog closed with the person asking to talk it over first (the answer is then not theirs). */
+  askFollowUp: boolean
   /** Every `$.tool.check` question, and the verdict it gets (default: the engine's plain "ask"). */
   checks: { tool: string; input: unknown }[]
   toolCheck: (tool: string, input: unknown) => ToolVerdict | Promise<ToolVerdict>
@@ -343,6 +345,7 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     askAnswer: undefined,
     askDelayMs: undefined,
     askIdleMs: undefined,
+    askFollowUp: false,
     checks: [],
     toolCheck: () => ({ decision: 'ask' }),
     homeDelayMs: undefined,
@@ -381,7 +384,8 @@ export function world(on: On, { env = WINDOWS_ENV, installed = true }: WorldOpti
     if (w.askDelayMs !== undefined) await clock.sleep(w.askDelayMs)
     if (w.askAnswer === undefined) return { deny: 'dismissed' }
     const idle = w.askIdleMs === undefined ? {} : { afkTimeoutMs: w.askIdleMs }
-    return { result: { questions: e.questions, answers: { [question]: w.askAnswer }, ...idle } }
+    const followUp = w.askFollowUp ? { followUp: true } : {}
+    return { result: { questions: e.questions, answers: { [question]: w.askAnswer }, ...idle, ...followUp } }
   })
   // The engine's verdict for the session's rules and mode; the default is its
   // plain "ask" for a tool nothing allows yet (default mode, no rule).

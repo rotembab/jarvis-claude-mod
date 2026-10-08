@@ -218,7 +218,7 @@ Jarvis applies your Claude Code permission rules to the device tool, and asks on
 - **dontAsk mode**: only your allow rule lets a call run, reading included. Anything that would ask is refused.
 - If your rules or your settings can't be read, nothing is done.
 
-**Devices that need your OK.** A few commands need your OK on screen even though the tool otherwise runs without a question: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of an ask rule, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too.
+**Devices that need your OK.** A few commands need your OK on screen even though the tool otherwise runs without a question: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of an ask rule, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too. A question that closes by itself while you are away, or when you ask to talk it over first, counts as a no, whichever option was picked.
 
 In the setup window, **Ask before Jarvis uses a device** sets any device you added there (not Home Assistant's) to:
 

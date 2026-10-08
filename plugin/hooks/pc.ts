@@ -92,6 +92,8 @@ const PLUGIN_NAME = 'jarvis'
 /** The chip on Jarvis's questions; with the "Jarvis: " lead it marks them as Jarvis's own. */
 const HEADER = 'Jarvis'
 const LEAD = 'Jarvis: '
+/** The chip on home control's questions (home.ts): its own, so a record of how one closed is read for it too. */
+export const HOME_HEADER = 'Jarvis home'
 const NO_RUN = "Don't run it"
 const YES_RUN = 'Run it'
 /** Typed under "Other", these count as yes (as do the yes option's own words). */
@@ -326,7 +328,13 @@ function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined):
 }
 
 /** How a dialog of Jarvis's ended other than by the person's answer, as its own record says. */
-type DialogEnd = 'idle' | 'follow_up'
+export type DialogEnd = 'idle' | 'follow_up'
+
+/** How a question dialog of Jarvis's came out, before any words for the model: see `askDialog`. */
+export type DialogOutcome =
+  | { kind: 'answered'; answer: string; end: DialogEnd | undefined }
+  | { kind: 'interrupted' }
+  | { kind: 'unasked'; error: unknown }
 
 /**
  * Undefined on a yes; else what the model is told. Only a person's click or
@@ -689,47 +697,71 @@ export class PcControl {
    * a yes; else what the model is told.
    */
   async askOnScreen(q: ScreenQuestion, ask: CallAsk, signal: AbortSignal | undefined, agentId: string | undefined): Promise<string | undefined> {
-    const interrupted = `The call was interrupted before the user answered, so ${q.nothing}.`
-    if (signal?.aborted === true) return interrupted
+    if (signal?.aborted === true) return `The call was interrupted before the user answered, so ${q.nothing}.`
     if (this.voiceTurnOf(agentId) !== undefined) this.app.voice?.say(ON_SCREEN)
-    let question = q.question
-    for (let n = 2; this.openQuestions.has(question); n += 1) question = `${q.question} (${n})`
+    const dialog = await this.askDialog(q.question, [q.no, q.yes], HEADER, ask, signal)
+    if (dialog.kind === 'interrupted') return `The call was interrupted before the user answered, so ${q.nothing}.`
+    if (dialog.kind === 'unasked') {
+      // Dismissed, a -p run or a background agent (no one to ask), or no dialog at all.
+      this.app.engine?.debug(`jarvis: the on-screen question was not answered: ${describeError(dialog.error)}`)
+      return `Jarvis could not ask the user on screen, so ${q.nothing}.`
+    }
+    return readAnswer(q, dialog.answer, dialog.end)
+  }
+
+  /**
+   * One question dialog, no spoken word: waits for it inside its own `$.ui.ask`,
+   * and gives the answer with how the dialog closed when it was not by the
+   * person (an idle auto-resolve picks an option nobody chose; home control
+   * reads this too). Questions open together get texts of their own, so the
+   * record is read for this call's.
+   */
+  async askDialog(
+    question: string,
+    options: string[],
+    header: string,
+    ask: CallAsk,
+    signal: AbortSignal | undefined,
+  ): Promise<DialogOutcome> {
+    if (signal?.aborted === true) return { kind: 'interrupted' }
+    let text = question
+    for (let n = 2; this.openQuestions.has(text); n += 1) text = `${question} (${n})`
     // Taken until the dialog closes, even when the call is abandoned first.
     let isTaken = true
     const free = (): void => {
-      if (isTaken) this.openQuestions.delete(question)
+      if (isTaken) this.openQuestions.delete(text)
       isTaken = false
     }
-    this.openQuestions.add(question)
-    this.dialogEnds.delete(question)
+    this.openQuestions.add(text)
+    this.dialogEnds.delete(text)
     this.awaitingClick += 1
     let answer: string | typeof ABORTED
     try {
-      const asked = ask(question, { options: [q.no, q.yes], header: HEADER })
+      const asked = ask(text, { options, header })
       asked.then(free, free)
       answer = await unlessAborted(asked, signal)
     } catch (error) {
-      // Dismissed, a -p run or a background agent (no one to ask), or no dialog at all.
-      this.app.engine?.debug(`jarvis: the on-screen question was not answered: ${describeError(error)}`)
       free()
-      return `Jarvis could not ask the user on screen, so ${q.nothing}.`
+      return { kind: 'unasked', error }
     } finally {
       this.awaitingClick -= 1
     }
-    if (answer === ABORTED) return interrupted
-    const end = this.dialogEnds.get(question)
-    this.dialogEnds.delete(question)
-    return readAnswer(q, answer, end)
+    if (answer === ABORTED) return { kind: 'interrupted' }
+    const end = this.dialogEnds.get(text)
+    this.dialogEnds.delete(text)
+    return { kind: 'answered', answer, end }
   }
 
   /**
    * Every AskUserQuestion call, after the dialog closed (a hook that changes
-   * nothing): for Jarvis's own questions, notes an idle auto-resolve or a
+   * nothing): for Jarvis's own questions (home control's too), notes an idle auto-resolve or a
    * request to talk it over, which the answer's label alone does not show.
    */
   noteDialog(questions: readonly { question: string; header?: string }[], outcome: { result?: unknown }): void {
     const [first] = questions
-    if (questions.length !== 1 || first === undefined || first.header !== HEADER || !first.question.startsWith(LEAD)) return
+    if (questions.length !== 1 || first === undefined) return
+    const isOwn = (first.header === HEADER && first.question.startsWith(LEAD)) || first.header === HOME_HEADER
+    if (!isOwn) return
     const result = outcome.result
     if (typeof result !== 'object' || result === null) return
     const { afkTimeoutMs, followUp } = result as Record<string, unknown>

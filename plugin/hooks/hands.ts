@@ -319,7 +319,7 @@ export function findKnob(text: string): Knob | undefined {
 
 export type KnobValue = { ok: true; value: number | 'default' } | { ok: false; why: 'not_number' | 'range' }
 
-const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)$/
+const DECIMAL = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/
 
 /**
  * A knob's new value from what the user typed or the model sent: "default",

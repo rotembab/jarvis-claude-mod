@@ -20,6 +20,7 @@ import type { OwnToolCall } from './desktop'
 import { checkRules } from './desktop'
 import { describeError } from './engine'
 import { actionLabel, logOwnTool } from './hud'
+import { HOME_HEADER } from './pc'
 import type { AskPorts } from './pc'
 import { shellCommandLine } from './platform'
 import { HOME_DEVICE_MAX, HOME_VALUE_MAX } from './protocol'
@@ -257,28 +258,6 @@ export function readHomeResponse(value: unknown): HomeResponse | undefined {
   }
 }
 
-const ABORTED = Symbol('aborted')
-
-/** `promise`, or ABORTED as soon as `signal` aborts (what it would settle to is then dropped). */
-function unlessAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
-  if (signal === undefined) return promise
-  return new Promise((resolve, reject) => {
-    const onAbort = () => resolve(ABORTED)
-    if (signal.aborted) onAbort()
-    else signal.addEventListener('abort', onAbort, { once: true })
-    promise.then(
-      value => {
-        signal.removeEventListener('abort', onAbort)
-        resolve(value)
-      },
-      (error: unknown) => {
-        signal.removeEventListener('abort', onAbort)
-        reject(error)
-      },
-    )
-  })
-}
-
 /** The last stdout line that is a JSON object (the helper's answer), if any. */
 function lastJsonLine(stdout: string): Record<string, unknown> | undefined {
   const lines = stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('{'))
@@ -458,19 +437,27 @@ export class HomeControl {
     const engine = this.app.engine
     if (engine === undefined) return NOT_READY
     if (signal?.aborted === true) return INTERRUPTED
-    let answer: string | typeof ABORTED
-    try {
-      answer = await unlessAborted(engine.ask(question, { options: CONFIRM_OPTIONS, header: 'Jarvis home' }), signal)
-    } catch (error) {
-      engine.debug(`jarvis: home confirmation not answered: ${describeError(error)}`)
+    const dialog = await this.app.pc.askDialog(question, CONFIRM_OPTIONS, HOME_HEADER, (text, options) => engine.ask(text, options), signal)
+    if (dialog.kind === 'interrupted') {
+      engine.debug('jarvis: home confirmation abandoned: the call was interrupted')
+      return INTERRUPTED
+    }
+    if (dialog.kind === 'unasked') {
+      engine.debug(`jarvis: home confirmation not answered: ${describeError(dialog.error)}`)
       return audience === 'model'
         ? 'The user could not be asked on screen (the question was dismissed, or nobody is at this session), so nothing was done.'
         : 'Not confirmed, so nothing was done.'
     }
-    if (answer === ABORTED) {
-      engine.debug('jarvis: home confirmation abandoned: the call was interrupted')
-      return INTERRUPTED
+    // An idle auto-resolve picks an option nobody chose, so it is no yes whichever it picked.
+    if (dialog.end === 'idle') {
+      return audience === 'model'
+        ? "Jarvis's on-screen question closed while the user was away, so nothing was done. Ask them again when they are back."
+        : 'The question closed while you were away, so nothing was done.'
     }
+    if (dialog.end === 'follow_up') {
+      return audience === 'model' ? 'The user wants to talk it over first, so nothing was done. Ask them what they want.' : 'Nothing was done.'
+    }
+    const { answer } = dialog
     if (answer === CONFIRM_YES) return undefined
     if (audience === 'user') return 'Nothing was done.'
     return answer === CONFIRM_NO
