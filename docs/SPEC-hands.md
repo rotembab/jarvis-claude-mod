@@ -318,6 +318,7 @@ Events (helper -> mod, stdout lines):
 | `gesture` | `name` | engage, disengage, click, double_click, right_click, drag_start, drag_end, scroll_start, grab, release, throw_left, throw_right, throw_up, throw_down, resize_start, user_input (at most 10 per second) |
 | `calibration` | `step`: `top_left`, `top_right`, `bottom_right`, `bottom_left`, `done`, `cancelled` | calibration progress |
 | `error` | `code, message, hint?, fatal` | see codes |
+| `keyboard` | `state`: `open`, `practice`, `closed`; `phase, reason?, hold?, lang, press, level, commit, private, review?, discarded?, practice?` (counts and enums only, never text) | the air keyboard changes (at most twice a second; a close is never held back). See [Air keyboard](#air-keyboard) |
 
 Error codes: `already_running`, `unsupported_platform`, `no_camera`, `camera_blocked`, `camera_in_use`, `camera_lost`, `model_missing`, `tracker_failed`, `input_blocked`, `overlay_failed`, `bad_request`, `unauthorized`, `internal`.
 
@@ -331,6 +332,7 @@ Commands (mod -> helper, `POST /v1/<name>`):
 | `pause` / `resume` | `{}` | release / reopen the camera. `{ok: true, pending: true}` while the camera is still opening, for a second pause too (and a resume before `start()` reaches the camera); a reopen that fails after that is an `error` event, unless a resume is still waiting on it (one sent after a pause during that open too), which answers with the error instead. A failed reopen pauses again as a pause does: a calibration or engage asked for meanwhile is dropped. A pause while `start()` opens the camera leaves hand control paused, not failed, even when that open then fails (a non-fatal `error` event says why); a resume a later pause countermands answers `bad_request`. |
 | `engage` / `disengage` | `{}` | take or drop the cursor (the `hands` tool) |
 | `calibrate` | `{action: "start" \| "cancel"}` | calibration. `start` answers `bad_request` while paused and while a resume is still reopening the camera; sent before the camera has first opened (state `starting`: `start()`'s open, or a resume's after a pause since `hello`), it begins with the first frame. |
+| `keyboard` | `{action: start \| practice \| stop \| recenter \| private \| public}` or `{action: configure, settings: {...}}` | open, close or tune the air keyboard. No action inserts, sends or clears, and no field carries text. See [Air keyboard](#air-keyboard) |
 | `shutdown` | `{}` | exit cleanly, once the answer is written |
 
 ## The mod side (plugin/hooks/hands.ts)

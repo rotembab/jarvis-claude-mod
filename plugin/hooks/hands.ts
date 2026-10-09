@@ -1122,7 +1122,7 @@ const HANDS_HELP = [
   '/jarvis hands reset [name]         put every setting (or one) back to its default',
   '/jarvis hands pause|resume         turn the camera off and on without turning hand control off',
   '/jarvis hands restart              restart the hand helper',
-  '/jarvis hands keyboard [off|practice|recenter|private]  type in the air on an on-screen keyboard (tap your fingers over the keys)',
+  '/jarvis hands keyboard [off|practice|recenter|private|public|press|help]  type in the air on an on-screen keyboard (tap your fingers over the keys)',
   '/jarvis setup hands                install hand control (about 500 MB)',
 ].join('\n')
 

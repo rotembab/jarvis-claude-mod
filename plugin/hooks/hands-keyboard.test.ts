@@ -1124,7 +1124,7 @@ describe('hands.ts wires the keyboard', () => {
     await handsUp($, w)
     const status = await jarvis($, 'hands')
     expect(status).not.toMatch(/Air keyboard:/)
-    expect(status).toContain('/jarvis hands keyboard [off|practice|recenter|private]  type in the air on an on-screen keyboard (tap your fingers over the keys)')
+    expect(status).toContain('/jarvis hands keyboard [off|practice|recenter|private|public|press|help]  type in the air on an on-screen keyboard (tap your fingers over the keys)')
   })
 
   test('E7: the gesture list names the keyboard when it is on', { options: { handKeyboard: 'on' } }, async ($, on) => {
@@ -1132,7 +1132,7 @@ describe('hands.ts wires the keyboard', () => {
     await handsUp($, w)
     const help = await jarvis($, 'hands help')
     expect(help).toContain('Air keyboard: tap a finger in the air over a key to type it; both fists held for a second close it')
-    expect(help).toContain('/jarvis hands keyboard [off|practice|recenter|private]')
+    expect(help).toContain('/jarvis hands keyboard [off|practice|recenter|private|public|press|help]')
   })
 
   test('E9: a helper that restarts forgets the open keyboard', { options: { handKeyboard: 'on' } }, async ($, on) => {

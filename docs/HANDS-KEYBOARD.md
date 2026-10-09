@@ -32,7 +32,7 @@ You can also ask Claude to open it ("open the air keyboard"). Jarvis asks you fi
 
 1. **Open it.** The keyboard appears at the top of the screen, on the display of the window in front, with an empty box above the keys. At size 1.0 and 96 DPI it is about 660 by 420 pixels. The hand control pointer is off while it is open. The strip says `Hold your hands over the keys`.
 2. **Placing.** Rest both hands over the home row (a s d f and j k l ') with the fingers raised and slightly curved, and keep them still for about half a second. Faint rings mark your home positions. One hand works too; it is slower.
-3. **Warm-up.** The strip names one finger at a time, `Tap: right index  1/8`, in a fixed order: right index, left index, right middle, left middle, right ring, left ring, right pinky, left pinky. With one hand: index, middle, ring, pinky. Tap that finger over its own home key, with the other fingers still. The ring turns green when the tap is counted and the next finger is named a second later. Nothing is typed. A tap of another finger is a stray, and the third stray sends you back to the first finger (`Only tap the finger the strip names. Starting again.`). A finger that is not seen after 15 seconds gets `tap a bit firmer with your fingers raised`; after 25 seconds without progress, or after the second restart, the strip says `Taps not showing up? Try /jarvis hands keyboard press pinch`. If the warm-up is not done in 90 seconds the keyboard closes. The warm-up measures how deep your own ring and little finger tap, and sets each finger's threshold from it. It is a speed bump against accidents. It does not prove that you meant to type.
+3. **Warm-up.** The strip names one finger at a time, `Tap: right index  1/8`, in a fixed order: right index, left index, right middle, left middle, right ring, left ring, right pinky, left pinky. With one hand: index, middle, ring, pinky. Tap that finger over its own home key, with the other fingers still. The ring turns green when the tap is counted and the next finger is named a second later. Nothing is typed. A tap of another finger is a stray, and the third stray sends you back to the first finger (`Only tap the finger the strip names. Starting again.`). A finger that is not seen after 15 seconds gets `tap a bit firmer with your fingers raised`; after 25 seconds without progress, or after the second restart, the strip says `Taps not showing up? Try /jarvis hands keyboard press pinch`. If the warm-up is not done in 90 seconds the keyboard closes. The warm-up measures how deep each of your fingers taps, and sets each finger's threshold from its own depth. It is a speed bump against accidents. It does not prove that you meant to type.
 4. **Typing.** A ghost key shows under every fingertip. When a finger starts to dip, the key under it turns amber (that is the key the tap will type), and a few frames later it flashes green and the letter appears in the box. A refused tap flashes red. Move the hand to the next key, let it stop, tap again. There is no key repeat: a finger held down types nothing more.
 5. **Fix mistakes.** `Bksp` (the end of the home row) removes the last character. `Clear` (bottom row, far left) empties the box after two taps. You cannot move a cursor inside the box: the box is edited at its end only.
 6. **Insert.** Tap `Insert` (bottom row, far right) three times. The strip counts: `Insert 37 characters into WindowsTerminal? Tap Insert 2 more, firmly.` then `Tap Insert once more to type into WindowsTerminal.` The third tap starts the run. The key reads `Stop`, the strip says `Typing 12/37 into WindowsTerminal. Tap Insert to stop.`, and the box dims as it empties. When it is done: `Typed 37 characters into WindowsTerminal. Send: 3 firm taps within 10 s.`
@@ -72,22 +72,24 @@ What the keyboard does not have, on purpose: digits, `!`, `;`, Esc, Tab, arrows,
 
 ### Insert and Send
 
-Nothing reaches another window until three deliberate taps on Insert. A tap counts toward Insert only when:
+Nothing reaches another window until three deliberate taps on Insert. With the air tap, a tap counts toward Insert only when:
 
 - it comes at least 0.25 seconds after the last one and all three come within 6 seconds;
 - your hand is at rest (it moves under 0.10 frame widths a second) at the moment of the tap;
 - one finger makes all the taps;
-- at least two of the three are firm (the strip asks `a little firmer` when they are not);
+- at least two of the taps are firm. A soft tap still counts, and when three have counted without two firm ones the run stays open and the strip asks `a little firmer`, so it can take four taps or more;
 - you tapped no other key, and did not edit the box, in between.
 
 A tap from a moving hand neither counts nor cancels, and the strip says `Hold your hand still, then tap Insert`. An empty box, or a box of only spaces, cannot be inserted.
+
+The stillness, one-finger and firmness rules come from the air tap's own evidence. A pinch press carries none, so with the pinch method Insert and Send count three taps, 0.25 seconds apart, within 6 seconds, and nothing else.
 
 A run types about 30 characters a second at 30 frames a second (one character per camera frame, with at least 0.030 seconds between them). A run is at most 200 characters and 30 seconds. It stops early when you tap Insert (`Stop`, from half a second after the run began), when you touch the real keyboard or mouse (the keyboard steps aside for 1.5 seconds, and for as long as Ctrl, Alt or Windows is down), when the window in front changes, when the window becomes one it may not type into, or when the keyboard cannot be drawn. Whatever was not typed stays in the box.
 
 Send presses Enter once in the same window. All of this must hold:
 
 - a text Insert has just finished, in a window that is still in front, and the box is empty;
-- each of the three taps comes within 10 seconds of the Insert, from a hand at rest, by one finger, with at least two firm (the same evidence as for Insert);
+- each of the three taps comes within 10 seconds of the Insert and, with the air tap, from a hand at rest, by one finger, with at least two firm (the same evidence as for Insert);
 - the text did not begin with `/` or `!`, and no earlier Insert in this session did. For those the strip says `Not sent: it starts with "/". Press Enter yourself.` Claude Code treats a first `/` as a command and a first `!` as shell mode. The refusal is a heuristic, not a boundary;
 - you tapped no other key since the Insert (a letter, Shift, a middle cell), and no hold came up (a slow camera does not count);
 - it is the first Send after that Insert.
@@ -181,7 +183,7 @@ The plugin options are **Air keyboard** (`handKeyboard`, `on` or `off`, default 
 
 ### Other press methods
 
-**pinch.** Pinch the finger over a key to your thumb. It has its own warm-up (pinch each finger once). With `commit review` (the default) it fills the same box, with no practice marker needed, and has the same Insert and Send. It is also what the air tap falls back to. The design expects it to be more reliable than the air tap, but it needs steadier landmarks (it fails near a landmark noise of 0.020), and that is not measured on your camera either.
+**pinch.** Pinch the finger over a key to your thumb. It has its own warm-up (pinch each finger once). With `commit review` (the default) it fills the same box, with no practice marker needed, and has the same Insert and Send, counted by number only (see [Insert and Send](#insert-and-send)). It is also what the air tap falls back to. The design expects it to be more reliable than the air tap, but it needs steadier landmarks (it fails near a landmark noise of 0.020), and that is not measured on your camera either.
 
 **pinch with `commit direct`.** Each pinch types its key straight into the window in front, with no box and no Insert. This is the only mode where a stray pinch is a stray key in a window. It needs its own practice (`keyboard-practice.json`: rests of at least 20 seconds, at most 1.0 false presses a minute) and shows the last 24 characters typed. Enter is two presses within 1.5 seconds. Use it only after you have seen the pinch behave on your camera.
 
@@ -219,12 +221,12 @@ Test Windows Terminal with Claude Code (at its empty prompt), Notepad and a brow
 
 When it is done run `/jarvis hands resume` (or `on`). It needs the hand model from `/jarvis setup hands`.
 
-Segments are `kind:seconds`, comma separated, at most 600 seconds in all. The kinds are `place` (hold both hands over the keys, still), `type` (type the practice phrases shown), `tap` (tap or pinch each finger in turn), `rest` (hands in view, do nothing), `wave` (wave, open and close your hands, tap nothing) and `drill` (air only: the console names a finger, and sometimes a key, every 1.2 seconds). A 3 second `place` is added before a `type`, `tap` or `drill` segment that does not follow another one. `--seconds N` alone records one stretch of `drill` (air) or `type` (pinch); the default is 120. Other options: `--press air|pinch`, `--camera INDEX|NAME`, `--countdown SECONDS` (default 5), `--data-dir D` (where the hand model is). `--out` must end in `.npz`. It will not overwrite a file; Ctrl+C stops early and saves what it has.
+Segments are `kind:seconds`, comma separated, at most 600 seconds in all. The kinds are `place` (hold both hands over the keys, still), `type` (type the practice phrases shown), `tap` (tap or pinch each finger in turn), `rest` (hands in view, do nothing), `wave` (wave, open and close your hands, tap nothing) and `drill` (air only: the console names a finger every 1.2 seconds, never a reach key). A 3 second `place` is added before a `type`, `tap` or `drill` segment that does not follow another one. `--seconds N` alone records one stretch of `drill` (air) or `type` (pinch); the default is 120. Other options: `--press air|pinch`, `--camera INDEX|NAME`, `--countdown SECONDS` (default 5), `--data-dir D` (where the hand model is). `--out` must end in `.npz`. It will not overwrite a file; Ctrl+C stops early and saves what it has.
 
 Two recordings answer the questions that matter:
 
 1. **The room** (about a minute): `--segments rest:20,wave:20,rest:20`. The report should show at least 26 fps by the median frame gap and a landmark noise under 0.022 (level `ok`), and the resting lift of each finger at least 0.40 with the posture gate closed under 2% of the time.
-2. **The drill** (about six minutes): `--segments drill:60,drill:60,drill:60,drill:60,drill:60,rest:20,wave:20`, which is 250 prompts. Tap the finger the console names, over the key it names when it names one.
+2. **The drill** (about six minutes): `--segments drill:60,drill:60,drill:60,drill:60,drill:60,rest:20,wave:20`, which is 250 prompts. Tap the finger the console names over its home key. The drill of `keytrace` names fingers only, with no reach keys, so the report's reach line says `(no prompts)`; the reach keys are measured by the practice (`/jarvis hands keyboard practice`), not here.
 
 Record each with its own `--out`, then replay:
 
@@ -232,7 +234,7 @@ Record each with its own `--out`, then replay:
 & $py -m jarvis_hands keyreplay "$env:USERPROFILE\kt-drill.npz"
 ```
 
-The replay of a five minute recording takes about a minute (49 seconds for a synthetic one on the development machine). The report prints the frame rate and landmark noise, the placement, the camera level, the taps counted and their latency, the hands in view, the drill (hits, wrong finger, extra and missed taps, and why), the false taps, a table per finger (taps, prompts, hits, recall, depth, threshold), the phantoms in each rest, the posture at rest and the key accuracy of each aim rule. It also prints the **decision rule**: index and middle recall in the drill at least 95%, extra taps at most 3% of the prompts, reach-key recall at least 85%, and ring and pinky recall reported against a target of 75%, each marked `met` or `below`. Those bars come from the simulation (see [the limits](#honest-limits)). A recording is not a live session, so it says nothing about the review box or Insert.
+The replay of a five minute recording takes about a minute (49 seconds for a synthetic one on the development machine). The report prints the frame rate and landmark noise, the placement, the camera level, the taps counted and their latency, the hands in view, the drill (hits, wrong finger, extra and missed taps, and why), the false taps, a table per finger (taps, prompts, hits, recall, depth, threshold), the phantoms in each rest, the posture at rest and the key accuracy of each aim rule. It also prints the **decision rule**: index and middle recall in the drill at least 95%, extra taps at most 3% of the prompts, reach-key recall at least 85% (when the recording has reach prompts), and ring and pinky recall reported against a target of 75%, each marked `met` or `below`. Those bars come from the simulation (see [the limits](#honest-limits)). A recording is not a live session, so it says nothing about the review box or Insert.
 
 Options: `--press air|pinch` (replay with the other method than the file was recorded for), `--set NAME=VALUE` (try a tuning field, for example `air_theta_k=6.5`; inside its range only; repeat for more), `--csv OUT.csv` (the per-frame numbers), `--no-suggest` (skip the search for better values), `--data-dir D`, and:
 
@@ -456,7 +458,7 @@ How to run them, and `KB_FULL=1` for the long statistical rows, `KB_FROZEN_BASE`
 
 Known limits of the suite:
 
-- **Runtime.** The whole helper suite took 10 minutes 48 seconds on the development machine after it was trimmed (the target was 8), and about 16 minutes is expected on the Windows runner. Before the trim the first CI run on the branch took 40 minutes on Windows and 15 on macOS. Running the suite under `pytest-xdist` in CI was suggested and has not been done. `KB_FULL=1` is much longer (the N48 run alone is about an hour).
+- **Runtime.** The whole helper suite took 10 minutes 48 seconds on the development machine after it was trimmed (the target was 8), and about 16 minutes is expected on the Windows runner. Before the trim, CI took 28 minutes on Windows, 13 on macOS and 17 on Ubuntu for the first run, and 40 on Windows and 15 on macOS for the run after it. Running the suite under `pytest-xdist` in CI was suggested and has not been done. `KB_FULL=1` is much longer (the N48 run alone is about an hour).
 - **Runner differences.** The first CI run found three failures that only appear off Linux: a render test that looked for pixels at fixed columns (the fonts differ: Segoe UI on Windows, an Arial-class font on macOS, DejaVu Sans on Linux), a log-size test that counted CRLF line ends on Windows, and tests whose giant parameters became `tmp_path` directory names that Windows refuses. They are fixed in the tree (`test_o44_*` now finds the typed letters from the pixels that change, the tap log is written with `\n` line ends, ids are short), and `test_kb_static.py` limits a test id to 1000 characters because Windows refuses an environment value over 32,767 characters. The fixes have not been confirmed on the runners yet.
 - **Real hardware.** Everything that touches Windows runs against fakes; see [what only your PC can settle](#what-only-your-pc-can-settle).
 
