@@ -918,6 +918,28 @@ def test_s57_thirty_taps_at_ten_a_second_freeze_once_keep_eleven_characters_and_
     assert len(rig.box) == 12 and rig.counts["storm_freeze"] == 1
 
 
+def test_s57_a_hint_does_not_take_the_strip_from_the_storm_sentence_while_the_freeze_lasts() -> None:
+    """The storm sentence is the only thing that tells the user why nothing is typed; a posture or weak-tap hint that
+    came due in the burst waits until the freeze is over (found end to end: ``Ring: tap a bit firmer`` over it)."""
+    rig = review_rig()
+    rig.press.view_states[("right", 1)] = ("open", 0.0, "weak")  # the note is there 1.5 s into the burst
+    t0 = rig.t + 0.1
+    for i in range(12):
+        rig.tap(t0 + 0.1 * i, LETTERS[i])
+    froze = rig.t
+    while rig.counts["storm_freeze"] == 0 and rig.t < froze + 4.0:
+        rig.run(0.1)
+    assert rig.counts["storm_freeze"] == 1
+    began = rig.t
+    strips = []
+    while rig.t < began + 2.9:
+        rig.run(0.1)
+        strips.append(rig.view.strip)
+    assert strips and set(strips) == {"Too many taps at once. Paused for 3 s."}
+    rig.run(1.0)
+    assert rig.view.strip != "Too many taps at once. Paused for 3 s."
+
+
 def test_s57_the_freeze_lasts_three_seconds_from_the_twelfth_tap() -> None:
     rig = review_rig()
     t0 = rig.t + 0.1

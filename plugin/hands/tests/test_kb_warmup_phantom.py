@@ -9,12 +9,12 @@ second). So what is under test is the session's wiring of the warm-up's own rule
 naming, no strays, a clean second before it.
 
 What a scripted press cannot say is how many phantoms a real detector makes of a still hand or a fidgeting finger:
-that is the end-to-end half of X53 (the repo's negative scenarios through ``AirTapPress`` and ``Warmup``), which is not
-in this file. Note what that means: phantoms that pass every gate and never raise a counter, one hand, at a rate high
-enough to hit the named finger by chance, can arm a warm-up of four fingers (twelve one-hand runs of one tap every
-1.1 to 2 s armed some of them when this was tried); nothing in the warm-up itself tells such a tap from the user, so
-this file is not a proof for them. Seeds 0 and 1 run by default (the stream is 90 s of frames each) and 0 to 11 with
-``KB_FULL=1``.
+that is the end-to-end half of X53, at the end of this file (the repo's negative scenarios as landmarks, through the
+real tracker, ``AirTapPress`` in calibrating mode, ``Warmup`` and the session). Note what the scripted half means:
+phantoms that pass every gate and never raise a counter, one hand, at a rate high enough to hit the named finger by
+chance, can arm a warm-up of four fingers (twelve one-hand runs of one tap every 1.1 to 2 s armed some of them when
+this was tried); nothing in the warm-up itself tells such a tap from the user, so the scripted half is not a proof for
+them. Seeds 0 and 1 run by default (the stream is 90 s of frames each) and 0 to 11 with ``KB_FULL=1``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from jarvis_hands.keyboard.rig import KbRig
+from jarvis_hands.keyboard.rig import AirScene, KbRig
 from jarvis_hands.keyboard.types import Side
 
 #: ("tap", t, side, finger, du, dv) or ("reject", t, counter name); t counts from the start of the warm-up.
@@ -172,3 +172,31 @@ def test_x53_a_tap_in_the_second_after_a_reject_counter_rose_is_not_taken() -> N
     rig.warm_tap("right", 0)
     rig.run(0.3)
     assert rig.counts["warmup_accepted"] == 1
+
+
+# ------------------------------------------------------------------------------ the end-to-end half: real detector
+
+#: The negative scenarios of ``synth.scenario`` that X53 names (``AirHand.scenario`` of the study).
+NEGATIVES = ("still", "open_close", "reach", "talk_hands", "talking", "fidget")
+NOISES = (0.001, 0.002)
+
+
+@pytest.mark.parametrize("sides", [("left", "right"), ("right",)], ids=["two_hands", "one_hand"])
+@pytest.mark.parametrize("sigma", NOISES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("name", NEGATIVES)
+def test_x53_hands_that_mean_nothing_do_not_arm_the_warmup_of_the_real_detector(
+    name: str, seed: int, sigma: float, sides: tuple[Side, ...]
+) -> None:
+    """The hands are placed as a still pair, then become the scenario for the 90 s of the warm-up. Every frame goes
+    through the real tracker, ``AirTapPress(calibrating=True)`` and ``Warmup`` exactly as the session wires them (the
+    reject total is read before each update); the session may close ``idle`` at the end of its 90 s or
+    ``air_unreliable`` when the ladder finds the stream unusable, and it must never arm."""
+    scene = AirScene(seed=100 * seed + len(sides), sigma=sigma, sides=sides, keep_views=False, alpha=1.0)
+    scene.place()
+    assert scene.session.phase == "warmup"
+    scene.negative(name, sigma=sigma, seconds=RUN_S + 10.0)
+    rig = scene.rig
+    scene.run_until(lambda: rig.session.armed, RUN_S + 5.0)
+    assert not rig.session.armed and rig.closed in ("idle", "air_unreliable")
+    assert rig.desktop.key_calls == [] and rig.box == ""

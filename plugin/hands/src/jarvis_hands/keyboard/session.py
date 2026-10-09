@@ -1240,6 +1240,9 @@ class KeyboardSession:
         left = self._idle_left(t)
         if left is not None:
             return REVIEW_TEXT["idle"].format(s=left)
+        machine = self._machine
+        if machine is not None and machine.frozen(t):
+            return machine.strip(t, self._target)  # why nothing is typed outranks a posture or weak-tap hint
         if self._hint is not None:
             return SESSION_TEXT[self._hint[0]]
         if self._weak is not None and t < self._weak[1]:

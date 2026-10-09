@@ -558,6 +558,10 @@ class ReviewMachine:
         began, self._storm = self._storm, False
         return began
 
+    def frozen(self, t: float) -> bool:
+        """The storm freeze is on at ``t``: the session keeps its sentence on the strip over any hint (2.7 step 8)."""
+        return t < self._frozen_until
+
     def discard(self) -> int:
         """Drops the box, the run, the guard and the last insert; returns how many characters were dropped.
 

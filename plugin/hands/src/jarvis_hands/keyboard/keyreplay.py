@@ -13,6 +13,16 @@ components directly: placing (2.4), the warm-up when the file has one (a practic
 (2.12.7), and then counts every tap. Where a file has no warm-up the finger depth ``D_f`` is the median depth of that
 finger's own prompted taps, and the report says so.
 
+The report is what Rotem's live tests read: the camera and landmark noise (L9, L60), the hands in view (L12), the
+posture at rest (L61), the drill's recall per finger and the numbers of the decision rule (L62), the false taps and the
+key accuracy of each aim rule (L63). The suggestions come in three kinds. Thresholds (``air_theta_k``,
+``air_theta_min``, ``air_depth_frac``) are searched one field at a time and replayed whole, but only when the recording
+does not already meet the target: values found by shaving two stray taps off one recording are a fit, not a setting.
+The aim (``air_aim``, ``air_aim_speed``) is chosen from the aims every rule gave for each prompted tap. The motion
+gate ``air_vmax_gate`` has its own rule (2.12.10): it is raised to 0.75 only when more than 15% of the prompts were
+refused for ``motion`` and the rest, in the recording and in its replay with the gate raised, has at most one stray
+tap a minute.
+
 ``--set`` overrides ``Tuning`` fields and refuses what the clamps of ``tuning.py`` would not take (it never changes a
 value silently). ``--write`` merges the suggested accuracy values (and the ``--set`` ones) into
 ``keyboard-tuning.json``: atomic, clamped to the same ranges, and unable to name anything that is not a ``Tuning``
@@ -72,8 +82,19 @@ PROMPTS_KEY: Final = "drill_prompts"
 JITTER_WARN_Z: Final = 0.015
 #: A decision needs at least this many prompts to say anything about recall.
 MIN_PROMPTS_TO_SUGGEST: Final = 20
-#: The decision rule (7.4): false taps at most this share of all taps.
+#: The decision rule (7.4): false taps at most this share of all taps, and at least this share of the prompts found.
 FALSE_RATE_LIMIT: Final = 0.05
+RECALL_TARGET: Final = 0.90
+#: The posture check of the live test L61: every finger's median lift at rest at least this, and the posture gate
+#: closed less than this share of the rest.
+REST_LIFT_MIN: Final = 0.40
+POSTURE_CLOSED_MAX: Final = 0.02
+#: The bars of the live test L62 (the decision rule): index and middle recall in the drill, extra taps as a share of the
+#: prompts, recall of the reach keys; ring and pinky are reported against a target.
+IM_RECALL_BAR: Final = 0.95
+EXTRA_BAR: Final = 0.03
+REACH_RECALL_BAR: Final = 0.85
+RING_PINKY_TARGET: Final = 0.75
 #: A frame gap longer than this is not counted as time spent in a segment.
 _GAP_CAP_S: Final = 0.25
 #: The still-hand placement of the session (``session.py``), repeated here because those names are private there.
@@ -83,12 +104,18 @@ _EPS: Final = 1e-9
 _PHANTOM_KINDS: Final = ("rest", "wave", "talk")
 _RULES: Final = ("onset", "commit", "auto", "peak")
 #: Where the search looks for a better value, field by field (each inside its clamp; the current value is added).
+#: ``air_vmax_gate`` is not here: the motion gate keeps waving and talking out, so it has its own rule (below), which
+#: loosens it to one value and only when the recording shows what that costs.
 _CANDIDATES: Final = {
     "air_theta_k": (4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0),
     "air_theta_min": (0.08, 0.09, 0.10, 0.12, 0.14, 0.16, 0.20),
     "air_depth_frac": (0.4, 0.5, 0.6, 0.7),
-    "air_vmax_gate": (0.3, 0.5, 0.75, 1.0),
 }
+#: The motion rule (DESIGN 2.12.10, amend-air 6.8): when more than this share of the named prompts were refused for
+#: ``motion`` and the rest has at most this many stray taps a minute, ``air_vmax_gate`` is suggested at this value.
+VMAX_SUGGESTED: Final = 0.75
+MOTION_SHARE_LIMIT: Final = 0.15
+REST_PHANTOMS_PER_MIN: Final = 1.0
 _AIM_SPEEDS: Final = (0.02, 0.03, 0.05, 0.08, 0.10, 0.15)
 #: A rule is kept when it is within this of the best one: a tie does not change the setting.
 _AIM_TIE: Final = 0.01
@@ -248,6 +275,11 @@ def _number(value: Any, low: float, high: float) -> float:
     return float(min(max(value, low), high))
 
 
+def _not_json(name: str) -> Any:
+    """``NaN`` and ``Infinity`` are not JSON: a file that holds them is one the merge would only carry on."""
+    raise ValueError(name)
+
+
 def _existing(path: Path) -> dict[str, Any]:
     """The tuning file as it is, or a new one; ReplayError when it is there but is not a file we may merge into."""
     unreadable = ReplayError("The tuning file cannot be read. Move it away, then run again.")
@@ -256,7 +288,7 @@ def _existing(path: Path) -> dict[str, Any]:
             return {"version": 1}
         if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
             raise unreadable
-        doc = json.loads(path.read_bytes().decode("utf-8-sig"))
+        doc = json.loads(path.read_bytes().decode("utf-8-sig"), parse_constant=_not_json)
     except (OSError, ValueError, RecursionError):  # ReplayError is a ValueError; also bad bytes and bad JSON
         raise unreadable from None
     if not isinstance(doc, dict) or doc.get("version", 1) != 1 or type(doc.get("version", 1)) is not int:
@@ -711,6 +743,22 @@ def _jitter(data: TraceData) -> dict[str, Any]:
     return {"xy": None, "z": None, "frames": 0, "from": "", "warn": False}
 
 
+def meets_target(recall: float, false_rate: float) -> bool:
+    """True when the recording already does what the decision rule asks: thresholds are then left as they are, because
+    a value found by shaving two stray taps off a recording is a fit to that recording, not a better setting."""
+    return recall >= RECALL_TARGET and false_rate <= FALSE_RATE_LIMIT
+
+
+def vmax_verdict(refused: int, named: int, rest_per_min: float | None, current: float) -> str:
+    """The motion rule: "raise" (suggest ``VMAX_SUGGESTED``), "keep" (nothing to say), "no_rest" (taps are refused for
+    motion but the recording holds no rest to show the gate may be loosened) or "rest_noisy" (the rest has strays)."""
+    if current >= VMAX_SUGGESTED or not named or refused / named <= MOTION_SHARE_LIMIT:
+        return "keep"
+    if rest_per_min is None:
+        return "no_rest"
+    return "raise" if rest_per_min <= REST_PHANTOMS_PER_MIN else "rest_noisy"
+
+
 class Analysis:
     """One replay of a recording with one tuning; ``report`` is everything the tool prints."""
 
@@ -830,8 +878,12 @@ class Analysis:
             "level": self._level(),
             "depth_source": run.depth_source,
             "prompts": self._prompt_block(scores),
+            "false_taps": self._false_taps(scores),
+            "decision": self._decision(scores),
             "fingers": self._fingers(scores),
+            "view": self._view(),
             "phantoms": self._phantoms(),
+            "posture": self._posture(),
             "aim": self._aim_table(scores),
             "phrase": self._phrase(),
             "suggest": None,
@@ -880,6 +932,46 @@ class Analysis:
             "extra": counts["extra"],
             "missed_by": dict(sorted(missed.items(), key=lambda kv: (-kv[1], kv[0]))),
             "recall": round(hits / len(named), 3) if named else None,
+        }
+
+    def _false_taps(self, scores: _Scores) -> dict[str, Any]:
+        """The taps nobody asked for, added up: a wrong finger or a second tap in a prompt's window, and a tap in a
+        rest, wave or talk. Taps that fall in no window of a drill or a typing stretch are not counted as false."""
+        counts = Counter(scores.outcome)
+        taps = len(self.run.taps)
+        false = counts["wrong"] + counts["extra"] + counts["phantom"]
+        return {
+            "taps": taps,
+            "wrong_finger": counts["wrong"],
+            "extra": counts["extra"],
+            "stray": counts["phantom"],
+            "share": round(false / taps, 3) if taps else None,
+        }
+
+    def _decision(self, scores: _Scores) -> dict[str, Any] | None:
+        """The numbers of the decision rule (L62): the drill's recall pooled over both hands for index and middle, for
+        ring and pinky and for the reach keys, and the extra taps as a share of all prompts. A tap is extra when it is
+        of a wrong finger, a second one in a prompt's window, or in the drill with no prompt at all."""
+        if not self.prompts:
+            return None
+        reach = {self.layout.find(kind=kind).index for kind, _, _ in AIR_DRILL_REACH_KEYS}
+        home = [(i, p) for i, p in enumerate(self.prompts) if p.side is not None and p.key not in reach]
+
+        def pool(indices: list[int]) -> dict[str, Any]:
+            hits = sum(1 for i in indices if scores.hit[i] is not None)
+            return {"prompts": len(indices), "hits": hits, "recall": round(hits / len(indices), 3) if indices else None}
+
+        extra = sum(
+            1
+            for tap, outcome in zip(self.run.taps, scores.outcome, strict=True)
+            if outcome in ("wrong", "extra") or (outcome == "free" and tap.kind == "drill")
+        )
+        total = len(self.prompts)
+        return {
+            "index_middle": pool([i for i, p in home if p.finger in (0, 1)]),
+            "ring_pinky": pool([i for i, p in home if p.finger in (2, 3)]),
+            "reach": pool([i for i, p in enumerate(self.prompts) if p.key in reach]),
+            "extra": {"taps": extra, "of": total, "share": round(extra / total, 3)},
         }
 
     def _why_missed(self, index: int) -> str:
@@ -935,27 +1027,82 @@ class Analysis:
                 )
         return out
 
+    def _phantom_block(self, run: _Run, kind: str) -> dict[str, Any] | None:
+        """The taps of ``run`` in segments of ``kind`` (rest, wave, talk) and the seconds with a hand in view in them;
+        None when the recording has no such segment."""
+        if kind not in self.kinds:
+            return None
+        present = self.rec.data.present.any(axis=1)
+        times = self.rec.data.t.tolist()
+        seconds = 0.0
+        for i, k in enumerate(self.kinds):
+            if k == kind and present[i] and i + 1 < len(times):
+                seconds += min(times[i + 1] - times[i], _GAP_CAP_S)
+        taps = [t for t in run.taps if t.kind == kind]
+        by_finger = Counter(_label(t.side, t.finger) for t in taps)
+        return {
+            "seconds": round(seconds, 3),
+            "taps": len(taps),
+            "per_min": round(60.0 * len(taps) / seconds, 2) if seconds > 0 else None,
+            "by_finger": dict(sorted(by_finger.items())),
+        }
+
     def _phantoms(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        data = self.rec.data
-        present = data.present.any(axis=1)
-        times = data.t.tolist()
-        for kind in _PHANTOM_KINDS:
-            seconds = 0.0
-            for i, k in enumerate(self.kinds):
-                if k == kind and present[i] and i + 1 < len(times):
-                    seconds += min(times[i + 1] - times[i], _GAP_CAP_S)
-            if not seconds and not any(k == kind for k in self.kinds):
+        blocks = {kind: self._phantom_block(self.run, kind) for kind in _PHANTOM_KINDS}
+        return {kind: block for kind, block in blocks.items() if block is not None}
+
+    def _rest_per_min(self, run: _Run) -> float | None:
+        """Stray taps a minute in the rests of ``run``; None when there is no second of rest with a hand in view."""
+        block = self._phantom_block(run, "rest")
+        return None if block is None else block["per_min"]
+
+    def _view(self) -> dict[str, Any]:
+        """How much of the recording each hand was in view (the tracker's hands, so a doubled label counts once)."""
+        samples = self.hands.samples
+        total = len(samples)
+        left = [any(s.side == "left" for s in frame) for frame in samples]
+        right = [any(s.side == "right" for s in frame) for frame in samples]
+
+        def share(flags: Iterable[bool]) -> float:
+            return round(sum(flags) / total, 3) if total else 0.0
+
+        return {
+            "frames": total,
+            "both": share(a and b for a, b in zip(left, right, strict=True)),
+            "left": share(left),
+            "right": share(right),
+            "none": share(not (a or b) for a, b in zip(left, right, strict=True)),
+        }
+
+    def _posture(self) -> dict[str, Any] | None:
+        """Air only: the median lift of each finger over the frames of the rests, and how much of them the posture gate
+        was closed (L61). None for a pinch file and for a recording without a rest that has a hand in view."""
+        if self.press != "air":
+            return None
+        lifts: dict[Side, list[list[float]]] = {"left": [[] for _ in range(4)], "right": [[] for _ in range(4)]}
+        frames: Counter[str] = Counter()
+        shut: Counter[str] = Counter()
+        for index, kind in enumerate(self.kinds):
+            if kind != "rest":
                 continue
-            taps = [t for t in self.run.taps if t.kind == kind]
-            by_finger = Counter(_label(t.side, t.finger) for t in taps)
-            out[kind] = {
-                "seconds": round(seconds, 3),
-                "taps": len(taps),
-                "per_min": round(60.0 * len(taps) / seconds, 2) if seconds > 0 else None,
-                "by_finger": dict(sorted(by_finger.items())),
-            }
-        return out
+            gates = self.run.gates[index] if index < len(self.run.gates) else {}
+            for sample in self.hands.samples[index]:
+                frames[sample.side] += 1
+                shut[sample.side] += gates.get(sample.side) == "posture"
+                for finger in range(4):
+                    lifts[sample.side][finger].append(sample.fingers[finger].lift)
+        sides: dict[str, Any] = {}
+        low: list[str] = []
+        for side in ("left", "right"):
+            if not frames[side]:
+                continue
+            medians = [round(float(np.median(values)), 3) for values in lifts[side]]
+            sides[side] = {"frames": frames[side], "lift": medians, "closed": round(shut[side] / frames[side], 4)}
+            low += [_label(side, f) for f, value in enumerate(medians) if value < REST_LIFT_MIN]
+        if not sides:
+            return None
+        ok = not low and all(row["closed"] < POSTURE_CLOSED_MAX for row in sides.values())
+        return {"sides": sides, "low": low, "ok": ok}
 
     def _key_of(self, aim: tuple[float, float]) -> int | None:
         plane = self.hands.placement.plane if self.hands.placement is not None else None
@@ -988,7 +1135,7 @@ class Analysis:
                 rules[rule][group][1] += 1
                 if self._key_of(aim) == wanted:
                     rules[rule][group][0] += 1
-        out: dict[str, Any] = {"n": len(scored), "aim_speed": speed, "rules": {}}
+        out: dict[str, Any] = {"n": len(scored), "aim_speed": speed, "in_use": self.tuning.air_aim, "rules": {}}
         for rule in _RULES:
             both = [rules[rule]["still"][0] + rules[rule]["moving"][0], len(scored)]
             out["rules"][rule] = {
@@ -1077,14 +1224,13 @@ class Analysis:
         notes: list[str] = []
         base: dict[str, Any] = {}
         if self.press == "air" and len(self.prompts) >= MIN_PROMPTS_TO_SUGGEST:
-            values, base = self._search_air(pinned)
+            values, base, notes = self._search_air(pinned)
         elif self.press == "air":
             notes.append("A drill of at least 20 prompts is needed to suggest the air tap's numbers.")
         if self.press == "pinch":
             values.update(self._plane_values(pinned))
             values.update(self._pinch_values(pinned))
         values = {k: v for k, v in values.items() if v != getattr(self.tuning, k)}
-        notes += [base.pop("note")] if "note" in base else []
         return {"values": values, "notes": notes, **base}
 
     def _plane_values(self, pinned: frozenset[str]) -> dict[str, Any]:
@@ -1107,7 +1253,7 @@ class Analysis:
             return {"close": round(min(max(float(np.median(recorded)), low), high), 3)}
         return {}
 
-    def _search_air(self, pinned: frozenset[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _search_air(self, pinned: frozenset[str]) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
         """One field at a time, each over its candidates; a change is kept only if the recording does better.
 
         The search holds the finger depths ``D_f`` of the baseline fixed (a warm-up is done once, whatever is tuned
@@ -1119,11 +1265,19 @@ class Analysis:
         base = self._measure(self.run)[:2]
         best = base
         found: dict[str, Any] = {}
+        notes: list[str] = []
         fields = [
             name for name in _CANDIDATES if name not in pinned and not (name == "air_depth_frac" and not self.run.depth)
         ]
-        total = sum(len(_CANDIDATES[name]) for name in fields)
-        self._say(f"Looking for better values (about {total} replays of the press)...")
+        if meets_target(*base):
+            fields = []
+            notes.append(
+                f"The recording already meets the target (recall {_pct(base[0])}, false taps {_pct(base[1])} of taps): "
+                "no threshold is changed."
+            )
+        else:
+            total = sum(len(_CANDIDATES[name]) for name in fields)
+            self._say(f"Looking for better values (about {total} replays of the press)...")
         for name in fields:
             # nearest to the current value first: among equally good values the smallest change wins
             for value in sorted(_CANDIDATES[name], key=lambda v, n=name: abs(v - getattr(self.tuning, n))):
@@ -1135,16 +1289,83 @@ class Analysis:
                 score = self._measure(self._press(trial, depths, aims=False))[:2]
                 if self._better(score, best):
                     best, tuning, found = score, trial, {**found, name: value}
-        stats = {"base_recall": round(base[0], 3), "base_false_rate": round(base[1], 3)}
+        stats: dict[str, Any] = {"base_recall": round(base[0], 3), "base_false_rate": round(base[1], 3)}
         if found:
             checked = Analysis(self.rec, tuning, self.press, hands=self.hands)
             best = checked._measure(checked.run)[:2]
             if not self._better(best, base):
-                found, best = {}, base
-                stats["note"] = "No value did better when the recording was replayed with it."
+                found, best, tuning = {}, base, self.tuning
+                notes.append("No value did better when the recording was replayed with it.")
         # the aim rule needs no replay: the aims of every rule are known for each prompted tap
         found.update(self._aim_choice(pinned))
-        return found, {**stats, "recall": round(best[0], 3), "false_rate": round(best[1], 3)}
+        gate = self._motion_gate(pinned, tuning)
+        if gate is not None:
+            stats["motion"], loosened, said = gate
+            notes += said
+            if loosened is not None:
+                found["air_vmax_gate"] = VMAX_SUGGESTED
+                best = loosened._measure(loosened.run)[:2]
+        return found, {**stats, "recall": round(best[0], 3), "false_rate": round(best[1], 3)}, notes
+
+    def _motion_gate(
+        self, pinned: frozenset[str], tuning: Tuning
+    ) -> tuple[dict[str, Any], Analysis | None, list[str]] | None:
+        """The motion rule: what the recording says about ``air_vmax_gate``, and the replay with it loosened.
+
+        None when there is nothing to say (the field is pinned, already as loose as the suggestion, or fewer than a
+        sixth of the named prompts were refused for motion). Otherwise the facts, and the replay of ``tuning`` with the
+        gate at ``VMAX_SUGGESTED`` when the rule says to raise it and that replay's own rest is still quiet.
+        """
+        if "air_vmax_gate" in pinned:
+            return None
+        named = sum(1 for p in self.prompts if p.side is not None)
+        refused = self._prompts_missed_for("motion")
+        rest = self._rest_per_min(self.run)
+        verdict = vmax_verdict(refused, named, rest, self.tuning.air_vmax_gate)
+        if verdict == "keep":
+            return None
+        facts: dict[str, Any] = {
+            "refused": refused,
+            "named": named,
+            "rest": rest,
+            "rest_after": None,
+            "wave_after": None,
+            "raised": False,
+        }
+        notes: list[str] = []
+        if verdict == "no_rest":
+            notes.append(
+                f"Taps are refused for motion ({refused} of {named}), but there is no rest in the recording to show "
+                "that air_vmax_gate can be raised: record a rest of 20 s with it."
+            )
+        elif verdict == "rest_noisy":
+            notes.append(
+                f"Taps are refused for motion ({refused} of {named}), but the rest has {rest:g} stray taps a minute "
+                "already: air_vmax_gate stays."
+            )
+        else:
+            loosened = Analysis(self.rec, replace(tuning, air_vmax_gate=VMAX_SUGGESTED), self.press, hands=self.hands)
+            after = loosened._rest_per_min(loosened.run)
+            facts["rest_after"] = after
+            wave = loosened._phantom_block(loosened.run, "wave")
+            facts["wave_after"] = None if wave is None else wave["per_min"]
+            if after is not None and after <= REST_PHANTOMS_PER_MIN:
+                facts["raised"] = True
+                return facts, loosened, notes
+            notes.append(
+                f"Taps are refused for motion ({refused} of {named}), but with air_vmax_gate={VMAX_SUGGESTED:g} the "
+                f"rest would have {_num(after, 1)} stray taps a minute: air_vmax_gate stays."
+            )
+        return facts, None, notes
+
+    def _prompts_missed_for(self, why: str) -> int:
+        """How many named prompts were missed, first of all, because a gate refused their peak for ``why``."""
+        scores = _classify(self.run.taps, self.prompts)
+        return sum(
+            1
+            for i, p in enumerate(self.prompts)
+            if p.side is not None and scores.hit[i] is None and self._why_missed(i) == why
+        )
 
     def _aim_choice(self, pinned: frozenset[str]) -> dict[str, Any]:
         scores = _classify(self.run.taps, self.prompts)
@@ -1214,8 +1435,9 @@ def render(report: Mapping[str, Any]) -> list[str]:
     name = "air tap" if report["press"] == "air" else "pinch"
     lines = [
         f"keyreplay: the {name}, {report['frames']} frames, {report['seconds']:.1f} s, "
-        f"{_num(report['fps']['median'], 1)} fps (recorded for the {report['recorded_for']}, "
-        f"file version {report['version']})",
+        f"{_num(report['fps']['median'], 1)} fps by the median frame gap, "
+        f"{_num(report['fps']['mean'], 1)} fps over the whole recording "
+        f"(recorded for the {report['recorded_for']}, file version {report['version']})",
         "segments: " + (", ".join(f"{kind} {seconds:.1f} s" for kind, seconds in report["segments"].items()) or "none"),
         _render_jitter(report["jitter"]),
     ]
@@ -1233,7 +1455,14 @@ def render(report: Mapping[str, Any]) -> list[str]:
             f"{level['gaps']} gaps"
         )
     lines.append(f"taps counted: {report['events']}, median onset-to-commit {_num(report['latency_ms'], 0)} ms")
+    view = report["view"]
+    lines.append(
+        f"hands in view: both {_pct(view['both'])}, left {_pct(view['left'])}, right {_pct(view['right'])}, "
+        f"none {_pct(view['none'])} of the frames"
+    )
     lines.extend(_render_prompts(report["prompts"]))
+    lines.extend(_render_false(report["false_taps"], bool(report["prompts"]["total"] or report["phantoms"])))
+    lines.extend(_render_decision(report["decision"]))
     lines.extend(_render_fingers(report["fingers"], report["press"] == "air"))
     if report["depth_source"] == "prompted taps":
         lines.append("D is the median depth of each finger's own prompted taps: the recording has no warm-up")
@@ -1245,6 +1474,7 @@ def render(report: Mapping[str, Any]) -> list[str]:
             f"phantoms in {kind}: {block['taps']} taps in {block['seconds']:.0f} s, "
             f"{_num(block['per_min'], 1)} a minute" + (f" ({split})" if split else "")
         )
+    lines.extend(_render_posture(report["posture"]))
     lines.extend(_render_aim(report["aim"]))
     phrase = report["phrase"]
     if phrase is not None:
@@ -1275,6 +1505,45 @@ def _render_prompts(prompts: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def _render_false(false: Mapping[str, Any], worth_saying: bool) -> list[str]:
+    if not false["taps"] or not worth_saying:
+        return []
+    count = false["wrong_finger"] + false["extra"] + false["stray"]
+    return [
+        f"false taps: {count} of {false['taps']} taps ({_pct(false['share'])}): {false['wrong_finger']} wrong finger, "
+        f"{false['extra']} extra, {false['stray']} stray in the rests"
+    ]
+
+
+def _bar(value: float | None, bar: float, *, most: bool = False) -> str:
+    """``met`` or ``below`` (``above`` for a share that must stay under its bar) the bar of the live test."""
+    if value is None:
+        return "no prompts"
+    return ("met" if value <= bar else "above") if most else ("met" if value >= bar else "below")
+
+
+def _render_decision(decision: Mapping[str, Any] | None) -> list[str]:
+    if decision is None:
+        return []
+
+    def recall(block: Mapping[str, Any], what: str, bar: float | None, word: str = "bar") -> str:
+        text = f"{what} recall {block['hits']} of {block['prompts']}"
+        if block["recall"] is None:
+            return text + " (no prompts)"
+        verdict = "" if bar is None else f", {word} {bar:.0%}: {_bar(block['recall'], bar)}"
+        return f"{text} ({block['recall']:.0%}{verdict})"
+
+    extra = decision["extra"]
+    parts = [
+        recall(decision["index_middle"], "index+middle", IM_RECALL_BAR),
+        f"extra taps {extra['taps']} of {extra['of']} prompts ({extra['share']:.1%}, bar {EXTRA_BAR:.0%}: "
+        f"{_bar(extra['share'], EXTRA_BAR, most=True)})",
+        recall(decision["reach"], "reach", REACH_RECALL_BAR),
+        recall(decision["ring_pinky"], "ring+pinky", RING_PINKY_TARGET, "target"),
+    ]
+    return ["decision rule (L62): " + "; ".join(parts)]
+
+
 def _render_fingers(fingers: Sequence[Mapping[str, Any]], air: bool) -> list[str]:
     if not air:
         lines = ["finger         taps  ms"]
@@ -1291,6 +1560,28 @@ def _render_fingers(fingers: Sequence[Mapping[str, Any]], air: bool) -> list[str
     return lines
 
 
+def _render_posture(posture: Mapping[str, Any] | None) -> list[str]:
+    if posture is None:
+        return []
+    lines = ["posture at rest (index, middle, ring, pinky):"]
+    for side, row in posture["sides"].items():
+        lift = " ".join(f"{x:.2f}" for x in row["lift"])
+        lines.append(
+            f"  {side:<5} lift {lift}, posture gate closed {100 * row['closed']:.1f}% of {row['frames']} frames"
+        )
+    parts = []
+    if posture["low"]:
+        parts.append(f"a median rest lift under {REST_LIFT_MIN:.2f} ({', '.join(posture['low'])})")
+    shut = [side for side, row in posture["sides"].items() if row["closed"] >= POSTURE_CLOSED_MAX]
+    if shut:
+        parts.append(f"the posture gate closed {POSTURE_CLOSED_MAX:.0%} of the rest or more ({', '.join(shut)})")
+    if parts:
+        lines.append(
+            "  WARNING: " + " and ".join(parts) + ": the fingers droop, or the camera sees them from too far above"
+        )
+    return lines
+
+
 def _render_aim(aim: Mapping[str, Any] | None) -> list[str]:
     if aim is None:
         return []
@@ -1298,9 +1589,10 @@ def _render_aim(aim: Mapping[str, Any] | None) -> list[str]:
         f"aim rules, prompted taps against their keys (n {aim['n']}; still = anchor speed up to {aim['aim_speed']}):"
     ]
     for rule, row in aim["rules"].items():
+        use = "   (in use)" if rule == aim["in_use"] else ""
         lines.append(
             f"  {rule:<7}{_pct(row['accuracy']):>5}   still {row['still'][0]}/{row['still'][1]}"
-            f"   moving {row['moving'][0]}/{row['moving'][1]}"
+            f"   moving {row['moving'][0]}/{row['moving'][1]}{use}"
         )
     return lines
 
@@ -1309,6 +1601,15 @@ def _render_suggest(suggest: Mapping[str, Any] | None) -> list[str]:
     if suggest is None:
         return []
     lines = [*suggest["notes"]]
+    motion = suggest.get("motion")
+    if motion is not None and motion["raised"]:
+        wave = "" if motion["wave_after"] is None else f", waving {_num(motion['wave_after'], 1)}"
+        lines.append(
+            f"motion gate: {motion['refused']} of {motion['named']} prompted taps were refused for motion and the rest "
+            f"has {_num(motion['rest'], 1)} stray taps a minute; at {VMAX_SUGGESTED:g} the rest has "
+            f"{_num(motion['rest_after'], 1)} a minute{wave} (waving and talking get through more: check the practice "
+            "rest)"
+        )
     if "recall" in suggest:
         lines.append(
             f"with the suggested values: recall {_pct(suggest['recall'])} (now {_pct(suggest['base_recall'])}), "
@@ -1342,8 +1643,8 @@ def _write_csv(path: Path, rows: Iterable[Sequence[Any]]) -> None:
 
 
 def run(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
-    """0 when the report was printed (and written, if asked), 1 when the tuning file or the csv could not be written,
-    2 when the arguments or the file were refused. Every refusal is one fixed line."""
+    """0 when the report was printed (and written, if asked), 1 when the tuning file or the csv could not be written or
+    Ctrl+C stopped the replay, 2 when the arguments or the file were refused. Every refusal is one fixed line."""
     stream = out if out is not None else sys.stdout
 
     def say(line: str) -> None:
@@ -1357,11 +1658,14 @@ def run(args: argparse.Namespace, *, out: TextIO | None = None) -> int:
         if csv_path is not None and (csv_path.suffix != ".csv" or csv_path.exists()):
             raise ReplayError("--csv is a new file name ending in .csv.")
         analysis = Analysis(rec, base, args.press, progress=say)
+        pinned = set_names(args.sets)
+        report = analysis.report(suggest=not args.no_suggest, pinned=pinned)
     except ReplayError as exc:
         say(str(exc))
         return EXIT_REFUSED
-    pinned = set_names(args.sets)
-    report = analysis.report(suggest=not args.no_suggest, pinned=pinned)
+    except KeyboardInterrupt:  # a long recording takes a minute; nothing has been written yet
+        say("Stopped with Ctrl+C. Nothing was written.")
+        return EXIT_FAILED
     if args.sets:
         say("settings tried: " + ", ".join(args.sets))
     for line in render(report):

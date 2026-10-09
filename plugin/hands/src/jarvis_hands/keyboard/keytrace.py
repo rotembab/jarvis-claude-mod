@@ -17,10 +17,13 @@ the handedness score and the 21 landmarks of each hand (x, y, z in frame widths,
 the segment table, and the prompted key index of each drill frame. ``press`` says which press method the recording is
 for and ``version`` is 2. On top of that one array, ``drill_prompts``, int32 ``[m, 5]``: for each drill prompt its first
 frame, the side (0 left, 1 right), the finger (0 index .. 3 pinky), the key index and 1 when the key is displaced. That
-is the whole file: **landmarks, times and the prompts the drill showed, no pixel, no window, no typed character**, and
-nothing is sent anywhere: it is written to the path given and stays local. A ``type`` segment is the one place where
-the person's own movements could in principle be read back into letters by this same tool; the console therefore shows
-a practice phrase to type, and the file is deleted by hand like any other (practice traces are kept 14 days).
+is the whole file, and it is **landmarks, times and key prompts only**: no pixel, no window, no key press and no
+character that was typed. The only text near it is what the console showed to be tapped: a finger and a key for a
+``drill`` (stored as numbers, never as letters) and one of the practice phrases for a ``type`` segment (shown on the
+console and not stored at all). Nothing is sent anywhere: the file is written to the path given and stays local.
+Type only what the console shows. The tool cannot tell what a hand is typing, and the same replay that scores the taps
+could in principle read the movements of a ``type`` segment back into letters, so a recording of private typing would
+be private text; delete a recording by hand like any other file (practice traces are kept 14 days).
 
 Only ``cli.py`` imports this module, lazily inside the function that dispatches the subcommand. The camera and the
 tracker are the package's own wrappers, opened inside ``run`` (the arguments of ``run`` replace them in tests).

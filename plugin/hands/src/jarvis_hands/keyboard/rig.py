@@ -687,16 +687,21 @@ def fitts(units: float) -> float:
 
 
 class RecordingAir(AirTapPress):
-    """The real air detector, with every event it emitted kept for the test to read."""
+    """The real air detector, with every event it emitted and every level it was told kept for the test to read."""
 
     def __init__(self, tuning: Tuning, **kw: Any) -> None:
         super().__init__(tuning, **kw)
         self.fired: list[PressEvent] = []
+        self.levels: list[PressLevel] = []
 
     def update(self, hands: Sequence[HandSample]) -> list[PressEvent]:
         out = super().update(hands)
         self.fired += out
         return out
+
+    def set_level(self, level: PressLevel) -> None:
+        self.levels.append(level)
+        super().set_level(level)
 
 
 class RecordingPinch(PinchPress):
@@ -762,6 +767,20 @@ class Shifted:
         return obs
 
 
+class Parked:
+    """A hand drawn ``(dx, dy)`` of the picture from where it was: the hand of a user who rests a finger on some key."""
+
+    def __init__(self, hand: Any, dx: float, dy: float) -> None:
+        self.hand, self.dx, self.dy = hand, dx, dy
+
+    def observe(self, t: float, dt: float) -> HandObservation:
+        obs: HandObservation = self.hand.observe(t, dt)
+        image = obs.image.copy()
+        image[:, 0] += self.dx
+        image[:, 1] += self.dy
+        return HandObservation(obs.handedness, obs.score, image, obs.world)
+
+
 @dataclass(frozen=True)
 class TapTruth:
     """A tap the scene scripted: when its stroke starts, who made it, and the key it was aimed at."""
@@ -817,6 +836,8 @@ class AirScene:
         #: The hands in view; a hand that is not in this set is left out of every frame.
         self.present: set[Side] = set(self.hands)
         self.taps: list[TapTruth] = []
+        #: Per side: the drawn offset of a hand that rests a finger on some key (``park``), as (dx, dy) of the picture.
+        self.parked: dict[Side, tuple[float, float]] = {}
         #: Each finger's resting (u, v) on the placed plane, measured by ``place``.
         self.rest: dict[tuple[Side, int], tuple[float, float]] = {}
         self._drop = drop
@@ -1023,6 +1044,29 @@ class AirScene:
             self.run(max(truth.t - self.rig.t, 0.0) + every_s)
         return self.rig.counts["insert_start"] > begun
 
+    def user_send(self, *, every_s: float = 1.0, limit_s: float = 12.0) -> bool:
+        """Tap Send (the left ring finger, the Enter key of the review layout) every ``every_s`` until a Send run has
+        begun; True when one has. The machine's own windows decide whether it counts (a Send needs a finished Insert
+        before it, at most ``SEND_WINDOW_S`` ago)."""
+        begun = self.rig.counts["send_start"]
+        end = self.rig.t + limit_s
+        while self.rig.counts["send_start"] == begun and self.rig.t < end and self.rig.closed is None:
+            truth = self.tap("enter")
+            self.run(max(truth.t - self.rig.t, 0.0) + every_s)
+        return self.rig.counts["send_start"] > begun
+
+    def burst(
+        self, who: Sequence[tuple[Side, int]], gap_s: float, *, amp: float = 42.0, dur: float = 0.2, lead_s: float = 0.5
+    ) -> float:
+        """Taps of the given fingers, one every ``gap_s`` from ``lead_s`` ahead, each on that finger's own resting
+        place and however fast: the strokes overlap when ``gap_s`` is short. Returns the time of the first."""
+        t0 = self.rig.t + lead_s
+        for i, (side, finger) in enumerate(who):
+            event = Event(side, finger, t0 + i * gap_s, (0.0, 0.0), amp, dur)
+            event.mt = 0.0
+            self.hands[side].add(event)
+        return t0
+
     # ------------------------------------------------------------------------------------- hands in and out of view
 
     def leave(self, side: Side) -> None:
@@ -1031,11 +1075,34 @@ class AirScene:
     def arrive(self, side: Side) -> None:
         self.present.add(side)
 
-    def negative(self, name: str, *, sigma: float | None = None) -> None:
-        """From now on every hand in view is a hand of ``synth.scenario`` ``name`` (a hand that never means a key)."""
+    def negative(self, name: str, *, sigma: float | None = None, seconds: float = 150.0) -> None:
+        """From now on every hand in view is a hand of ``synth.scenario`` ``name`` (a hand that never means a key).
+
+        ``seconds`` sizes the scenario's random processes and event lists (they are built up front); a hand carries on
+        past it, held at its last value."""
         noise = self.noise if sigma is None else Noise(sigma=sigma, glitch_p=self.noise.glitch_p)
         for side in list(self.hands):
-            self.hands[side] = Shifted(scenario(name, side, self.rng, noise, duration=3600.0), self.rig.t)
+            hand: Any = Shifted(scenario(name, side, self.rng, noise, duration=seconds), self.rig.t)
+            if side in self.parked:
+                hand = Parked(hand, *self.parked[side])
+            self.hands[side] = hand
+
+    def park(self, side: Side, finger: int, key_or_char: Key | str) -> None:
+        """The hand of ``side`` rests with ``finger`` over the centre of ``key`` from the next frame on, and stays so
+        through ``negative``: every frame of that hand is drawn that far from where the placed plane has it (the plane
+        and the session's home do not move, which is the point: the finger is now over a key it does not belong to)."""
+        plane = self.session.plane
+        assert plane is not None, "park after the hands are placed"
+        key = self.rig.key(key_or_char)
+        u0, v0 = self.rest.get((side, finger)) or self.session.home_f[(side, finger)]
+        x0, y0 = plane.pose(u0, v0)
+        x1, y1 = plane.pose(key.col + key.width / 2, key.row + 0.5)
+        offset = (x1 - x0, (y1 - y0) / ASPECT)  # pose space scales y by the aspect ratio
+        self.parked[side] = offset
+        hand = self.hands[side]
+        if isinstance(hand, Parked):
+            hand = hand.hand
+        self.hands[side] = Parked(hand, *offset)
 
 
 class Clockwork:

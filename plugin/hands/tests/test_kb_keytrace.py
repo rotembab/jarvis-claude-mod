@@ -19,6 +19,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pytest
 
@@ -31,7 +32,10 @@ from jarvis_hands.keyboard.limits import AIR_DRILL_GAP_S, AIR_DRILL_MOVE_ROWS, A
 from jarvis_hands.keyboard.practice import FINGER_NAMES, HOME_CHARS, PHRASES
 from jarvis_hands.keyboard.trace import TRACE_MAX_S, read_trace
 from jarvis_hands.landmarks import Frame
+from jarvis_hands.tracker import create_tracker
 from jarvis_hands.tracker.base import TrackerError
+
+from conftest import fetch_photo, real_model
 
 REVIEW = layout_for("review")
 FPS = 30.0
@@ -70,8 +74,10 @@ class ScriptedCamera:
         lost_after: int | None = None,
         stall_after: int | None = None,
         interrupt_after: int | None = None,
+        image: np.ndarray | None = None,
     ) -> None:
         self.clock, self.fps = clock, fps
+        self.image = np.zeros((2, 2, 3), dtype=np.uint8) if image is None else image
         self.lost_after, self.stall_after, self.interrupt_after = lost_after, stall_after, interrupt_after
         self.reads = 0
         self.opened = 0
@@ -95,7 +101,7 @@ class ScriptedCamera:
             self.clock.t += timeout
             return None
         self.clock.t += 1.0 / self.fps
-        return CameraFrame(self.reads, self.clock.t, np.zeros((2, 2, 3), dtype=np.uint8))
+        return CameraFrame(self.reads, self.clock.t, self.image.copy())
 
     def close(self) -> None:
         self.closed += 1
@@ -724,9 +730,12 @@ def test_a_tracker_that_cannot_start_is_said_and_the_camera_is_never_opened(tmp_
 
 
 def test_the_module_says_what_is_recorded_and_what_is_not():
-    doc = (keytrace.__doc__ or "").lower()
+    doc = " ".join((keytrace.__doc__ or "").lower().split())
     for phrase in ("landmark", "no pixel", "typed", "local", "prompt"):
         assert phrase in doc, phrase
+    assert "landmarks, times and key prompts only" in doc
+    assert "no key press and no character that was typed" in doc
+    assert "type only what the console shows" in doc
 
 
 def test_the_recorder_imports_no_opencv_and_prints_only_through_its_stream():
@@ -734,3 +743,37 @@ def test_the_recorder_imports_no_opencv_and_prints_only_through_its_stream():
     assert "import cv2" not in source and "mediapipe" not in source
     prints = [line for line in source.splitlines() if "print(" in line]
     assert prints and all("file=stream" in line for line in prints)
+
+
+# ------------------------------------------------------------------------------------------ the real model, end to end
+
+
+@real_model
+def test_real_model_a_photo_of_two_hands_is_recorded_by_keytrace_and_replayed_by_keyreplay(tmp_path, real_model_path):
+    """The real tracker's frames go into the file and the file replays whole: two hands in view for every frame, the
+    drill's prompts scored (nobody tapped, so nothing is hit), and no landmark noise on a picture that never changes."""
+    from jarvis_hands.keyboard import keyreplay
+    from jarvis_hands.keyboard.tuning import Tuning
+
+    image = cv2.imread(str(fetch_photo("woman_hands")))
+    assert image is not None
+    clock = Clock()
+    camera = ScriptedCamera(clock, image=image)
+    tracker = create_tracker(real_model_path, num_hands=2)
+    path = tmp_path / "real.npz"
+    out = io.StringIO()
+    args = parse("--yes-record", "--countdown", "0", "--segments", "rest:3,drill:6", "--out", str(path))
+    code = keytrace.run(args, camera=camera, tracker=tracker, clock=clock, out=out, rng=random.Random(5))
+    assert code == 0, out.getvalue()
+    data = read_trace(path)
+    assert len(data) == 360 and data.press == "air" and data.version == 2  # rest 3 s, a place of 3 s, the drill 6 s
+    assert [kind for _, _, kind in data.segments] == ["rest", "place", "drill"]
+    assert bool(data.present.all()) and {int(x) for x in data.side.ravel()} == {0, 1}
+    assert np.isfinite(data.lm).all() and data.lm.dtype == np.float32
+
+    report = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=False)
+    assert report["view"] == {"frames": 360, "both": 1.0, "left": 1.0, "right": 1.0, "none": 0.0}
+    assert report["prompts"]["total"] == 5 and report["prompts"]["hit"] == 0 and report["events"] == 0
+    assert report["jitter"]["z"] is not None and report["jitter"]["z"] < keyreplay.JITTER_WARN_Z
+    lines = keyreplay.render(report)
+    assert any(line.startswith("hands in view: both 100%") for line in lines)

@@ -1049,6 +1049,17 @@ def test_s57_thirty_taps_at_ten_a_second_freeze_once_and_leave_eleven_characters
     assert b.m.strip(10.0 + 2.9, "Code") == REVIEW_TEXT["storm"]
 
 
+def test_s57_frozen_says_whether_the_freeze_is_on_so_the_session_can_keep_its_sentence_on_the_strip() -> None:
+    b = Bench()
+    assert not b.m.frozen(10.0)
+    for i in range(limits.STORM_N):
+        b.at(10.0 + i * 0.1, ("char", "a"))
+    t_freeze = 10.0 + (limits.STORM_N - 1) * 0.1
+    assert b.m.frozen(t_freeze + 0.5) and b.m.frozen(t_freeze + limits.STORM_FREEZE_S - 0.01)
+    assert not b.m.frozen(t_freeze + limits.STORM_FREEZE_S + 0.01)
+    assert (b.m.strip(t_freeze + 0.5, "Code") == REVIEW_TEXT["storm"]) == b.m.frozen(t_freeze + 0.5)
+
+
 def test_s57_the_freeze_lasts_three_seconds_and_taps_work_again_after_it() -> None:
     b = Bench()
     for i in range(limits.STORM_N):

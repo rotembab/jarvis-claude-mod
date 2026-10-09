@@ -106,6 +106,7 @@ def drill_trace(
     move_s: float = 0.2,
     drill_kind: str = "drill",
     warm_taps: int = len(WARM_ORDER),
+    drift: float = 0.0,
 ) -> Made:
     """place, (a warm-up of one tap per finger,) ``prompts`` drill prompts 1.2 s apart (one tap each, 0.25 s into its
     window), then rest and wave.
@@ -114,7 +115,9 @@ def drill_trace(
     second tap, or one of the wrong finger), ``rest_taps`` are ``(side, finger, second in the rest)``, ``lead_s`` is
     how long the hand holds over the key before the tap (0 and it is still moving), ``move_s`` how long it takes to
     get there, ``drill_kind`` what the prompted stretch is called in the file ("phrase" in a practice trace) and
-    ``warm_taps`` how many of the warm-up's eight taps are made (the segment is as long as ever).
+    ``warm_taps`` how many of the warm-up's eight taps are made (the segment is as long as ever) and ``drift`` how far
+    the hands wander while the drill runs (a random walk in frame widths per root second; the place and the rest are
+    still): a typist who hurries, whose hand is still on its way when the finger taps.
     """
     rng = np.random.default_rng(seed)
     order = [(sides[k % len(sides)], fingers[(k // len(sides)) % len(fingers)]) for k in range(prompts)]
@@ -152,6 +155,8 @@ def drill_trace(
     writer = TraceWriter(press=press)  # type: ignore[arg-type]
     for n in range(int(total * fps)):
         t = n / fps
+        for s in SIDES:
+            hands[s].drift_sigma = drift if drill_start <= t < drill_end else 0.0
         frame = Frame(T0 + t, tuple(hands[s].observe(t, 1 / fps) for s in SIDES), 1280, 720)
         window = int((t - drill_start) / AIR_DRILL_GAP_S)
         if t < place_s:
@@ -406,7 +411,8 @@ def test_no_safety_constant_of_limits_can_be_named_in_a_write(tmp_path):
 @pytest.mark.parametrize(
     "content",
     [b"{not json", b"[]", b'"text"', b'{"version": 2, "air": {}}', b'{"version": "1"}', b'{"version": 1, "air": 5}',
-     b'{"version": 1, "air": []}', b"\xff\xfe", b"x" * 70000],
+     b'{"version": 1, "air": []}', b"\xff\xfe", b"x" * 70000,
+     b'{"version": 1, "other": NaN}', b'{"version": 1, "air": {"x": Infinity}}'],  # not JSON: another reader would balk
 )  # fmt: skip
 def test_a_write_over_a_file_it_cannot_read_as_a_tuning_file_refuses_and_leaves_it_as_it_is(tmp_path, content):
     path = tuning_path(tmp_path)
@@ -465,14 +471,16 @@ def hover_trace(
     press: str = "air",
     kind: str = "rest",
     taps: tuple[tuple[str, int, float], ...] = (),
+    posture: tuple[float, float, float] = sy.REST,
 ) -> Path:
-    """Two still hands at ``fps``, with a tap by ``(side, finger, second)`` where scripted (none by default)."""
+    """Two still hands at ``fps``, with a tap by ``(side, finger, second)`` where scripted (none by default), held in
+    ``posture`` (finger angles: ``synth.REST``, raised and slightly curved, or ``synthetic.RELAXED``, drooping)."""
     rng = np.random.default_rng(3)
     noise = sy.Noise(sigma=0.0008, glitch_p=0.0)
     events = {
         s: [sy.Event(s, f, at, (0.0, 0.0), 40.0, 0.2, mt=0.2) for side, f, at in taps if side == s] for s in SIDES
     }
-    hands = {s: sy.AirTypist(s, HOME[s], events[s], rng, noise) for s in SIDES}
+    hands = {s: sy.AirTypist(s, HOME[s], events[s], rng, noise, rest=posture) for s in SIDES}
     writer = TraceWriter(press=press)  # type: ignore[arg-type]
     for n in range(int(seconds * fps)):
         t = n / fps
@@ -682,8 +690,8 @@ def test_the_plane_is_placed_when_the_hands_have_been_still_and_taps_count_after
 
 @pytest.mark.parametrize(("onset", "counted"), [(0.9, 0), (1.3, 0), (1.317, 0), (1.35, 1), (2.5, 1)])
 def test_a_tap_is_counted_from_the_frame_after_the_one_that_placed_the_plane(tmp_path, onset, counted):
-    """The plane is placed at 1.5 s (frame 45). A tap committed on that frame or before it is not a tap of the
-    typing: the person has not seen the keyboard yet."""
+    """The plane is placed at 1.5 s, on the frame at that time. A tap committed on that frame or before it is not a
+    tap of the typing: the person has not seen the keyboard yet."""
     path = hover_trace(tmp_path / "t.npz", fps=30, seconds=5, taps=(("left", 0, onset),))
     report = keyreplay.analyse(keyreplay.load(path), Tuning(still_s=1.5), suggest=False)
     assert report["placed"]["at"] == pytest.approx(1.5, abs=0.001) and report["events"] == counted
@@ -1550,6 +1558,18 @@ def test_a_gap_in_the_frames_is_not_counted_as_time_spent_in_the_segment(tmp_pat
     assert report["phantoms"]["rest"]["seconds"] == pytest.approx(4.25, abs=0.1)
 
 
+def test_the_header_gives_the_pace_the_camera_held_and_the_pace_it_kept_over_the_whole_recording(tmp_path):
+    """The median gap is the nominal rate; frames over time is the measured one, and a stall pulls it down."""
+    path = hover_trace(tmp_path / "g.npz", fps=30, seconds=4)
+    shift_times(path, from_frame=60, seconds=3.0)
+    report = phrase_report(path)
+    assert report["fps"]["median"] == pytest.approx(30.0, abs=0.1) and report["fps"]["mean"] == pytest.approx(
+        17.0, abs=0.5
+    )
+    header = keyreplay.render(report)[0]
+    assert "30.0 fps by the median frame gap" in header and "17.1 fps over the whole recording" in header
+
+
 def test_the_data_dir_is_the_argument_then_the_environment_then_the_home_folder(clean, tmp_path, monkeypatch):
     elsewhere, home = tmp_path / "env", tmp_path / "home"
     monkeypatch.setenv("JARVIS_DATA_DIR", str(elsewhere))
@@ -2101,3 +2121,478 @@ def test_a_rule_within_a_hundredth_of_the_best_is_as_good_and_the_setting_stays(
         scored[count - 1].rules["onset"] = (u + 1.5, v)
         expected = {} if count == 1 else {"air_aim": "commit"}
         assert analysis._aim_choice(frozenset()) == expected, count
+
+
+# ----------------------------------------------------------------- X50: the threshold factor alone changes the events
+
+
+def test_x50_the_threshold_factor_alone_changes_the_event_count(tmp_path):
+    """Landmark noise of 0.002 puts the threshold on the noise (sigma-hat 0.028 here, so 5.0 sigma is 0.14 and 6.5 is
+    0.18): a larger factor takes the stray taps away and leaves every prompted one."""
+    path = drill_trace(tmp_path / "n.npz", prompts=24, sigma=0.002).path
+    _, plain = replay(path, "--no-suggest")
+    code, text = replay(path, "--no-suggest", "--set", "air_theta_k=6.5")
+    assert code == 0 and "settings tried: air_theta_k=6.5" in text
+    assert taps_counted(text) < taps_counted(plain)
+    assert "drill: 24 prompts" in text and "24 hit" in text and "24 hit" in plain
+
+
+# ------------------------------------------------------------------------------------ the motion gate (DESIGN 2.12.10)
+
+#: A drill typed by a hand that wanders (a random walk of 0.07 frame widths per root second while the drill runs): a
+#: quarter of the prompted taps are refused for ``motion``, and loosening the gate to 0.75 finds them again.
+HURRIED = dict(prompts=32, drift=0.07, rest_s=20.0, wave_s=6.0, seed=1)
+
+
+@pytest.fixture(scope="module")
+def hurried(tmp_path_factory) -> Made:
+    return drill_trace(tmp_path_factory.mktemp("hurried") / "h.npz", **HURRIED)  # type: ignore[arg-type]
+
+
+@pytest.fixture(scope="module")
+def hurried_report(hurried: Made) -> dict[str, Any]:
+    return keyreplay.analyse(keyreplay.load(hurried.path), Tuning(), suggest=True)
+
+
+def test_prompted_taps_refused_for_motion_over_a_quiet_rest_get_the_motion_gate_at_three_quarters(hurried_report):
+    report = hurried_report
+    missed = report["prompts"]["missed_by"]
+    assert missed["motion"] / report["prompts"]["named"] > keyreplay.MOTION_SHARE_LIMIT == 0.15
+    assert report["phantoms"]["rest"]["per_min"] == 0.0
+    suggest = report["suggest"]
+    assert suggest["values"]["air_vmax_gate"] == keyreplay.VMAX_SUGGESTED == 0.75
+    assert suggest["recall"] > suggest["base_recall"] + 0.2
+    motion = suggest["motion"]
+    assert motion["raised"] is True and (motion["refused"], motion["named"]) == (missed["motion"], 32)
+    assert motion["rest"] == 0.0 and motion["rest_after"] == 0.0
+
+
+def test_the_numbers_said_with_the_motion_gate_are_what_a_replay_with_it_gives(hurried, hurried_report):
+    suggest = hurried_report["suggest"]
+    again = keyreplay.analyse(keyreplay.load(hurried.path), replace(Tuning(), **suggest["values"]), suggest=False)
+    assert again["prompts"]["recall"] == pytest.approx(suggest["recall"], abs=0.001)
+    assert again["phantoms"]["rest"]["per_min"] == suggest["motion"]["rest_after"]
+    assert again["phantoms"]["wave"]["per_min"] == suggest["motion"]["wave_after"]
+
+
+def test_the_motion_gate_is_only_ever_suggested_at_three_quarters_and_is_not_part_of_the_search():
+    assert "air_vmax_gate" not in keyreplay._CANDIDATES
+    low, high = RANGES["air_vmax_gate"]
+    assert low <= keyreplay.VMAX_SUGGESTED <= high
+    assert Tuning().air_vmax_gate < keyreplay.VMAX_SUGGESTED
+
+
+def test_other_drills_never_get_a_motion_gate(weak_report, clean_suggested):
+    for report in (weak_report, clean_suggested):
+        assert "air_vmax_gate" not in report["suggest"]["values"] and "motion" not in report["suggest"]
+
+
+@pytest.mark.parametrize(
+    ("refused", "named", "rest", "current", "verdict"),
+    [
+        (9, 32, 0.0, 0.5, "raise"),
+        (5, 32, 1.0, 0.5, "raise"),  # a rest of exactly one a minute is the most that is allowed
+        (5, 32, 1.01, 0.5, "rest_noisy"),
+        (5, 32, None, 0.5, "no_rest"),  # no seconds of rest with a hand in view: nothing shows the gate may be loosened
+        (3, 20, 0.0, 0.5, "keep"),  # 15% is not more than 15%
+        (4, 20, 0.0, 0.5, "raise"),
+        (0, 32, 0.0, 0.5, "keep"),
+        (9, 0, 0.0, 0.5, "keep"),  # no named prompt at all
+        (9, 32, 0.0, 0.75, "keep"),  # already as loose as the suggestion
+        (9, 32, 0.0, 1.0, "keep"),  # looser: it is never tightened by this rule
+        (9, 32, 5.0, 0.75, "keep"),
+    ],
+)
+def test_the_motion_rule_is_more_than_fifteen_percent_refused_and_at_most_one_stray_tap_a_minute_of_rest(
+    refused, named, rest, current, verdict
+):
+    assert keyreplay.vmax_verdict(refused, named, rest, current) == verdict
+
+
+def test_stray_taps_in_the_rest_keep_the_motion_gate_where_it_is_and_say_why(tmp_path):
+    path = drill_trace(
+        tmp_path / "h.npz",
+        **{**HURRIED, "rest_taps": (("left", 0, 5.0), ("right", 1, 12.0))},  # type: ignore[arg-type]
+    ).path
+    report = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True)
+    suggest = report["suggest"]
+    assert report["phantoms"]["rest"]["per_min"] == 6.0
+    assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
+    assert any("stray taps a minute already" in note and "air_vmax_gate stays" in note for note in suggest["notes"])
+
+
+def test_a_recording_without_a_rest_cannot_show_the_motion_gate_may_be_loosened_and_says_so(tmp_path):
+    path = drill_trace(tmp_path / "h.npz", **{**HURRIED, "rest_s": 0.0, "wave_s": 0.0}).path  # type: ignore[arg-type]
+    suggest = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True)["suggest"]
+    assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
+    assert any("record a rest" in note for note in suggest["notes"])
+
+
+def test_a_motion_gate_that_would_let_the_rest_fill_with_taps_is_not_suggested(hurried, monkeypatch):
+    """The replay with 0.75 is looked at too: the quiet rest of the recording as it is does not decide alone."""
+    analysis = keyreplay.Analysis(keyreplay.load(hurried.path), Tuning())
+    real = keyreplay.Analysis._rest_per_min
+    monkeypatch.setattr(
+        keyreplay.Analysis, "_rest_per_min", lambda self, run: real(self, run) if self is analysis else 4.0
+    )  # the replay with the gate loosened is another Analysis: its rest is the one that is made noisy
+    suggest = analysis.suggest()
+    assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
+    assert any("would have 4.0 stray taps a minute" in note for note in suggest["notes"])
+
+
+def test_a_pinned_or_already_loose_motion_gate_is_left_alone_without_a_word(hurried):
+    rec = keyreplay.load(hurried.path)
+    pinned = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.5)).suggest(pinned=("air_vmax_gate",))
+    assert "air_vmax_gate" not in pinned["values"] and "motion" not in pinned
+    loose = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.75)).suggest()
+    assert "air_vmax_gate" not in loose["values"] and "motion" not in loose
+
+
+def test_the_report_text_gives_the_motion_gate_in_numbers_only(hurried_report):
+    text = "\n".join(keyreplay.render(hurried_report))
+    assert "air_vmax_gate=0.75" in text
+    line = next(line for line in text.splitlines() if line.startswith("motion gate:"))
+    motion = hurried_report["suggest"]["motion"]
+    assert f"{motion['refused']} of {motion['named']} prompted taps were refused for motion" in line
+    assert "waving" in line and "stray taps a minute" in line
+
+
+# ----------------------------------------------------------------------------- a recording that already does its job
+
+
+@pytest.mark.parametrize(
+    ("recall", "false_rate", "met"),
+    [(0.90, 0.05, True), (0.95, 0.0, True), (0.899, 0.0, False), (0.95, 0.051, False), (0.0, 0.0, False)],
+)
+def test_the_target_is_ninety_percent_of_the_prompts_found_and_at_most_five_percent_false_taps(recall, false_rate, met):
+    assert keyreplay.meets_target(recall, false_rate) is met
+    assert keyreplay.RECALL_TARGET == 0.90 and keyreplay.FALSE_RATE_LIMIT == 0.05
+
+
+@pytest.fixture(scope="module")
+def good(tmp_path_factory) -> Made:
+    """48 prompts, half of them displaced: recall 96% with 4% false taps, which the thresholds could trade down."""
+    return drill_trace(
+        tmp_path_factory.mktemp("good") / "g.npz",
+        prompts=48,
+        rest_s=20.0,
+        wave_s=10.0,
+        displaced=True,
+        sigma=0.0015,
+        seed=4,
+    )
+
+
+def test_a_recording_that_already_meets_the_target_keeps_its_thresholds_and_says_so(good):
+    suggest = keyreplay.analyse(keyreplay.load(good.path), Tuning(), suggest=True)["suggest"]
+    assert keyreplay.meets_target(suggest["base_recall"], suggest["base_false_rate"])
+    assert not {"air_theta_k", "air_theta_min", "air_depth_frac", "air_vmax_gate"} & set(suggest["values"])
+    assert (suggest["recall"], suggest["false_rate"]) == (suggest["base_recall"], suggest["base_false_rate"])
+    assert any("already meets the target" in note and "no threshold is changed" in note for note in suggest["notes"])
+
+
+def test_the_thresholds_are_not_even_tried_when_the_target_is_met(good, monkeypatch):
+    tried = []
+    real = keyreplay.Analysis._press
+
+    def spy(self, tuning, depths, **kw):
+        tried.append(tuning)
+        return real(self, tuning, depths, **kw)
+
+    monkeypatch.setattr(keyreplay.Analysis, "_press", spy)
+    analysis = keyreplay.Analysis(keyreplay.load(good.path), Tuning())
+    tried.clear()
+    analysis.suggest()
+    assert tried == []
+
+
+def test_the_aim_is_still_looked_at_when_the_target_is_met(good, monkeypatch):
+    """The aim rule and speed are about the key, not the threshold: a recording that finds its taps can miss keys."""
+    asked = []
+    real = keyreplay.Analysis._aim_choice
+    monkeypatch.setattr(
+        keyreplay.Analysis, "_aim_choice", lambda self, pinned: (asked.append(pinned), real(self, pinned))[1]
+    )
+    keyreplay.Analysis(keyreplay.load(good.path), Tuning()).suggest()
+    assert len(asked) == 1
+
+
+# ------------------------------------------------------------------------- the false taps and the wrong keys, in a line
+
+
+def test_the_false_taps_are_added_up_wrong_finger_extra_and_stray(clean_report):
+    false = clean_report["false_taps"]
+    assert false["taps"] == clean_report["events"]
+    assert false["wrong_finger"] == clean_report["prompts"]["wrong_finger"] > 0
+    assert false["extra"] == clean_report["prompts"]["extra"]
+    assert false["stray"] == sum(block["taps"] for block in clean_report["phantoms"].values()) > 0
+    total = false["wrong_finger"] + false["extra"] + false["stray"]
+    assert (
+        false["share"]
+        == pytest.approx(total / false["taps"], abs=0.001)
+        == pytest.approx(false_share(clean_report), abs=0.001)
+    )
+
+
+def test_a_recording_with_no_tap_has_no_share_of_false_taps(tmp_path):
+    report = keyreplay.analyse(
+        keyreplay.load(hover_trace(tmp_path / "h.npz", fps=30, seconds=3)), Tuning(), suggest=False
+    )
+    assert report["false_taps"] == {"taps": 0, "wrong_finger": 0, "extra": 0, "stray": 0, "share": None}
+    assert not any(line.startswith("false taps:") for line in keyreplay.render(report))
+
+
+def test_the_text_gives_the_false_taps_in_one_line_after_the_drill(clean_report):
+    lines = keyreplay.render(clean_report)
+    line = next(line for line in lines if line.startswith("false taps:"))
+    false = clean_report["false_taps"]
+    assert line.startswith(
+        f"false taps: {false['wrong_finger'] + false['extra'] + false['stray']} of {false['taps']} taps ("
+    )
+    assert f"{false['wrong_finger']} wrong finger" in line and f"{false['stray']} stray in the rests" in line
+    assert lines.index(line) == lines.index(next(x for x in lines if x.startswith("drill:"))) + 1
+
+
+def test_the_aim_table_says_which_rule_is_in_use_and_the_text_marks_it(moving):
+    for rule in AIR_AIM_CHOICES:
+        report = keyreplay.analyse(keyreplay.load(moving.path), Tuning(air_aim=rule), suggest=False)
+        assert report["aim"]["in_use"] == rule
+        marked = [x for x in keyreplay.render(report) if x.endswith("(in use)")]
+        assert len(marked) == 1 and marked[0].lstrip().startswith(rule)
+
+
+# ------------------------------------------------------------------------------------- the posture at rest (L61)
+
+
+def decision_of(path: Path) -> dict[str, Any]:
+    decision = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=False)["decision"]
+    assert decision is not None
+    return decision
+
+
+def posture_of(path: Path) -> dict[str, Any] | None:
+    return keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=False)["posture"]
+
+
+def test_the_rest_lift_of_each_finger_and_the_share_of_the_posture_gate_are_reported_for_the_rests(tmp_path):
+    posture = posture_of(hover_trace(tmp_path / "h.npz", fps=30, seconds=20))
+    assert posture is not None and set(posture["sides"]) == {"left", "right"}
+    for side in SIDES:
+        row = posture["sides"][side]
+        assert len(row["lift"]) == 4 and all(keyreplay.REST_LIFT_MIN <= x <= 1.0 for x in row["lift"])
+        assert row["closed"] == 0.0 and row["frames"] >= 500
+    assert posture["ok"] is True and posture["low"] == []
+
+
+def test_a_hand_that_droops_has_a_low_rest_lift_and_the_posture_gate_shut_most_of_the_time(tmp_path):
+    posture = posture_of(hover_trace(tmp_path / "r.npz", fps=30, seconds=20, posture=syn.RELAXED))
+    assert posture is not None and posture["ok"] is False
+    assert posture["sides"]["left"]["closed"] > 0.5
+    assert all(x < keyreplay.REST_LIFT_MIN for x in posture["sides"]["right"]["lift"])
+    assert posture["low"] == [f"{side}.{name}" for side in SIDES for name in keyreplay.FINGER_NAMES]
+
+
+def test_the_lift_is_that_of_the_rest_frames_only(tmp_path):
+    """A drill's frames (fingers tapping) and the wave are not the hand at rest."""
+    made = drill_trace(tmp_path / "d.npz", prompts=12, rest_s=10.0, wave_s=6.0)
+    posture = posture_of(made.path)
+    assert posture is not None and 250 <= posture["sides"]["left"]["frames"] <= 300  # ten seconds at 30 fps
+    assert posture_of(drill_trace(tmp_path / "n.npz", prompts=12, rest_s=0.0, wave_s=6.0).path) is None
+
+
+def posture_with_gate_shut(tmp_path: Path, frames: int) -> dict[str, Any] | None:
+    """The posture of a healthy hover (lift high) after the posture gate is made to have closed the left hand in
+    ``frames`` of its rest frames."""
+    analysis = keyreplay.Analysis(keyreplay.load(hover_trace(tmp_path / "h.npz", fps=30, seconds=20)), Tuning())
+    for index in [i for i, kind in enumerate(analysis.kinds) if kind == "rest"][:frames]:
+        analysis.run.gates[index]["left"] = "posture"
+    return analysis._posture()
+
+
+def test_a_posture_gate_that_was_shut_for_the_limit_share_of_the_rest_fails_the_check_with_a_high_lift(tmp_path):
+    whole = posture_with_gate_shut(tmp_path, 0)
+    assert whole is not None
+    n = whole["sides"]["left"]["frames"]
+    at_limit = next(k for k in range(n) if round(k / n, 4) >= keyreplay.POSTURE_CLOSED_MAX)
+    under = posture_with_gate_shut(tmp_path, at_limit - 1)
+    shut = posture_with_gate_shut(tmp_path, at_limit)
+    assert under is not None and shut is not None
+    assert under["sides"]["left"]["closed"] < keyreplay.POSTURE_CLOSED_MAX and under["ok"] is True
+    assert shut["sides"]["left"]["closed"] >= keyreplay.POSTURE_CLOSED_MAX and shut["ok"] is False
+    assert shut["low"] == [] and all(x >= keyreplay.REST_LIFT_MIN for x in shut["sides"]["left"]["lift"])
+    assert shut["sides"]["right"]["closed"] == 0.0
+
+
+def test_the_text_warns_of_a_shut_posture_gate_even_when_the_lift_is_high(tmp_path):
+    report = phrase_report(hover_trace(tmp_path / "h.npz", fps=30, seconds=20))
+    report["posture"]["sides"]["left"]["closed"] = 0.5
+    report["posture"]["ok"] = False
+    text = "\n".join(keyreplay.render(report))
+    assert "WARNING: the posture gate closed 2% of the rest or more (left)" in text
+
+
+def test_the_limits_of_the_posture_check_are_the_ones_of_the_live_test():
+    assert keyreplay.REST_LIFT_MIN == 0.40 and keyreplay.POSTURE_CLOSED_MAX == 0.02
+
+
+def test_a_pinch_report_has_no_posture_block(tmp_path):
+    report = keyreplay.analyse(keyreplay.load(pinch_trace(tmp_path / "p.npz")), Tuning(), suggest=False)
+    assert report["posture"] is None
+
+
+def test_the_text_gives_the_posture_per_side_and_warns_when_it_is_low(tmp_path):
+    good = "\n".join(keyreplay.render(phrase_report(hover_trace(tmp_path / "h.npz", fps=30, seconds=20))))
+    assert "posture at rest (index, middle, ring, pinky):" in good and "WARNING" not in good
+    assert "left  lift " in good and "right lift " in good and "posture gate closed 0.0% of " in good
+    bad = "\n".join(
+        keyreplay.render(phrase_report(hover_trace(tmp_path / "r.npz", fps=30, seconds=20, posture=syn.RELAXED)))
+    )
+    assert "WARNING: a median rest lift under 0.40 (left.index" in bad
+
+
+# ------------------------------------------------------------------------------- the hands in view (L12)
+
+
+def test_the_share_of_frames_with_both_hands_one_hand_or_none_is_reported(tmp_path):
+    both = keyreplay.analyse(
+        keyreplay.load(hover_trace(tmp_path / "h.npz", fps=30, seconds=4)), Tuning(), suggest=False
+    )
+    assert both["view"] == {"frames": 120, "both": 1.0, "left": 1.0, "right": 1.0, "none": 0.0}
+    writer = TraceWriter(press="air")
+    right = syn.hand("palm", (0.64, 0.55), handedness="right")
+    for n in range(100):  # the right hand alone for 38 frames, nothing for 30, and the right hand again for 32
+        frames = (HandObservation("right", 0.95, right.image, right.world),) if n < 38 or n >= 68 else ()
+        writer.add(Frame(T0 + n / FPS, frames, 1280, 720), "rest")
+    one = phrase_report(writer.save(tmp_path / "o.npz"))
+    assert one["view"] == {"frames": 100, "both": 0.0, "left": 0.0, "right": 0.7, "none": 0.3}
+
+
+def test_both_hands_in_view_is_the_frames_with_the_two_of_them_not_the_frames_with_one(tmp_path):
+    left, right = (syn.hand("palm", (x, 0.55), handedness=side) for x, side in ((0.36, "left"), (0.64, "right")))
+    seen = {
+        "left": HandObservation("left", 0.95, left.image, left.world),
+        "right": HandObservation("right", 0.95, right.image, right.world),
+    }
+    writer = TraceWriter(press="air")
+    # 20 frames of the left hand alone, 30 of both, 20 of the right alone and 30 of nothing
+    for n, who in enumerate(["left"] * 20 + ["both"] * 30 + ["right"] * 20 + ["none"] * 30):
+        frames = {"left": ("left",), "right": ("right",), "both": ("left", "right"), "none": ()}[who]
+        writer.add(Frame(T0 + n / FPS, tuple(seen[side] for side in frames), 1280, 720), "rest")
+    view = phrase_report(writer.save(tmp_path / "v.npz"))["view"]
+    assert view == {"frames": 100, "both": 0.3, "left": 0.5, "right": 0.5, "none": 0.3}
+
+
+def test_the_text_says_how_much_of_the_recording_the_hands_were_in_view(tmp_path):
+    lines = keyreplay.render(phrase_report(hover_trace(tmp_path / "h.npz", fps=30, seconds=4)))
+    assert "hands in view: both 100%, left 100%, right 100%, none 0% of the frames" in lines
+
+
+# ------------------------------------------------------------------------------------- the decision rule of L62
+
+
+def test_the_decision_block_pools_index_and_middle_and_ring_and_pinky_over_both_hands(clean_report):
+    decision = clean_report["decision"]
+    fingers = {(f["side"], f["finger"]): f for f in clean_report["fingers"]}
+    for name, wanted in (("index_middle", (0, 1)), ("ring_pinky", (2, 3))):
+        prompts = sum(fingers[side, f]["prompts"] for side in SIDES for f in wanted)
+        hits = sum(fingers[side, f]["hits"] for side in SIDES for f in wanted)
+        assert decision[name] == {"prompts": prompts, "hits": hits, "recall": round(hits / prompts, 3)}
+    assert decision["index_middle"]["prompts"] == 16 and decision["ring_pinky"]["prompts"] == 16
+
+
+def test_the_extra_taps_of_the_drill_are_a_wrong_finger_a_second_tap_or_a_tap_with_no_prompt(tmp_path):
+    made = drill_trace(tmp_path / "e.npz", prompts=24, extra=((3, "left", 3), (5, "right", 0)), skip=(7,), rest_s=5.0)
+    decision = keyreplay.analyse(keyreplay.load(made.path), Tuning(), suggest=False)["decision"]
+    assert decision["extra"] == {"taps": 2, "of": 24, "share": round(2 / 24, 3)}
+
+
+def test_a_tap_in_the_rest_is_not_an_extra_tap_of_the_drill(clean_report):
+    decision = clean_report["decision"]
+    stray = sum(block["taps"] for block in clean_report["phantoms"].values())
+    assert (
+        stray > 0
+        and decision["extra"]["taps"] == clean_report["prompts"]["wrong_finger"] + clean_report["prompts"]["extra"]
+    )
+
+
+def test_the_reach_keys_of_a_practice_trace_are_pooled_and_a_keytrace_drill_has_none(tmp_path, clean_report):
+    assert clean_report["decision"]["reach"] == {"prompts": 0, "hits": 0, "recall": None}
+    wanted = [REVIEW.find(kind=kind).index for kind, _, _ in keyreplay.AIR_DRILL_REACH_KEYS]
+    assert len(set(wanted)) == 4
+    path = drill_trace(tmp_path / "r.npz", prompts=8, written_prompts=False).path
+    with np.load(path, allow_pickle=False) as npz:
+        arrays = {name: npz[name] for name in npz.files}
+    targets = arrays["targets"].copy()
+    drill = np.flatnonzero(targets >= 0)
+    # the first prompt window of the drill asks for Backspace, which the right index reaches
+    window = drill[(drill >= drill[0]) & (drill < drill[0] + int(AIR_DRILL_GAP_S * FPS))]
+    targets[window] = wanted[0]
+    arrays["targets"] = targets
+    np.savez_compressed(path, **arrays)
+    reach = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=False)["decision"]["reach"]
+    assert reach["prompts"] == 1
+
+
+def test_a_reach_key_prompt_is_in_the_reach_pool_and_not_in_the_pools_of_the_home_fingers(tmp_path):
+    before = decision_of(drill_trace(tmp_path / "b.npz", prompts=8, written_prompts=False).path)
+    path = drill_trace(tmp_path / "r.npz", prompts=8, written_prompts=False).path
+    backspace = REVIEW.find(kind=keyreplay.AIR_DRILL_REACH_KEYS[0][0]).index
+    ask_for_another_key(path, from_second=PLACE_S, to_second=PLACE_S + AIR_DRILL_GAP_S, key=backspace)
+    after = decision_of(path)
+    home = ("index_middle", "ring_pinky")
+    assert sum(before[x]["prompts"] for x in home) == 8 and before["reach"]["prompts"] == 0
+    assert sum(after[x]["prompts"] for x in home) == 7 and after["reach"]["prompts"] == 1
+
+
+def test_a_tap_in_a_drill_with_no_prompt_is_an_extra_tap_and_one_in_the_warm_up_is_not(tmp_path):
+    path = drill_trace(
+        tmp_path / "f.npz", prompts=24, extra=((5, "right", 0),), warm=True, written_prompts=False, rest_s=3.0
+    ).path
+    quiet = decision_of(path)
+    assert quiet["extra"] == {"taps": 1, "of": 24, "share": round(1 / 24, 3)}  # the second tap in window 5
+    first = PLACE_S + 2.0 * len(WARM_ORDER) + 1.0  # the drill's start
+    ask_for_another_key(path, from_second=first + 5 * AIR_DRILL_GAP_S, to_second=first + 6 * AIR_DRILL_GAP_S, key=-1)
+    gap = decision_of(path)  # window 5 is no longer asked for: both of its taps are in the drill with no prompt
+    assert gap["extra"] == {"taps": 2, "of": 23, "share": round(2 / 23, 3)}
+
+
+def test_a_recording_without_a_drill_has_no_decision_block(tmp_path):
+    report = keyreplay.analyse(
+        keyreplay.load(hover_trace(tmp_path / "h.npz", fps=30, seconds=3)), Tuning(), suggest=False
+    )
+    assert report["decision"] is None
+    assert not any(line.startswith("decision rule") for line in keyreplay.render(report))
+
+
+def test_the_bars_are_those_of_the_live_test():
+    assert keyreplay.IM_RECALL_BAR == 0.95 and keyreplay.EXTRA_BAR == 0.03
+    assert keyreplay.REACH_RECALL_BAR == 0.85 and keyreplay.RING_PINKY_TARGET == 0.75
+
+
+def test_the_text_gives_the_decision_numbers_and_says_whether_each_bar_is_met(clean_report):
+    lines = keyreplay.render(clean_report)
+    line = next(line for line in lines if line.startswith("decision rule (L62):"))
+    decision = clean_report["decision"]
+    im = decision["index_middle"]
+    assert f"index+middle recall {im['hits']} of {im['prompts']} ({im['recall']:.0%}, bar 95%" in line
+    assert "extra taps " in line and "of 32 prompts" in line and "ring+pinky recall " in line
+    assert ("met" in line) or ("below" in line)
+
+
+# --------------------------------------------------------------------------------------------------------- Ctrl+C
+
+
+@pytest.mark.parametrize("where", ["Analysis", "report"])
+def test_ctrl_c_during_the_replay_stops_it_with_one_line_and_writes_nothing(clean, tmp_path, monkeypatch, where):
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    if where == "Analysis":
+        monkeypatch.setattr(keyreplay, "Analysis", interrupted)
+    else:
+        monkeypatch.setattr(keyreplay.Analysis, "report", interrupted)
+    csv_path = tmp_path / "out.csv"
+    code, text = replay(clean.path, "--write", "--set", "air_theta_k=6.0", "--csv", str(csv_path), data_dir=tmp_path)
+    assert code == keyreplay.EXIT_FAILED == 1
+    assert lines_of(text)[-1] == "Stopped with Ctrl+C. Nothing was written."
+    assert not csv_path.exists() and not tuning_path(tmp_path).exists()
