@@ -298,6 +298,8 @@ describe('the plugin option is the only switch', () => {
     expect(r.sent).toEqual([])
     expect(r.store.size).toBe(0)
     // Every body this class ever sends is one of the six actions or a configure of the protocol's settings.
+    // recenter, private and public are only sent to a keyboard that is open (the helper drops them otherwise).
+    r.keyboard.onEvent(OPEN)
     for (const word of ['on', 'practice', 'off', 'recenter', 'private', 'public']) await r.keyboard.run([word])
     for (const args of [['press', 'pinch'], ['commit', 'direct'], ['layout', 'he'], ['size', '1.4'], ['reach', '0.9'], ['dock', 'bottom'], ['enter', 'off']]) await r.keyboard.run(args)
     await r.keyboard.runTool('keyboard')
@@ -446,7 +448,7 @@ describe('/jarvis hands keyboard: opening and closing', () => {
       const text = await r.keyboard.run(args)
       expect(bodies(r)).toEqual([configure(), { action: 'start' }])
       expect(text).toBe(
-        'Opening the air keyboard. Hold your hands over the keys, then tap each finger the strip names. What you tap goes into a review box; nothing reaches another window until you tap Insert three times.',
+        'Opening the air keyboard. Hold your hands over the keys, then tap each finger the strip names. What you tap goes into a review box; nothing reaches another window until you tap Insert three times, firmly, with your hand still.',
       )
     }
     const practice = rig()
@@ -464,10 +466,52 @@ describe('/jarvis hands keyboard: opening and closing', () => {
 
   test('recenter, private and public are plain commands', async () => {
     const r = rig()
+    r.keyboard.onEvent(OPEN)
     expect(await r.keyboard.run(['recenter'])).toBe('Recentering the air keyboard on your hands.')
     expect(await r.keyboard.run(['private'])).toBe('Air keyboard private mode is on: the box and the key highlights are hidden on screen.')
     expect(await r.keyboard.run(['public'])).toBe('Air keyboard private mode is off: the box and the key highlights show again.')
     expect(bodies(r)).toEqual([{ action: 'recenter' }, { action: 'private' }, { action: 'public' }])
+    // The practice is a keyboard too: private and recenter reach it.
+    const practice = rig()
+    practice.keyboard.onEvent(event({ state: 'practice', phase: 'placing', press: 'air', level: 'ok', lang: 'en', private: false }))
+    expect(await practice.keyboard.run(['private'])).toBe('Air keyboard private mode is on: the box and the key highlights are hidden on screen.')
+    expect(await practice.keyboard.run(['recenter'])).toBe('Recentering the air keyboard on your hands.')
+    expect(actions(practice)).toEqual(['private', 'recenter'])
+  })
+
+  test('with no keyboard open, recenter, private and public say so and send nothing (the helper would drop them, and a new open starts public)', async () => {
+    const notOpen = (action: string): string => `The air keyboard is not open. Open it first, then use ${action}.`
+    const r = rig()
+    // Never opened: no event yet.
+    for (const action of ['recenter', 'private', 'public']) expect(await r.keyboard.run([action]), action).toBe(notOpen(action))
+    expect(r.sent).toEqual([])
+    // Closed again: the same, and the reply never claims private mode is on.
+    r.keyboard.onEvent(OPEN)
+    r.keyboard.onEvent(event({ state: 'closed', reason: 'command' }))
+    for (const action of ['recenter', 'private', 'public']) expect(await r.keyboard.run([action]), `closed ${action}`).toBe(notOpen(action))
+    expect(r.sent).toEqual([])
+    // A helper that restarted took its keyboard with it.
+    r.keyboard.onEvent(OPEN)
+    r.keyboard.reset()
+    expect(await r.keyboard.run(['private'])).toBe(notOpen('private'))
+    expect(r.sent).toEqual([])
+    // Open again: it goes through.
+    r.keyboard.onEvent(OPEN)
+    expect(await r.keyboard.run(['private'])).toBe('Air keyboard private mode is on: the box and the key highlights are hidden on screen.')
+    expect(bodies(r)).toEqual([{ action: 'private' }])
+  })
+
+  test('the closed-keyboard answer comes after the off and too-old answers, which still win', async () => {
+    const off = rig({ keyboard: false })
+    expect(await off.keyboard.run(['private'])).toBe(OFF)
+    const old = rig({ capabilities: ['ptt'] })
+    expect(await old.keyboard.run(['private'])).toBe(TOO_OLD)
+    const down = rig()
+    down.state.notRunning = 'Hand control is off. Turn it on with /jarvis hands on.'
+    expect(await down.keyboard.run(['recenter'])).toBe('Hand control is off. Turn it on with /jarvis hands on.')
+    expect(off.sent).toEqual([])
+    expect(old.sent).toEqual([])
+    expect(down.sent).toEqual([])
   })
 
   test('the plain subcommands take no words: an extra one is named and nothing is sent', async () => {
@@ -674,7 +718,7 @@ describe('/jarvis hands keyboard: settings', () => {
     expect(KEYBOARD_HELP).toContain('/jarvis hands keyboard practice')
     expect(KEYBOARD_HELP).toContain('press <air|pinch|windows|default>')
     expect(KEYBOARD_HELP).toContain('commit <review|direct|default>')
-    expect(KEYBOARD_HELP).toContain('Nothing reaches another window until you tap Insert three times')
+    expect(KEYBOARD_HELP).toContain('Nothing reaches another window until you tap Insert three times, firmly, with your hand still')
     // It claims no more than the design lets it (SR19).
     expect(KEYBOARD_HELP).not.toMatch(/never|always|cannot be|safe|guarantee|understand/i)
     expect(KEYBOARD_HELP).not.toMatch(/insert (the|it|text)|send (the|it|text)/i)
@@ -789,7 +833,7 @@ describe('events: toasts with fixed words and numbers only', () => {
       ['camera', 'Air keyboard closed: the camera stopped.', false],
       ['error', 'Air keyboard closed after an internal error; hand control carries on.', true],
       ['input_blocked', 'Air keyboard closed: Windows would not take the keys (is the window running as administrator?).', true],
-      ['air_unreliable', 'Air keyboard closed: the camera or hand tracking was too unsteady for tapping.', true],
+      ['air_unreliable', 'Air keyboard closed: the camera or hand tracking was too unsteady for tapping. If the air tap does not work on this camera, try /jarvis hands keyboard press pinch.', true],
       // These show no toast of their own.
       ['command', undefined, false],
       ['close_key', undefined, true],
@@ -1100,6 +1144,23 @@ describe('hands.ts wires the keyboard', () => {
     hands.exit(1)
     await w.settle()
     expect(await jarvis($, 'hands')).not.toContain('review box')
+  })
+
+  test('private, public and recenter reach a keyboard only while the helper says it is open', { options: { handKeyboard: 'on' } }, async ($, on) => {
+    const w = handsWorld(on)
+    const hands = await handsUp($, w)
+    const sent = keyboardSent(w).length
+    expect(await jarvis($, 'hands keyboard private')).toBe('The air keyboard is not open. Open it first, then use private.')
+    expect(keyboardSent(w)).toHaveLength(sent)
+    hands.event({ type: 'keyboard', state: 'open', phase: 'placing', press: 'air', level: 'ok', commit: 'review', lang: 'en', private: false })
+    await w.settle()
+    expect(await jarvis($, 'hands keyboard private')).toBe('Air keyboard private mode is on: the box and the key highlights are hidden on screen.')
+    expect(keyboardSent(w).at(-1)).toEqual({ action: 'private' })
+    hands.event({ type: 'keyboard', state: 'closed', reason: 'fists', discarded: 0 })
+    await w.settle()
+    const after = keyboardSent(w).length
+    expect(await jarvis($, 'hands keyboard recenter')).toBe('The air keyboard is not open. Open it first, then use recenter.')
+    expect(keyboardSent(w)).toHaveLength(after)
   })
 
   test('E8, M6: the tool opens the keyboard for the user, announces it, and cannot do more', { options: { handKeyboard: 'on' } }, async ($, on) => {

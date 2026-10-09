@@ -88,7 +88,7 @@ PRACTICE_TEXT: Final = MappingProxyType(
         "talk": "Talk to the camera as on a call. Keep your hands moving. Do not tap.",
         "start_air": "Practice checks your camera and your taps. Nothing is typed anywhere.",
         "one_hand": "One hand: move to the key, stop, then tap.",
-        "not_usable": "Air tap is not usable on this camera: see the report",
+        "not_usable": "Air tap is not usable on this camera. Use the pinch method.",
         "phrase": "Phrase {n}/{total}",
         "bad_phrase": "a practice phrase uses a character the keyboard does not have",
     }
@@ -624,7 +624,9 @@ def write_marker(
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
     try:
-        temp.write_text(json.dumps(build_marker(result, press, now=now), allow_nan=False) + "\n", encoding="utf-8")
+        # newline="\n": the same bytes on every platform (text mode would write CRLF on Windows).
+        text = json.dumps(build_marker(result, press, now=now), allow_nan=False) + "\n"
+        temp.write_text(text, encoding="utf-8", newline="\n")
         os.replace(temp, path)
     except OSError:
         temp.unlink(missing_ok=True)

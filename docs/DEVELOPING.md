@@ -108,6 +108,14 @@ uvx ruff format --check --config plugin\hands\pyproject.toml plugin\hands
 
 This creates `plugin\hands\.venv`. The tests need no camera and no display: the camera, the tracker and the desktop have fakes (`camera\fake.py`, `tracker\fake.py`, `desktop\fake.py`), gestures are written as scripts of synthetic hands (`tests\scripted.py`, built on `jarvis_hands.synthetic`; `Script.transition(start, end, seconds=...)` blends one pose into another the way a real hand moves, thumb timing and landmark jitter included, which is how the tests catch a fist that clicks on its way closed), and the Windows desktop and reticle code also runs against stand-in Win32 layers that check every call against its declared prototype. On Windows, the tests in `test_desktop_windows.py` and `test_overlay_windows.py` also drive the real cursor and create real windows for a moment, so leave the mouse alone while they run. The real MediaPipe model tests (the tracker, and poses on MediaPipe's own test photos) are skipped unless `JARVIS_HANDS_MODELS_DIR` names a folder for the model and photos (downloaded there when missing, about 8 MB); CI sets it. `tests\conftest.py` holds the `real_model` mark for such tests, the `real_model_path` fixture (the model, checked against its sha256) and `fetch_photo()`.
 
+The air keyboard has its own family, `tests\test_kb_*.py` (with `hands-keyboard.test.ts` on the mod side). `pytest -q plugin\hands\tests -k test_kb_` runs just those: 4923 of the helper's 7242 tests when this was written. They need no camera, display or keyboard either, and **none has run against real Windows input, a real overlay window or a real camera**: the Windows calls go to `FakeWin32`, the rest to `FakeDesktop`, a recording overlay and synthetic hands (`keyboard\synth.py`, `keyboard\rig.py`). Three environment variables change what runs:
+
+- `KB_FULL=1` (`$env:KB_FULL = '1'` in PowerShell) runs the statistical rows over every seed and cell their bounds were measured on, and one bound that depends on machine speed. It is a long run (the parked-hand row N48 alone is about an hour), meant for a release or after a change to `press_air.py`, `synth.py` or `limits.py`, and on the machine the bounds were set on.
+- `KB_FROZEN_BASE=<commit>` turns on two checks that need git: the pointer-path files (the frozen list in `test_kb_static.py`) have an empty diff against that commit, and the hands version was not bumped by the keyboard work. Use the commit the keyboard branched from (`ed04e05`).
+- `JARVIS_HANDS_MODELS_DIR` is the one above; one keyboard test uses it (a photo of two hands, recorded by `keytrace` and replayed by `keyreplay`).
+
+Timing in these tests uses injected clocks and `jarvis_hands.clock.now`, never real sleeps. The whole helper suite took 10 minutes 48 seconds on the development machine after it was trimmed (the target was 8), about 16 minutes is expected on the Windows runner, and the first CI run before the trim took 40 minutes on Windows. The module map, the safety rules with the test that holds each one, and how to add a layout are in [HANDS-KEYBOARD.md](HANDS-KEYBOARD.md#for-developers). Documents must not state how many keys the keyboard has (`test_kb_static.py` scans every `.md` file); say "every key" or name the layout.
+
 MediaPipe is pinned to 0.10.33 on purpose: 0.10.35 and later send usage telemetry to Google with no way to turn it off. Do not upgrade it without checking that is still so.
 
 ### Mod (TypeScript)
@@ -243,6 +251,23 @@ Two more commands help while tuning:
 ```
 
 The doctor reports the helper and library versions, the model, the cameras it can list (with a one-frame test of the chosen one), the displays (virtual ones flagged, such as a Virtual Display Driver screen) and whether the reticle can be shown. The preview draws each hand's landmarks and pose name with the frame rate and the model's time per frame, which is the quickest way to see why a gesture is not recognized. The names are the ones the gesture engine works from: `hover` (pointing, or a relaxed hand), `palm`, `pinch` (thumb and index), `pinch_middle` (thumb and middle), `fist` and `two` (index and middle up: scroll). `--camera` takes an index or part of a camera's name, as does the **Hand control camera** option.
+
+### Air keyboard tools
+
+Three more commands check what only a real PC can settle. They are the same ones the user guide describes ([HANDS-KEYBOARD.md](HANDS-KEYBOARD.md#try-it-on-your-pc)); from a checkout, run them with `uv run --project plugin\hands python -m jarvis_hands ...`.
+
+```powershell
+$py = "$env:USERPROFILE\.jarvis\hands\venv\Scripts\python.exe"
+& $py -m jarvis_hands keytest --inject both --hebrew
+& $py -m jarvis_hands keytrace --yes-record --segments rest:20,wave:20,rest:20 --out "$env:USERPROFILE\kt-room.npz"
+& $py -m jarvis_hands keyreplay "$env:USERPROFILE\kt-room.npz"
+```
+
+- **keytest** types `abc ABC .,'-?/ ok` (and a Hebrew word with `--hebrew`), then `x` and a Backspace, into the window in front after a countdown (`--countdown`, 0 to 60, default 5), one stroke at a time through `KeyStroke` (the allow-list) and `KeyDesktop.send_keys`, the calls the keyboard's run lane ends in (it reads `key_target()` once before it starts and does not go through the sink). `--inject unicode|vk|both`. Click into the target window first. It refuses on a desktop that does not type for real. It prints the median of 100 `key_target()` reads against a 2 ms budget. Output holds fixed sentences and the program name only, never what was typed.
+- **keytrace** records landmarks and times (and, for a drill, key indices as numbers) to an `.npz` file; no picture, window, key or character. It needs `--yes-record` and `--out`, will not overwrite a file, cannot open a camera the hand helper holds (`/jarvis hands pause` first), and takes at most 600 seconds. Segments are `kind:seconds` with `kind` one of `place`, `type`, `tap`, `rest`, `wave`, `drill`; `--seconds N` records one stretch instead.
+- **keyreplay** reads a recording (a practice's own `keyboard-trace-<time>.npz` too) and prints the camera level, the drill and false-tap figures, the per-finger table, phantoms, posture and aim accuracy, and the decision rule. `--set NAME=VALUE` tries a tuning field inside its range, `--csv OUT.csv` writes the per-frame numbers, `--press` replays with the other method, `--no-suggest` skips the search, and `--write` merges clamped suggestions into `keyboard-tuning.json` atomically. It reads the file and writes only the CSV and the tuning file, so it needs no camera and no model.
+
+`keytrace` is the only one of the three that opens the camera and the hand model; the model comes from `/jarvis setup hands` (`--data-dir` names another place).
 
 ## Hand control settings
 

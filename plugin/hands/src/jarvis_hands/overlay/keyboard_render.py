@@ -1081,8 +1081,8 @@ def _compose(base: np.ndarray, geometry: KeyboardGeometry, view: KeyboardView) -
     cv = view.compose
     if cv is not None and geometry.compose is not None:
         _paint_box(out, geometry, m, view, cv)
-    elif geometry.echo[3] > 0:
-        _paint_echo(out, geometry, m, view)
+    elif geometry.echo[3] > 0 or geometry.compose is not None:
+        _paint_echo(out, geometry, m, view)  # the review layout has no compose box in practice: the panel is the row
     if view.private and view.pulse:
         _blit(
             out,
@@ -1168,7 +1168,12 @@ def _paint_strip(out: np.ndarray, geometry: KeyboardGeometry, m: _Metrics, view:
 
 
 def _paint_echo(out: np.ndarray, geometry: KeyboardGeometry, m: _Metrics, view: KeyboardView) -> None:
-    ex, ey, ew, eh = geometry.echo
+    # The direct layout has an echo row. The review layout has none, but in the air practice (no compose box, so
+    # nothing to type into a window) its box panel carries the phrase and what the person has tapped of it.
+    row = geometry.echo if geometry.echo[3] > 0 else geometry.compose
+    if row is None:
+        return
+    ex, ey, ew, eh = row
     echo = "" if view.private else _clean(view.echo)
     prompt = _clean(view.prompt)
     if prompt == _clean(view.strip):

@@ -915,6 +915,53 @@ def test_the_prompt_stands_in_for_an_empty_box_in_review_mode() -> None:
     assert changed(region(out, box_rect), region(render(review("", strip="x")), box_rect)).any()
 
 
+def practice(**kw: Any) -> KeyboardView:
+    """The air practice's view: the review layout with no compose box (nothing reaches a window), so the phrase and
+    the typed echo have the box's panel to themselves."""
+    return view(commit="review", compose=None, **kw)
+
+
+@needs_font
+def test_the_practice_phrase_and_echo_are_painted_in_the_box_panel(spy: TextSpy) -> None:
+    v = practice(strip="Phrase 1/6", prompt="the quick brown fox", echo="the q")
+    out = render(v)
+    panel = geometry_of(v).compose
+    assert panel is not None
+    # the phrase alone moves the box panel, and so does the echo alone
+    assert changed(region(out, panel), region(render(practice(strip="Phrase 1/6", echo="the q")), panel)).any()
+    assert changed(region(out, panel), region(render(practice(strip="Phrase 1/6", prompt=v.prompt)), panel)).any()
+    assert {"the quick brown fox", "the q"} <= set(spy.texts)
+    # and nothing outside the panel and the strip changes: the keys are the keys' own business
+    bare = render(practice(strip="Phrase 1/6"))
+    strip = geometry_of(v).strip
+    mask = changed(out, bare)
+    mask[strip[1] : strip[1] + strip[3], :] = False
+    ys, xs = np.nonzero(mask)
+    assert inside((int(xs.min()), int(ys.min()), int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)), panel)
+
+
+@needs_font
+def test_a_practice_prompt_that_is_the_strip_text_is_not_painted_twice(spy: TextSpy) -> None:
+    render(practice(strip="Tap your left index finger", prompt="Tap your left index finger"))
+    assert spy.texts.count("Tap your left index finger") == 1
+
+
+@needs_font
+def test_a_private_practice_view_paints_no_echo_in_the_panel(spy: TextSpy) -> None:
+    v = practice(strip="Phrase 1/6", prompt="the quick brown fox", echo="secret", private=True)
+    render(v)
+    assert "secret" not in spy.joined()
+    assert "the quick brown fox" in spy.texts  # the phrase is the script's, not the person's
+
+
+@needs_font
+def test_a_practice_view_with_nothing_to_say_leaves_the_panel_as_baked() -> None:
+    v = practice(strip="Phrase 1/6")
+    panel = geometry_of(v).compose
+    assert panel is not None
+    assert not changed(region(render(v), panel), region(plain(v), panel)).any()
+
+
 # --------------------------------------------------------------------------- the box (O41, O42, O44)
 
 
@@ -1068,17 +1115,30 @@ def test_o42_the_private_count_is_the_real_length_not_the_number_of_bullets(spy:
 
 @needs_font
 def test_o44_the_typed_prefix_of_a_run_is_painted_at_reduced_brightness() -> None:
+    """Where "hello" lands depends on the font (Segoe UI on Windows, an Arial-class font on macOS, DejaVu Sans on Linux:
+    the CI runners fail a test with fixed pixel columns), so the typed letters are found as the pixels that change when
+    five characters are marked sent."""
     text = "hello world"
     rect = geometry_of(review()).compose
     assert rect is not None
     full = region(render(review(text, compose=box(text, sent=0))), rect)
     half = region(render(review(text, compose=box(text, sent=5))), rect)
-    left = (slice(0, rect[3]), slice(8, 52))  # "hello": the typed part
-    right = (slice(0, rect[3]), slice(70, 130))  # "world"
+    panel = region(plain(review(text)), rect)  # what the box looks like with no text on it
     red = 2  # premultiplied red: the legend colour is light, the panel's is dark
-    assert 225 <= full[left][..., red].max() <= 240
-    assert 105 <= half[left][..., red].max() <= 125  # 0.45 of that
-    assert np.array_equal(full[right], half[right])  # the rest of the text is as bright as before
+    assert 225 <= full[..., red].max() <= 240
+    dimmed = changed(full, half)
+    assert dimmed.any()
+    # How far a pixel sits above the panel is the ink's coverage times the legend colour, so for a pixel that the ink
+    # covers well it is 0.45 of what it was whatever the glyph shape (the panel's own red would skew a raw ratio).
+    lift_full = full[..., red].astype(float) - panel[..., red]
+    lift_half = half[..., red].astype(float) - panel[..., red]
+    solid = dimmed & (lift_full > 100)
+    assert solid.sum() >= 20
+    ratios = lift_half[solid] / lift_full[solid]
+    assert ratios.min() >= 0.40 and ratios.max() <= 0.50
+    last = int(np.nonzero(dimmed.any(axis=0))[0].max())  # "hello" ends here, whatever the font
+    assert np.array_equal(full[:, last + 1 :], half[:, last + 1 :])  # the rest of the text is as bright as before
+    assert full[:, last + 1 :][..., red].max() > 200  # and there is some: the part that was left alone is not empty
 
 
 @needs_font

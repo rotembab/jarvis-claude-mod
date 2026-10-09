@@ -63,8 +63,6 @@ class _Cfg:
     sigma_win_s: float = 3.0
     sigma_min_n: int = 12
     quiet_speed: float = 0.12
-    cal_k: float = 4.0
-    cal_min: float = 0.07
     lo_k: float = 4.0
     lo_min: float = 0.07
     floor_frac: float = 0.75
@@ -262,7 +260,7 @@ class AirTapPress:
         self._mult = self._c.degraded_mult if level == "degraded" else 1.0
 
     def set_calibrating(self, on: bool) -> None:
-        """The warm-up threshold rule of S6 (more sensitive, because the user taps deliberately)."""
+        """The warm-up threshold rule of S6: the nominal threshold, without the depth and the ladder's multiplier."""
         self._calibrating = on
 
     def quality(self) -> PressQuality:
@@ -375,9 +373,13 @@ class AirTapPress:
     def theta_of(self, st: _Hand, side: Side, i: int) -> float:
         c = self._c
         sg = st.sigma[i]
-        if self._calibrating:
-            return max(c.cal_min, c.cal_k * sg)
         nominal = min(c.theta_max, max(c.theta_min, c.theta_k * sg))
+        if self._calibrating:
+            # Never more sensitive than typing: the warm-up asks for depth 0.10 at least (AIR_WARMUP_MIN_DEPTH, the
+            # default theta_min), so a lower bar here only turns the resting fingers' noise into strays that restart
+            # the sequence (at landmark noise 0.002 a 4 sigma bar armed 4 of 12 two-hand runs, the typing bar 12 of
+            # 12). The depth and the ladder's multiplier belong to the typing threshold below.
+            return nominal
         depth = self._depth.get((side, i))
         if depth is not None:
             lo = max(c.lo_min, c.lo_k * sg, c.floor_frac * nominal)

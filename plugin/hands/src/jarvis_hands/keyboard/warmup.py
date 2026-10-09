@@ -34,11 +34,12 @@ from .types import HandSample, PressEvent, PressName, Side
 PINCH_ARM = 0.60
 PINCH_FALL = 0.50
 PINCH_RISE_S = 3.0
-#: It is valid when the minimum is below RMIN, the finger leads the other three by MARGIN, none of them is below OTHER,
-#: fewer than CURLED fingers are curled and the hand never moves faster than SPEED (frame widths a second).
+#: It is valid when the minimum is below RMIN, the finger leads the other three by MARGIN, fewer than CURLED fingers
+#: are curled and the hand never moves faster than SPEED (frame widths a second). There is no floor on the others: the
+#: neighbours of a pinching finger on a relaxed hand rest at 0.3 to 0.5 of the thumb, and the margin already refuses a
+#: finger that is nearly as closed as the one pinching.
 PINCH_RMIN = 0.40
 PINCH_MARGIN = 0.08
-PINCH_OTHER = 0.45
 PINCH_CURLED = 3
 PINCH_SPEED = 0.5
 #: ``open_f = max(tuning.open, close_f + PINCH_OPEN_GAP)``.
@@ -235,8 +236,6 @@ class Warmup:
         others = [f.ratio for i, f in enumerate(hand.fingers) if i != finger]
         if min(others) - mine < PINCH_MARGIN:
             return False  # not clearly the smallest of the four
-        if min(others) < PINCH_OTHER:
-            return False  # another finger is nearly as closed
         return sum(1 for f in hand.fingers if f.curled) < PINCH_CURLED
 
     # ------------------------------------------------------------------------------------------------------- air

@@ -127,6 +127,24 @@ def test_a12_one_right_hand_puts_j_k_l_quote_under_its_fingers() -> None:
     assert set(placement.home) == {"right"}
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a12_one_flipped_label_in_a_lone_hands_window_does_not_name_the_other_cluster(side: Side) -> None:
+    """The engine's label is its newest guess and flips for a frame; the cluster is the label the hand carried for most
+    of the window, not the one it carried in the last frame."""
+    other: Side = "left" if side == "right" else "right"
+    x = 0.30 if side == "left" else 0.70
+    steady = hand(1, side, cluster(x, 0.55))
+    flipped = hand(1, other, cluster(x, 0.55))
+    frames = [[steady], [steady], [steady], [flipped]]
+    placement = place_plane(frames, layout=DIRECT, tuning=TUNING)
+    assert set(placement.home) == {side}
+    assert set(placement.home_f) == {(side, f) for f in range(4)}
+    assert math.isclose(placement.home[side][0], 2.0 if side == "left" else 8.0, abs_tol=1e-9)
+    # the flipped sample alone, first or last, changes nothing against a clean window
+    clean = place_plane(window(steady), layout=DIRECT, tuning=TUNING)
+    assert placement.plane == clean.plane and placement.home == clean.home
+
+
 def test_a12_two_hands_set_the_pitch_from_their_distance_and_centre_between_them() -> None:
     left = hand(1, "left", cluster(0.30, 0.55))
     right = hand(2, "right", cluster(0.30 + 6.0 * PX0 * 1.05, 0.55))

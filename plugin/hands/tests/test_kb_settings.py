@@ -44,6 +44,13 @@ WIRE_TO_FIELD = {
 }
 
 
+def short_id(value: Any) -> str:
+    """``repr`` for a test's id, cut when long: an id is also an environment value (PYTEST_CURRENT_TEST), and 10**400
+    is 400 digits of every case's name."""
+    text = repr(value)
+    return text if len(text) <= 60 else f"{text[:24]}...[{len(text)} characters]"
+
+
 def state(settings: KeyboardSettings) -> dict[str, Any]:
     return dataclasses.asdict(settings)
 
@@ -92,7 +99,7 @@ def test_the_wire_keys() -> None:
             {"press": "pinch", "commit": "direct", "layout": "en", "size": 1.2, "dock": "bottom"},
         ),
     ],
-    ids=repr,
+    ids=short_id,
 )
 def test_a_valid_body_changes_exactly_what_it_names(body: dict[str, Any], changed: dict[str, Any]) -> None:
     s = KeyboardSettings()
@@ -179,7 +186,7 @@ BAD_BODIES: list[Any] = [
 ]
 
 
-@pytest.mark.parametrize("body", BAD_BODIES, ids=repr)
+@pytest.mark.parametrize("body", BAD_BODIES, ids=short_id)
 def test_a_bad_body_raises_value_error_and_changes_nothing(body: Any) -> None:
     s = KeyboardSettings()
     s.apply({"enabled": True, "size": 1.25, "press": "pinch"})
@@ -227,7 +234,7 @@ def test_air_with_direct_is_refused_with_the_fixed_text() -> None:
         ({"press": "pinch", "commit": "direct"}, {"enabled": True}, True),
         ({}, {"enabled": True}, True),
     ],
-    ids=repr,
+    ids=short_id,
 )
 def test_the_merged_result_is_checked(start: dict[str, Any], body: dict[str, Any], ok: bool) -> None:
     s = KeyboardSettings()

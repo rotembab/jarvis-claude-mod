@@ -31,8 +31,11 @@ from .compose import ComposeBuffer, insert_check
 from .limits import (
     ABORT_SHOW_S,
     COMPOSE_MAX,
+    GUARD_FIRM_CONF,
+    GUARD_FIRM_TAPS,
     GUARD_MAX_S,
     GUARD_MIN_S,
+    GUARD_STILL_SPEED,
     INSERT_GAP_S,
     INSERT_MAX_S,
     INSERT_TAPS,
@@ -44,7 +47,7 @@ from .limits import (
     STORM_N,
     STORM_S,
 )
-from .types import Decoder, GuardKind, Hold, InsertAbort, InsertResult, KeyKind, ReviewState, RunKind, Touch
+from .types import Decoder, GuardKind, Hold, InsertAbort, InsertResult, KeyKind, ReviewState, RunKind, Side, Touch
 
 #: Which key starts which guard, and how many taps each needs. INSERT_TAPS and SEND_TAPS are floors of 3 (limits.py).
 GUARD_OF_KEY = {"insert": "insert", "clear": "clear", "enter": "send", "close": "close"}
@@ -59,21 +62,26 @@ REVIEW_TEXT: Final = MappingProxyType(
     {
         "hint_empty": "Tap letters. Insert types them into the window in front.",
         "counter": "-> {target}   {n}/200",
-        "arm_insert_1": "Insert {n} characters into {target}? Tap Insert 2 more times.",
+        # No "times": with 200 characters and a long window name the sentence is the widest of the strip, and on a
+        # fallback font (DejaVu, a quarter wider than Segoe UI) "times" pushes "firmly." off it, the one word that
+        # is new here.
+        "arm_insert_1": "Insert {n} characters into {target}? Tap Insert 2 more, firmly.",
         "arm_insert_2": "Tap Insert once more to type into {target}.",
+        "arm_insert_firm": "Tap Insert once more, a little firmer.",
+        "still_insert": "Hold your hand still, then tap Insert.",
         "arm_clear": "Clear the box? Tap Clear again.",
         "arm_close": "Close and throw away {n} characters? Tap Close again.",
-        "arm_send_1": "Press Enter in {target}? Tap Send 2 more times.",
+        "arm_send_1": "Press Enter in {target}? Tap Send 2 more times, firmly.",
         "arm_send_2": "Tap Send once more to press Enter in {target}.",
+        "arm_send_firm": "Tap Send once more, a little firmer.",
+        "still_send": "Hold your hand still, then tap Send.",
         "inserting": "Typing {sent}/{total} into {target}. Tap Insert to stop.",
         "sending": "Pressing Enter in {target}.",
         "done": "Typed {n} characters into {target}.",
-        "done_send": "Typed {n} characters into {target}. Tap Send 3 times within 10 s to press Enter.",
+        "done_send": "Typed {n} characters into {target}. Send: 3 firm taps within 10 s.",
         "done_slash": 'Typed {n} characters. Not sent: it starts with "/". Press Enter yourself.',
         "done_bang": 'Typed {n} characters. Not sent: it starts with "!". Press Enter yourself.',
-        "done_prefix": (
-            'Typed {n} characters. Not sent: this session inserted text starting with "/" or "!". Press Enter yourself.'
-        ),
+        "done_prefix": 'Typed {n} characters. Not sent: text began with "/" or "!". Press Enter yourself.',
         "sent": "Enter pressed.",
         "aborted": "Typed {sent} of {total}, then stopped ({why}). The rest is still in the box.",
         "full": "The box is full (200). Insert it or clear it.",
@@ -148,6 +156,20 @@ class LastInsert:
     chars: int
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class GuardTap:
+    """What the air press knew of a tap on Insert or Send, for the guard to weigh (2.13.4): how firm it was, how fast
+    the hand moved at that frame, and whose finger. Never where it fell (SR13); a pinch tap has none (``None``)."""
+
+    conf: float
+    speed: float
+    side: Side
+    finger: int
+
+    def __repr__(self) -> str:
+        return "<GuardTap>"
+
+
 @dataclass
 class _Guard:
     kind: GuardKind
@@ -156,6 +178,10 @@ class _Guard:
     n: int
     #: The box version when armed: any change of the box since voids the guard.
     version: int
+    #: The finger of the run (a tap by another finger starts it again) and how many counted taps were firm. A tap
+    #: without ``GuardTap`` is a firm tap of nobody in particular.
+    who: tuple[Side, int] | None = None
+    firm: int = 0
 
 
 @dataclass(repr=False)
@@ -226,8 +252,13 @@ class ReviewMachine:
 
     # ------------------------------------------------------------------------------------------------------- taps
 
-    def tap(self, kind: KeyKind, ch: str, t: float, *, touch: Touch | None = None) -> InsertStep | None:
-        """Precondition: no hold, session phase is typing. Returns the first step when this tap starts a run."""
+    def tap(
+        self, kind: KeyKind, ch: str, t: float, *, touch: Touch | None = None, guard: GuardTap | None = None
+    ) -> InsertStep | None:
+        """Precondition: no hold, session phase is typing. Returns the first step when this tap starts a run.
+
+        ``touch`` is for the characters, ``guard`` for Insert and Send (the air press's evidence; None is the plain
+        count of a pinch, a test or a replay)."""
         self.flash = None
         self._note = None
         if self._run is not None:
@@ -252,9 +283,9 @@ class ReviewMachine:
         elif kind == "clear":
             self._tap_clear(t)
         elif kind == "insert":
-            return self._tap_insert(t)
+            return self._tap_insert(t, guard)
         elif kind == "enter":
-            return self._tap_enter(t)
+            return self._tap_enter(t, guard)
         elif kind == "close":
             self._tap_close(t)
         elif kind == "chip":
@@ -338,7 +369,7 @@ class ReviewMachine:
             self.counts["cleared"] += 1
             self._edited()
 
-    def _tap_insert(self, t: float) -> InsertStep | None:
+    def _tap_insert(self, t: float, guard: GuardTap | None) -> InsertStep | None:
         why = insert_check(self.buffer.text(), alphabet=self.buffer.alphabet)
         if why is not None:
             self.counts[f"refused_{why}"] += 1
@@ -347,11 +378,11 @@ class ReviewMachine:
             if why == "empty":
                 self._set_note("empty_insert", t)
             return None
-        if self._count_guard("insert", t):
+        if self._count_guard("insert", t, guard):
             return self._start_text(t)
         return None
 
-    def _tap_enter(self, t: float) -> InsertStep | None:
+    def _tap_enter(self, t: float, guard: GuardTap | None) -> InsertStep | None:
         why = self._send_refusal(t)
         if why is not None:
             self.counts[why] += 1
@@ -362,7 +393,7 @@ class ReviewMachine:
             elif why != "refused_send_prefix":  # a prefix refusal is already said by the strip's `done_*` sentence
                 self._set_note("send_none", t)
             return None
-        if self._count_guard("send", t):
+        if self._count_guard("send", t, guard):
             self.last_insert = None  # single-shot: an attempt that reaches the sink consumes the opportunity
             return self._start_enter(t)
         return None
@@ -385,11 +416,28 @@ class ReviewMachine:
 
     # ----------------------------------------------------------------------------------------------------- guards
 
-    def _count_guard(self, kind: GuardKind, t: float) -> bool:
-        """One tap on a guarded key (2.13.4): True when it confirms. Sets ``flash``: a bounce has none."""
+    def _count_guard(self, kind: GuardKind, t: float, guard: GuardTap | None = None) -> bool:
+        """One tap on a guarded key (2.13.4): True when it confirms. Sets ``flash``: a bounce has none.
+
+        An air tap for Insert or Send must come from a hand at rest, and the run must be one finger's with
+        GUARD_FIRM_TAPS firm taps among those counted: a hand that gestures makes taps that are fast, soft and of every
+        finger, and three of those in a row are not rare (N48). A tap from a moving hand is refused as it stands: it
+        neither counts nor clears, so the user who tapped while the hand drifted taps again."""
+        if guard is not None and guard.speed > GUARD_STILL_SPEED:
+            self.counts["guard_moving"] += 1
+            self.flash = "drop"
+            self._set_note(f"still_{kind}", t)
+            return False
+        who = (guard.side, guard.finger) if guard is not None else None
+        firm = 1 if guard is None or guard.conf >= GUARD_FIRM_CONF else 0
         g = self._guard
         if g is None or g.kind != kind or t - g.t_first > GUARD_WINDOW[kind] or g.version != self.buffer.version:
-            self._guard = _Guard(kind, t, t, 1, self.buffer.version)
+            self._guard = _Guard(kind, t, t, 1, self.buffer.version, who, firm)
+            self.flash = "ok"
+            return False
+        if who != g.who:
+            self._guard = _Guard(kind, t, t, 1, self.buffer.version, who, firm)
+            self.counts["guard_finger"] += 1
             self.flash = "ok"
             return False
         if t - g.t_last < GUARD_MIN_S:
@@ -397,8 +445,12 @@ class ReviewMachine:
             return False
         g.n += 1
         g.t_last = t
+        g.firm += firm
         self.flash = "ok"
         if g.n < GUARD_TAPS[kind]:
+            return False
+        if g.firm < min(GUARD_FIRM_TAPS, GUARD_TAPS[kind]):
+            self.counts["guard_weak"] += 1  # counted enough, not firm enough: the window stays open for another tap
             return False
         self._guard = None
         return True
@@ -606,7 +658,7 @@ class ReviewMachine:
             state=self.state,
             sent=run.sent if run is not None else 0,
             guard=g.kind if g is not None else None,
-            guard_taps=g.n if g is not None else 0,
+            guard_taps=min(g.n, GUARD_TAPS[g.kind] - 1) if g is not None else 0,
             guard_need=GUARD_TAPS[g.kind] if g is not None else 0,
             guard_left=max(0.0, 1.0 - (t - g.t_first) / GUARD_WINDOW[g.kind]) if g is not None else 0.0,
             can_send=self._send_refusal(t) is None,
@@ -626,6 +678,9 @@ class ReviewMachine:
             return text["storm"]
         g = self._live_guard(t)
         if g is not None:
+            note = self._note
+            if note is not None and t <= note[1] and note[0].startswith("still_"):
+                return text[note[0]]
             return self._guard_text(g, where)
         run = self._run
         if run is not None:
@@ -650,10 +705,10 @@ class ReviewMachine:
         text = REVIEW_TEXT
         n = len(self.buffer)
         if g.kind == "insert":
-            key = "arm_insert_1" if g.n == 1 else "arm_insert_2"
+            key = "arm_insert_1" if g.n == 1 else "arm_insert_firm" if g.n >= GUARD_TAPS["insert"] else "arm_insert_2"
             return text[key].format(n=n, target=where)
         if g.kind == "send":
-            key = "arm_send_1" if g.n == 1 else "arm_send_2"
+            key = "arm_send_1" if g.n == 1 else "arm_send_firm" if g.n >= GUARD_TAPS["send"] else "arm_send_2"
             return text[key].format(target=where)
         if g.kind == "clear":
             return text["arm_clear"]

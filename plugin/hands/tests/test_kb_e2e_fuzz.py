@@ -19,7 +19,8 @@ Whatever the program does the desktop may only ever see:
 
 These are properties of every stream, so they are asserted for every seed. How much a seed typed is not: a separate
 check per variant asserts that the programs typed enough, over all seeds, to make the invariants mean something.
-Seeds 0 to 5 run by default and 0 to 47 with ``KB_FULL=1``.
+Seeds 0 to 2 run by default (each is a program of 36 steps through a whole session, three to four seconds) and 0 to 47
+with ``KB_FULL=1``.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from jarvis_hands.keyboard.types import Side
 
 #: Things the program does to a session.
 STEPS = 36
-SEEDS = range(48) if os.environ.get("KB_FULL") == "1" else range(6)
+SEEDS = range(48) if os.environ.get("KB_FULL") == "1" else range(3)
 LETTERS = "abcdefghijklmnopqrstuvwxyz'"
 #: How much of the default a random tuning field may move, as a fraction of its clamp.
 SPREAD = 0.15

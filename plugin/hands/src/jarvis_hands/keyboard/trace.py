@@ -147,7 +147,9 @@ class TapLog:
             current = 0
         if current > 0 and current + size > self._max:
             self._rotate()
-        with self.path.open("a", encoding="utf-8") as out:
+        # newline="\n": the size above counts a line break as one byte, and text mode would write two on Windows, so the
+        # file would outgrow its cap by a byte a line and rotate a line early.
+        with self.path.open("a", encoding="utf-8", newline="\n") as out:
             out.write("".join(lines))
         return len(lines)
 

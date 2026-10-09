@@ -1487,8 +1487,10 @@ class WindowsDesktop(Desktop):
         told, level = _process_integrity(self._w, pid)
         if not told:
             return True
-        # Compared by band (the high byte of the RID): Medium+ (0x2100) is a Medium process for this purpose.
-        elevated = level is None or level >= INTEGRITY_HIGH_RID or level >> 12 > self.integrity >> 12
+        # The exact RID, not its band: SendInput returns the full count when UIPI drops the keys (the docs say so),
+        # so this is the only protection there is, and a UIAccess (0x2010) or Medium+ (0x2100) window is above a
+        # Medium helper even though both share its band. Whether Windows really refuses them can't be tested here.
+        elevated = level is None or level >= INTEGRITY_HIGH_RID or level > self.integrity
         if len(self._key_blocked) >= BLOCKED_CACHE_SIZE:
             self._key_blocked.clear()
         self._key_blocked[key] = elevated
@@ -1574,9 +1576,11 @@ class WindowsDesktop(Desktop):
         """Types the strokes in order, one SendInput call each. The number sent in full.
 
         Every stroke is checked and turned into events before the first is sent, so a refused one sends nothing.
-        InputBlocked when Windows took none of the first stroke (UIPI, the secure desktop); OSError when it took
-        part of one (its missing key-ups are sent at once, or kept and retried). A later stroke Windows refuses
-        whole ends the call with the count so far. Nothing in an exception or a log names a typed character.
+        InputBlocked when Windows took none of the first stroke (the secure desktop, BlockInput); OSError when it
+        took part of one (its missing key-ups are sent at once, or kept and retried). A later stroke Windows
+        refuses whole ends the call with the count so far. SendInput does not report a UIPI block (it returns the
+        full count and the keys vanish), so ``key_target``'s elevation rule is the protection against that, not
+        this. Nothing in an exception or a log names a typed character.
         """
         if inject not in ("unicode", "vk"):
             raise ValueError("inject must be 'unicode' or 'vk'")

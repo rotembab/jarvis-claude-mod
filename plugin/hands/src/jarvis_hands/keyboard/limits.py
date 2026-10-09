@@ -138,6 +138,16 @@ SEND_TAPS = 3
 #: GUARD_MAX_S.
 GUARD_MIN_S = 0.25
 GUARD_MAX_S = 6.0
+#: An air tap counts toward a guard (Insert, Send) only from a hand at rest: its anchor speed (``HandSample.speed``,
+#: frame widths per second) at the frame of the press is at most GUARD_STILL_SPEED. A hand on the move taps by accident;
+#: a user who means Insert holds the hand over the key (0.013 at the 95th percentile of the typist model, 0.07 at the
+#: 5th of the phantoms of a moving hand). Below Tuning.still_speed (0.15), which gates placing, not tapping.
+GUARD_STILL_SPEED = 0.10
+#: Of the taps of one guard run (one finger's), at least GUARD_FIRM_TAPS must be firm: ``PressEvent.conf`` at least
+#: GUARD_FIRM_CONF. Stillness stops the phantoms of a moving hand and firmness those of landmark noise on a hand at
+#: rest; neither alone ends N48 (0.7 let a still hand at noise 0.002 through). Air presses only: a pinch has no conf.
+GUARD_FIRM_CONF = 0.8
+GUARD_FIRM_TAPS = 2
 #: Minimum spacing of two characters of a run.
 INSERT_GAP_S = 0.030
 #: The sink's run-lane breaker: the 81st send in 2.0 s closes the session (runaway).

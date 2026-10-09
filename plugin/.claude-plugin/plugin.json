@@ -141,14 +141,14 @@
     "handKeyboard": {
       "type": "string",
       "title": "Air keyboard",
-      "description": "on: lets you type in the air on an on-screen keyboard shown by hand control (tap a finger over a key). Needs hand control on and a practice run first (/jarvis hands keyboard practice). What you tap goes into a review box on the keyboard; nothing reaches another window until you tap Insert three times. Letters, space, backspace and a few punctuation marks only (Enter only as Send, right after an Insert); it refuses administrator windows and the password boxes it can recognise, and it cannot see Claude Code's prompts. off: the keyboard cannot open. This option is the only switch; commands and the hands tool cannot turn it on.",
+      "description": "on: lets you type in the air on an on-screen keyboard shown by hand control (tap a finger over a key). Needs hand control on and a practice run first (/jarvis hands keyboard practice). What you tap goes into a review box on the keyboard; nothing reaches another window until you tap Insert three times, firmly, with your hand still. Letters, space, backspace and a few punctuation marks only (Enter only as Send, right after an Insert); it refuses administrator windows and the password boxes it can recognise, and it cannot see Claude Code's prompts. off: the keyboard cannot open. This option is the only switch; commands and the hands tool cannot turn it on.",
       "options": ["on", "off"],
       "default": "off"
     },
     "handKeyboardPress": {
       "type": "string",
       "title": "Air keyboard press method",
-      "description": "How a key is pressed: air (tap a finger in the air, the default; letters go to a review box first), pinch (pinch your thumb to the finger over a key), windows (just open Windows' own on-screen keyboard and press its keys with the hand-control pointer; Jarvis' keyboard safeguards (administrator-window refusal, Enter guard, rate limits, yielding to your real keyboard) do NOT apply to it and it can type into administrator windows).",
+      "description": "How a key is pressed: air (tap a finger in the air, the default; letters go to a review box first), pinch (pinch your thumb to the finger over a key), windows (just open Windows' own on-screen keyboard and press its keys with the hand-control pointer; Jarvis' keyboard safeguards (administrator-window refusal, Enter guard, rate limits, yielding to your real keyboard) do NOT apply to it and it can type into administrator windows). /jarvis hands keyboard press <method> overrides this option until you run /jarvis hands keyboard press default.",
       "options": ["air", "pinch", "windows"],
       "default": "air"
     }

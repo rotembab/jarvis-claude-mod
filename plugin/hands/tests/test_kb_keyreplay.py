@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
+import functools
+import hashlib
 import io
 import json
 import os
@@ -81,7 +84,28 @@ def with_prompts(path: Path, rows: list[tuple[int, int, int, int, int]]) -> None
 
 WARM_ORDER = [(side, f) for f in range(4) for side in ("right", "left")]  # AIR_WARMUP_ORDER: right first, then left
 
+_TRACES_MADE: dict[str, tuple[bytes, Made]] = {}
 
+
+def made_once(make: Any) -> Any:
+    """A trace is a pure function of its arguments (the generator is seeded) and a dozen tests ask for the same one:
+    the file of the first is kept, and the others get a copy of it at their own path."""
+
+    @functools.wraps(make)
+    def wrapper(path: Path, **kwargs: Any) -> Made:
+        key = repr(sorted(kwargs.items()))
+        if key not in _TRACES_MADE:
+            made = make(path, **kwargs)
+            _TRACES_MADE[key] = (path.read_bytes(), made)
+            return made
+        content, made = _TRACES_MADE[key]
+        path.write_bytes(content)
+        return replace(made, path=path, taps=list(made.taps), prompts=list(made.prompts))
+
+    return wrapper
+
+
+@made_once
 def drill_trace(
     path: Path,
     *,
@@ -185,6 +209,73 @@ def replay(path: Path, *argv: str, data_dir: Path | None = None) -> tuple[int, s
     extra = ["--data-dir", str(data_dir)] if data_dir is not None else []
     code = keyreplay.run(arguments(str(path), *extra, *argv), out=out)
     return code, out.getvalue()
+
+
+# ------------------------------------------------------------------------------------------ the passes made once
+
+#: One press pass (the detector over every frame of a recording) takes about a second, and it is a pure function of
+#: the recording, the tuning, the press method, the segment kinds and the depths. ``suggest()`` replays one file with
+#: some forty candidate tunings, and the tests of a report ask for the same replay again and again: half of all the
+#: passes of this file were repeats, and that was a third of its run time on a Windows runner. A pass already made is
+#: kept for the rest of the run and every caller gets its own deep copy, so a test that edits what it was given cannot
+#: reach the next. The tests that mean to ask twice (determinism) request ``unmemoised``.
+_ORIGINAL_PRESS_PASS = keyreplay._press_pass
+_ORIGINAL_HAND_PASS = keyreplay._hand_pass
+_PASSES_MADE: dict[tuple[Any, ...], Any] = {}
+_HANDS_MADE: dict[tuple[Any, ...], Any] = {}
+
+
+def _recording_key(data: Any) -> str:
+    digest = hashlib.sha1(usedforsecurity=False)
+    for array in (data.t, data.present, data.side, data.score, data.lm):
+        digest.update(np.ascontiguousarray(array).tobytes())
+    digest.update(repr((data.width, data.height, data.segments, data.press)).encode())
+    return digest.hexdigest()
+
+
+def _press_pass_made_once(data, hands, tuning, name, kinds, *, depths=None):  # type: ignore[no-untyped-def]
+    key = (
+        _recording_key(data),
+        repr(tuning),
+        name,
+        tuple(kinds),
+        repr(sorted(depths.items())) if depths else None,
+    )
+    if key not in _PASSES_MADE:
+        _PASSES_MADE[key] = copy.deepcopy(_ORIGINAL_PRESS_PASS(data, hands, tuning, name, kinds, depths=depths))
+    return copy.deepcopy(_PASSES_MADE[key])
+
+
+def _hand_pass_made_once(data, tuning, layout):  # type: ignore[no-untyped-def]
+    """The tracker's pass is made once for a recording and a tuning as well. Its samples are frozen and only read; a
+    caller gets its own ``_Hands`` (a test assigns ``levels`` and ``placement`` on the one it holds)."""
+    key = (_recording_key(data), repr(tuning), layout.name)
+    if key not in _HANDS_MADE:
+        _HANDS_MADE[key] = _ORIGINAL_HAND_PASS(data, tuning, layout)
+    return replace(_HANDS_MADE[key], levels=dict(_HANDS_MADE[key].levels))
+
+
+@pytest.fixture(autouse=True)
+def _passes_made_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(keyreplay, "_press_pass", _press_pass_made_once)
+    monkeypatch.setattr(keyreplay, "_hand_pass", _hand_pass_made_once)
+
+
+@pytest.fixture
+def unmemoised(_passes_made_once: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The replay is the real one every time: for the test that asks whether it gives the same answer twice."""
+    monkeypatch.setattr(keyreplay, "_press_pass", _ORIGINAL_PRESS_PASS)
+    monkeypatch.setattr(keyreplay, "_hand_pass", _ORIGINAL_HAND_PASS)
+
+
+@pytest.fixture(autouse=True)
+def _nothing_of_the_real_home_folder(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory) -> None:
+    """``replay`` without ``--data-dir`` reads (and ``--write`` writes) the tuning file of the data folder, which is
+    the real ``~/.jarvis`` unless something points elsewhere. A folder of its own, not the test's ``tmp_path``: a test
+    that checks where a file lands looks inside its ``tmp_path`` and must not find this one there."""
+    nowhere = tmp_path_factory.mktemp("home")
+    monkeypatch.delenv("JARVIS_DATA_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: nowhere))
 
 
 # ------------------------------------------------------------------------------------------------- the module
@@ -328,6 +419,23 @@ def test_a_write_makes_the_file_with_the_group_of_each_field_and_loads_back(tmp_
     assert (loaded.air_theta_k, loaded.air_aim, loaded.pitch) == (6.0, "onset", 0.05)
 
 
+def test_a_write_asks_for_unix_line_ends_so_the_file_is_the_same_bytes_on_every_platform(tmp_path, monkeypatch):
+    """Text mode turns "\\n" into CRLF on Windows; the loader copes, but a file that differs by platform is a diff for
+    nothing. A Linux run cannot see the translation, so the call itself is pinned."""
+    path = tuning_path(tmp_path)
+    asked = []
+    real = Path.write_text
+
+    def spy(self, data, *args, **kwargs):
+        asked.append(kwargs.get("newline"))
+        return real(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    keyreplay.write_tuning(path, {"pitch": 0.05})
+    assert asked == ["\n"]
+    assert b"\r" not in path.read_bytes()
+
+
 def test_a_write_merges_into_what_is_there_and_keeps_the_rest(tmp_path):
     path = tuning_path(tmp_path)
     path.parent.mkdir(parents=True)
@@ -411,7 +519,10 @@ def test_no_safety_constant_of_limits_can_be_named_in_a_write(tmp_path):
 @pytest.mark.parametrize(
     "content",
     [b"{not json", b"[]", b'"text"', b'{"version": 2, "air": {}}', b'{"version": "1"}', b'{"version": 1, "air": 5}',
-     b'{"version": 1, "air": []}', b"\xff\xfe", b"x" * 70000,
+     b'{"version": 1, "air": []}', b"\xff\xfe",
+     # An id is the test's name in PYTEST_CURRENT_TEST, and Windows refuses an environment value over 32,767
+     # characters: a 70,000-byte payload in its own id errored on the Windows runner at setup and at teardown.
+     pytest.param(b"x" * 70000, id="too_large"),
      b'{"version": 1, "other": NaN}', b'{"version": 1, "air": {"x": Infinity}}'],  # not JSON: another reader would balk
 )  # fmt: skip
 def test_a_write_over_a_file_it_cannot_read_as_a_tuning_file_refuses_and_leaves_it_as_it_is(tmp_path, content):
@@ -785,7 +896,7 @@ def test_the_taps_are_what_the_detector_gives_on_the_recorded_frames(clean):
     assert len(counted) > 30
 
 
-def test_the_replay_is_deterministic(clean):
+def test_the_replay_is_deterministic(clean, unmemoised):
     one = keyreplay.analyse(keyreplay.load(clean.path), Tuning(), suggest=False)
     two = keyreplay.analyse(keyreplay.load(clean.path), Tuning(), suggest=False)
     assert one == two
@@ -1099,7 +1210,8 @@ def test_no_suggest_leaves_the_block_out(clean):
 def test_the_tuning_a_file_asks_for_is_the_base_of_the_search(weak):
     """Starting from the better numbers, there is nothing left for the search to add."""
     better = replace(Tuning(), air_theta_min=0.08)
-    suggest = keyreplay.analyse(keyreplay.load(weak.path), better, suggest=True)["suggest"]
+    only_theta_min = tuple(sorted(SEARCHED - {"air_theta_min"}))  # the field the base was moved on
+    suggest = keyreplay.analyse(keyreplay.load(weak.path), better, suggest=True, pinned=only_theta_min)["suggest"]
     assert suggest["base_recall"] > 0.6 and "air_theta_min" not in suggest["values"]
 
 
@@ -1570,17 +1682,20 @@ def test_the_header_gives_the_pace_the_camera_held_and_the_pace_it_kept_over_the
     assert "30.0 fps by the median frame gap" in header and "17.1 fps over the whole recording" in header
 
 
-def test_the_data_dir_is_the_argument_then_the_environment_then_the_home_folder(clean, tmp_path, monkeypatch):
+def test_the_data_dir_is_the_argument_then_the_environment_then_the_home_folder(tmp_path, monkeypatch):
+    path = drill_trace(
+        tmp_path / "t.npz", prompts=6
+    ).path  # where the file goes is not about the recording: a short one
     elsewhere, home = tmp_path / "env", tmp_path / "home"
     monkeypatch.setenv("JARVIS_DATA_DIR", str(elsewhere))
-    assert replay(clean.path, "--no-suggest", "--write", "--set", "air_theta_k=6.0")[0] == 0
+    assert replay(path, "--no-suggest", "--write", "--set", "air_theta_k=6.0")[0] == 0
     assert load_tuning(elsewhere).air_theta_k == 6.0
     explicit = tmp_path / "explicit"
-    assert replay(clean.path, "--no-suggest", "--write", "--set", "air_theta_k=5.0", data_dir=explicit)[0] == 0
+    assert replay(path, "--no-suggest", "--write", "--set", "air_theta_k=5.0", data_dir=explicit)[0] == 0
     assert load_tuning(explicit).air_theta_k == 5.0 and load_tuning(elsewhere).air_theta_k == 6.0
     monkeypatch.delenv("JARVIS_DATA_DIR")
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    assert replay(clean.path, "--no-suggest", "--write", "--set", "air_theta_k=7.0")[0] == 0
+    assert replay(path, "--no-suggest", "--write", "--set", "air_theta_k=7.0")[0] == 0
     assert load_tuning(home / ".jarvis").air_theta_k == 7.0
 
 
@@ -1599,7 +1714,8 @@ def test_a_candidate_that_breaks_a_relation_between_two_fields_is_never_tried(we
     """With every candidate taken as better, the lower limit still stops short of the upper one."""
     monkeypatch.setattr(keyreplay.Analysis, "_better", staticmethod(lambda new, old: True))
     tuning = Tuning(air_theta_max=0.18)  # the lowest the range allows: 0.20 would be above it
-    values = keyreplay.Analysis(keyreplay.load(weak.path), tuning).suggest()["values"]
+    only_theta_min = tuple(sorted(SEARCHED - {"air_theta_min"}))  # the one field the relation is about
+    values = keyreplay.Analysis(keyreplay.load(weak.path), tuning).suggest(pinned=only_theta_min)["values"]
     assert values["air_theta_min"] == 0.16
     assert keyreplay._fits(replace(tuning, **values))
 
@@ -1612,7 +1728,9 @@ def test_values_that_are_better_in_the_search_but_not_in_the_whole_replay_are_no
         return (0.0, 0.0, named) if self.tuning != Tuning() else (recall, false_rate, named)
 
     monkeypatch.setattr(keyreplay.Analysis, "_measure", measure)
-    suggest = keyreplay.Analysis(keyreplay.load(weak.path), Tuning()).suggest()
+    # on this recording the search finds air_theta_min alone (see test_weak_taps_get_values...): the rest is not needed
+    only_theta_min = tuple(sorted(SEARCHED - {"air_theta_min"}))
+    suggest = keyreplay.Analysis(keyreplay.load(weak.path), Tuning()).suggest(pinned=only_theta_min)
     assert suggest["values"] == {} and suggest["recall"] == suggest["base_recall"]
     assert suggest["notes"] == ["No value did better when the recording was replayed with it."]
 
@@ -1696,7 +1814,10 @@ def test_the_aim_speed_is_chosen_from_a_fixed_grid_and_the_one_nearest_the_curre
     [
         (b"{not json", "The tuning file cannot be read."),
         (b"\xff\xfe", "The tuning file cannot be read."),
-        (b'{"version":1,"pad":"' + b"x" * 70000 + b'"}', "The tuning file cannot be read."),  # valid, too large
+        # valid, too large; the explicit id keeps the 70,000 bytes out of the test's name (see the test above)
+        pytest.param(
+            b'{"version":1,"pad":"' + b"x" * 70000 + b'"}', "The tuning file cannot be read.", id="valid_but_too_large"
+        ),
         (b"[]", "The tuning file is not a version 1 object."),
         (b'{"version": 2, "air": {}}', "The tuning file is not a version 1 object."),
         (b'{"version": true}', "The tuning file is not a version 1 object."),
@@ -2094,7 +2215,7 @@ def test_the_search_leaves_the_depth_fraction_alone_when_there_is_no_depth_to_sc
     monkeypatch.setattr(keyreplay.Analysis, "_press", spy)
     with_depths = keyreplay.Analysis(keyreplay.load(weak.path), Tuning())
     assert with_depths.depths
-    with_depths.suggest()
+    with_depths.suggest(pinned=("air_theta_k",))  # the threshold factor is not what this is about: 8 replays fewer
     assert len({t.air_depth_frac for t, _ in asked}) > 1  # tried, because the depths are known
     assert all(depths == with_depths.depths for _, depths in asked)  # and every trial holds the fingers' depths fixed
     asked.clear()
@@ -2102,7 +2223,7 @@ def test_the_search_leaves_the_depth_fraction_alone_when_there_is_no_depth_to_sc
         keyreplay.load(drill_trace(weak.path.with_name("n.npz"), prompts=24, skip=tuple(range(24))).path), Tuning()
     )
     assert not without.depths and not without.run.depth
-    without.suggest()
+    without.suggest(pinned=("air_theta_k",))
     assert asked and {t.air_depth_frac for t, _ in asked} == {Tuning().air_depth_frac}
     assert all(not depths for _, depths in asked)
 
@@ -2142,6 +2263,10 @@ def test_x50_the_threshold_factor_alone_changes_the_event_count(tmp_path):
 #: A drill typed by a hand that wanders (a random walk of 0.07 frame widths per root second while the drill runs): a
 #: quarter of the prompted taps are refused for ``motion``, and loosening the gate to 0.75 finds them again.
 HURRIED = dict(prompts=32, drift=0.07, rest_s=20.0, wave_s=6.0, seed=1)
+#: Everything the threshold search and the aim rule can change but the motion gate. A row about the motion rule alone
+#: pins these, so it does not pay for the search (about twenty replays of the press, six to eight seconds on a recording
+#: this long); the report of ``hurried_report`` is the one row that runs the whole of it.
+BUT_THE_MOTION_GATE = tuple(sorted(SEARCHED - {"air_vmax_gate"}))
 
 
 @pytest.fixture(scope="module")
@@ -2214,7 +2339,7 @@ def test_stray_taps_in_the_rest_keep_the_motion_gate_where_it_is_and_say_why(tmp
         tmp_path / "h.npz",
         **{**HURRIED, "rest_taps": (("left", 0, 5.0), ("right", 1, 12.0))},  # type: ignore[arg-type]
     ).path
-    report = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True)
+    report = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True, pinned=BUT_THE_MOTION_GATE)
     suggest = report["suggest"]
     assert report["phantoms"]["rest"]["per_min"] == 6.0
     assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
@@ -2223,7 +2348,8 @@ def test_stray_taps_in_the_rest_keep_the_motion_gate_where_it_is_and_say_why(tmp
 
 def test_a_recording_without_a_rest_cannot_show_the_motion_gate_may_be_loosened_and_says_so(tmp_path):
     path = drill_trace(tmp_path / "h.npz", **{**HURRIED, "rest_s": 0.0, "wave_s": 0.0}).path  # type: ignore[arg-type]
-    suggest = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True)["suggest"]
+    report = keyreplay.analyse(keyreplay.load(path), Tuning(), suggest=True, pinned=BUT_THE_MOTION_GATE)
+    suggest = report["suggest"]
     assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
     assert any("record a rest" in note for note in suggest["notes"])
 
@@ -2235,16 +2361,16 @@ def test_a_motion_gate_that_would_let_the_rest_fill_with_taps_is_not_suggested(h
     monkeypatch.setattr(
         keyreplay.Analysis, "_rest_per_min", lambda self, run: real(self, run) if self is analysis else 4.0
     )  # the replay with the gate loosened is another Analysis: its rest is the one that is made noisy
-    suggest = analysis.suggest()
+    suggest = analysis.suggest(pinned=BUT_THE_MOTION_GATE)
     assert "air_vmax_gate" not in suggest["values"] and suggest["motion"]["raised"] is False
     assert any("would have 4.0 stray taps a minute" in note for note in suggest["notes"])
 
 
 def test_a_pinned_or_already_loose_motion_gate_is_left_alone_without_a_word(hurried):
     rec = keyreplay.load(hurried.path)
-    pinned = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.5)).suggest(pinned=("air_vmax_gate",))
+    pinned = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.5)).suggest(pinned=("air_vmax_gate", *BUT_THE_MOTION_GATE))
     assert "air_vmax_gate" not in pinned["values"] and "motion" not in pinned
-    loose = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.75)).suggest()
+    loose = keyreplay.Analysis(rec, Tuning(air_vmax_gate=0.75)).suggest(pinned=BUT_THE_MOTION_GATE)
     assert "air_vmax_gate" not in loose["values"] and "motion" not in loose
 
 

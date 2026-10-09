@@ -50,7 +50,16 @@ from .limits import (
 )
 from .plane import Plane, place_plane
 from .practice import FINGER_NAMES, PRACTICE_TEXT, PracticeResult, PracticeScript
-from .review import ABORT_WHY, NOTE_SHOW_S, REVIEW_TEXT, UNKNOWN_TARGET, InsertStep, InsertSummary, ReviewMachine
+from .review import (
+    ABORT_WHY,
+    NOTE_SHOW_S,
+    REVIEW_TEXT,
+    UNKNOWN_TARGET,
+    GuardTap,
+    InsertStep,
+    InsertSummary,
+    ReviewMachine,
+)
 from .tuning import Tuning
 from .types import (
     CloseReason,
@@ -86,9 +95,7 @@ SESSION_TEXT: Final = MappingProxyType(
         "good": "Good  {n}/{N}",
         "restart": "Only tap the finger the strip names. Starting again.",
         "stuck_finger": "{Side} {finger}: tap a bit firmer with your fingers raised",
-        "stuck_all": (
-            "Taps not showing up? Raise your fingers a little, or choose pinch: /jarvis hands keyboard press pinch"
-        ),
+        "stuck_all": "Taps not showing up? Try /jarvis hands keyboard press pinch",
         "posture": "Raise your fingers a little, curved, as over a real keyboard",
         "speed": "Hold your hands steadier to type",
         "coherence": "Keep the other fingers still while one taps",
@@ -137,6 +144,9 @@ _TARGET_FILL: Final = 0.6
 _RESTART_SHOW_S: Final = 2.0
 _STUCK_FINGER_S: Final = 15.0
 _STUCK_ALL_S: Final = 25.0
+#: Restarts of one warm-up after which the general hint shows without waiting for its 25 s: every accepted tap restarts
+#: that clock, so a warm-up that accepts a finger and then restarts on three strays (noise, two hands) never reaches it.
+_STUCK_ALL_RESTARTS: Final = 2
 _STUCK_SHOW_S: Final = 6.0
 _HINT_AFTER_S: Final = 1.5
 _HINT_GAP_S: Final = 5.0
@@ -172,6 +182,8 @@ class _Tap:
     u: float
     v: float
     touch: Touch | None
+    #: Insert and Send taps of an air press: what the guard weighs (firmness, hand speed, finger). Not where it fell.
+    guard: GuardTap | None = None
 
     def __repr__(self) -> str:
         return "<Tap>"
@@ -284,6 +296,7 @@ class KeyboardSession:
         self._named: tuple[Side, int] | None = None
         self._named_since = 0.0
         self._accept_t = 0.0
+        self._restarts = 0
         self._stuck: dict[str, float] = {}
         self._stuck_done: set[str] = set()
         self._stuck_who: tuple[Side, int] = ("right", 0)
@@ -562,7 +575,9 @@ class KeyboardSession:
         if self._phase == "placing" and not self._ever_placed and t - self._start_t >= PLACE_TIMEOUT_S - _EPS:
             return "idle"
         if not self.armed and t >= self._arm_by - _EPS:
-            return "idle"
+            # A user who tapped for the whole time was there: "nobody was using it" is false, and the air tap did not
+            # work for him. (The pinch warm-up shows no taps, so it keeps the plain reason.)
+            return "air_unreliable" if self._press.name == "air" and self.counts["warmup_tap"] > 0 else "idle"
         if not hands and t - self._last_hand_t >= self._idle_limit() - _EPS:
             return "idle"
         if self.armed and t - self._last_key_t >= NO_KEY_CLOSE_S - _EPS:
@@ -589,8 +604,18 @@ class KeyboardSession:
         if key != self._banner_key:
             self._banner_key = key
             self._banner = self._banner_text(level, self._ladder.reason, quality.fps)
-        if level == "off" and not self._cut:
+        if level == "off" and not self._cut and not self._prompting_gestures():
             self._pending_fallback = True
+
+    def _prompting_gestures(self) -> bool:
+        """The practice asks for a wave or a talk (the hands that make a camera read noisy) or is already over.
+
+        The ladder must not cut the drill by its own prompt, and a cut that comes after the last frame of the talk
+        would turn a finished script into one that did not complete. The level and the banner go on as they are, and a
+        camera that is still unusable when the next segment begins is cut then.
+        """
+        script = self._script
+        return self._mode == "practice" and script is not None and script.segment in ("rest", "talk", "done")
 
     def _banner_text(self, level: str, reason: str, fps: float) -> tuple[str, str]:
         n = round(fps)
@@ -691,6 +716,7 @@ class KeyboardSession:
         self._named = None
         self._named_since = t
         self._accept_t = t
+        self._restarts = 0
         self._restart_until = -math.inf
 
     # ------------------------------------------------------------------------------------------------- warm-up
@@ -710,6 +736,7 @@ class KeyboardSession:
                     if outcome == "accepted":
                         self._accept_t = t
                     elif outcome == "restart":
+                        self._restarts += 1
                         self._restart_until = t + _RESTART_SHOW_S
                         self._stuck_done.discard("finger")
             else:
@@ -760,6 +787,7 @@ class KeyboardSession:
         self._drift_step(hands, t)
         plane = self._plane
         assert plane is not None
+        speeds = {h.hand: h.speed for h in hands}
         for ev in events:
             if hold is not None:
                 self._drop("held", ev, t, self._key_of(plane, ev)[0])
@@ -776,7 +804,12 @@ class KeyboardSession:
             touch = None
             if self._machine is not None and key.kind in ("char", "space"):
                 touch = Touch(u, v, ev.finger, ev.side, ev.onset_t, ev.conf if ev.conf > 0 else 1.0)
-            self._queue.append(_Tap(ev, key, u, v, touch))
+            guard = None
+            if self._machine is not None and key.kind in ("insert", "enter") and ev.conf > 0:
+                # the speed of the frame of the press, not of the delivery: a queued tap is weighed where it was made. A
+                # hand that is not in the frame is not at rest.
+                guard = GuardTap(ev.conf, speeds.get(ev.hand, math.inf), ev.side, ev.finger)
+            self._queue.append(_Tap(ev, key, u, v, touch, guard))
 
     def _key_of(self, plane: Plane, ev: PressEvent) -> tuple[Key | None, float, float]:
         u, v = plane.units(ev.aim)
@@ -890,7 +923,7 @@ class KeyboardSession:
             ch = str(self._chips.index(key.index))
         else:
             ch = ""
-        step = machine.tap(kind, ch, t, touch=tap.touch)  # type: ignore[arg-type]
+        step = machine.tap(kind, ch, t, touch=tap.touch, guard=tap.guard)  # type: ignore[arg-type]
         if kind == "char":
             self._shift_until = -math.inf
         if machine.flash is not None:
@@ -1296,7 +1329,9 @@ class KeyboardSession:
         """The two hints of a warm-up that does not go on (2.12.5): each once, for a few seconds."""
         warmup = self._warmup
         assert warmup is not None
-        if "all" not in self._stuck_done and t - self._accept_t >= _STUCK_ALL_S - _EPS:
+        if "all" not in self._stuck_done and (
+            t - self._accept_t >= _STUCK_ALL_S - _EPS or self._restarts >= _STUCK_ALL_RESTARTS
+        ):
             self._stuck_done.add("all")
             self._stuck["all"] = t + _STUCK_SHOW_S
         if (

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tokenize
 import tomllib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -1055,6 +1055,9 @@ def is_stub(label: str) -> bool:
     return marker(stub_tree(label), "STUB_OWNER") is not None
 
 
+PENDING_STUBS = [label for label in STUB_LABELS if is_stub(label)]
+
+
 def canonical_getattr(label: str, owner: str) -> list[ast.stmt]:
     source = f'''
 def __getattr__(name: str) -> object:
@@ -1166,19 +1169,17 @@ def stub_problems(label: str, owner: str, tree: ast.Module | None = None) -> lis
     return problems
 
 
-@pytest.mark.parametrize("label", STUB_LABELS)
-def test_a_stub_declares_its_owner(label: str) -> None:
-    owner = marker(stub_tree(label), "STUB_OWNER")
-    if owner is None:
-        pytest.skip(f"{label} has been implemented: its own tests take over")
-    assert owner == OWNER_OF[label]
+# The three checks of a stub run on the modules that are still one. A module that has been built is checked by its
+# own tests, and a check that is skipped on every one of them is only noise in the report (66 of them at the end).
+if PENDING_STUBS:
 
+    @pytest.mark.parametrize("label", PENDING_STUBS)
+    def test_a_stub_declares_its_owner(label: str) -> None:
+        assert marker(stub_tree(label), "STUB_OWNER") == OWNER_OF[label]
 
-@pytest.mark.parametrize("label", STUB_LABELS)
-def test_a_stub_is_pinned_signatures_and_raising_bodies_only(label: str) -> None:
-    if not is_stub(label):
-        pytest.skip(f"{label} has been implemented")
-    assert stub_problems(label, OWNER_OF[label]) == []
+    @pytest.mark.parametrize("label", PENDING_STUBS)
+    def test_a_stub_is_pinned_signatures_and_raising_bodies_only(label: str) -> None:
+        assert stub_problems(label, OWNER_OF[label]) == []
 
 
 def defined_names(label: str) -> set[str]:
@@ -1208,38 +1209,38 @@ def test_the_pinned_names_are_offered(label: str, name: str) -> None:
         assert not missing, missing
 
 
-@pytest.mark.parametrize("label", STUB_LABELS)
-def test_a_stub_module_imports_quietly_and_fails_loudly_when_used(label: str) -> None:
-    if not is_stub(label):
-        pytest.skip(f"{label} has been implemented")
-    module = importlib.import_module(f"{PKG}.{label}")
-    message = f"{OWNER_OF[label]}: {label}"
-    tree = stub_tree(label)
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name != "__getattr__":
-            fn = getattr(module, node.name)
-            required = sum(1 for a in node.args.args if a is not None) - len(node.args.defaults)
-            kw_required = {
-                a.arg: None for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True) if d is None
-            }
+if PENDING_STUBS:
+
+    @pytest.mark.parametrize("label", PENDING_STUBS)
+    def test_a_stub_module_imports_quietly_and_fails_loudly_when_used(label: str) -> None:
+        module = importlib.import_module(f"{PKG}.{label}")
+        message = f"{OWNER_OF[label]}: {label}"
+        tree = stub_tree(label)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name != "__getattr__":
+                fn = getattr(module, node.name)
+                required = sum(1 for a in node.args.args if a is not None) - len(node.args.defaults)
+                kw_required = {
+                    a.arg: None for a, d in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True) if d is None
+                }
+                with pytest.raises(NotImplementedError, match=message):
+                    fn(*([None] * required), **kw_required)
+            elif isinstance(node, ast.ClassDef):
+                init = next((m for m in node.body if isinstance(m, ast.FunctionDef) and m.name == "__init__"), None)
+                if init is None or node.name in REAL_IN_STUB.get(label, ()):
+                    continue
+                cls = getattr(module, node.name)
+                required = len(init.args.args) - 1 - len(init.args.defaults)
+                kw_required = {
+                    a.arg: None for a, d in zip(init.args.kwonlyargs, init.args.kw_defaults, strict=True) if d is None
+                }
+                with pytest.raises(NotImplementedError, match=message):
+                    cls(*([None] * required), **kw_required)
+        for name in getattr(module, "_STUB_DATA", ()):
             with pytest.raises(NotImplementedError, match=message):
-                fn(*([None] * required), **kw_required)
-        elif isinstance(node, ast.ClassDef):
-            init = next((m for m in node.body if isinstance(m, ast.FunctionDef) and m.name == "__init__"), None)
-            if init is None or node.name in REAL_IN_STUB.get(label, ()):
-                continue
-            cls = getattr(module, node.name)
-            required = len(init.args.args) - 1 - len(init.args.defaults)
-            kw_required = {
-                a.arg: None for a, d in zip(init.args.kwonlyargs, init.args.kw_defaults, strict=True) if d is None
-            }
-            with pytest.raises(NotImplementedError, match=message):
-                cls(*([None] * required), **kw_required)
-    for name in getattr(module, "_STUB_DATA", ()):
-        with pytest.raises(NotImplementedError, match=message):
-            getattr(module, name)
-    with pytest.raises(AttributeError):
-        _ = module.no_such_name_at_all
+                getattr(module, name)
+        with pytest.raises(AttributeError):
+            _ = module.no_such_name_at_all
 
 
 def test_the_stub_checker_bites() -> None:
@@ -1551,3 +1552,28 @@ def test_the_frozen_list_names_files_that_exist() -> None:
 def test_the_frozen_files_are_untouched() -> None:
     base = os.environ["KB_FROZEN_BASE"]
     assert changed_since(REPO, base, FROZEN) == []
+
+
+# --------------------------------------------------------------------------- test ids and the environment (Windows)
+
+#: pytest copies a test's id into ``PYTEST_CURRENT_TEST`` at setup, call and teardown, and Windows refuses an
+#: environment value over 32,767 characters. The longest id in the suite is about 500; this leaves a wide margin and
+#: still catches a payload put in a parameter by value (a 70,000-byte one errored four tests on the Windows runner).
+MAX_TEST_ID_CHARS = 1000
+
+
+def ids_over_the_limit(nodeids: Iterable[str]) -> list[str]:
+    return [f"{len(nodeid)} characters: {nodeid[:100]}" for nodeid in nodeids if len(nodeid) > MAX_TEST_ID_CHARS]
+
+
+def test_the_id_check_sees_the_case_that_errored_on_the_windows_runner() -> None:
+    assert 32767 - len(" (teardown)") - len("PYTEST_CURRENT_TEST=") > MAX_TEST_ID_CHARS
+    big = "tests/test_x.py::test_a_write[" + "x" * 70000 + "]"
+    assert ids_over_the_limit([big, "tests/test_x.py::test_a_write[too_large]"]) == [
+        f"{len(big)} characters: {big[:100]}"
+    ]
+
+
+def test_no_test_id_is_long_enough_to_break_the_environment_on_windows(request: pytest.FixtureRequest) -> None:
+    long_ones = ids_over_the_limit(item.nodeid for item in request.session.items)
+    assert long_ones == [], "give each such case a short pytest.param(..., id=...) and build the payload in the test"

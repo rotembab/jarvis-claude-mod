@@ -19,8 +19,12 @@ from jarvis_hands.keyboard.session import SESSION_TEXT
 from jarvis_hands.keyboard.tuning import Tuning
 from jarvis_hands.keyboard.types import PressEvent, PressQuality, Side
 from jarvis_hands.keyboard.warmup import Warmup
+from jarvis_hands.landmarks import Frame
 
 PLANE = Plane(0.5, 0.5, 0.05, 0.0625, 5)
+#: What the strip says of a practice the ladder cut (Appendix F.1). No report is shown to the user, so it names the
+#: way out.
+NOT_USABLE = "Air tap is not usable on this camera. Use the pinch method."
 TUNING = Tuning()
 
 
@@ -588,9 +592,7 @@ F1 = {
     "good": "Good  {n}/{N}",
     "restart": "Only tap the finger the strip names. Starting again.",
     "stuck_finger": "{Side} {finger}: tap a bit firmer with your fingers raised",
-    "stuck_all": (
-        "Taps not showing up? Raise your fingers a little, or choose pinch: /jarvis hands keyboard press pinch"
-    ),
+    "stuck_all": "Taps not showing up? Try /jarvis hands keyboard press pinch",
     "posture": "Raise your fingers a little, curved, as over a real keyboard",
     "speed": "Hold your hands steadier to type",
     "coherence": "Keep the other fingers still while one taps",
@@ -716,6 +718,85 @@ def test_x28_the_finger_clock_restarts_when_the_next_finger_is_named_and_the_gen
     assert finger[0] == pytest.approx(named + 15.0, abs=0.1)
     (everything,) = spans(log, "Taps not showing up?")
     assert everything[0] == pytest.approx(1.5 + 25.0, abs=0.2)  # 25 s after the last accepted tap
+
+
+def test_x28_a_warmup_that_accepts_some_taps_and_keeps_restarting_points_to_pinch_after_the_second_restart() -> None:
+    """The 25 s clock restarts at every accepted tap, so a warm-up that accepts a finger and then restarts on three
+    strays (landmark noise of 0.002, two hands) never reached it: the user saw only "Starting again" for 90 s."""
+    rig = KbRig(commit="review", keep_views=False)
+    rig.place()
+    begun = rig.t
+    log: list[tuple[float, str]] = []
+    for _ in range(2):
+        log += watch(rig, 1.5)
+        prompt = rig.session.warmup_prompt
+        assert prompt is not None
+        rig.warm_tap(*prompt)  # one good tap: the clock of the general hint starts again
+        log += watch(rig, 1.2)
+        for _ in range(3):
+            rig.warm_tap("right", 3)  # never the finger that is named next
+            log += watch(rig, 0.2)
+    assert rig.counts["warmup_restart"] == 2 and not rig.session.armed
+    log += watch(rig, 10.0)
+    log = [(t - begun, strip) for t, strip in log]
+    (everything,) = spans(log, "Taps not showing up?")
+    assert everything[0] < 20.0  # well before 25 s without an accepted tap could say it
+    assert everything[1] - everything[0] == pytest.approx(6.0, abs=0.2)
+
+
+def test_x28_one_restart_is_not_yet_a_reason_to_say_pinch() -> None:
+    rig = KbRig(commit="review", keep_views=False)
+    rig.place()
+    log = watch(rig, 1.5)
+    for _ in range(3):
+        rig.warm_tap("right", 3)
+        log += watch(rig, 0.2)
+    assert rig.counts["warmup_restart"] == 1
+    log += watch(rig, 12.0)
+    assert not spans(log, "Taps not showing up?")
+
+
+def test_x28_a_warmup_that_was_tapped_and_never_armed_closes_air_unreliable_not_idle() -> None:
+    """The toast "nobody was using it" is false for a user who tapped for 90 s on a camera too noisy for the air tap."""
+    rig = KbRig(commit="review", keep_views=False)
+    rig.place()
+    begun = rig.t
+    while rig.closed is None and rig.t < begun + 100.0:
+        rig.warm_tap("right", 3)
+        rig.run(1.0)
+    assert not rig.session.armed and rig.counts["warmup_tap"] > 0
+    assert rig.closed == "air_unreliable" and rig.t - begun == pytest.approx(90.0, abs=1.5)
+    assert rig.desktop.key_calls == []
+
+
+def one_hand_rig(flip_at: int | None) -> KbRig:
+    """One right hand standing still; the label of frame ``flip_at`` (counted from 1) says "left". The tracker names the
+    placed hand by the label of its last placing frame, so the frame that places it is the one that matters."""
+    rig = KbRig(commit="review", sides=("right",), keep_views=False)
+    while rig.session.phase == "placing" and rig.t < 5.0:
+        frame = rig.hands_frame(rig.t + rig.dt)
+        if rig.frames + 1 == flip_at:
+            hands = tuple(dataclasses.replace(h, handedness="left") for h in frame.hands)
+            frame = Frame(frame.t, hands, frame.width, frame.height)
+        rig.feed([frame])
+    return rig
+
+
+def test_x26_one_flipped_label_on_the_frame_that_places_a_lone_hand_does_not_name_the_other_hand() -> None:
+    clean = one_hand_rig(None)
+    placed_at = clean.frames
+    assert clean.session.phase == "warmup"
+    flipped = one_hand_rig(placed_at)
+    assert flipped.frames == placed_at and flipped.session.phase == "warmup"  # the control: the same frame places it
+    flipped.run(1.5)
+    assert flipped.session.warmup_prompt == ("right", 0)
+
+
+def test_x26_a_flipped_label_a_few_frames_before_the_placing_frame_is_harmless() -> None:
+    clean = one_hand_rig(None)
+    flipped = one_hand_rig(clean.frames - 3)
+    flipped.run(1.5)
+    assert flipped.session.warmup_prompt == ("right", 0)
 
 
 # ----------------------------------------------------------------------------------- X29: a returning hand
@@ -911,8 +992,60 @@ def test_x38_a_practice_session_never_falls_back_it_cuts_the_drill_and_reports_o
     assert rig.session.practice_done and rig.closed is None and rig.session.press_name == "air"
     result = rig.session.practice_result()
     assert result is not None and result.level == "off" and not result.completed
-    assert rig.view.strip == "Air tap is not usable on this camera: see the report"
+    assert rig.view.strip == NOT_USABLE
     assert rig.view.banner == ""  # the strip says it; no second line
+
+
+def practice_rig(phrases: tuple[str, ...]) -> KbRig:
+    """An armed air practice that cannot fall back, with short phrases (the script runs on time, not on typing)."""
+    rig = KbRig(commit="review", mode="practice", fallback=False, phrases=phrases)
+    rig.arm()
+    return rig
+
+
+def segment_of(rig: KbRig) -> str:
+    script = rig.session._script
+    assert script is not None
+    return script.segment
+
+
+def run_to_segment(rig: KbRig, segment: str, limit_s: float = 300.0) -> None:
+    begun = rig.t
+    while segment_of(rig) != segment and rig.t < begun + limit_s:
+        rig.run(rig.dt)
+    assert segment_of(rig) == segment
+
+
+def test_x38_the_ladder_does_not_cut_a_practice_during_its_own_wave_and_waits_for_the_next_segment() -> None:
+    """The rest asks for a wave and the talk for moving hands, which is what makes a camera read noisy: the ladder
+    finding the air tap unusable there would cut the practice by its own prompt (the prompt still shows and the level
+    is still reported)."""
+    rig = practice_rig(("a", "b", "c", "d"))  # phrase, rest, phrase, rest, talk
+    run_to_segment(rig, "rest")
+    rig.press.set_quality(10.0, 0.001)
+    rig.run(limits.AIR_REST_S - 1.0)
+    assert rig.session.level == "off" and segment_of(rig) == "rest"
+    assert not rig.session.practice_done and rig.view.strip == "Rest: do not tap. Wave, open and close your hands."
+    assert rig.view.banner == ""
+    rig.run(2.0)  # the rest is over; the camera is still unusable and the next phrase is not a wave
+    assert segment_of(rig) == "phrase" and rig.session.practice_done
+    result = rig.session.practice_result()
+    assert result is not None and result.level == "off" and not result.completed
+    assert rig.view.strip == NOT_USABLE
+
+
+def test_x38_a_cut_that_waits_past_the_last_frame_of_the_talk_does_not_unfinish_a_finished_practice() -> None:
+    rig = practice_rig(("a",))  # phrase, rest, talk
+    run_to_segment(rig, "talk")
+    rig.press.set_quality(10.0, 0.001)
+    rig.run(limits.AIR_TALK_S - 1.0)
+    assert segment_of(rig) == "talk" and not rig.session.practice_done
+    assert rig.view.strip == "Talk to the camera as on a call. Keep your hands moving. Do not tap."
+    rig.run(3.0)  # the talk ends, and the ladder is still off in the frames after it
+    assert segment_of(rig) == "done" and rig.session.practice_done
+    result = rig.session.practice_result()
+    assert result is not None and result.completed and result.level == "off"
+    assert rig.view.strip != NOT_USABLE
 
 
 # ---------------------------------------------------------------------------------- X39 to X43: events and the phases

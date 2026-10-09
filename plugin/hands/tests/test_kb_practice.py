@@ -1048,7 +1048,13 @@ def test_x37_negative_numbers_are_a_marker_out_of_range(tmp_path) -> None:
         assert practice.load_marker(tmp_path, "air", now=NOW) is None
 
 
-@pytest.mark.parametrize("text", ["", "{", "[]", "null", "42", '"air"', '{"version": 1', "\u0000\u0001", "{" * 5000])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "", "{", "[]", "null", "42", '"air"', '{"version": 1', "\u0000\u0001",
+        pytest.param("{" * 5000, id="5000_open_braces"),  # not 5,000 characters in the test's name (Windows env limit)
+    ],
+)  # fmt: skip
 def test_x37_an_unparsable_file_is_no_marker(tmp_path, text) -> None:
     put(tmp_path, AIR_FILE, text)
     assert practice.load_marker(tmp_path, "air", now=NOW) is None
@@ -1327,6 +1333,37 @@ def test_a_file_may_fill_to_exactly_its_size_and_the_next_line_starts_the_next_f
     log.write([PINCH_LINE])
     assert log.path.with_name("keyboard-practice.jsonl.1").stat().st_size == 2 * size
     assert log.path.stat().st_size == size
+
+
+@pytest.fixture
+def windows_newlines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Text mode on Windows writes "\\n" as "\\r\\n" when the caller leaves ``newline`` alone; here too."""
+    real = Path.open
+
+    def opened(self, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+        if newline is None and "b" not in mode and any(c in mode for c in "wax+"):
+            newline = "\r\n"
+        return real(self, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", opened)
+
+
+def test_the_tap_log_is_lf_only_so_its_size_cap_counts_the_bytes_on_disk(tmp_path, windows_newlines) -> None:
+    """The cap counts one byte for a line break; a file written with CRLF has two, so it outgrows the cap by a byte a
+    line and rotates a line early (Windows CI: ``142 == 2 * 141``)."""
+    line = trace.tap_log_line(PINCH_LINE)
+    assert line is not None
+    size = len(line) + 1
+    log = TapLog(tmp_path, max_bytes=2 * size, files=3)
+    log.write([PINCH_LINE])
+    log.write([PINCH_LINE])
+    assert log.path.stat().st_size == 2 * size and b"\r" not in log.path.read_bytes()
+    assert not log.path.with_name("keyboard-practice.jsonl.1").exists()
+
+
+def test_a_marker_is_lf_only_whatever_the_platform(tmp_path, windows_newlines) -> None:
+    path = practice.write_marker(tmp_path, "air", result(), now=NOW)
+    assert path is not None and b"\r" not in path.read_bytes()
 
 
 def test_a_batch_larger_than_a_file_is_written_whole_into_an_empty_log_without_rotating(tmp_path) -> None:

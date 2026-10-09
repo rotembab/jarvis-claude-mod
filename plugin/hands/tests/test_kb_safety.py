@@ -13,6 +13,7 @@ import inspect
 import random
 from collections.abc import Callable
 from itertools import pairwise
+from typing import Any
 
 import pytest
 
@@ -25,6 +26,7 @@ from jarvis_hands.keyboard.limits import (
 from jarvis_hands.keyboard.rig import ASPECT, KbRig, ScriptedPress
 from jarvis_hands.keyboard.session import KeyboardSession
 from jarvis_hands.keyboard.tuning import Tuning
+from jarvis_hands.keyboard.types import PressEvent, Touch
 
 SPACE = (0x20, 0x39, 0)
 UNICODE = 0x4
@@ -1111,3 +1113,57 @@ def test_a_pinch_press_touch_has_confidence_one_and_a_direct_session_has_no_box_
     assert touch is not None and touch.conf == 1.0
     direct = KbRig(commit="direct")
     assert direct.session._machine is None
+
+
+def test_u80_a_character_or_space_tap_reaches_the_machine_with_the_touch_of_its_press_and_no_other_key_has_one() -> (
+    None
+):
+    """U80: ``Touch(u, v, finger, side, t, conf)`` with ``u, v`` from ``plane.units(ev.aim)`` unrounded, ``t`` the time
+    the finger went down (``onset_t``, a tenth of a second before the press was seen: not ``ev.t``) and ``conf`` the
+    press's own (1.0 when the press has none). Backspace and Clear are given none, and a tap that fell off the keys
+    never reaches the machine at all."""
+    rig = review_rig()
+    plane = rig.session.plane
+    assert plane is not None
+    seen: list[tuple[str, Touch | None]] = []
+    take = machine(rig).tap
+
+    def spy_machine(kind: str, ch: str, t: float, **kw: Any) -> Any:
+        seen.append((kind, kw.get("touch")))
+        return take(kind, ch, t, **kw)
+
+    machine(rig).tap = spy_machine  # type: ignore[method-assign]
+    made: list[PressEvent] = []
+    emit_at = rig.active.emit_at
+
+    def spy_press(t: float, make: Callable[[float], PressEvent]) -> None:
+        def recorded(at: float) -> PressEvent:
+            made.append(make(at))
+            return made[-1]
+
+        emit_at(t, recorded)
+
+    rig.active.emit_at = spy_press  # type: ignore[method-assign]
+    plan: list[tuple[str, dict[str, float]]] = [
+        ("h", {"du": 0.1, "dv": -0.05, "conf": 0.6}),
+        ("space", {"conf": 0.7}),
+        ("backspace", {"conf": 0.8}),
+        ("i", {"du": -0.1, "conf": 0.0}),  # a press that measures no confidence: the touch says 1.0
+        ("clear", {"conf": 0.8}),
+        ("e", {"du": 40.0}),  # far off the keys: dropped by the session
+    ]
+    for k, (name, kw) in enumerate(plan):
+        rig.tap(rig.t + 0.2 + 0.5 * k, name, **kw)  # type: ignore[arg-type]
+    rig.run(0.5 * len(plan) + 1.0)
+    assert len(made) == len(plan)
+    assert [kind for kind, _ in seen] == ["char", "space", "backspace", "char", "clear"]
+    for (kind, touch), event in zip(seen, made[: len(seen)], strict=True):  # the dropped tap is the last of the plan
+        if kind not in ("char", "space"):
+            assert touch is None, kind
+            continue
+        assert touch is not None
+        u, v = plane.units(event.aim)
+        assert (touch.u, touch.v) == (u, v)
+        assert (touch.finger, touch.side) == (event.finger, event.side)
+        assert touch.t == event.onset_t and touch.t != event.t
+        assert touch.conf == (event.conf if event.conf > 0 else 1.0)

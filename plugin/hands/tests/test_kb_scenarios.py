@@ -16,6 +16,7 @@ Timing is the frame's own ``t`` and no test sleeps. Seeds are fixed.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
@@ -42,6 +43,14 @@ STRICT = ("rest", "straight")
 PRESSES = 40  # not a key count
 #: Appendix C home row: left pinky to index, then right index to pinky.
 HOME_ROW = "asdfjkl'"
+#: The rows that sweep seeds, cells or minutes of hovering run a short list by default (a row of the pinch detector is
+#: a second or two on a Windows runner and there are a hundred and forty of them); ``KB_FULL=1`` runs all of it, which
+#: is what the design's numbers (A10: 480 presses a level, N1: five minutes) were measured on.
+FULL = os.environ.get("KB_FULL") == "1"
+#: N1 and N15: how long the hands hover. A phantom press of a still hand comes at a rate, not at a time: the default
+#: is a third of the design's five minutes and a third of its three.
+N1_S = 300.0 if FULL else 100.0
+N15_S = 180.0 if FULL else 60.0
 
 
 @dataclass(frozen=True)
@@ -204,7 +213,7 @@ def run_a2(layout: str, posture: sy.Posture, jitter: float, seed: int) -> tuple[
     return tally(rig, keys)
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("seed", [0, 1, 2] if FULL else [0, 1])
 @pytest.mark.parametrize("jitter", [0.001, 0.002])
 @pytest.mark.parametrize("posture", STRICT)
 def test_a2_random_keys_with_the_standard_fingering_are_all_right(posture, jitter, seed):
@@ -402,7 +411,9 @@ def test_a9_hebrew_text_is_typed_by_the_same_fingers_in_the_same_places():
     assert "".join(h.key.he for h in rig.hits) == word
 
 
-@pytest.mark.parametrize("z_noise", [0.005, 0.010, 0.015, 0.020, 0.025])
+# Both kinds of bound are met by the cells that stay: exact up to 0.010 (the row at 0.005 is quieter than it) and no
+# wrong key from 0.020 (0.025 is noisier than it).
+@pytest.mark.parametrize("z_noise", [0.005, 0.010, 0.015, 0.020, 0.025] if FULL else [0.010, 0.015, 0.025])
 def test_a10_the_z_noise_sweep(z_noise):
     """Landmark depth noise: exact to 0.010 fw, then the pinch begins to miss. From 0.020 it may miss but must not type
     something else. (The design says never; over 480 presses at each level the measurement is 0 to 2 wrong keys.)"""
@@ -424,7 +435,7 @@ def test_a10_the_z_noise_sweep(z_noise):
 
 def warm_up_records(rig: PinchRig) -> dict[tuple[Side, int], float]:
     """The minimum ratio of each valid warm-up pinch (2.5): a fall below 0.50 from at least 0.60 and back above it,
-    the finger the nearest of the four at its minimum by 0.08 and no other finger below 0.45 there."""
+    the finger the nearest of the four at its minimum by 0.08."""
     records: dict[tuple[Side, int], float] = {}
     falling: dict[tuple[int, int], tuple[float, bool]] = {}  # (hand, finger) -> (minimum so far, valid there)
     armed: dict[tuple[int, int], bool] = {}
@@ -437,7 +448,7 @@ def warm_up_records(rig: PinchRig) -> dict[tuple[Side, int], float]:
                 others = sorted(o.ratio for o in hand.fingers if o.finger != f.finger)
                 if key in falling:
                     if f.ratio < falling[key][0]:
-                        falling[key] = (f.ratio, others[0] - f.ratio >= 0.08 and others[0] >= 0.45)
+                        falling[key] = (f.ratio, others[0] - f.ratio >= 0.08)
                     if f.ratio > 0.50:
                         low, valid = falling.pop(key)
                         if low < 0.40 and valid:
@@ -707,7 +718,7 @@ def assert_silent(rig: PinchRig) -> None:
 @pytest.mark.parametrize("posture", ["rest", "relaxed", "straight"])
 def test_n1_both_hands_hovering_with_jitter_for_five_minutes_press_nothing(posture):
     rig = PinchRig(posture=posture, jitter=0.003, seed=21)
-    rig.feed(rig.typist.hover(300))
+    rig.feed(rig.typist.hover(N1_S))
     assert_silent(rig)
 
 
@@ -807,7 +818,7 @@ def test_n5_thirty_reaches_to_the_mouse_and_back_press_nothing():
     assert rig.lowest < 0.3  # the thumb did cross the fingertips on the way
 
 
-@pytest.mark.parametrize("finger", range(4))
+@pytest.mark.parametrize("finger", range(4) if FULL else (0, 3))  # the index and the pinky: the two ends of the hand
 @pytest.mark.parametrize(("lowest", "z_noise"), [(0.30, 0.0), (0.33, 0.004)])
 def test_n6_a_thumb_wandering_between_ratios_near_a_third_and_a_half_presses_nothing(finger, lowest, z_noise):
     """The nominal ratio wanders between ``lowest`` and 0.50. With the model's depth noise a nominal 0.30 is the closing
@@ -988,7 +999,7 @@ def test_n14_hands_that_cross_again_and_again_press_nothing():
 @pytest.mark.parametrize("posture", ["rest", "relaxed", "straight"])
 def test_n15_a_hover_with_jitter_of_six_thousandths_for_three_minutes_presses_nothing(posture):
     rig = PinchRig(posture=posture, jitter=0.006, seed=42)
-    rig.feed(rig.typist.hover(180.0))
+    rig.feed(rig.typist.hover(N15_S))
     assert_silent(rig)
     assert rig.press.rejects.get("closing_timeout", 0) <= 3
 
@@ -1157,5 +1168,5 @@ def test_a80_the_aim_of_a_pinch_press_is_where_the_finger_was_before_the_thumb_c
         base = np.array(rig.plane.units(rig.tip_at(e.hand, e.finger, start - rig.script.dt)))
         commit = np.array(rig.plane.units(rig.tip_at(e.hand, e.finger, e.t)))
         worst = max(worst, min(np.abs(aim - base).max(), np.abs(aim - commit).max()))
-    record_property("worst_distance_units", worst)
+    record_property("worst_distance_units", float(worst))  # a numpy scalar does not survive xdist
     assert worst <= 0.15

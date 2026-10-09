@@ -965,9 +965,12 @@ def _elevated(api: FakeWin32, wdesk: WindowsDesktop, *, helper: Any, target: Any
 @pytest.mark.parametrize(
     ("helper", "target", "elevated"),
     [
-        # a normal helper: Medium, Medium+ and Low targets are clear, High and System are not
+        # a normal helper: Medium and Low targets are clear, High and System are not
         (MEDIUM, MEDIUM, False),
-        (MEDIUM, 0x2100, False),
+        # SendInput says nothing when UIPI drops a key, so anything above our exact level is out up front: a
+        # UIAccess window (0x2010) and Medium+ (0x2100) share Medium's band, which a band compare would clear
+        (MEDIUM, 0x2010, True),
+        (MEDIUM, 0x2100, True),
         (MEDIUM, LOW, False),
         (MEDIUM, 0x0000, False),
         (MEDIUM, HIGH, True),
@@ -977,6 +980,8 @@ def _elevated(api: FakeWin32, wdesk: WindowsDesktop, *, helper: Any, target: Any
         (HIGH, SYSTEM, True),
         (HIGH, MEDIUM, False),
         (HIGH, 0x2100, False),
+        (0x2100, MEDIUM, False),  # a helper above the target is fine; only the exact level decides
+        (0x2100, 0x2100, False),
         # a sandboxed helper: anything above it is out
         (LOW, MEDIUM, True),
         (LOW, LOW, False),

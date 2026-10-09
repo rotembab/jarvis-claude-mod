@@ -22,7 +22,9 @@ Timing is the frame's own ``t``; nothing sleeps. Seeds are fixed.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from itertools import pairwise
@@ -31,20 +33,42 @@ import pytest
 
 from jarvis_hands.desktop.fake import events_balanced
 from jarvis_hands.desktop.keys import ALLOWED_CHARS
-from jarvis_hands.keyboard.limits import GUARD_MAX_S, GUARD_MIN_S, INSERT_TAPS, SEND_TAPS, STORM_N
-from jarvis_hands.keyboard.review import REVIEW_TEXT
+from jarvis_hands.keyboard.limits import GUARD_MAX_S, GUARD_MIN_S, GUARD_STILL_SPEED, INSERT_TAPS, SEND_TAPS, STORM_N
+from jarvis_hands.keyboard.review import REVIEW_TEXT, GuardTap
 from jarvis_hands.keyboard.rig import AirScene, PinchScene, RecordingPinch
 from jarvis_hands.keyboard.tuning import Tuning
 from jarvis_hands.keyboard.types import PressMethod, Side
 
-#: Seeds whose streams the liveness rows were checked on.
-SEEDS = (0, 1, 2, 3)
+FULL = os.environ.get("KB_FULL") == "1"
+#: Seeds whose streams the liveness rows were checked on (0 to 3). Each is a whole armed session and about a second, so
+#: the default run takes the first two and ``KB_FULL=1`` all four. Safety does not depend on the seed: every row that
+#: asserts it asserts it for each seed that runs.
+SEEDS = (0, 1, 2, 3) if FULL else (0, 1)
+THREE_SEEDS = (0, 1, 2) if FULL else (0, 1)
+#: How long a hand that means no key is watched for strays (N40). A stray is a few a second at worst, so twenty seconds
+#: of a gesturing hand is a long run for "none of them reaches the window"; ``KB_FULL=1`` watches for forty.
+NO_KEY_S = 40.0 if FULL else 20.0
 SENTENCE = "hello there, my friend"
+
+#: ``armed`` builds a scene once for each (seed, options) and hands every test its own deep copy: placing the hands and
+#: the warm-up are half a second of the one second most of these rows take, and they are the same frames every time.
+#: The copy carries the typists' random streams where they stood, so a row sees exactly what it saw when it built its
+#: own scene, whatever order the rows run in.
+_ARMED: dict[tuple[object, ...], AirScene] = {}
 
 
 def armed(seed: int = 0, **kw: object) -> AirScene:
     """A warmed-up review session on a typist that moves its hand as a whole, past the sink's warm-up window."""
     kw.setdefault("alpha", 1.0)
+    key = (seed, *sorted(kw.items()))
+    if "drop" in kw:  # a test's own closure: no other test would ask for the same one
+        return _armed(seed, kw)
+    if key not in _ARMED:
+        _ARMED[key] = _armed(seed, kw)
+    return copy.deepcopy(_ARMED[key])
+
+
+def _armed(seed: int, kw: dict[str, object]) -> AirScene:
     scene = AirScene(seed=seed, **kw)  # type: ignore[arg-type]
     scene.arm()
     scene.run(0.5)
@@ -285,7 +309,15 @@ MOVING = ("wave", "wave_fast", "open_close", "open_close_fast", "reach", "finger
 GESTURING = ("talk_hands", "talking", "fidget")
 
 
-@pytest.mark.parametrize("name", [*CALM, *MOVING, *GESTURING])
+#: The default run leaves out the scenarios that are a gentler version of another: ``roll``, ``thumb`` and ``drift``
+#: are calm hands like ``still``, ``wave`` and ``open_close`` the slower ones of their ``_fast`` kin. ``KB_FULL=1``
+#: runs all of them.
+NO_KEY_SCENARIOS = [*CALM, *MOVING, *GESTURING]
+if not FULL:
+    NO_KEY_SCENARIOS = [n for n in NO_KEY_SCENARIOS if n not in ("roll", "thumb", "drift", "wave", "open_close")]
+
+
+@pytest.mark.parametrize("name", NO_KEY_SCENARIOS)
 def test_hands_that_mean_no_key_never_put_a_stroke_on_the_desktop(name: str) -> None:
     """The invariant of N40: a stream of tapping-like movement fills the box with strays at worst. It never reaches
     the window, and no run starts. The ladder may judge the camera unreliable on a hand that is gesturing: with the
@@ -296,8 +328,8 @@ def test_hands_that_mean_no_key_never_put_a_stroke_on_the_desktop(name: str) -> 
     log = TapLog.on(scene)
     compose(scene, "hello")
     keys = rig.counts["keys"]
-    scene.negative(name, seconds=45.0)
-    scene.run(40.0)
+    scene.negative(name, seconds=NO_KEY_S + 5.0)
+    scene.run(NO_KEY_S)
     assert rig.desktop.key_calls == [] and rig.counts["insert_start"] == 0 and log.starts == []
     assert rig.closed in (None, "air_unreliable")  # never input_blocked or runaway
     allowed_only(scene)
@@ -320,12 +352,40 @@ def test_three_insert_taps_by_a_parked_pinky_in_a_gesturing_stream_do_not_start_
     log.check_oracle()
 
 
+def test_the_session_gives_the_machine_the_evidence_of_an_air_tap_on_insert_and_send_only() -> None:
+    """The guards weigh a tap by what the press knew of it (2.13.4): its firmness, the speed of its hand at the frame of
+    the press and its finger. That is the session's to hand over, for Insert and Send and for nothing else, and it
+    carries no place and no letter."""
+    scene = armed(1)
+    machine = scene.session._machine
+    assert machine is not None
+    seen: list[tuple[str, object, object]] = []
+    original = machine.tap
+
+    def spy(kind: str, ch: str, t: float, **kw: object) -> object:
+        seen.append((kind, kw.get("touch"), kw.get("guard")))
+        return original(kind, ch, t, **kw)  # type: ignore[arg-type]
+
+    machine.tap = spy  # type: ignore[method-assign]
+    compose(scene, "hi")
+    insert(scene)
+    letters = [(touch, guard) for kind, touch, guard in seen if kind == "char"]
+    inserts = [(touch, guard) for kind, touch, guard in seen if kind == "insert"]
+    assert letters and all(touch is not None and guard is None for touch, guard in letters)
+    assert len(inserts) >= INSERT_TAPS and all(touch is None for touch, _ in inserts)
+    for _, guard in inserts:
+        assert isinstance(guard, GuardTap)
+        assert 0.0 < guard.conf <= 1.0 and 0.0 <= guard.speed <= GUARD_STILL_SPEED
+        assert (guard.side, guard.finger) == ("right", 3)  # the pinky of the right hand, the user's Insert finger
+        assert repr(guard) == "<GuardTap>"
+
+
 # -------------------------------------------------------------------------------------- X42: storm and tremor
 
 TWO_HANDS = [("left", 0), ("right", 0), ("left", 1), ("right", 1), ("left", 2), ("right", 2), ("left", 3), ("right", 3)]
 
 
-@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("seed", THREE_SEEDS)
 def test_x42_sixteen_taps_of_two_hands_in_two_seconds_freeze_the_taps_at_the_twelfth_and_close_nothing(
     seed: int,
 ) -> None:
@@ -384,7 +444,7 @@ def test_x42_a_twelve_a_second_burst_of_one_hand_trips_the_tremor_guard_not_the_
 # ---------------------------------------------------------------------------------------- X43: two hands at once
 
 
-@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("seed", SEEDS)
 def test_x43_taps_of_both_hands_in_the_same_frame_are_both_typed_in_order(seed: int) -> None:
     scene = armed(seed)
     rig = scene.rig
@@ -504,7 +564,7 @@ def test_a_hand_that_leaves_for_three_seconds_comes_back_to_a_session_that_is_st
     assert rig.session.phase == "typing" and rig.desktop.key_calls == []
 
 
-@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("seed", THREE_SEEDS)
 def test_a_hand_lost_in_the_middle_of_a_tap_types_nothing_for_that_tap(seed: int) -> None:
     """2.8 and X18: a tap still in progress when the hand goes is ignored; the hand that returns is a new track whose
     fingers are latched, so the dip is never finished by a hand that comes back."""
@@ -533,7 +593,7 @@ def test_a_tap_that_had_already_committed_is_delivered_when_the_hand_leaves_righ
     assert rig.box == "j" and rig.counts["stale"] == 0
 
 
-@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("seed", THREE_SEEDS)
 def test_a_camera_stall_in_the_middle_of_a_tap_gives_no_key_and_the_next_tap_is_typed(seed: int) -> None:
     """N11 for the air tap: no frames for 0.4 s (above GAP_RESET_S): the press resets, the dip is not finished."""
     stall: list[float] = []
@@ -582,7 +642,7 @@ def test_hands_that_come_back_before_the_idle_close_find_the_box_as_they_left_it
 
 
 @pytest.mark.parametrize("side", ["right", "left"])
-@pytest.mark.parametrize("seed", (0, 1, 2))
+@pytest.mark.parametrize("seed", THREE_SEEDS)
 def test_one_hand_warms_up_with_four_taps_and_types_a_word_and_inserts_it(side: Side, seed: int) -> None:
     scene = AirScene(seed=seed, alpha=1.0, sides=(side,))
     scene.place()

@@ -5,7 +5,10 @@ reference detector; the port has to reproduce them, so a change to a number or a
 here first. The rest of the file is of three kinds: crafted streams (``Rig``: every lift, position and ratio is a
 function of time written in the test, so each gate has the stream that fails without it), the simulated typist of
 ``keyboard.synth`` through the real ``HandTracker`` (the streams the design's measurements were made on), and the
-statistical rows, pooled over many seeds with bounds a few standard errors below the measurement.
+statistical rows, pooled over many seeds with bounds a few standard errors below the measurement. Those rows are
+minutes of pure Python (28 minutes of a Windows runner, which has no process pool for them), so by default each
+runs the first few seeds, in this process, against the same bound moved down by the standard errors of the smaller
+sample, and some cells wait for ``KB_FULL=1``, which runs every cell over the seeds the bounds were measured on.
 
 Every compared time is a frame's own ``t``: the tests never sleep and never read a clock (X52 reads one on purpose,
 and is skipped on a slow machine).
@@ -39,13 +42,17 @@ from jarvis_hands.keyboard.layout import layout_for
 from jarvis_hands.keyboard.plane import Plane, place_plane
 from jarvis_hands.keyboard.press_air import AirTapPress
 from jarvis_hands.keyboard.press_pinch import PinchPress
+from jarvis_hands.keyboard.rig import AirScene
 from jarvis_hands.keyboard.tuning import GROUPS, RANGES, Tuning, parse_tuning
 from jarvis_hands.keyboard.types import FingerSample, HandSample, PressEvent, Side
-from jarvis_hands.landmarks import Frame
+from jarvis_hands.landmarks import Frame, HandObservation
 
 DATA = Path(__file__).parent / "data"
 SRC = Path(__file__).parent.parent / "src" / "jarvis_hands" / "keyboard"
 DEFAULTS = Tuning()
+#: ``KB_FULL=1``: the statistical rows over the seeds and cells their bounds were measured on (a long run, once, at
+#: integration: DESIGN 6.3). Without it they run a few seeds of the cells that stand for the rest.
+FULL = os.environ.get("KB_FULL") == "1"
 
 
 # --------------------------------------------------------------------------------------------- the golden fixtures
@@ -519,6 +526,7 @@ def test_x10_two_fingers_at_nearly_equal_depths_never_type_within_the_hand_exclu
         assert len(mine) <= 1 or mine[1].t - mine[0].t <= 0.16 + 1e-9  # the other one is typed soon, or it was vetoed
 
 
+@functools.cache  # three rows ask for the same (delay, fps) run; they only read it
 def chord_run(delay: float, fps: float, seed: int = 1) -> tuple[list[PressEvent], dict[str, int]]:
     events = []
     for k in range(10):
@@ -592,7 +600,8 @@ def test_x17_five_commits_of_a_hand_inside_half_a_second_are_discarded_and_hold_
 def test_x17_a_fast_trill_of_two_fingers_trips_the_guard_in_every_trill(spacing, fps):
     tremors = 0
     most = 0
-    for seed in range(5):
+    seeds = seed_count(1, 5)
+    for seed in range(seeds):
         events = []
         t = 4.0
         for _ in range(3):
@@ -605,7 +614,7 @@ def test_x17_a_fast_trill_of_two_fingers_trips_the_guard_in_every_trill(spacing,
         ts = [e.t for e in got]
         most = max([most] + [sum(1 for x in ts if a <= x < a + 0.5) for a in ts])
         tremors += press.rejects.get("tremor", 0)
-    assert tremors >= 13  # of 15 trills (the design measured 15 in all six cells)
+    assert tremors >= (13 if FULL else 3 * seeds - 1)  # of 3 a seed (the design measured 15 of 15 in all six cells)
     assert most <= 4
 
 
@@ -734,6 +743,47 @@ def test_x14_a_finger_dipping_with_the_thumb_on_its_tip_is_rejected_pinched(rati
     else:
         assert times_of(events) == [2.2, 3.2]
         assert "pinched" not in press.rejects
+
+
+class TurnedToTheCamera:
+    """A resting hand turned about the line through its knuckles, with the landmark noise of a camera.
+
+    The noise is added after the turn: a camera's noise does not depend on where the hand points, whereas the noise of
+    ``AirTypist`` (added before) would leave a hand pointing at the lens with none along the axis it has lost. The depth
+    gets twice the noise of the picture's axes, as MediaPipe's does.
+    """
+
+    def __init__(self, inner: sy.AirTypist, degrees: float, sigma: float, rng: np.random.Generator) -> None:
+        self.inner, self.degrees, self.sigma, self.rng = inner, degrees, sigma, rng
+        self.walk = np.zeros((21, 3))
+
+    def observe(self, t: float, dt: float) -> HandObservation:
+        seen = self.inner.observe(t, dt)
+        points = np.asarray(seen.image, float) * np.array([1.0, sy.ASPECT, 1.0])
+        anchor = (points[5] + points[9]) / 2
+        q = points - anchor
+        c, s = math.cos(math.radians(self.degrees)), math.sin(math.radians(self.degrees))
+        turned = np.stack([q[:, 0], q[:, 1] * c - q[:, 2] * s, q[:, 1] * s + q[:, 2] * c], axis=1) + anchor
+        self.walk = 0.6 * self.walk + 0.8 * self.rng.normal(0.0, 1.0, (21, 3)) * np.array([1.0, 1.0, 2.0]) * self.sigma
+        image = (turned + self.walk) / np.array([1.0, sy.ASPECT, 1.0])
+        return HandObservation(seen.handedness, seen.score, image, seen.world)
+
+
+@pytest.mark.parametrize("degrees", [89.5, 90.0, 91.0, -89.0])
+def test_x12_a_hand_pointing_at_the_camera_types_nothing_at_landmark_noise_0_002(degrees):
+    """The 2D axis of such a hand (wrist to middle knuckle) is smaller than the noise, so a lift measured along it is
+    noise over noise and the posture gate opens by chance: 14 to 60 phantom taps in 20 s with two hands before the
+    tracker gave a hand with less than a quarter of its palm in the picture no axis at all."""
+    quiet = sy.Noise(sigma=0.0, glitch_p=0.0)
+    for seed in range(seed_count(1, 3)):
+        rng = np.random.default_rng(seed)
+        sims = {
+            side: TurnedToTheCamera(sy.AirTypist(side, HOME[side], [], rng, quiet), degrees, 0.002, rng)
+            for side in (LEFT, RIGHT)
+        }
+        press = warmed()
+        assert run_sims(sims, press, 20.0) == [], (degrees, seed)
+        assert press.rejects.get("g_posture", 0) > 0  # shut by the posture gate, not by luck
 
 
 # --------------------------------------------------------------------------------- X15, X16: shapes that are not taps
@@ -896,7 +946,7 @@ def estimate_with_taps(rate: float, seed: int, noise: float = 0.002) -> float:
 def test_x19_taps_inside_the_stream_hardly_move_the_median_estimate():
     """Four taps a second over the two hands: a mean-based estimate rises about 1.95 times (measured with the
     estimator swapped), the median one by a sixth on average (seeds spread from 0.9 to 1.4: the bound is the mean's)."""
-    ratios = [estimate_with_taps(2.0, seed) / estimate_with_taps(0.0, seed) for seed in range(8)]
+    ratios = [estimate_with_taps(2.0, seed) / estimate_with_taps(0.0, seed) for seed in range(seed_count(1, 8))]
     assert np.mean(ratios) <= 1.35
     assert max(ratios) <= 1.8
 
@@ -993,18 +1043,62 @@ def test_x24_the_calibrated_threshold_is_half_the_depth_held_between_three_quart
     assert press.theta(1, 2) <= max(nominal, lo) + 1e-12  # and a deep one cannot make it less sensitive than nominal
 
 
-def test_x24_without_a_warm_up_depth_the_threshold_is_the_nominal_one_and_while_calibrating_the_sensitive_one():
+def test_x24_without_a_warm_up_depth_the_threshold_is_the_nominal_one():
     nominal, rig = armed(depth=None)
     rig.run(4.0)
     assert nominal.theta(1, 0) == pytest.approx(0.10)
-    calibrating, rig = armed(depth=None, calibrating=True)
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.01, 0.03])
+def test_x24_while_calibrating_the_threshold_is_the_nominal_one_never_a_more_sensitive_one(noise):
+    """A warm-up that listened at 4 sigma (floor 0.07) heard the resting hand's own noise as taps: at landmark noise
+    0.002 every name of the strip drew strays from the other fingers and the sequence restarted for ever. The warm-up
+    asks for depth 0.10 at least (AIR_WARMUP_MIN_DEPTH), so a threshold under the nominal one gains it nothing."""
+    calibrating, rig = armed(depth=None, calibrating=True, noise=noise)
     rig.run(4.0)
     sigma = calibrating.sigma(1, 0)
     assert sigma is not None
-    assert calibrating.theta(1, 0) == pytest.approx(max(0.07, 4.0 * sigma))
+    nominal = min(0.25, max(0.10, 5.0 * sigma))
+    assert calibrating.theta(1, 0) == pytest.approx(nominal)
     calibrating.set_calibrating(False)
     rig.run(4.2)
+    assert calibrating.theta(1, 0) == pytest.approx(nominal)
+
+
+def test_x24_while_calibrating_a_depth_from_an_earlier_warm_up_does_not_lower_the_threshold():
+    """The depth lowers the typing threshold; a warm-up that is running measures a new one, not the old one."""
+    typing, rig = armed(depth=0.16)
+    rig.run(4.0)
+    calibrating, rig = armed(depth=0.16, calibrating=True)
+    rig.run(4.0)
+    assert typing.theta(1, 0) == pytest.approx(0.08)  # half the depth (held at three quarters of nominal or more)
     assert calibrating.theta(1, 0) == pytest.approx(0.10)
+
+
+#: By default one style at each end of the band (the quieter noise with the lazier user, the noisier with the
+#: ordinary one); the other two cells are the same warm-up with the styles swapped and wait for KB_FULL.
+X24_CELLS = [(0.0015, 12, "ordinary"), (0.0015, 12, "lazy"), (0.002, 11, "ordinary"), (0.002, 11, "lazy")]
+
+
+@pytest.mark.parametrize(
+    ("sigma", "bar", "style"),
+    [c for c in X24_CELLS if FULL or c[1:] in ((12, "lazy"), (11, "ordinary"))],
+    ids=lambda v: str(v),
+)
+def test_x24_in_the_degraded_noise_band_a_two_hand_warm_up_still_arms(sigma, bar, style):
+    """Two hands, 12 seeds (3 by default), 90 s each, the user tapping the finger the strip names (``AirScene.warm``).
+    The warm-up listened more sensitively than typing does (4 sigma, floor 0.07 against 5 sigma, floor 0.10), and at
+    this noise the resting fingers of the other hand drew a stray every few seconds: the sequence restarted over and
+    over, the strip blamed the user and the session closed idle (measured with that rule: 11 of 12 at 0.0015, 4 of 12
+    ordinary and 7 of 12 lazy at 0.002). With the typing threshold every run arms, with at most a restart or two."""
+    armed_runs = 0
+    seeds = seed_count(3, 12)
+    for seed in range(seeds):
+        scene = AirScene(seed=seed, style=style, sigma=sigma, keep_views=False, alpha=1.0)
+        scene.place()
+        armed_runs += bool(scene.warm())
+        assert scene.rig.desktop.key_calls == [] and scene.rig.box == "", (sigma, style, seed)
+    assert armed_runs >= bar - (12 - seeds), (sigma, style, armed_runs)  # the same misses allowed, of fewer seeds
 
 
 AIR_FIELDS = {name for name in GROUPS["air"]}
@@ -1236,6 +1330,10 @@ def test_x44_the_notes_of_a_stream_are_from_the_fixed_vocabulary():
 # ------------------------------------------------------------------------------------------------------- X52: the cost
 
 
+# The one row of this file that reads a real clock: its bound is a machine's speed, not the detector's behaviour, and a
+# runner that is busy or slow (a Windows or macOS CI machine at the wrong moment) says nothing with it. It runs with
+# ``KB_FULL=1``, on the integration machine the bound was set on, and not otherwise.
+@pytest.mark.skipif(not FULL, reason="a machine-speed bound: set KB_FULL=1 on the machine it was set on")
 @pytest.mark.skipif(bool(os.environ.get("CI_SLOW")), reason="CI_SLOW: a timing bound says nothing on a slow machine")
 def test_x52_update_costs_under_a_millisecond_a_hand_frame_at_sixty_fps_with_two_hands():
     events = {side: [tap(side, k % 4, 3.0 + 0.5 * k) for k in range(30)] for side in (LEFT, RIGHT)}
@@ -1480,18 +1578,60 @@ def run_typing(
     }
 
 
+def seed_count(default: int, full: int) -> int:
+    return full if FULL else default
+
+
+def floor_for(bound: float, measured: float, n: int) -> float:
+    """The lower bound of a rate over ``n`` trials. ``bound`` is three standard errors under the measurement over the
+    full sample; a smaller sample has larger standard errors, so its bound is the same three under the same
+    measurement, and the full run keeps its own."""
+    if FULL:
+        return bound
+    return min(bound, measured - 3.0 * math.sqrt(measured * (1.0 - measured) / n))
+
+
+def ceiling_for(bound: float, measured: float, minutes: float) -> float:
+    """The upper bound of events a minute averaged over ``minutes`` (Poisson), by the same rule as ``floor_for``."""
+    if FULL:
+        return bound
+    return max(bound, measured + 3.0 * math.sqrt(measured / minutes))
+
+
+def ceiling_share(bound: float, measured: float, n: int) -> float:
+    """The upper bound of a share of ``n`` trials, by the same rule as ``floor_for``."""
+    if FULL:
+        return bound
+    return max(bound, measured + 3.0 * math.sqrt(measured * (1.0 - measured) / n))
+
+
+def floor_mean(bound: float, measured: float, spread: float, seeds: int) -> float:
+    """The lower bound of a mean over ``seeds`` seeds whose values spread by ``spread`` (one standard deviation), by the
+    same rule as ``floor_for``."""
+    if FULL:
+        return bound
+    return min(bound, measured - 3.0 * spread / math.sqrt(seeds))
+
+
+def ceiling_mean(bound: float, measured: float, spread: float, seeds: int) -> float:
+    if FULL:
+        return bound
+    return max(bound, measured + 3.0 * spread / math.sqrt(seeds))
+
+
 def pooled(fn: Callable[[Any], Any], jobs: Sequence[Any]) -> list[Any]:
-    """``fn`` over the jobs, in a process pool when the machine has one (these rows are minutes of pure Python).
+    """``fn`` over the jobs: in this process by default (a handful of jobs, and the same on every platform), and with
+    ``KB_FULL=1`` in a process pool when the machine has one.
 
     The workers come from a fork server, not from a fork of the test process: that process has threads by now (other
     tests start them), and a fork with threads about can hand the child a lock nobody will release.
     """
     workers = min(len(jobs), os.cpu_count() or 1)
+    if not FULL or workers < 2:
+        return [fn(job) for job in jobs]
     try:
         context = multiprocessing.get_context("forkserver")
     except ValueError:  # no fork server here (Windows): the same answer, in a loop
-        return [fn(job) for job in jobs]
-    if workers < 2:
         return [fn(job) for job in jobs]
     with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         return list(pool.map(fn, jobs, chunksize=1))
@@ -1503,7 +1643,7 @@ def typing_job(arg: tuple[int, dict[str, Any]]) -> dict[str, Any]:
 
 
 @functools.cache
-def pooled_typing(seeds: int = 24, **kw: Any) -> dict[str, float]:
+def pooled_typing(seeds: int, **kw: Any) -> dict[str, float]:
     """Counts summed over ``seeds`` runs (seeds 0 up) of the given configuration."""
     rows = pooled(typing_job, [(s, kw) for s in range(seeds)])
     total = {
@@ -1518,21 +1658,33 @@ def pooled_typing(seeds: int = 24, **kw: Any) -> dict[str, float]:
 # --------------------------------------------------------------------------------- X7, X8, X20, X21, X22: pooled runs
 #
 # Every bound is at least three standard errors from the pooled 24-seed measurement the design records, so a correct
-# port passes with any other random draws and a regression of a few points does not.
+# port passes with any other random draws and a regression of a few points does not. By default the first seeds run
+# (4, 2, 1, 2, 2 and 1 for the rows below, where a seed is one simulated minute or so) against the bound moved down by
+# the standard errors of that many trials; ``KB_FULL=1`` runs 24 and keeps the bound.
 
 
 def test_x7_recall_and_false_taps_after_a_simulated_warm_up():
-    c = pooled_typing(24, warmup=True)  # 30 fps, landmark noise 0.001, ordinary taps, 100 taps a seed
-    assert c["n_im"] > 1200
-    assert c["h_im"] / c["n_im"] >= 0.90  # index and middle (measured 0.931)
-    assert c["h"] / c["n"] >= 0.84  # all fingers (0.860)
-    assert c["false_im"] / c["n_im"] <= 0.055  # false taps on index and middle (0.035)
+    count = seed_count(4, 24)
+    c = pooled_typing(count, warmup=True)  # 30 fps, landmark noise 0.001, ordinary taps, 100 taps a seed
+    assert c["n_im"] > (1200 if FULL else 35 * count)
+    assert c["h_im"] / c["n_im"] >= floor_for(0.90, 0.931, int(c["n_im"]))  # index and middle (measured 0.931)
+    assert c["h"] / c["n"] >= floor_for(0.84, 0.860, int(c["n"]))  # all fingers (0.860)
+    # false taps on index and middle (0.035)
+    assert c["false_im"] / c["n_im"] <= ceiling_share(0.055, 0.035, int(c["n_im"]))
 
 
-@pytest.mark.parametrize("fps", [15.0, 24.0, 30.0, 60.0])
+#: Frame rates of X20's recall rows. 24 fps is in the same smoothing window (3 samples) as 30, and X7 is the 30 fps row
+#: (the same stream, with its warm-up); both wait for KB_FULL.
+X20_FPS = [15.0, 24.0, 30.0, 60.0] if FULL else [15.0, 60.0]
+#: Seeds by frame rate (a second of 60 fps costs four of 15).
+X20_SEEDS = {15.0: 1, 24.0: 1, 30.0: 1, 60.0: 1}
+X20_MEASURED = {15.0: 0.919, 24.0: 0.903, 30.0: 0.932, 60.0: 0.947}
+
+
+@pytest.mark.parametrize("fps", X20_FPS)
 def test_x20_recall_holds_at_every_frame_rate(fps):
-    c = pooled_typing(24, fps=fps)
-    assert c["h_im"] / c["n_im"] >= 0.88  # measured 0.919, 0.903, 0.932, 0.947
+    c = pooled_typing(seed_count(X20_SEEDS[fps], 24), fps=fps)
+    assert c["h_im"] / c["n_im"] >= floor_for(0.88, X20_MEASURED[fps], int(c["n_im"]))  # measured 0.919 .. 0.947
 
 
 @pytest.mark.parametrize(
@@ -1558,20 +1710,23 @@ def test_x20_the_smoothing_window_is_one_three_or_five_samples_by_frame_rate(fps
 
 
 def test_x21_the_aim_at_the_onset_lands_on_the_key_the_aim_at_the_peak_does_not():
-    c = pooled_typing(24, motor=(0.0, 0.0), aim="onset", peaks=True)  # lead 0.08 s, no motor noise
-    assert c["hit"] > 1800
-    assert c["key_aim"] / c["hit"] >= 0.97  # measured 0.999
-    assert c["key_peak"] / c["hit"] <= 0.80  # 0.759: the fingertip has travelled on by then
+    c = pooled_typing(seed_count(1, 24), motor=(0.0, 0.0), aim="onset", peaks=True)  # lead 0.08 s, no motor noise
+    assert c["hit"] > (1800 if FULL else 70 * seed_count(1, 24))
+    assert c["key_aim"] / c["hit"] >= floor_for(0.97, 0.999, int(c["hit"]))  # measured 0.999
+    # 0.759: the fingertip has travelled on by then
+    assert c["key_peak"] / c["hit"] <= ceiling_share(0.80, 0.759, int(c["hit"]))
 
 
 def test_x21_the_aim_at_the_commit_is_nearly_as_good_when_asked_for():
-    c = pooled_typing(24, motor=(0.0, 0.0), aim="commit")
-    assert c["key_aim"] / c["hit"] >= 0.95  # measured 0.966
+    c = pooled_typing(seed_count(1, 24), motor=(0.0, 0.0), aim="commit")
+    assert c["key_aim"] / c["hit"] >= floor_for(0.95, 0.966, int(c["hit"]))  # measured 0.966
 
 
-@pytest.mark.parametrize(("sigma", "expected"), [(0.001, 0.017), (0.002, 0.030), (0.004, 0.052)])
+@pytest.mark.parametrize(
+    ("sigma", "expected"), [c for c in [(0.001, 0.017), (0.002, 0.030), (0.004, 0.052)] if FULL or c[0] != 0.002]
+)  # 0.002 lies between the two that run by default
 def test_x22_the_noise_estimate_of_a_typing_stream_follows_the_landmark_noise(sigma, expected):
-    assert pooled_typing(6, warmup=True, sigma=sigma)["noise"] == pytest.approx(expected, rel=0.25)
+    assert pooled_typing(seed_count(1, 6), warmup=True, sigma=sigma)["noise"] == pytest.approx(expected, rel=0.25)
 
 
 def neg_job(arg: tuple[str, int]) -> int:
@@ -1594,18 +1749,24 @@ NEG_BOUNDS = {
     "talk_hands": 15.0,
     "fidget": 42.0,  # a documented stress: it cannot be told from tapping
 }
+#: Events a minute over 24 seeds (the bound is three standard errors over this).
+NEG_MEASURED = dict(
+    zip(NEG_BOUNDS, (0.12, 0.08, 0.12, 0.25, 1.17, 1.46, 2.54, 12.2, 36.2), strict=True)
+)  # fmt: skip
+#: Roll and thumb are calm hands like the still one (a tenth of an event a minute), drift is a calmer one and wave a
+#: slower open_close; they wait for KB_FULL.
+NEG_CELLS = list(NEG_BOUNDS) if FULL else [n for n in NEG_BOUNDS if n not in ("roll", "thumb", "drift", "wave")]
 
 
 @functools.cache
-def neg_means() -> dict[str, float]:
-    jobs = [(name, seed) for name in NEG_BOUNDS for seed in range(24)]
-    counts = pooled(neg_job, jobs)
-    return {name: float(np.mean(counts[24 * k : 24 * (k + 1)])) for k, name in enumerate(NEG_BOUNDS)}
+def neg_mean(name: str, seeds: int) -> float:
+    return float(np.mean(pooled(neg_job, [(name, seed) for seed in range(seeds)])))
 
 
-@pytest.mark.parametrize("name", list(NEG_BOUNDS))
+@pytest.mark.parametrize("name", NEG_CELLS)
 def test_x8_a_hand_that_is_not_typing_types_at_most_so_many_keys_a_minute(name):
-    assert neg_means()[name] <= NEG_BOUNDS[name]  # measured: 0.12 0.08 0.12 0.25 1.17 1.46 2.54 12.2 36.2
+    minutes = seed_count(1, 24)
+    assert neg_mean(name, minutes) <= ceiling_for(NEG_BOUNDS[name], NEG_MEASURED[name], minutes)
 
 
 # ---------------------------------------------------------------------------- X13: a hand that slowly lets go (sag)
@@ -1630,8 +1791,9 @@ def sag_job(arg: tuple[int, float, bool]) -> int:
 
 @pytest.mark.parametrize(("sigma", "degraded"), [(0.001, False), (0.002, True)], ids=["quiet", "noisy_degraded"])
 def test_x13_a_drooping_hand_invents_at_most_two_taps_a_minute(sigma, degraded):
-    counts = pooled(sag_job, [(seed, sigma, degraded) for seed in range(8)])
-    assert np.mean(counts) <= 2.0  # measured 1.2 and 1.0
+    seeds = seed_count(1, 8)
+    counts = pooled(sag_job, [(seed, sigma, degraded) for seed in range(seeds)])
+    assert np.mean(counts) <= ceiling_for(2.0, 0.9 if degraded else 1.2, seeds)  # measured 1.2 and 1.0
 
 
 # ------------------------------------------------------------------------- X56: reach recall by displacement (layout)
@@ -1675,20 +1837,31 @@ REACH_CELLS = [
 ]
 
 
+#: Recall over 6 seeds of 40 taps (not a key count), in the order of ``REACH_CELLS``.
+REACH_MEASURED = dict(
+    zip((c[0] for c in REACH_CELLS), (1.00, 0.99, 0.87, 0.86, 0.91, 0.93, 1.00, 0.96, 0.95, 0.97, 0.95), strict=True)
+)  # fmt: skip
+#: By default the four cells the drill's reach keys come from (backspace, Insert, Clear, Send) and the pinky at rest,
+#: the weakest finger there; the other cells are the same stream with another finger or key and wait for KB_FULL.
+REACH_RUN = {"index_to_backspace", "pinky_to_insert", "left_pinky_to_clear", "left_ring_to_send", "right_pinky_rest"}
+
+
 @functools.cache
-def reach_recalls() -> dict[str, float]:
-    jobs = [(side, finger, du, dv, seed) for _, side, finger, du, dv, _ in REACH_CELLS for seed in range(6)]
-    rows = pooled(reach_job, jobs)
-    out = {}
-    for k, (name, *_rest) in enumerate(REACH_CELLS):
-        cell = rows[6 * k : 6 * (k + 1)]
-        out[name] = sum(h for h, _ in cell) / sum(n for _, n in cell)
-    return out
+def reach_recall(name: str, seeds: int) -> tuple[int, int]:
+    """(found, taps) of the cell over ``seeds`` seeds."""
+    side, finger, du, dv = next((s, f, du, dv) for n, s, f, du, dv, _ in REACH_CELLS if n == name)
+    rows = pooled(reach_job, [(side, finger, du, dv, seed) for seed in range(seeds)])
+    return sum(h for h, _ in rows), sum(n for _, n in rows)
 
 
-@pytest.mark.parametrize(("name", "bound"), [(c[0], c[5]) for c in REACH_CELLS], ids=[c[0] for c in REACH_CELLS])
+@pytest.mark.parametrize(
+    ("name", "bound"),
+    [(c[0], c[5]) for c in REACH_CELLS if FULL or c[0] in REACH_RUN],
+    ids=[c[0] for c in REACH_CELLS if FULL or c[0] in REACH_RUN],
+)
 def test_x56_a_finger_reaching_to_a_key_is_still_seen_tapping(name, bound):
-    assert reach_recalls()[name] >= bound  # measured 1.00 0.99 0.87 0.86 0.91 0.93 | 1.00 0.96 0.95 0.97 0.95
+    found, taps = reach_recall(name, seed_count(1, 6))
+    assert found / taps >= floor_for(bound, REACH_MEASURED[name], taps)  # measured 1.00 0.99 0.87 0.86 0.91 0.93 | ..
 
 
 def test_x56_no_reach_key_lies_above_the_finger_that_types_it():
@@ -1823,14 +1996,23 @@ def holes_share(arg: tuple[int, float, float, float]) -> float:
     return float(np.mean(shares))
 
 
-@pytest.mark.parametrize("fps", [30.0, 15.0])
+#: The rows of X57 that wait for KB_FULL by default are the 15 fps ones: the 30 fps ones stand for them (the holes are
+#: counted by the same code, and the typing row below keeps a 15 fps cell).
+HOLE_FPS = [30.0, 15.0] if FULL else [30.0]
+
+
+@pytest.mark.parametrize("fps", HOLE_FPS)
 def test_x57_holes_a_second_apart_keep_the_count_at_three_or_more_most_of_the_time(fps):
-    assert np.mean(pooled(holes_share, [(s, fps, 1.0, 0.30) for s in range(8)])) >= 0.70  # measured 0.84
+    seeds = seed_count(1, 8)
+    share = np.mean(pooled(holes_share, [(s, fps, 1.0, 0.30) for s in range(seeds)]))
+    assert share >= floor_mean(0.70, 0.83, 0.10, seeds)  # measured 0.84
 
 
-@pytest.mark.parametrize("fps", [30.0, 15.0])
+@pytest.mark.parametrize("fps", HOLE_FPS)
 def test_x57_holes_three_seconds_apart_rarely_do(fps):
-    assert np.mean(pooled(holes_share, [(s, fps, 3.0, 0.30) for s in range(8)])) <= 0.30  # measured 0.17
+    seeds = seed_count(1, 8)
+    share = np.mean(pooled(holes_share, [(s, fps, 3.0, 0.30) for s in range(seeds)]))
+    assert share <= ceiling_mean(0.30, 0.17, 0.08, seeds)  # measured 0.17
 
 
 def holed_typing(arg: tuple[int, float, float]) -> tuple[int, int]:
@@ -1855,8 +2037,10 @@ def holed_typing(arg: tuple[int, float, float]) -> tuple[int, int]:
     ids=["30fps_3s", "30fps_1s", "15fps_1s"],
 )
 def test_x57_typing_through_holes_keeps_its_recall(fps, every, bound):
-    rows = pooled(holed_typing, [(s, fps, every) for s in range(8)])
-    assert sum(h for h, _ in rows) / sum(n for _, n in rows) >= bound  # measured 0.90 0.75 0.59
+    rows = pooled(holed_typing, [(s, fps, every) for s in range(seed_count(1, 8))])
+    taps = sum(n for _, n in rows)
+    measured = {(30.0, 3.0): 0.90, (30.0, 1.0): 0.75, (15.0, 1.0): 0.59}[fps, every]
+    assert sum(h for h, _ in rows) / taps >= floor_for(bound, measured, taps)  # measured 0.90 0.75 0.59
 
 
 # ----------------------------------------------------------------------------- X58: bursts are disclosed, not defended
@@ -1877,11 +2061,12 @@ def burst_job(arg: tuple[int, float]) -> tuple[int, float]:
     return len(events), quality
 
 
-@pytest.mark.parametrize("sigma_b", [0.004, 0.010])
+@pytest.mark.parametrize("sigma_b", [0.004, 0.010] if FULL else [0.004])  # the stronger bursts wait for KB_FULL
 def test_x58_half_a_second_of_jitter_every_four_seconds_is_a_few_phantoms_and_the_ladder_does_not_see_it(sigma_b):
     """Pins today's behaviour as a regression guard and a disclosure; a burst gate would change it (7.4)."""
-    rows = pooled(burst_job, [(s, sigma_b) for s in range(6)])
-    assert np.mean([n for n, _ in rows]) <= 30  # events a minute; measured 20 and 12
+    seeds = seed_count(1, 6)
+    rows = pooled(burst_job, [(s, sigma_b) for s in range(seeds)])
+    assert np.mean([n for n, _ in rows]) <= ceiling_for(30, 20 if sigma_b < 0.01 else 12, seeds)  # measured 20 and 12
     assert max(q for _, q in rows) < limits.AIR_LEVEL_NOISE_DEGRADED  # measured 0.0169 and 0.0167 at the worst
 
 
@@ -1910,13 +2095,9 @@ def test_x59_one_finger_never_types_twice_inside_the_refractory_spacing(spacing,
 
 
 def test_x59_the_double_tap_stimulus_does_violate_the_spacing_without_the_refractory():
-    assert (
-        sum(
-            refractory_pairs(0.07, fps, refractory=0.0) + refractory_pairs(0.10, fps, refractory=0.0)
-            for fps in (30.0, 60.0)
-        )
-        > 0
-    )
+    # the rows above are not empty: with no refractory a double tap 0.10 s apart at 60 fps is typed twice (ten of ten).
+    # The cells at 30 fps and at 0.07 s are not as fine as that and may not show it, so they are not asked.
+    assert refractory_pairs(0.10, 60.0, refractory=0.0) > 0
 
 
 def low_score_events(score_of: float, *, min_score: float | None = None) -> tuple[int, dict[str, int]]:
@@ -2055,13 +2236,21 @@ def recall_of(jobs: Sequence[tuple[int, float, bool, float, float]]) -> float:
 
 @pytest.mark.parametrize(
     ("alpha", "lead", "gap", "bound"),
-    [(0.65, 0.2, 1.8, 0.87), (1.0, 0.2, 0.9, 0.90), (1.0, 0.2, 1.8, 0.96)],
-    ids=["moving_hand_slow", "whole_hand_fast", "whole_hand_slow"],
-)
+    [(0.65, 0.2, 1.8, 0.87)] + ([(1.0, 0.2, 0.9, 0.90), (1.0, 0.2, 1.8, 0.96)] if FULL else []),
+    ids=["moving_hand_slow"] + (["whole_hand_fast", "whole_hand_slow"] if FULL else []),
+)  # the hand as shipped (alpha 0.65); the cells of the whole hand wait for KB_FULL
 def test_x60_one_hand_typing_the_whole_keyboard_with_the_index_finger(alpha, lead, gap, bound):
-    assert recall_of([(s, gap, True, alpha, lead) for s in range(8)]) >= bound  # measured 0.91 0.94 0.99
+    seeds = seed_count(1, 8)
+    measured = {(0.65, 1.8): 0.91, (1.0, 0.9): 0.94, (1.0, 1.8): 0.99}[alpha, gap]
+    assert recall_of([(s, gap, True, alpha, lead) for s in range(seeds)]) >= floor_for(bound, measured, 100 * seeds)
 
 
-@pytest.mark.parametrize(("gap", "bound"), [(1.0, 0.89), (0.6, 0.84), (0.4, 0.74)])
-def test_x61_recall_falls_with_the_pace_of_the_typist(gap, bound):
-    assert recall_of([(s, gap, False, 0.65, 0.08) for s in range(8)]) >= bound  # measured 0.92 0.88 0.79
+#: The fastest pace (0.4 s) is the demanding cell and runs by default; the slower two, which X7 and X60 stand in for,
+#: wait for KB_FULL.
+X61_CELLS = [(1.0, 0.89, 0.92), (0.6, 0.84, 0.88), (0.4, 0.74, 0.79)]
+
+
+@pytest.mark.parametrize(("gap", "bound", "measured"), [c for c in X61_CELLS if FULL or c[0] == 0.4])
+def test_x61_recall_falls_with_the_pace_of_the_typist(gap, bound, measured):
+    seeds = seed_count(1, 8)
+    assert recall_of([(s, gap, False, 0.65, 0.08) for s in range(seeds)]) >= floor_for(bound, measured, 120 * seeds)

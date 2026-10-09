@@ -234,7 +234,7 @@ def _type_the_line(
         say("Stopped. Any key still held was released.")
         return EXIT_FAILED
     except InputBlocked:
-        say("Windows took none of the keys (a window with higher rights or the lock screen has the input). Stopped.")
+        say("Windows took none of the keys (the lock screen or another input block has the input). Stopped.")
         return EXIT_FAILED
     except OSError:
         say("Windows took only part of a key; it was released. Stopped.")

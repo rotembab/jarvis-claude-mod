@@ -217,12 +217,17 @@ def test_u7_condition_4_the_finger_must_lead_the_other_three_by_a_margin() -> No
     assert w.done == {("right", 0)}
 
 
-def test_u7_condition_5_no_other_finger_may_be_nearly_closed_too() -> None:
+def test_u7_condition_5_a_neighbour_far_behind_a_clean_pinch_does_not_stop_it() -> None:
+    """The margin of condition 4 is the whole rule: a finger that is clearly behind the pinching one is not "nearly as
+    closed", however low it sits. (An absolute floor on the others used to refuse every pinch of a relaxed hand, whose
+    neighbours rest at 0.3 to 0.5 of the thumb while one finger pinches it, and the warm-up never completed.)"""
+    clean = (0.8, 0.55, 0.30, 0.15, 0.05, 0.15, 0.30, 0.55, 0.8)
     w, p = pinch_warmup()
-    p.pinch(0, DOWN, others=(0.8, 0.44, 0.8, 0.8))
-    assert w.done == frozenset()
-    p.pinch(0, DOWN, others=(0.8, 0.46, 0.8, 0.8))
+    p.pinch(0, clean, others=(0.8, 0.30, 0.8, 0.8))  # 0.25 behind, and under the old floor of 0.45
     assert w.done == {("right", 0)}
+    w, p = pinch_warmup()
+    p.pinch(0, clean, others=(0.8, 0.12, 0.8, 0.8))  # 0.07 behind: the margin, not a floor, says no
+    assert w.done == frozenset()
 
 
 def test_u7_condition_6_fewer_than_three_fingers_curled() -> None:

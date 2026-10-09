@@ -30,6 +30,10 @@ _PIP, _DIP = _MCP + 1, _MCP + 2
 _LIFT_WEIGHTS = (0.25, 0.35, 0.40)
 #: A hand is ignored whose palm (wrist to middle knuckle) is outside this, in frame widths.
 _PALM_RANGE = (0.03, 0.40)
+#: A hand whose axis (wrist to middle knuckle) shows less than this share of its 3D palm in the picture has no usable
+#: axis: it points within about 14 degrees of the line of sight, where the axis is smaller than the landmark noise and
+#: the lift and the levelling, which divide by it, are noise over noise (phantom taps by the dozen at noise 0.002).
+_MIN_AXIS = 0.25
 #: The anchor speed is read over this long, and over at least this long while the hand is new.
 _SPEED_SPAN_S = 0.15
 _SPEED_MIN_SPAN_S = 0.05
@@ -142,7 +146,7 @@ class HandTracker:
         # The levelled tip (2.2). The design writes the hand's down direction as (-sin t, cos t) with
         # t = atan2(d.x, -d.y), which is the unit vector opposite to d: it rotates with the hand, so tilting the hand
         # does not shear the correction. A hand pointing at the camera has no axis in the picture: no levelling or lift.
-        if length > 1e-9:
+        if length > _MIN_AXIS * palm:
             up = axis / length
             down = -up
             offset = np.outer(np.array(track.levels), down) * palm

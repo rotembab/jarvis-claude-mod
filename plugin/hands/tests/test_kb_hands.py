@@ -73,6 +73,27 @@ def crafted(reach: tuple[float, float, float, float], thumb_ratio: float = 1.0, 
     return HandObservation("right", 0.95, image, image.copy())
 
 
+def pitched(obs: HandObservation, degrees: float) -> HandObservation:
+    """The hand turned toward (or away from) the camera about the horizontal line through its knuckles, in pose space.
+
+    At 90 degrees the hand points straight at the lens: the wrist and the middle knuckle land on one picture point,
+    and what is left of the axis between them is the depth difference of two landmarks, not a direction.
+    """
+    p = poses.pose_points(obs.image, ASPECT)
+    anchor = (p[INDEX_MCP] + p[MIDDLE_MCP]) / 2
+    q = p - anchor
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    turned = np.stack([q[:, 0], q[:, 1] * c - q[:, 2] * s, q[:, 1] * s + q[:, 2] * c], axis=1) + anchor
+    image = turned / np.array([1.0, ASPECT, 1.0])
+    return HandObservation(obs.handedness, obs.score, image, image.copy())
+
+
+def axis_share(obs: HandObservation) -> float:
+    """How much of the 3D palm (wrist to middle knuckle) the picture shows: the length of the 2D axis over the palm."""
+    p = poses.pose_points(obs.image, ASPECT)
+    return float(np.hypot(*(p[MIDDLE_MCP, :2] - p[WRIST, :2])) / np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
+
+
 # --------------------------------------------------------------------------------------------------- U3: identity
 
 
@@ -524,6 +545,41 @@ def test_the_lift_does_not_depend_on_the_depth_axis() -> None:
     a = HandTracker(TUNING).update(syn.frame(0.0, obs))[0]
     b = HandTracker(TUNING).update(syn.frame(0.0, HandObservation("right", 0.95, deeper, obs.world)))[0]
     assert [f.lift for f in a.fingers] == pytest.approx([f.lift for f in b.fingers], abs=1e-12)
+
+
+@pytest.mark.parametrize("degrees", [80.0, 84.0, 88.0, 90.0, -90.0, 92.0])
+def test_a_hand_that_points_at_the_camera_has_no_axis_so_no_lift_and_no_levelling(degrees: float) -> None:
+    """The picture shows less than a quarter of the palm: the axis is smaller than the landmark noise, so the lift
+    and the levelling (both divide by it) would be noise over noise. The hand takes the no-axis branch (2.2)."""
+    obs = pitched(posture(), degrees)
+    assert axis_share(obs) < 0.2  # the premise: a hand within a dozen degrees of the line of sight
+    sample = HandTracker(TUNING).update(syn.frame(0.0, obs))[0]
+    points = poses.pose_points(obs.image, ASPECT)
+    assert [f.lift for f in sample.fingers] == [0.0, 0.0, 0.0, 0.0]
+    for f, tip in zip(sample.fingers, (8, 12, 16, 20), strict=True):
+        np.testing.assert_allclose(f.aim, points[tip, :2], atol=1e-12)  # the raw tip: no levelling offset
+
+
+@pytest.mark.parametrize("degrees", [0.0, 45.0, 60.0, 70.0, -70.0])
+def test_a_hand_whose_axis_is_over_a_quarter_of_the_palm_keeps_its_lift_and_levelling(degrees: float) -> None:
+    obs = pitched(posture(), degrees)
+    assert axis_share(obs) > 0.3
+    sample = HandTracker(TUNING).update(syn.frame(0.0, obs))[0]
+    points = poses.pose_points(obs.image, ASPECT)
+    assert any(f.lift != 0.0 for f in sample.fingers)
+    # the middle, ring and pinky levels are not zero: their aims sit off their tips
+    for f, tip in zip(sample.fingers[1:], (12, 16, 20), strict=True):
+        assert float(np.linalg.norm(f.aim - points[tip, :2])) > 0.01 * sample.palm
+
+
+def test_the_axis_threshold_is_a_quarter_of_the_palm() -> None:
+    """Either side of 0.25: the pitches are found on the share the picture shows, not on a guessed angle."""
+    shares = {deg: axis_share(pitched(posture(), deg)) for deg in np.arange(60.0, 90.0, 0.25)}
+    inside = max(deg for deg, share in shares.items() if share > 0.26)
+    outside = min(deg for deg, share in shares.items() if share < 0.24)
+    for degrees, live in ((inside, True), (outside, False)):
+        sample = HandTracker(TUNING).update(syn.frame(0.0, pitched(posture(), float(degrees))))[0]
+        assert any(f.lift != 0.0 for f in sample.fingers) == live, degrees
 
 
 def test_a_sample_is_the_documented_record() -> None:

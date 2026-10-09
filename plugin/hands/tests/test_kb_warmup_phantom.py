@@ -14,7 +14,11 @@ real tracker, ``AirTapPress`` in calibrating mode, ``Warmup`` and the session). 
 phantoms that pass every gate and never raise a counter, one hand, at a rate high enough to hit the named finger by
 chance, can arm a warm-up of four fingers (twelve one-hand runs of one tap every 1.1 to 2 s armed some of them when
 this was tried); nothing in the warm-up itself tells such a tap from the user, so the scripted half is not a proof for
-them. Seeds 0 and 1 run by default (the stream is 90 s of frames each) and 0 to 11 with ``KB_FULL=1``.
+them.
+
+The streams are 90 s of frames each (a second or two of CPU for each cell, and 48 cells made 80 s of a suite that has
+to run on a Windows runner), so by default only a diagonal of the grid runs: seed 0 and, for each scenario, one hand
+count and one landmark noise, varied from one scenario to the next. ``KB_FULL=1`` runs every cell of seeds 0 to 11.
 """
 
 from __future__ import annotations
@@ -32,8 +36,11 @@ from jarvis_hands.keyboard.types import Side
 Item = tuple[object, ...]
 Stream = Callable[[random.Random, tuple[Side, ...], float], Iterator[Item]]
 
-SEEDS = range(12) if os.environ.get("KB_FULL") == "1" else range(2)
+FULL = os.environ.get("KB_FULL") == "1"
+SEEDS = range(12) if FULL else range(1)
 RUN_S = 90.0
+ONE = ("right",)
+TWO = ("left", "right")
 
 
 def fingers_of(sides: tuple[Side, ...]) -> list[tuple[Side, int]]:
@@ -131,9 +138,16 @@ def play(rig: KbRig, items: list[Item], begun: float, seconds: float, rng: rando
         assert not rig.session.armed
 
 
-@pytest.mark.parametrize("sides", [("left", "right"), ("right",)], ids=["two_hands", "one_hand"])
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("name", SCENARIOS)
+#: (scenario, hands) of the scripted half by default: each scenario once, with one hand or with two.
+SCRIPTED_DIAGONAL = [("still", TWO), ("open_close", ONE), ("reach", TWO), ("talk_hands", ONE), ("talking", TWO)]
+SCRIPTED_CELLS = [(name, seed, sides) for sides in (TWO, ONE) for seed in SEEDS for name in SCENARIOS]
+
+
+@pytest.mark.parametrize(
+    ("name", "seed", "sides"),
+    SCRIPTED_CELLS if FULL else [(name, 0, sides) for name, sides in SCRIPTED_DIAGONAL],
+    ids=lambda v: "two_hands" if v == TWO else "one_hand" if v == ONE else None,
+)
 def test_x53_no_stream_of_phantoms_arms_the_warmup_in_ninety_seconds(
     name: str, seed: int, sides: tuple[Side, ...]
 ) -> None:
@@ -142,7 +156,8 @@ def test_x53_no_stream_of_phantoms_arms_the_warmup_in_ninety_seconds(
     rng = random.Random(f"{name}/{seed}/{len(sides)}")
     items = list(SCENARIOS[name](rng, sides, RUN_S))
     play(rig, items, rig.t, RUN_S + 5.0, rng)
-    assert not rig.session.armed and rig.closed == "idle"  # the 90 s of the warm-up ran out
+    # the 90 s of the warm-up ran out: "idle" for a stream that made no tap, "air_unreliable" for one that did
+    assert not rig.session.armed and rig.closed in ("idle", "air_unreliable")
     assert rig.desktop.key_calls == [] and rig.box == ""
 
 
@@ -181,10 +196,26 @@ NEGATIVES = ("still", "open_close", "reach", "talk_hands", "talking", "fidget")
 NOISES = (0.001, 0.002)
 
 
-@pytest.mark.parametrize("sides", [("left", "right"), ("right",)], ids=["two_hands", "one_hand"])
-@pytest.mark.parametrize("sigma", NOISES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("name", NEGATIVES)
+#: (scenario, noise, hands) of the real-detector half by default: each scenario once, the fidget (the one the study
+#: could not tell from tapping) with two hands at the higher noise.
+REAL_DIAGONAL = [
+    ("still", 0.001, TWO),
+    ("open_close", 0.002, ONE),
+    ("reach", 0.002, TWO),
+    ("talk_hands", 0.001, ONE),
+    ("talking", 0.001, TWO),
+    ("fidget", 0.002, TWO),
+]
+REAL_CELLS = [
+    (name, seed, sigma, sides) for sides in (TWO, ONE) for sigma in NOISES for seed in SEEDS for name in NEGATIVES
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "seed", "sigma", "sides"),
+    REAL_CELLS if FULL else [(name, 0, sigma, sides) for name, sigma, sides in REAL_DIAGONAL],
+    ids=lambda v: "two_hands" if v == TWO else "one_hand" if v == ONE else None,
+)
 def test_x53_hands_that_mean_nothing_do_not_arm_the_warmup_of_the_real_detector(
     name: str, seed: int, sigma: float, sides: tuple[Side, ...]
 ) -> None:

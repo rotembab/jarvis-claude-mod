@@ -19,6 +19,14 @@ import pytest
 from jarvis_hands.keyboard import limits, tuning
 from jarvis_hands.keyboard.tuning import Tuning
 
+
+def short_id(value: Any) -> str:
+    """``repr`` for a test's id, cut when long: an id is also an environment value (PYTEST_CURRENT_TEST), and 10**400
+    is 400 digits of every case's name."""
+    text = repr(value)
+    return text if len(text) <= 60 else f"{text[:24]}...[{len(text)} characters]"
+
+
 # name: (default, low, high). An independent copy of the tables of 3.2; a change to the module fails here.
 SCALARS: dict[str, tuple[Any, float, float]] = {
     "close": (0.28, 0.22, 0.36),
@@ -223,7 +231,7 @@ def test_just_outside_the_clamp_falls_back_to_the_default(name: str) -> None:
         10**400,
         -(10**400),
     ],
-    ids=repr,
+    ids=short_id,
 )
 def test_wrongly_typed_or_non_finite_values_fall_back(name: str, bad: Any) -> None:
     assert getattr(parse(**{name: bad}), name) == SCALARS[name][0]

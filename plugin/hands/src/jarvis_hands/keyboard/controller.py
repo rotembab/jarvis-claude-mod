@@ -65,9 +65,14 @@ TEXT = MappingProxyType(
         "render": "Text rendering is unavailable, so the keyboard cannot be shown.",
         "no_typing": "This computer cannot type for the keyboard yet.",
         "air_direct": AIR_NEEDS_REVIEW,
+        "not_open": "The air keyboard is not open. Open it first, then use {action}.",
         "practice_windows": "Practice needs the air or pinch method.",
         "practice_air": "Practice first: run /jarvis hands keyboard practice once with the air method.",
         "practice_air_poor": "The last air practice had too many false or missed taps; practice again.",
+        "practice_air_cut": (
+            "The last air practice found the air tap unusable on this camera. "
+            "Use the pinch method instead: /jarvis hands keyboard press pinch."
+        ),
         "practice_pinch": "Practice first: run /jarvis hands keyboard practice once on this computer.",
         "practice_pinch_poor": "The last practice had too many false presses; practice again.",
         "osk": "Windows' on-screen keyboard did not start.",
@@ -166,6 +171,9 @@ class KeyboardController:
         # health of the overlay, and the practice's cut
         self._bad_since: float | None = None
         self._cut_since: float | None = None
+        #: The newest air practice was cut by the ladder and none has been finished since. It outlives the open: it is
+        #: what the next refusal says, because the marker of a cut practice is never written and the file cannot say it.
+        self._air_cut = False
         self._quality: tuple[float, float | None] = (0.0, None)
         self._quality_at = float("-inf")
         # practice only: the tap log and the landmark trace (X47: never in a live session)
@@ -214,6 +222,10 @@ class KeyboardController:
         if action == "stop":
             self.close("command")
             return protocol.ok_response()
+        if action in ("recenter", "private", "public") and not self._active:
+            # Defence in depth (the mod sends none of them while closed): the next open starts public, so an "ok" for
+            # private here would be a false assurance.
+            return protocol.error_response("bad_request", TEXT["not_open"].format(action=action))
         if action == "recenter":
             if self._session is not None:
                 self._session.recenter()
@@ -330,6 +342,8 @@ class KeyboardController:
         if live and press == "air":
             status = marker_status(deps.data_dir, "air")
             if status != "ok":
+                if self._air_cut:
+                    return TEXT["practice_air_cut"]  # "practice first" would send the user round the same loop again
                 return TEXT["practice_air" if status == "missing" else "practice_air_poor"]
         elif live and press == "pinch" and settings.commit == "direct":
             status = marker_status(deps.data_dir, "pinch")
@@ -530,8 +544,10 @@ class KeyboardController:
         # The ladder found the air tap unusable and cut the drill: its one sentence stays up for a while.
         if self._cut_since is None:
             self._cut_since = now
+            self._air_cut = True  # at once: a stop while the sentence is up must not lose it
         elif now - self._cut_since >= CUT_SHOW_S:
-            self.close("command")
+            # Not "command": the mod says nothing of that reason, so the user would get no word after the strip.
+            self.close("air_unreliable")
 
     # ----------------------------------------------------------------------------------------------------- events
 
@@ -667,6 +683,8 @@ class KeyboardController:
         """Marker, trace and tap log, each on its own: a failing write is a missing file and never an exception."""
         data_dir = self._deps.data_dir
         if result is not None:
+            if result.completed and plan.press == "air":
+                self._air_cut = False  # the newest word on the air tap is a finished practice now, not the cut
             self._step("marker", lambda: write_marker(data_dir, plan.press, result))
         if trace is not None and len(trace) > 0:
             self._step("trace", lambda: trace.save(trace_path(data_dir)))

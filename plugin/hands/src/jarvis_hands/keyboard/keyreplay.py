@@ -325,7 +325,8 @@ def write_tuning(path: Path, values: Mapping[str, Any]) -> list[str]:
     temp = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+        # "\n" as is: text mode would write CRLF on Windows, and the file should be the same bytes on every platform.
+        temp.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8", newline="\n")
         os.replace(temp, path)
     except OSError:
         temp.unlink(missing_ok=True)

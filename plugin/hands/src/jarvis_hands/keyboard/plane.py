@@ -6,6 +6,7 @@ Everything is in pose space (frame widths) on the way in and in key units on the
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -64,9 +65,10 @@ def place_plane(
 
     ``window`` holds the frames of the still period, each the samples of the hands that were still. Two hands are
     ordered by their position in the picture, never by their label (the label is the engine's newest guess); they set
-    the pitch from their distance, within 0.90 to 1.15 of the base pitch. One hand uses the base pitch and its own label
-    to know which cluster it is. The base pitch ``tuning.pitch * reach`` and the layout's ``home_v`` and ``rows`` are
-    not in the window, so they come in as arguments. A window without a hand is a caller's bug and raises.
+    the pitch from their distance, within 0.90 to 1.15 of the base pitch. One hand uses the base pitch and its own
+    label (the one most of the window carried) to know which cluster it is. The base pitch ``tuning.pitch * reach`` and
+    the layout's ``home_v`` and ``rows`` are not in the window, so they come in as arguments. A window without a hand is
+    a caller's bug and raises.
     """
     tracks: dict[int, list[HandSample]] = {}
     for frame in window:
@@ -90,7 +92,9 @@ def place_plane(
         sides: tuple[Side, ...] = ("left", "right")
     else:
         px = px0
-        sides = (kept[0][-1].side,)
+        # The label the hand carried for most of the window: one flipped frame (the last one included) must not pick
+        # the other cluster, which would make every warm-up and pinch tap a stray.
+        sides = (Counter(s.side for s in kept[0]).most_common(1)[0][0],)
         x_mean = float(np.mean(aims[0][:, 0]))
         home_u = _LEFT_HOME_U if sides[0] == "left" else _RIGHT_HOME_U
         cx = x_mean - (home_u - WIDTH_U / 2) * px

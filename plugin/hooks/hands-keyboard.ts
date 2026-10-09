@@ -200,6 +200,10 @@ const TEXT = {
   off: 'The air keyboard is off. Turn it on in the Jarvis plugin settings (handKeyboard).',
   tooOld: 'The hand helper is too old for the air keyboard: run /jarvis setup hands.',
   notOpen: 'The air keyboard is not open.',
+  // recenter, private and public act on an open keyboard only: the helper keeps no private mode between sessions, so a "done" would be false.
+  notOpenRecenter: 'The air keyboard is not open. Open it first, then use recenter.',
+  notOpenPrivate: 'The air keyboard is not open. Open it first, then use private.',
+  notOpenPublic: 'The air keyboard is not open. Open it first, then use public.',
   // Toasts when it opens.
   openAir: 'Air keyboard open. Hold your hands over the keys, then tap each finger the strip names.',
   openPinch: 'Air keyboard open. Hold your hands over the keys, then pinch each finger once.',
@@ -216,7 +220,7 @@ const TEXT = {
   closedCamera: 'Air keyboard closed: the camera stopped.',
   closedError: 'Air keyboard closed after an internal error; hand control carries on.',
   closedInputBlocked: 'Air keyboard closed: Windows would not take the keys (is the window running as administrator?).',
-  closedAirUnreliable: 'Air keyboard closed: the camera or hand tracking was too unsteady for tapping.',
+  closedAirUnreliable: 'Air keyboard closed: the camera or hand tracking was too unsteady for tapping. If the air tap does not work on this camera, try /jarvis hands keyboard press pinch.',
   pointerBack: ' Lower your hands for a second to give the pointer back.',
   discardedOne: ' {discarded} typed character was thrown away.',
   discardedMany: ' {discarded} typed characters were thrown away.',
@@ -230,7 +234,7 @@ const TEXT = {
   abortedEnterNoWhy: 'Air keyboard: Enter was not pressed.',
   // What /jarvis hands keyboard answers.
   openingAir:
-    'Opening the air keyboard. Hold your hands over the keys, then tap each finger the strip names. What you tap goes into a review box; nothing reaches another window until you tap Insert three times.',
+    'Opening the air keyboard. Hold your hands over the keys, then tap each finger the strip names. What you tap goes into a review box; nothing reaches another window until you tap Insert three times, firmly, with your hand still.',
   openingPinchReview:
     'Opening the air keyboard. Hold your hands over the keys, then pinch each finger once. What you type goes into a review box; nothing reaches another window until you press Insert three times.',
   openingPinchDirect:
@@ -311,7 +315,7 @@ const KEYBOARD_HELP_LINES = [
   '/jarvis hands keyboard commit <review|direct|default>      review: taps fill a box first (the only choice for air)',
   '/jarvis hands keyboard layout <auto|en|he|default>   dock <top|bottom|default>   enter <twice|off|default>',
   '/jarvis hands keyboard size <0.6-1.6|default>   reach <0.8-1.5|default>',
-  'What you tap goes into a review box. Nothing reaches another window until you tap Insert three times; Jarvis cannot read the box or type it for you.',
+  'What you tap goes into a review box. Nothing reaches another window until you tap Insert three times, firmly, with your hand still; Jarvis cannot read the box or type it for you.',
 ]
 export const KEYBOARD_HELP: string = KEYBOARD_HELP_LINES.join('\n')
 
@@ -582,11 +586,19 @@ export class HandsKeyboard {
     return by === 'claude' ? TEXT.toolClosing : TEXT.closing
   }
 
-  /** recenter, private and public: one command each. */
+  /**
+   * recenter, private and public: one command each, for a keyboard that is open.
+   * The helper answers them with "ok" when it is closed too, then forgets
+   * private at the next open; "private mode is on" for a keyboard that will
+   * open in the clear would be a false assurance. The state is the one the
+   * open and closed events set (neither is rate limited away) and a helper
+   * restart clears.
+   */
   private async simple(action: 'recenter' | 'private' | 'public'): Promise<string> {
     const notRunning = await this.deps.notRunning()
     if (notRunning !== undefined) return notRunning
     if (!this.hasKeyboard()) return TEXT.tooOld
+    if (this.state !== 'open' && this.state !== 'practice') return action === 'recenter' ? TEXT.notOpenRecenter : action === 'private' ? TEXT.notOpenPrivate : TEXT.notOpenPublic
     const outcome = await this.deps.helper.send('keyboard', { action })
     if (!outcome.ok) return this.failure(outcome, action === 'recenter' ? 'recenter the air keyboard' : 'change the air keyboard\'s private mode')
     return action === 'recenter' ? TEXT.recentering : action === 'private' ? TEXT.privateOn : TEXT.privateOff

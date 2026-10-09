@@ -13,6 +13,7 @@ The stream builders (the talking hands, a hand that appears pinching, a hand los
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 import numpy as np
@@ -27,8 +28,11 @@ from jarvis_hands.landmarks import Frame
 from scripted import Blend
 
 #: The design's rows are N1: 5 minutes, N15: 3, N9: 2. The session closes ``idle`` after ``NO_KEY_CLOSE_S`` = 300 s
-#: without a key, however the hands move, so N1 here is the 280 s that the session can see.
-N1_S, N9_S, N15_S = 280.0, 120.0, 180.0
+#: without a key, however the hands move, so N1 here is the 280 s that the session can see. A still hand makes a
+#: phantom press at a rate, not at a moment, and ``test_kb_scenarios`` runs the same detector over the same hover: the
+#: default run here is 100 s and 60 s of it, ``KB_FULL=1`` the design's minutes.
+FULL = os.environ.get("KB_FULL") == "1"
+N1_S, N9_S, N15_S = (280.0 if FULL else 100.0), 120.0, (180.0 if FULL else 60.0)
 
 
 def armed(commit: str = "direct", **kw: object) -> PinchScene:
@@ -63,7 +67,8 @@ def smooth_k(x: float) -> float:
 # ----------------------------------------------------------------------------------------------------- N1, N15
 
 
-#: The postures whose pinch warm-up arms a session (``relaxed`` does not: see the repro below).
+#: The postures the long hover rows run on. ``relaxed`` is left out of those (a five-minute hover of a third posture
+#: adds time and no case); the warm-up below arms on all three.
 POSTURES = ["rest", "straight"]
 
 
@@ -85,17 +90,15 @@ def test_n15_a_hover_with_jitter_of_six_thousandths_for_three_minutes_presses_no
     assert scene.press.rejects.get("closing_timeout", 0) <= 3
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "the pinch warm-up of 2.5 (OTHER 0.45, MARGIN 0.08) rejects every finger of the synthetic relaxed hand but the "
-        "first: when one finger pinches the neighbours stay at 0.41 to 0.50 of the thumb. Warmup's rule or the posture"
-    ),
-)
 @pytest.mark.parametrize("seed", [21, 1])
-def test_repro_the_pinch_warmup_arms_a_session_on_the_relaxed_posture(seed: int) -> None:
-    scene = PinchScene(commit="direct", posture="relaxed", seed=seed)
+@pytest.mark.parametrize("posture", ["rest", "straight", "relaxed"])
+def test_the_pinch_warmup_arms_a_session_on_every_posture(posture: sy.Posture, seed: int) -> None:
+    """The relaxed hand is the one a user who does not hold his fingers up has: the neighbours of a pinching finger
+    stay at 0.3 to 0.5 of the thumb. An absolute floor on them (OTHER 0.45) refused every pinch of that hand but the
+    first, and the pinch method, the air method's fallback, could not be used at all."""
+    scene = PinchScene(commit="direct", posture=posture, seed=seed)
     scene.arm()
+    silent(scene)
 
 
 # --------------------------------------------------------------------------------------------------------- N7

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import random
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -23,12 +25,15 @@ from jarvis_hands.keyboard.review import (
     GUARD_TAPS,
     GUARD_WINDOW,
     REVIEW_TEXT,
+    GuardTap,
     InsertStep,
     InsertSummary,
     LastInsert,
     ReviewMachine,
 )
-from jarvis_hands.keyboard.types import Hold, InsertResult, KeyKind, Touch
+from jarvis_hands.keyboard.session import HOLD_WHY, SESSION_TEXT
+from jarvis_hands.keyboard.types import Hold, InsertResult, KeyKind, Side, Touch
+from jarvis_hands.overlay import keyboard_render as kr
 
 SENTINEL = "zzqxjv"
 ALL_KINDS: tuple[KeyKind, ...] = (
@@ -64,14 +69,21 @@ class Bench:
         self.starts = 0
 
     # -- time
-    def at(self, t: float, tap: tuple[KeyKind, str] | None = None, *, touch: Touch | None = None) -> list[InsertStep]:
+    def at(
+        self,
+        t: float,
+        tap: tuple[KeyKind, str] | None = None,
+        *,
+        touch: Touch | None = None,
+        guard: GuardTap | None = None,
+    ) -> list[InsertStep]:
         self.t = t
         emitted: list[InsertStep] = []
         step = self.m.tick(t, self.hold)
         if step is not None:
             emitted.append(step)
         if tap is not None:
-            started = self.m.tap(tap[0], tap[1], t, touch=touch)
+            started = self.m.tap(tap[0], tap[1], t, touch=touch, guard=guard)
             if started is not None:
                 assert not emitted, "a tap cannot start a run while a step came out of tick"
                 emitted.append(started)
@@ -143,21 +155,23 @@ def start_run(text: str, *, enter: str = "twice", fps: float = 30.0) -> Bench:
 EXPECTED_TEXT = {
     "hint_empty": "Tap letters. Insert types them into the window in front.",
     "counter": "-> {target}   {n}/200",
-    "arm_insert_1": "Insert {n} characters into {target}? Tap Insert 2 more times.",
+    "arm_insert_1": "Insert {n} characters into {target}? Tap Insert 2 more, firmly.",
     "arm_insert_2": "Tap Insert once more to type into {target}.",
+    "arm_insert_firm": "Tap Insert once more, a little firmer.",
+    "still_insert": "Hold your hand still, then tap Insert.",
     "arm_clear": "Clear the box? Tap Clear again.",
     "arm_close": "Close and throw away {n} characters? Tap Close again.",
-    "arm_send_1": "Press Enter in {target}? Tap Send 2 more times.",
+    "arm_send_1": "Press Enter in {target}? Tap Send 2 more times, firmly.",
     "arm_send_2": "Tap Send once more to press Enter in {target}.",
+    "arm_send_firm": "Tap Send once more, a little firmer.",
+    "still_send": "Hold your hand still, then tap Send.",
     "inserting": "Typing {sent}/{total} into {target}. Tap Insert to stop.",
     "sending": "Pressing Enter in {target}.",
     "done": "Typed {n} characters into {target}.",
-    "done_send": "Typed {n} characters into {target}. Tap Send 3 times within 10 s to press Enter.",
+    "done_send": "Typed {n} characters into {target}. Send: 3 firm taps within 10 s.",
     "done_slash": 'Typed {n} characters. Not sent: it starts with "/". Press Enter yourself.',
     "done_bang": 'Typed {n} characters. Not sent: it starts with "!". Press Enter yourself.',
-    "done_prefix": (
-        'Typed {n} characters. Not sent: this session inserted text starting with "/" or "!". Press Enter yourself.'
-    ),
+    "done_prefix": 'Typed {n} characters. Not sent: text began with "/" or "!". Press Enter yourself.',
     "sent": "Enter pressed.",
     "aborted": "Typed {sent} of {total}, then stopped ({why}). The rest is still in the box.",
     "full": "The box is full (200). Insert it or clear it.",
@@ -204,6 +218,64 @@ def test_the_guard_tables_are_the_pinned_ones() -> None:
     assert GUARD_TAPS == {"insert": limits.INSERT_TAPS, "clear": 2, "send": limits.SEND_TAPS, "close": 2}
     assert set(GUARD_WINDOW.values()) == {limits.GUARD_MAX_S}
     assert limits.INSERT_TAPS >= 3 and limits.SEND_TAPS >= 3
+
+
+#: Fonts with Arial's widths (Arial itself, and Liberation Sans or Arimo, which are metric-compatible): the strip is
+#: drawn in Segoe UI on Windows, a little narrower, so a sentence that fits these fits there. DejaVu is a quarter wider
+#: and is not the font the sentences are written for.
+ARIAL_METRIC_FONTS = (
+    *(os.path.join(os.environ[v], "Fonts", "arial.ttf") for v in ("WINDIR", "SYSTEMROOT") if v in os.environ),
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/croscore/Arimo-Regular.ttf",
+)
+
+
+@pytest.fixture
+def arial_metrics(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    found = [f for f in ARIAL_METRIC_FONTS if os.path.exists(f)]
+    if not found:
+        pytest.skip("no font with Arial's widths on this machine")
+    monkeypatch.setattr(kr, "_font_candidates", lambda: found)
+    kr._font_path.cache_clear()
+    kr._font_at.cache_clear()
+    try:
+        if not kr.font_available():
+            pytest.skip("the Arial-metric font has no Hebrew glyphs here")
+        yield
+    finally:
+        monkeypatch.undo()
+        kr._font_path.cache_clear()
+        kr._font_at.cache_clear()
+
+
+def test_every_fixed_sentence_of_the_strip_fits_beside_the_counter(arial_metrics: None) -> None:
+    """The strip is one line with the box counter at its right edge, and a sentence that does not fit loses its end
+    with an ellipsis: the end is where the instruction is ("Press Enter yourself", the pinch command). The worst
+    cases: the longest window name, a full box, the longest reason. ``aborted`` is the one sentence that can be longer
+    (its reason is one of nine phrases); the mod's toast says it in full."""
+    metrics = kr._metrics(kr.BASE_PITCH, "review")
+    px = kr._scaled(metrics.unit, kr.STRIP_PX)
+    margin = kr._scaled(metrics.unit, 10)
+    font = kr._font(px)
+    counter = math.ceil(font.getlength(f"{kr.COMPOSE_MAX}/{kr.COMPOSE_MAX}")) + 2
+    room = metrics.width - 2 * metrics.pad - 3 * margin - counter  # the strip, its margins and the counter
+    longest = max(ABORT_WHY.values(), key=len)
+    fill = {
+        "n": limits.COMPOSE_MAX, "sent": limits.COMPOSE_MAX, "total": limits.COMPOSE_MAX, "s": 3, "N": 8, "fps": 15,
+        "target": "ApplicationFrameHost", "why": longest, "side": "right", "Side": "Right", "finger": "pinky",
+        "Finger": "Pinky", "lang": "EN",
+    }  # fmt: skip
+    too_wide = []
+    for table, sentences in (("review", REVIEW_TEXT), ("session", SESSION_TEXT), ("hold", HOLD_WHY)):
+        for key, text in sentences.items():
+            sentence = f"Paused: {text}" if table == "hold" else text.format(**fill)
+            if (table, key) != ("review", "aborted") and font.getlength(sentence) > room:
+                too_wide.append((table, key, round(font.getlength(sentence)), room))
+    assert not too_wide, too_wide
 
 
 # ------------------------------------------------------------------------------------------------- U42 and U43: guards
@@ -323,6 +395,124 @@ def test_u42_a_bounce_neither_counts_nor_cancels() -> None:
         b.at(t, ("insert", ""))
     assert b.starts == 1
     assert b.m.counts["bounce"] == 2
+
+
+# ------------------------------------------------------------------- U42b: what the air press says of a guard tap
+
+
+def air_tap(conf: float = 1.0, speed: float = 0.0, finger: int = 3, side: Side = "right") -> GuardTap:
+    return GuardTap(conf, speed, side, finger)
+
+
+def guard_taps(
+    b: Bench, t0: float, taps: list[GuardTap], key: KeyKind = "insert", gap: float = 0.5
+) -> list[InsertStep]:
+    out: list[InsertStep] = []
+    for i, g in enumerate(taps):
+        out += b.at(t0 + i * gap, (key, ""), guard=g)
+    return out
+
+
+def test_u42b_a_guard_tap_has_no_repr_and_no_place() -> None:
+    g = air_tap(0.9, 0.01)
+    assert repr(g) == "<GuardTap>" and not hasattr(g, "u") and not hasattr(g, "v")
+
+
+def test_u42b_three_firm_still_taps_of_one_finger_confirm_like_the_plain_count() -> None:
+    b = box_of()
+    out = guard_taps(b, 10.0, [air_tap(), air_tap(), air_tap()])
+    assert len(out) == 1 and b.starts == 1 and b.m.counts["guard_moving"] == 0 and b.m.counts["guard_weak"] == 0
+
+
+def test_u42b_a_tap_from_a_hand_on_the_move_neither_counts_nor_clears_the_guard() -> None:
+    b = box_of()
+    b.at(10.0, ("insert", ""), guard=air_tap())
+    b.at(10.5, ("insert", ""), guard=air_tap(speed=limits.GUARD_STILL_SPEED + 0.01))
+    assert b.m.flash == "drop" and b.m.counts["guard_moving"] == 1
+    assert b.m.strip(10.5, "X") == REVIEW_TEXT["still_insert"]
+    assert b.m.view(10.5, private=False).guard_taps == 1  # not counted, not cleared
+    b.at(11.0, ("insert", ""), guard=air_tap())
+    assert b.m.strip(11.0, "X") == REVIEW_TEXT["arm_insert_2"].format(target="X")  # the next tap takes the hint away
+    b.at(11.5, ("insert", ""), guard=air_tap())
+    assert b.starts == 1
+
+
+def test_u42b_a_first_tap_from_a_hand_on_the_move_does_not_arm() -> None:
+    b = box_of()
+    b.at(10.0, ("insert", ""), guard=air_tap(speed=1.0))
+    assert b.m.view(10.0, private=False).guard is None and b.m.strip(10.0, "X") == REVIEW_TEXT["still_insert"]
+    b.at(10.5, ("insert", ""), guard=air_tap())
+    b.at(11.0, ("insert", ""), guard=air_tap())
+    assert b.starts == 0 and b.m.view(11.0, private=False).guard_taps == 2
+
+
+def test_u42b_the_speed_limit_itself_counts() -> None:
+    at_limit, above = box_of(), box_of()
+    guard_taps(at_limit, 10.0, [air_tap(speed=limits.GUARD_STILL_SPEED)] * 3)
+    guard_taps(above, 10.0, [air_tap(speed=math.nextafter(limits.GUARD_STILL_SPEED, 1.0))] * 3)
+    assert at_limit.starts == 1 and above.starts == 0
+
+
+def test_u42b_three_soft_taps_wait_for_firm_ones_and_the_window_stays_open() -> None:
+    soft = limits.GUARD_FIRM_CONF - 0.01
+    b = box_of()
+    guard_taps(b, 10.0, [air_tap(soft)] * 3)
+    assert b.starts == 0 and b.m.counts["guard_weak"] == 1
+    assert b.m.strip(11.0, "X") == REVIEW_TEXT["arm_insert_firm"]
+    assert b.m.view(11.0, private=False).guard_taps == limits.INSERT_TAPS - 1
+    b.at(11.5, ("insert", ""), guard=air_tap())  # one firm tap of the two it takes
+    assert b.starts == 0
+    b.at(12.0, ("insert", ""), guard=air_tap())
+    assert b.starts == 1
+
+
+@pytest.mark.parametrize("pattern", [(0, 1, 1), (1, 0, 1), (1, 1, 0)])
+def test_u42b_two_firm_taps_of_three_confirm_wherever_they_fall(pattern: tuple[int, ...]) -> None:
+    b = box_of()
+    confs = [limits.GUARD_FIRM_CONF if firm else 0.3 for firm in pattern]  # the firmness limit itself is firm
+    guard_taps(b, 10.0, [air_tap(c) for c in confs])
+    assert b.starts == 1
+
+
+def test_u42b_a_tap_of_another_finger_or_hand_starts_the_run_again() -> None:
+    for other in (air_tap(finger=2), air_tap(side="left")):
+        b = box_of()
+        guard_taps(b, 10.0, [air_tap(), air_tap(), other])
+        assert b.starts == 0 and b.m.view(11.0, private=False).guard_taps == 1 and b.m.counts["guard_finger"] == 1
+        guard_taps(b, 11.5, [other, other])
+        assert b.starts == 1
+
+
+def test_u42b_a_tap_without_evidence_is_the_plain_count() -> None:
+    b = box_of()
+    b.at(10.0, ("insert", ""))
+    b.at(10.5, ("insert", ""))
+    b.at(11.0, ("insert", ""), guard=None)
+    assert b.starts == 1 and b.m.counts["guard_moving"] == 0
+
+
+def test_u42b_send_weighs_its_taps_the_same_way() -> None:
+    moving = inserted()
+    t = moving.m.last_insert.t + 1.0  # type: ignore[union-attr]
+    moving.at(t, ("enter", ""), guard=air_tap(finger=2, side="left"))
+    moving.at(t + 0.5, ("enter", ""), guard=air_tap(speed=1.0, finger=2, side="left"))
+    assert moving.m.strip(t + 0.5, "X") == REVIEW_TEXT["still_send"] and moving.m.last_insert is not None
+    moving.at(t + 1.0, ("enter", ""), guard=air_tap(finger=2, side="left"))
+    assert moving.m.counts["send_start"] == 0
+    moving.at(t + 1.5, ("enter", ""), guard=air_tap(finger=2, side="left"))
+    assert moving.m.counts["send_start"] == 1
+    soft = inserted()
+    t = soft.m.last_insert.t + 1.0  # type: ignore[union-attr]
+    for i in range(3):
+        soft.at(t + i * 0.5, ("enter", ""), guard=air_tap(0.3, finger=2, side="left"))
+    assert soft.m.counts["send_start"] == 0 and soft.m.strip(t + 1.0, "X") == REVIEW_TEXT["arm_send_firm"]
+
+
+def test_u42b_clear_and_close_never_weigh_a_tap() -> None:
+    b = box_of("abc")
+    b.at(10.0, ("clear", ""), guard=air_tap(0.2, 5.0))
+    b.at(10.5, ("clear", ""), guard=air_tap(0.2, 5.0))
+    assert b.box == "" and b.m.counts["guard_moving"] == 0
 
 
 def test_u42_the_version_of_the_box_is_part_of_the_guard() -> None:

@@ -697,7 +697,10 @@ def test_p5_a_keyboard_command_before_start_is_safe_configure_works_and_start_sa
     refusal = {"ok": False, "error": {"code": "bad_request", "message": "Hand control is still starting."}}
     assert item.kb("start") == refusal
     assert item.kb("practice")["error"]["message"] == "Hand control is still starting."
-    assert item.kb("stop") == {"ok": True} and item.kb("recenter") == {"ok": True}
+    assert item.kb("stop") == {"ok": True}
+    message = "The air keyboard is not open. Open it first, then use recenter."
+    not_open = {"ok": False, "error": {"code": "bad_request", "message": message}}
+    assert item.kb("recenter") == not_open  # nothing is open to recenter
     assert item.keyboard == {"enabled": True, "state": "closed", "practiced": False}
     item.stop()
 
@@ -971,6 +974,21 @@ def test_rt7_a_locked_desktop_closes_the_session(lockstep: Callable[..., Lockste
     item.feed(typist.hover(1.0))
     eventually(lambda: item.writer.closed() == ["desktop_locked"], "the lock screen to close the session")
     assert desktop.release_keys_calls > released and item.keyboard["state"] == "closed"
+
+
+def test_s21_unlocking_after_a_locked_desktop_leaves_the_session_closed(lockstep: Callable[..., Lockstep]) -> None:
+    """S21 (SR10): nothing reopens or resumes by itself, including after an unlock. The hands go on hovering over the
+    unlocked desktop for three seconds and the session neither opens again nor sends a key."""
+    desktop = AwakeDesktop()
+    item = lockstep(desktop=desktop).start()
+    typist = item.armed("review")
+    desktop.input_ok = False
+    item.feed(typist.hover(1.0))
+    eventually(lambda: item.writer.closed() == ["desktop_locked"], "the lock screen to close the session")
+    desktop.input_ok = True  # the user unlocks
+    item.feed(typist.hover(3.0))
+    eventually(lambda: item.keyboard["state"] == "closed", "the keyboard to still be closed after the unlock")
+    assert item.writer.closed() == ["desktop_locked"] and desktop.key_calls == []
 
 
 def test_rt8_an_overlay_that_fails_while_the_keyboard_is_open_closes_it_and_reports_the_type_only(

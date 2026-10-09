@@ -391,6 +391,11 @@ def refusal_cases() -> list[tuple[str, Callable[[Bench], str], str]]:
 
         return setup
 
+    def after_a_cut(b: Bench) -> str:
+        b.tmp.joinpath("hands", "keyboard-practice-air.json").unlink()
+        b.ctl._air_cut = True  # type: ignore[union-attr]  # what a cut practice leaves; the k9 tests get here for real
+        return "start"
+
     def osk_fails(b: Bench) -> str:
         b.cmd("configure", settings={"press": "windows"})
         b.desktop.os_keyboard_starts = False
@@ -417,6 +422,12 @@ def refusal_cases() -> list[tuple[str, Callable[[Bench], str], str]]:
             "air with a poor marker",
             poor_marker("air", "review"),
             "The last air practice had too many false or missed taps; practice again.",
+        ),
+        (
+            "air after a cut practice",
+            after_a_cut,
+            "The last air practice found the air tap unusable on this camera. "
+            "Use the pinch method instead: /jarvis hands keyboard press pinch.",
         ),
         (
             "pinch direct without a marker",
@@ -459,6 +470,7 @@ def test_p6_every_refusal_of_the_table_is_reachable() -> None:
         "practice_windows",
         "practice_air",
         "practice_air_poor",
+        "practice_air_cut",
         "practice_pinch",
         "practice_pinch_poor",
         "osk",
@@ -712,14 +724,33 @@ def reach(bench: Bench, phase: str) -> None:
 
 def test_k3_the_simple_commands_answer_ok_in_every_phase_and_do_their_work(make_bench: Callable[..., Bench]) -> None:
     bench = make_bench()
-    for action in ("recenter", "private", "public", "configure"):
-        assert bench.cmd(action, **({"settings": {"size": 1.1}} if action == "configure" else {})) == {"ok": True}
+    assert bench.cmd("configure", settings={"size": 1.1}) == {"ok": True}
     for phase in PHASES:
         reach(bench, phase)
         for action in ("recenter", "private", "public", "configure"):
             extra = {"settings": {"size": 1.1}} if action == "configure" else {}
             assert bench.cmd(action, **extra) == {"ok": True}, (phase, action)
         assert bench.ctl.active  # type: ignore[union-attr]
+
+
+def test_k3_recenter_private_and_public_refuse_a_closed_keyboard_with_a_fixed_sentence(
+    make_bench: Callable[..., Bench],
+) -> None:
+    """Defence in depth (the mod sends none of them while closed): an "ok" for ``private`` on a closed keyboard would
+    be a false assurance, as the next open starts public."""
+    bench = make_bench()
+    for action in ("recenter", "private", "public"):
+        message = f"The air keyboard is not open. Open it first, then use {action}."
+        expected = {"ok": False, "error": {"code": "bad_request", "message": message}}
+        assert bench.cmd(action) == expected, action
+        assert bench.cmd("configure", settings={"size": 1.1}) == {"ok": True}  # the settings do not need a keyboard
+    bench.open()
+    bench.cmd("stop")
+    for action in ("recenter", "private", "public"):
+        assert bench.cmd(action)["ok"] is False, action  # closed again
+    bench.open()
+    assert bench.cmd("private") == {"ok": True}  # open: it goes through, before the first frame as well
+    assert bench.ctl.status()["private"] is True  # type: ignore[index,union-attr]
 
 
 def test_k3_private_and_public_reach_the_session_and_the_view(make_bench: Callable[..., Bench]) -> None:
@@ -1299,6 +1330,85 @@ def test_k9_a_cut_practice_writes_no_marker_and_says_nothing_of_a_result(make_be
     (closed,) = bench.kb_events("closed")
     assert closed["reason"] == "command" and "practice" not in closed
     assert marker_status(bench.tmp, "air") == "missing"
+
+
+def cut_by_the_ladder(bench: Bench) -> None:
+    """A practice on a camera whose air tap the ladder finds unusable (10 fps): the drill is cut, its sentence shown."""
+    bench.press.set_quality(10.0, 0.001)
+    bench.run(2.4)
+    assert bench.session.practice_done and bench.ctl.active  # type: ignore[union-attr]
+
+
+def test_k9_a_practice_the_ladder_cut_closes_air_unreliable_after_its_sentence_and_writes_no_marker(
+    make_bench: Callable[..., Bench],
+) -> None:
+    bench = make_bench(markers=False).arm_up_practice()
+    cut_by_the_ladder(bench)
+    bench.run(controller_module.CUT_SHOW_S - 1.0)
+    assert bench.ctl.active and not bench.kb_events("closed")  # type: ignore[union-attr]  # its sentence stays up
+    bench.run(2.0)
+    (closed,) = bench.kb_events("closed")
+    # Not "command": the mod says nothing of that reason, so the user would be left with no word at all (X38).
+    assert closed["reason"] == "air_unreliable" and closed["discarded"] == 0 and "practice" not in closed
+    assert marker_status(bench.tmp, "air") == "missing"
+
+
+def test_k9_after_a_cut_practice_the_next_air_open_names_the_pinch_not_practice_first(
+    make_bench: Callable[..., Bench],
+) -> None:
+    bench = make_bench(markers=False)
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air"]  # never practised: practise
+    bench.arm_up_practice()
+    cut_by_the_ladder(bench)
+    bench.run(controller_module.CUT_SHOW_S + 1.0)
+    reply = bench.cmd("start")
+    assert reply == {"ok": False, "error": {"code": "bad_request", "message": TEXT["practice_air_cut"]}}
+    validate(reply, "CommandResponse")
+    assert "press pinch" in TEXT["practice_air_cut"] and "Practice first" not in TEXT["practice_air_cut"]
+    assert not bench.ctl.active and bench.pointer_off_calls == 1  # type: ignore[union-attr]  # only the practice's own
+    # the way out it names works at once: the pinch with the review box needs no marker
+    assert bench.cmd("configure", settings={"press": "pinch"}) == {"ok": True}
+    bench.open("start")
+    assert bench.ctl.status()["press"] == "pinch"  # type: ignore[index,union-attr]
+
+
+def test_k9_a_stop_in_the_middle_of_a_practice_is_not_a_cut(make_bench: Callable[..., Bench]) -> None:
+    bench = make_bench(markers=False).arm_up_practice()
+    bench.cmd("stop")
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air"]
+
+
+def test_k9_a_stop_while_the_cut_sentence_is_up_still_remembers_the_cut(make_bench: Callable[..., Bench]) -> None:
+    bench = make_bench(markers=False).arm_up_practice()
+    cut_by_the_ladder(bench)
+    bench.cmd("stop")  # the user read the strip and did not wait for the close
+    (closed,) = bench.kb_events("closed")
+    assert closed["reason"] == "command"
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air_cut"]
+
+
+def test_k9_a_cut_practice_before_a_poor_marker_still_names_the_pinch(make_bench: Callable[..., Bench]) -> None:
+    bench = make_bench(markers=False)
+    write_marker(bench.tmp, "air", result(rest_s=15.0, phantoms=0, hits_im=2))
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air_poor"]
+    bench.arm_up_practice()
+    cut_by_the_ladder(bench)
+    bench.run(controller_module.CUT_SHOW_S + 1.0)
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air_cut"]  # the newer word is the cut
+
+
+def test_k9_a_practice_that_ends_after_a_cut_takes_the_cut_back(make_bench: Callable[..., Bench]) -> None:
+    bench = make_bench(markers=False).arm_up_practice()
+    cut_by_the_ladder(bench)
+    bench.run(controller_module.CUT_SHOW_S + 1.0)
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air_cut"]
+    # the camera is fine this time (the open builds a new press); the user taps the wrong things, so it ends poor
+    bench.arm_up_practice()
+    while bench.ctl.active and bench.t < 1200:  # type: ignore[union-attr]
+        bench.tap(bench.t + bench.dt, "a")  # a tap now and then keeps the practice from idling out
+        bench.run(8.0)
+    assert bench.kb_events("closed")[-1]["reason"] == "command" and marker_status(bench.tmp, "air") == "out_of_range"
+    assert bench.cmd("start")["error"]["message"] == TEXT["practice_air_poor"]  # not the cut's: it is over
 
 
 def test_k9_a_practice_keeps_its_trace_in_memory_until_the_close(make_bench: Callable[..., Bench]) -> None:
