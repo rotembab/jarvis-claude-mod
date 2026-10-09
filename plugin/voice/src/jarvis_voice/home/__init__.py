@@ -1,4 +1,4 @@
-"""Home control: Apple TV, Sony Bravia, Tuya (Tuya Smart or Smart Life) and Home Assistant from the voice helper.
+"""Home control: Apple TV, Sony Bravia, Plex, Tuya (Tuya Smart or Smart Life) and Home Assistant from the voice helper.
 
 The mod's ``home_control`` tool sends ``home`` commands to the helper, which
 answers them with ``HomeService``. Device libraries are imported only when a

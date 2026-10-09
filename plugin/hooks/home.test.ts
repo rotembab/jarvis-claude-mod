@@ -133,6 +133,8 @@ describe('home_control: registration', () => {
     expect(spec?.description.length).toBeLessThan(1500)
     expect(spec?.description).toContain('Never ask for a PIN, key, password or token in the chat')
     expect(spec?.description).toContain('"scan" looks for smart devices on the home network')
+    expect(spec?.description).toContain('Give that link, unchanged and not read aloud, to launch_app on the Apple TV')
+    expect(spec?.description).toContain('Never make up a link. If the Apple TV refuses, it may be asleep: turn_on, then retry.')
     expect(spec?.inputSchema).toEqual({
       type: 'object',
       properties: {

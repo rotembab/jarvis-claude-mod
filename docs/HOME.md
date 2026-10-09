@@ -1,19 +1,21 @@
 # Home control
 
-Jarvis can control the devices in your home over your home network: an Apple TV, a Sony Bravia TV, Tuya devices from the Tuya Smart or Smart Life app (lights, plugs, switches, curtains, fans, heaters, Fingerbots), and anything Home Assistant controls. Ask in your own words, by voice or typed:
+Jarvis can control the devices in your home over your home network: an Apple TV, a Sony Bravia TV, your own Plex Media Server (to find a movie or the next episode and open it on the Apple TV), Tuya devices from the Tuya Smart or Smart Life app (lights, plugs, switches, curtains, fans, heaters, Fingerbots), and anything Home Assistant controls. Ask in your own words, by voice or typed:
 
 - "Jarvis, turn on the TV and open Netflix on the Apple TV."
 - "Dim the bedroom lights to 30 percent."
 - "Pause the Apple TV." "Switch the TV to HDMI 2." "What's the TV on?"
 - "Close the living room curtains." "Run movie night."
+- "Put on the next episode of How I Met Your Mother." "Play Inception on the Apple TV."
 
-Claude sees your devices through a tool called `home_control`, finds the one you mean ("the TV", "bedroom light"), and runs the command. Jarvis talks to most devices directly on your network, so they answer quickly and keep working when the internet is down. The exceptions are Tuya scenes, which run in Tuya's cloud, the one-time Tuya account link that fetches your Tuya devices' keys, and [Tuya's cloud fallback](#tuyas-cloud-fallback), only if you turn it on.
+Claude sees your devices through a tool called `home_control`, finds the one you mean ("the TV", "bedroom light"), and runs the command. Jarvis talks to most devices directly on your network, so they answer quickly and keep working when the internet is down. The exceptions are Plex when your server is away from home, Tuya scenes, which run in Tuya's cloud, the one-time Tuya account link that fetches your Tuya devices' keys, and [Tuya's cloud fallback](#tuyas-cloud-fallback), only if you turn it on.
 
 ## Contents
 
 - [Set up your devices](#set-up-your-devices)
   - [Apple TV](#apple-tv)
   - [Sony Bravia TV](#sony-bravia-tv)
+  - [Plex](#plex)
   - [Tuya Smart and Smart Life](#tuya-smart-and-smart-life)
     - [Devices in a brand app (MOES and others)](#devices-in-a-brand-app-moes-and-others)
     - [Fingerbots and other button pushers](#fingerbots-and-other-button-pushers)
@@ -23,6 +25,7 @@ Claude sees your devices through a tool called `home_control`, finds the one you
 - [Siri and Apple Home](#siri-and-apple-home)
 - [Using it](#using-it)
 - [Open a channel or a video](#open-a-channel-or-a-video)
+- [Play something from Plex](#play-something-from-plex)
 - [What Jarvis asks you first](#what-jarvis-asks-you-first)
 - [Commands](#commands)
 - [Where your devices and keys are kept](#where-your-devices-and-keys-are-kept)
@@ -71,6 +74,28 @@ TVs made since August 2025 accept only a secure (HTTPS) connection. Setup tries 
 Jarvis can turn the TV on and off, set the volume and mute, switch inputs by their names ("Apple TV", "HDMI 2"), open apps, type into the TV's on-screen keyboard, press remote buttons (play, pause, back, home, arrows) and say what is on. With a soundbar or receiver on HDMI (eARC), Jarvis always uses the remote's volume and mute buttons, because the TV's own volume setting can silently do nothing then. So "volume 20" works only if the TV reports the soundbar's level, and the TV's status leaves the volume out. The TV can't tell Jarvis whether something is playing, so "play/pause" pauses; say "play" to carry on.
 
 Some budget models (BRAVIA 2 II and some BRAVIA 3) list only **Simple IP control** and **Control4** under IP control. Jarvis can't control those.
+
+### Plex
+
+Jarvis can look up a movie, a show or a particular episode on your own Plex Media Server and ask the Apple TV to open it in the Plex app. You need:
+
+- the Apple TV set up in Jarvis ([above](#apple-tv)), with the Plex app installed on it and signed in to the Plex account you watch with;
+- a Plex Media Server that this PC can reach. It can be on your home network, or away from home with remote access turned on (Plex's own **Settings > Remote Access**).
+
+Then:
+
+1. In the setup window, choose **Connect Plex**.
+2. A page from plex.tv opens in your browser. Sign in to Plex there if it asks, and approve Jarvis, the way you would approve a TV app. Jarvis never sees your Plex password. If no browser opens, Jarvis shows the sign-in link instead, to open on any device (only then, because the link holds the sign-in code).
+3. If your account has more than one server, pick yours. Jarvis looks for it, the home network first, then the internet, and tells you how it got there. If it can't reach the server from this PC, it asks whether to keep the sign-in anyway.
+4. Name it (the default is "Plex"). Jarvis offers a test that reads the names of your libraries.
+
+What it can do: `find` a title on the server. Say "the next episode of Severance", "season 3 episode 5 of How I Met Your Mother", "the latest episode of Fauda", "continue watching Chernobyl", "Inception" or "Dune 1984". Titles can be in any language. For a show, "next" means the episode Plex would continue with (one you stopped halfway, or the one after the last you watched); Specials are skipped unless you ask for season 0. When two titles fit, such as two films called Dune, Jarvis tells you which and asks. You can try it from Claude Code: `/jarvis home do Plex -- find inception`.
+
+The answer says what Jarvis found and where you stopped, and ends with a link. Claude gives that link to the Apple TV, which opens it in the Plex app. The link opens the title's page in Plex, so **press play on the remote**. The Apple TV doesn't say whether it worked, so Jarvis says it only *asked*. The Apple TV must be awake: say "turn on the Apple TV" first, or press a button on its remote.
+
+Which episode is next follows the Plex account Jarvis signed in with. If different people use different Plex users on the Apple TV, connect Plex with the account that does the watching. Jarvis only looks things up and sends a link; it doesn't play anything itself, and it doesn't change what Plex counts as watched. In plan mode Jarvis runs no device commands, so it won't look up a title then.
+
+Advanced: the link kind is the `link` setting of the Plex entry in `%USERPROFILE%\.jarvis\home\devices.json`. Add `"link": "play"` to that entry's `settings` (next to `"server_id"`), save the file and ask again; Jarvis reads the file on every request, so there is nothing to restart. `preplay` (the default) opens the title's page. `play` is meant to start it but hasn't been tried on a real Apple TV yet, so use it only to experiment, and set it back to `preplay` if the Apple TV answers `Open URL failed`. Any value other than `play` or `preplay` means `preplay`.
 
 ### Tuya Smart and Smart Life
 
@@ -206,6 +231,14 @@ Ask for a streamer or a link, for example "open xQc on Kick on the Apple TV". Cl
 - **Don't have Jarvis type a password.** What Jarvis types passes through the chat.
 - **On this PC**, Claude can open the channel in your browser instead, with Jarvis's desktop tool (Windows). It asks you on screen first unless your rules allow `mcp__jarvis__desktop`; see [the desktop tool](PC-CONTROL.md#the-desktop-tool).
 
+## Play something from Plex
+
+Ask for a title and the device to show it on, for example "put on the next episode of Severance on the Apple TV". Claude does two steps. It asks the Plex server (`find`), which answers with the episode and a link. Then it gives that link to the Apple TV's `launch_app`, exactly as it came. The link looks like `plex://preplay/?metadataKey=%2Flibrary%2Fmetadata%2F14779&server=...`: the number is the title's id on your server, and the server is named by its machine identifier. It holds no token.
+
+- **Apple TV only.** Opening a link in an app is what the Apple TV's remote connection does. The Sony TV can't open a link inside an app, so use the Plex app on the Apple TV, or open Plex on the Sony TV by name and use the remote.
+- **Pressing play.** The link opens the title's page. Press play, and Plex continues from where you stopped.
+- **Wrong title or episode.** Say more: the year ("Dune 1984"), or the season and episode ("season 2 episode 4"). Ask Claude what Jarvis found; the answer names the title and the episode.
+
 ## What Jarvis asks you first
 
 Jarvis applies your Claude Code permission rules to the device tool, and asks once more for a device that needs your OK.
@@ -255,15 +288,16 @@ From a terminal on the PC, the same commands work without Claude Code, for examp
 
 | File | Holds |
 | --- | --- |
-| `%USERPROFILE%\.jarvis\home\devices.json` | Your devices: names, rooms, network addresses, what they can do. No secrets. |
-| `%USERPROFILE%\.jarvis\home\credentials.dat` | The Apple TV pairing, the Sony pre-shared key, the Tuya local keys and your Tuya account link (with your cloud fallback choice), and the Home Assistant token. They are encrypted with Windows DPAPI, so only your Windows account on this PC can read them. |
+| `%USERPROFILE%\.jarvis\home\devices.json` | Your devices: names, rooms, network addresses, what they can do. For Plex, the server's name, its machine identifier, the addresses plex.tv lists for it and an id for this PC's Plex sign-in. No secrets. |
+| `%USERPROFILE%\.jarvis\home\credentials.dat` | The Apple TV pairing, the Sony pre-shared key, the Plex sign-in token (and the token plex.tv gives for your server), the Tuya local keys and your Tuya account link (with your cloud fallback choice), and the Home Assistant token. They are encrypted with Windows DPAPI, so only your Windows account on this PC can read them. |
 
-To remove a device, use **Rename a device, set its room, or remove it** in the setup window. That also deletes its credentials. To remove everything, delete the `home` folder. Then also remove Jarvis on the devices themselves: unpair it on the Apple TV, change the TV's pre-shared key, and delete the Home Assistant token.
+To remove a device, use **Rename a device, set its room, or remove it** in the setup window. That also deletes its credentials. To remove everything, delete the `home` folder. Then also remove Jarvis on the devices themselves: unpair it on the Apple TV, change the TV's pre-shared key, remove Jarvis from your Plex account (**Account settings > Authorized Devices** on plex.tv; it is listed as Jarvis), and delete the Home Assistant token.
 
 ## Privacy
 
 - Jarvis sends device commands from your PC straight to your devices on your network. They don't go through Anthropic, Fish Audio or any cloud, with one exception that you choose: with [Tuya's cloud fallback](#tuyas-cloud-fallback) on, a Tuya command goes through Tuya's cloud when the device doesn't answer at home, or when only the cloud can reach it.
-- Claude sees your device names, rooms, states and commands, and the names and kinds of devices a network search finds. It never sees an address, a PIN, a key or a token.
+- Claude sees your device names, rooms, states and commands, and the names and kinds of devices a network search finds. It never sees an address, a PIN, a key or a token. For Plex it sees the titles your server finds, the episode and the link described [above](#play-something-from-plex); the link holds the title's id and the server's machine identifier, not a token.
+- Plex: plex.tv sees the sign-in and the list of your servers and their addresses. The titles you ask for go only to your own server, on your home network when the PC can reach it there; away from home they cross the internet (encrypted), or Plex's relay. The Plex token is sent only in a header, and only to an address that has first said it is your server (asked without the token, and without this PC's name). That check is a name, not a password: it keeps the token from another machine that inherited an address, not from someone on your own network. Jarvis tries the encrypted address first. When it can't be used and the server's **Secure connections** setting is **Preferred** (Plex's default), Jarvis uses the server's plain home-network address, and then the token crosses your home network unencrypted, as it does for Plex's own apps. Set **Secure connections** to **Required** in the server's Network settings to rule that out, if the encrypted address works for this PC. The token of your account is sent only to a server your account owns; a server shared with you is reached with the token plex.tv gives for it.
 - The Tuya link signs in to Tuya's cloud once, to fetch your devices and their keys, and again when you refresh. Running a Tuya scene asks Tuya's cloud to run it, and so does a command that falls back to the cloud.
 - The helper's log never holds a Tuya key, token or reply from Tuya's cloud. For a Tuya command it records the device's Tuya id, whether it went over your network or the cloud, and error codes.
 - Nothing polls your devices in the background. Jarvis talks to a device, or searches the network, only when you ask it to.
@@ -278,6 +312,18 @@ To remove a device, use **Rename a device, set its room, or remove it** in the s
 | Sony setup says the TV "refused the connection" | Check that IP control and **Control remotely** are on (see the [Sony Bravia TV](#sony-bravia-tv) steps). If IP control lists only **Simple IP control** and **Control4**, Jarvis can't control this model. |
 | The Sony TV "has no on-screen keyboard open" | Select the app's search box with the remote first. If it is selected, the app uses a keyboard of its own, which Jarvis can't type into: type with the remote. |
 | The Apple TV says pairing failed | See the [Apple TV](#apple-tv) steps: allow access, restart it, and pair again. |
+| Plex says it "no longer accepts Jarvis's sign-in" | The sign-in was revoked (for example under **Authorized Devices** on plex.tv) or its account was changed. Choose **Connect Plex** in the setup window again. |
+| "The Plex server doesn't accept the account Jarvis is signed in with" | Plex knows the sign-in but the server turns the account away, for example because the server's owner stopped sharing it. Check that the account can open the server in the Plex app, or connect Plex with another account. |
+| "The Plex server isn't answering" | Check that the server is on, and that this PC can reach it: on the same network, or with **Remote Access** on in the server's settings. Jarvis tries the home network, then the internet, then Plex's relay, which is slow and may be limited. Connect Plex again if the server's address changed. |
+| Plex says this PC "doesn't trust its secure certificate" | Jarvis couldn't complete the check of the server's secure certificate, and it never turns checking off. At home, set **Secure connections** to **Preferred** in the server's **Settings > Network**, and Jarvis uses the server's plain home-network address instead. Away from home that doesn't help yet: try again from home. |
+| Plex says the server "refused Jarvis's sign-in, and plex.tv could not be reached to check it" | Jarvis couldn't tell whether the sign-in is still good, so it kept it. Check the internet connection and ask again in a minute. |
+| Plex setup says plex.tv gave Jarvis no access to a server shared with you | plex.tv sent no key for that server, and Jarvis never uses your account's own key on someone else's server. Ask the owner to share it with you again, or connect Plex with the owner's account. |
+| Plex says it has nothing matching a title | The server's search found nothing, and neither did a look through each library. Check the spelling, say the title as your library spells it (original titles work too), or add the year ("Dune 1984"). It can also be that the title isn't on the server. |
+| The Apple TV says `Open URL failed` for a Plex link | Try these in order: wake the Apple TV ("turn on the Apple TV", or press a button on its remote); make sure the Plex app is installed on it and that you have opened it once and signed in; if you changed the `link` setting to `play` ([Plex](#plex)), set it back to `preplay`. |
+| The Apple TV "isn't answering. It may be asleep or off the network" when opening a Plex title | Wake the Apple TV ("turn on the Apple TV", or press a button on its remote), then ask again. |
+| The Plex app opens but doesn't play | The link opens the title's page: press play. See [Play something from Plex](#play-something-from-plex). |
+| Plex offers the wrong episode as the next one | "Next" follows the Plex account Jarvis signed in with. Connect Plex with the account that watches, or name the season and episode. |
+| Plex setup says the sign-in link expired | Say yes when Jarvis offers a new link, and approve it in the browser straight away. |
 | The Apple TV "didn't accept that command" | The Apple TV answered and turned the command down. When it gives a reason, Jarvis adds it (`It said: "..."`) and `%USERPROFILE%\.jarvis\logs\voice.log` keeps it: include it if you report the problem. The text comes only from the Apple TV and never holds a key. Make sure the Apple TV is awake and the TV is on, then try again. Opening an app by name ("open Kick") and opening a link are separate requests, and a link can be turned down while the app opens fine. |
 | The phone says "Please use the designated APP to scan the code to log in" | Only Smart Life and Tuya Smart work. If your devices are in a brand's app such as MOES, [move them to Smart Life](#devices-in-a-brand-app-moes-and-others) first. Otherwise, scan with the same app you took the User Code from: Tuya Smart and Smart Life have separate accounts. If you did, try the other of the two apps: since 2026 Tuya has sometimes accepted only one of them. Tuya doesn't tell Jarvis the phone refused, so Jarvis keeps waiting until the code expires or the wait ends, then offers a new code. |
 | Setup keeps waiting after you confirmed on the phone | Jarvis notices a confirmed login within a few seconds, so if it still waits, Tuya didn't accept the login. The causes are the same as for "designated APP" above: a brand app such as MOES, a User Code from the other app, or Tuya accepting only one of the two apps for now. When the wait ends, Jarvis shows Tuya's last answer (such as `E0020003`), and `%USERPROFILE%\.jarvis\logs\voice.log` keeps it: include it if you report the problem. |
@@ -306,6 +352,7 @@ The `home_control` tool belongs to the Jarvis mod. The mod checks each call (its
 
 - **Apple TV**: [pyatv](https://pyatv.dev), over Apple's Companion protocol.
 - **Sony**: the Bravia REST API and IRCC remote codes, over HTTP or HTTPS, with the pre-shared key.
+- **Plex**: your Plex Media Server's own web API (search and library details), found through plex.tv. Setup signs in with plex.tv's PIN flow, the way a TV app does. Jarvis only searches; the Apple TV's Plex app plays what the link names.
 - **Tuya**: [tinytuya](https://github.com/jasonacox/tinytuya) with local keys, fetched once by the Tuya account link ([tuya-device-sharing-sdk](https://github.com/tuya/tuya-device-sharing-sdk)). The cloud fallback sends commands through the same SDK.
 - **Home Assistant**: its REST and WebSocket APIs.
 
