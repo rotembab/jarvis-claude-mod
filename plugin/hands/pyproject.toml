@@ -15,6 +15,9 @@ dependencies = [
     # Camera capture, drawing and (later) ArUco calibration; mediapipe depends on
     # it too. OpenCV 5 changed APIs this code uses (cv2.utils.logging, ArucoDetector).
     "opencv-contrib-python>=5.0,<6",
+    # The air keyboard's key legends and review box (overlay/keyboard_render.py): glyph masks only. It was already
+    # installed through mediapipe -> matplotlib; declared here because the keyboard imports it directly.
+    "pillow>=12.3,<13",
 ]
 
 [project.scripts]

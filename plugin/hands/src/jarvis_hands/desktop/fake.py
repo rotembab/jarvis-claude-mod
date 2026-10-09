@@ -11,11 +11,13 @@ real mouse: it changes the cursor without being logged as one of our moves.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ..geometry import Point, Rect
-from .base import Desktop, Display, InputBlocked, Window, WindowState
+from .base import Desktop, Display, InputBlocked, KeyTarget, Window, WindowState
+from .keys import KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, KeyStroke, VkLookup, events_for
 
 DEFAULT_WINDOW_RECT = Rect(100, 100, 800, 600)
 
@@ -53,6 +55,7 @@ class FakeDesktop(Desktop):
         *,
         cursor: tuple[int, int] | None = None,
         double_click: tuple[float, int, int] = (0.5, 4, 4),
+        injects_for_real: bool = False,
     ) -> None:
         self._displays = list(displays) if displays is not None else default_displays()
         #: Z-order: index 0 is the topmost window.
@@ -65,6 +68,34 @@ class FakeDesktop(Desktop):
         self.calls: list[tuple[Any, ...]] = []
         self.double_click_metrics = double_click
         self.closed = False
+        # -- the keyboard (see the "keyboard" section below)
+        self.injects_for_real = injects_for_real
+        #: One (kind, value) per stroke sent, in order. Characters are recorded here because a test has to see them.
+        self.key_calls: list[tuple[str, str]] = []
+        #: The raw (vk, scan, flags) events of each stroke: one batch per stroke, balanced.
+        self.key_batches: list[list[tuple[int, int, int]]] = []
+        self.target = KeyTarget(100, 200, "FakeTerminal", 0x0409, None, False, False)
+        #: Counts input that was not ours; ``foreign_input`` answers whether it moved since it was last asked.
+        self.foreign_events = 0
+        self._foreign_seen = 0
+        #: A physical Ctrl, Alt or Win key is down.
+        self.modifiers = False
+        #: The next N ``send_keys`` calls raise InputBlocked and record nothing.
+        self.fail_keys = 0
+        #: The next N ``send_keys`` calls record the stroke and then raise OSError (a partly taken batch).
+        self.partial_keys = 0
+        #: The next ``send_keys`` call records its strokes and then raises this (a delivered stroke, then an unexpected
+        #: failure).
+        self.raise_after: Exception | None = None
+        #: Called after every recorded stroke with the running count (1-based): a test changes ``target`` or bumps
+        #: ``foreign_events`` between two characters of a run.
+        self.after_key: Callable[[int], None] | None = None
+        #: char -> (virtual key, shift state, scan code), for ``inject="vk"``; None answers like a layout without the
+        #: key.
+        self.vk_lookup: VkLookup | None = None
+        self.os_keyboard_starts = True
+        self.os_keyboard_opened = 0
+        self.release_keys_calls = 0
 
     # -- test hooks ---------------------------------------------------------------------
 
@@ -169,6 +200,71 @@ class FakeDesktop(Desktop):
         self.calls.append(("close",))
         self.closed = True
 
+    # -- the keyboard ---------------------------------------------------------------------
+    # None of these is logged in ``calls``: the pointer differential tests compare that list and the keyboard is not
+    # part of it.
+
+    @property
+    def typed_text(self) -> str:
+        """What the strokes spell: the characters, a space, a line feed for Enter, a backspace for Backspace."""
+        spelled = {"space": " ", "enter": "\n", "backspace": "\b"}
+        return "".join(value if kind == "char" else spelled[value] for kind, value in self.key_calls)
+
+    def user_typed(self) -> None:
+        """The USER types on the real keyboard."""
+        self.foreign_events += 1
+
+    def user_moved_mouse(self) -> None:
+        """The USER moves the real mouse (``move_mouse`` moves the cursor; ``foreign_input`` sees it as this)."""
+        self.foreign_events += 1
+
+    def key_target(self) -> KeyTarget:
+        return self.target
+
+    def foreground_window(self) -> int:
+        return self.target.hwnd
+
+    def send_keys(self, strokes: Sequence[KeyStroke], *, inject: Literal["unicode", "vk"] = "unicode") -> int:
+        if self.fail_keys > 0:
+            self.fail_keys -= 1
+            raise InputBlocked("fake: Windows took none of the keys")
+        partial = self.partial_keys > 0
+        if partial:
+            self.partial_keys -= 1
+        sent = 0
+        for stroke in strokes:
+            events = events_for(
+                stroke, inject=inject, vk_lookup=self.vk_lookup
+            )  # KeyRefused before anything is recorded
+            if not events_balanced(events):
+                raise AssertionError("fake: an unbalanced key batch, a key would stay down")
+            self.key_calls.append((stroke.kind, stroke.value))
+            self.key_batches.append(events)
+            sent += 1
+            if self.after_key is not None:
+                self.after_key(len(self.key_calls))
+            if partial:
+                raise OSError("fake: Windows took part of the batch")
+        if self.raise_after is not None:
+            failure, self.raise_after = self.raise_after, None
+            raise failure
+        return sent
+
+    def foreign_input(self) -> bool:
+        changed = self.foreign_events != self._foreign_seen
+        self._foreign_seen = self.foreign_events
+        return changed
+
+    def modifiers_down(self) -> bool:
+        return self.modifiers
+
+    def release_keys(self) -> None:
+        self.release_keys_calls += 1
+
+    def open_os_keyboard(self) -> bool:
+        self.os_keyboard_opened += 1
+        return self.os_keyboard_starts
+
     # -- helpers ------------------------------------------------------------------------
 
     def _clamp(self, x: int, y: int) -> tuple[int, int]:
@@ -184,3 +280,17 @@ class FakeDesktop(Desktop):
             if d.rect.contains(centre):
                 return d
         return min(self._displays, key=lambda d: d.rect.distance_to(centre))
+
+
+def events_balanced(events: Sequence[tuple[int, int, int]]) -> bool:
+    """Every key-down has its key-up in the list, and no key-up comes before its down."""
+    held: dict[tuple[int, int, bool], int] = {}
+    for vk, scan, flags in events:
+        key = (vk, scan, bool(flags & KEYEVENTF_UNICODE))
+        if flags & KEYEVENTF_KEYUP:
+            if held.get(key, 0) <= 0:
+                return False
+            held[key] -= 1
+        else:
+            held[key] = held.get(key, 0) + 1
+    return not any(held.values())

@@ -5,6 +5,10 @@ MediaPipe finds them, and the helper turns poses into mouse and window actions: 
 to move the cursor, pinch to click and drag, two fingers to scroll, a fist to grab a
 window. The build spec is [`docs/SPEC-hands.md`](../../docs/SPEC-hands.md).
 
+It also has an air keyboard: an on-screen keyboard you type on in the air, off until the
+`handKeyboard` plugin option is on. The guide is [`docs/HANDS-KEYBOARD.md`](../../docs/HANDS-KEYBOARD.md),
+and its last half is the map of the code for people changing it.
+
 It runs as its own process with its own venv (`<dataDir>/hands/venv`), separate from the
 voice helper, and talks to the mod the same way: JSON events on stdout, commands over a
 token-protected HTTP server on 127.0.0.1. The contract is
@@ -19,6 +23,11 @@ python -m jarvis_hands run     [--data-dir D] [--camera INDEX|NAME] [--width 128
 python -m jarvis_hands setup   [--data-dir D]
 python -m jarvis_hands doctor  [--data-dir D] [--no-camera]
 python -m jarvis_hands preview [--data-dir D] [--camera INDEX|NAME]
+python -m jarvis_hands keytest   [--countdown SECONDS] [--inject unicode|vk|both] [--hebrew]
+python -m jarvis_hands keytrace  --yes-record --out FILE.npz [--segments KIND:SECONDS,... | --seconds N]
+                                 [--press air|pinch] [--camera INDEX|NAME] [--countdown SECONDS] [--data-dir D]
+python -m jarvis_hands keyreplay FILE.npz [--press air|pinch] [--set NAME=VALUE]... [--csv OUT.csv]
+                                 [--write] [--no-suggest] [--data-dir D]
 ```
 
 - **run**: the helper the mod starts (`/jarvis hands on`).
@@ -38,6 +47,18 @@ python -m jarvis_hands preview [--data-dir D] [--camera INDEX|NAME]
 - **doctor**: prints a JSON health report; `--no-camera` leaves the camera off.
 - **preview**: a window with the camera picture and the tracked hands, for checking the
   camera and lighting.
+- **keytest**, **keytrace**, **keyreplay**: console tools for the air keyboard, run by hand
+  on the PC (the helper does not start them).
+  - `keytest` types a fixed line (`abc ABC .,'-?/ ok`, and a Hebrew word with `--hebrew`)
+    into the window in front after a countdown, to check that Windows takes the keys, and
+    times the window check. It types only on a desktop that types for real.
+  - `keytrace` records hand landmarks and times to an `.npz` file, never a picture or a key.
+    It needs `--yes-record`, opens the camera itself (pause hand control first) and needs
+    the hand model.
+  - `keyreplay` replays such a file (or a practice's own trace) offline and prints the
+    report and the decision rule; `--write` merges clamped suggestions into
+    `keyboard-tuning.json`. It needs no camera and no model.
+  - Details and exact use: [`docs/HANDS-KEYBOARD.md`](../../docs/HANDS-KEYBOARD.md#try-it-on-your-pc).
 
 Exit codes: 0 OK, 1 error, 2 usage error or `JARVIS_TOKEN` missing, 3 another instance
 is already running.
@@ -48,6 +69,9 @@ is already running.
 |------|------|
 | `<dataDir>/models/hands/hand_landmarker.task` | The hand model |
 | `<dataDir>/hands/calibration.json` | The four-corner calibration, when you made one |
+| `<dataDir>/hands/keyboard-practice-air.json`, `keyboard-practice.json` | The air keyboard's practice markers (numbers only), written by a completed practice |
+| `<dataDir>/hands/keyboard-trace-<time>.npz`, `keyboard-practice.jsonl` | A practice's landmark trace (kept 14 days) and tap log (1 MB, three copies). Practice only; a live keyboard session writes neither |
+| `<dataDir>/hands/keyboard-tuning.json` | Accuracy numbers `keyreplay --write` may set. Read at every keyboard open, clamped, never holds a safety rule |
 | `<dataDir>/logs/hands.log` | Log (1 MB, three old copies kept) |
 | `<dataDir>/run/JarvisHands.lock` | Single-instance lock on macOS and Linux (`Local\JarvisHands` mutex on Windows) |
 
@@ -69,3 +93,9 @@ uv sync                      # dev group included
 uv run pytest                # no camera, GPU, display or network needed
 uvx ruff check src tests && uvx ruff format --check src tests
 ```
+
+The air keyboard's tests are `tests/test_kb_*.py` (`uv run pytest -k test_kb_`). They run
+against fakes: nothing has run against a real Windows `SendInput`, overlay window or camera.
+`KB_FULL=1` adds the long statistical rows, `KB_FROZEN_BASE=<commit>` turns on the check that
+the pointer files are unchanged since that commit, and `JARVIS_HANDS_MODELS_DIR` the
+real-model tests. The `hello` event lists `keyboard` among its capabilities.

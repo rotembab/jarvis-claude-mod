@@ -14,6 +14,7 @@ import ctypes
 import os
 import sys
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from ctypes import wintypes as wt
 from dataclasses import dataclass, field
@@ -286,6 +287,8 @@ class FakeWin:
     #: IsZoomed reads before a queued restore takes effect.
     restore_lag: int = 0
     pending: list[int] = field(default_factory=list)
+    #: The id of the thread that owns the window (GetWindowThreadProcessId); the keyboard layout is per thread.
+    tid: int = 77
 
     @property
     def outer(self) -> tuple[int, int, int, int]:
@@ -293,10 +296,41 @@ class FakeWin:
         return left - bl, top - bt, right + br, bottom + bb
 
 
+#: The keys of a US layout, as VkKeyScanExW answers: the virtual key in the low byte, the shift state in the high byte
+#: (1 Shift). Letters are their upper-case ASCII code; the marks sit on the OEM keys.
+_US_OEM = {",": 0xBC, ".": 0xBE, "/": 0xBF, "-": 0xBD, "'": 0xDE}
+US_LAYOUT: dict[str, int] = {
+    **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
+    **{c: ord(c) | 0x100 for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+    **_US_OEM,
+    "?": 0xBF | 0x100,
+}
+#: The Hebrew layout puts its letters on the keys that carry Latin letters on a US one: the home row is enough.
+HE_LAYOUT: dict[str, int] = {"ש": 0x41, "ד": 0x53, "ג": 0x44, "כ": 0x46, "ע": 0x47, "י": 0x48, ",": 0xBC}
+#: Scan codes (set 1) of the keys above, as MapVirtualKeyExW(MAPVK_VK_TO_VSC) answers on any layout.
+SCAN_CODES: dict[int, int] = {
+    **dict(zip(map(ord, "QWERTYUIOP"), range(0x10, 0x1A), strict=True)),
+    **dict(zip(map(ord, "ASDFGHJKL"), range(0x1E, 0x27), strict=True)),
+    **dict(zip(map(ord, "ZXCVBNM"), range(0x2C, 0x33), strict=True)),
+    0xBC: 0x33,
+    0xBE: 0x34,
+    0xBF: 0x35,
+    0xBD: 0x0C,
+    0xDE: 0x28,
+}
+US_HKL, HE_HKL = 0x04090409, 0x040D040D  # the language id is the low word, the keyboard id the high one
+
+
 class FakeWin32:
-    """The DLL functions WindowsDesktop calls, over a small in-memory Windows."""
+    """The DLL functions WindowsDesktop calls, over a small in-memory Windows.
+
+    Every call to one of its Win32 names is counted in ``calls`` and can be made to raise with ``broken`` (name ->
+    exception), so a test can say "this API fails" without a method per API.
+    """
 
     def __init__(self) -> None:
+        self.calls: Counter[str] = Counter()
+        self.broken: dict[str, BaseException] = {}
         self.last_error = 0
         self.metrics: dict[int, int] = {
             win.SM_XVIRTUALSCREEN: 0,
@@ -338,6 +372,58 @@ class FakeWin32:
         self.input_desktop: str | None = "Default"
         self.desktops_closed = 0
         self.execution_states: list[int] = []
+        # -- the keyboard side
+        #: Per SendInput call with keyboard input: the (wVk, wScan, dwFlags) of the events Windows took.
+        self.sent_keys: list[list[tuple[int, int, int]]] = []
+        #: (time, dwExtraInfo) of every keyboard event taken, in order.
+        self.key_tags: list[tuple[int, int]] = []
+        #: How many events each of those calls asked for.
+        self.key_requests: list[int] = []
+        #: Per-call limits, consumed first (a call takes at most that many events); then ``send_limit`` applies.
+        self.send_script: list[int] = []
+        #: GetForegroundWindow, and the window with the keyboard focus (None: the foreground window itself).
+        self.foreground_hwnd = 0
+        self.focus_hwnd: int | None = None
+        self.gui_info_ok = True
+        #: thread id -> HKL; GetKeyboardLayout asks for the foreground thread, never for ours (0).
+        self.layouts: dict[int, int] = {}
+        self.default_layout = US_HKL
+        self.layout_queries: list[int] = []
+        #: HKL -> {character: VkKeyScanExW answer}; a character it does not hold is -1 (no such key).
+        self.key_maps: dict[int, dict[str, int]] = {US_HKL: dict(US_LAYOUT), HE_HKL: dict(HE_LAYOUT)}
+        self.scan_codes: dict[int, int] = dict(SCAN_CODES)
+        self.vk_queries: list[tuple[str, int]] = []
+        #: Virtual keys physically down, and toggled on (Caps Lock).
+        self.keys_down: set[int] = set()
+        self.toggled: set[int] = set()
+        #: GetLastInputInfo's tick; every injected batch moves it on, and so does ``user_input``.
+        self.tick = 100_000
+        self.tick_step = 7
+        self.last_input_ok = True
+        #: pid -> the executable's full path, for QueryFullProcessImageNameW.
+        self.images: dict[int, str] = {}
+        self.notification_state = win.QUNS_ACCEPTS_NOTIFICATIONS
+        self.notification_hr = 0
+        self.shell_executes: list[tuple[Any, ...]] = []
+        self.shell_result: int | None = 42
+
+    def __getattribute__(self, name: str) -> Any:
+        value = object.__getattribute__(self, name)
+        if name[:1].isupper() and callable(value):
+            broken = object.__getattribute__(self, "broken")
+            object.__getattribute__(self, "calls")[name] += 1
+            if name in broken:
+                failure = broken[name]
+
+                def fail(*args: Any, **kwargs: Any) -> Any:
+                    raise failure
+
+                return fail
+        return value
+
+    def user_input(self, ms: int = 11) -> None:
+        """The USER touches the real keyboard or mouse: the last-input tick moves on."""
+        self.tick += ms
 
     def set_last_error(self, value: int) -> int:
         old, self.last_error = self.last_error, value
@@ -370,9 +456,20 @@ class FakeWin32:
 
     def SendInput(self, count: int, inputs: Any, size: int) -> int:
         assert size == ctypes.sizeof(win.INPUT)
-        accepted = count if self.send_limit is None else min(count, self.send_limit)
+        limit = self.send_script.pop(0) if self.send_script else self.send_limit
+        accepted = count if limit is None else min(count, limit)
         left, top, width, height = (self.metrics[i] for i in range(76, 80))
-        for item in list(inputs)[:accepted]:
+        asked = list(inputs)[:count]
+        keyboard = any(item.type == win.INPUT_KEYBOARD for item in asked)
+        if keyboard:
+            self.key_requests.append(count)
+            self.sent_keys.append([])
+        for item in asked[:accepted]:
+            if item.type == win.INPUT_KEYBOARD:
+                ki = item.ki
+                self.sent_keys[-1].append((ki.wVk, ki.wScan, ki.dwFlags))
+                self.key_tags.append((ki.time, ki.dwExtraInfo))
+                continue
             assert item.type == win.INPUT_MOUSE
             mi = item.mi
             self.sent.append((mi.dwFlags, mi.dx, mi.dy, mi.mouseData, mi.dwExtraInfo))
@@ -382,6 +479,8 @@ class FakeWin32:
                     self._pending_move, self._lag_left = target, self.move_lag
                 else:
                     self.cursor = target
+        if accepted:
+            self.tick += self.tick_step  # injected input counts as input for GetLastInputInfo
         return accepted if accepted == count else self._fail(win.ERROR_ACCESS_DENIED, accepted)
 
     def GetDoubleClickTime(self) -> int:
@@ -467,7 +566,7 @@ class FakeWin32:
         if window is None:
             return 0
         ref._obj.value = window.pid
-        return 77
+        return window.tid
 
     def IsWindow(self, hwnd: int) -> int:
         return int(hwnd in self.windows)
@@ -503,6 +602,8 @@ class FakeWin32:
         return style - 2**32 if style & 0x80000000 else style  # a LONG, sign-extended like Windows does
 
     def GetClassNameW(self, hwnd: int, buffer: Any, size: int) -> int:
+        if hwnd not in self.windows:
+            return self._fail(1400)  # ERROR_INVALID_WINDOW_HANDLE
         buffer.value = self.windows[hwnd].cls[: size - 1]
         return len(buffer.value)
 
@@ -623,19 +724,82 @@ class FakeWin32:
         ctypes.c_void_p.from_buffer(buffer).value = base + 16
         return 1
 
+    # -- the keyboard side
+
+    def GetForegroundWindow(self) -> int | None:
+        return self.foreground_hwnd or None  # a NULL handle comes back as None
+
+    def GetGUIThreadInfo(self, tid: int, ref: Any) -> int:
+        assert tid == 0, "the foreground thread is asked for with 0, not with a thread id"
+        info = ref._obj
+        assert info.cbSize == ctypes.sizeof(win.GUITHREADINFO)
+        if not self.gui_info_ok:
+            return self._fail(win.ERROR_ACCESS_DENIED)
+        focus = self.focus_hwnd if self.focus_hwnd is not None else self.foreground_hwnd
+        info.hwndActive, info.hwndFocus = self.foreground_hwnd or None, focus or None
+        return 1
+
+    def GetKeyboardLayout(self, tid: int) -> int | None:
+        self.layout_queries.append(tid)
+        return self.layouts.get(tid, self.default_layout)
+
+    def VkKeyScanExW(self, char: str, hkl: int) -> int:
+        self.vk_queries.append((char, hkl))
+        return self.key_maps.get(hkl, {}).get(char, -1)
+
+    def MapVirtualKeyExW(self, code: int, kind: int, hkl: int) -> int:
+        assert kind == win.MAPVK_VK_TO_VSC
+        return self.scan_codes.get(code, 0)
+
+    def GetLastInputInfo(self, ref: Any) -> int:
+        info = ref._obj
+        assert info.cbSize == ctypes.sizeof(win.LASTINPUTINFO)
+        if not self.last_input_ok:
+            return self._fail(win.ERROR_ACCESS_DENIED)
+        info.dwTime = self.tick
+        return 1
+
+    def GetAsyncKeyState(self, vk: int) -> int:
+        return -32768 if vk in self.keys_down else 0  # the high bit of a SHORT: down now
+
+    def GetKeyState(self, vk: int) -> int:
+        return 1 if vk in self.toggled else 0
+
+    def QueryFullProcessImageNameW(self, process: int, flags: int, buffer: Any, size: Any) -> int:
+        assert flags == 0 and 0 < size._obj.value <= 32768
+        path = self.images.get(process - 50000)
+        if path is None or len(path) >= size._obj.value:
+            return self._fail(win.ERROR_INSUFFICIENT_BUFFER if path else 31)
+        buffer.value = path
+        size._obj.value = len(path)
+        return 1
+
+    def SHQueryUserNotificationState(self, ref: Any) -> int:
+        ref._obj.value = self.notification_state
+        return self.notification_hr
+
+    def ShellExecuteW(self, hwnd: Any, operation: Any, file: Any, params: Any, directory: Any, show: int) -> int | None:
+        self.shell_executes.append((hwnd, operation, file, params, directory, show))
+        return self.shell_result
+
     def CloseHandle(self, handle: Any) -> int:
         self.closed_handles.append(getattr(handle, "value", handle))
         return 1
 
 
-@pytest.fixture
-def api(monkeypatch: pytest.MonkeyPatch) -> FakeWin32:
+def install_fake_api(monkeypatch: pytest.MonkeyPatch) -> FakeWin32:
+    """A FakeWin32, with ctypes' last-error functions standing in for it (also used by ``test_kb_desktop.py``)."""
     fake = FakeWin32()
     win.make_dpi_aware()  # the real, process-wide call (on Windows), made before last-error is faked
     # Off Windows ctypes has no last-error functions; on Windows these stand in for the real ones.
     monkeypatch.setattr(ctypes, "get_last_error", lambda: fake.last_error, raising=False)
     monkeypatch.setattr(ctypes, "set_last_error", fake.set_last_error, raising=False)
     return fake
+
+
+@pytest.fixture
+def api(monkeypatch: pytest.MonkeyPatch) -> FakeWin32:
+    return install_fake_api(monkeypatch)
 
 
 @pytest.fixture
@@ -1390,6 +1554,8 @@ def test_structure_sizes_on_64_bit_windows() -> None:
         win.KEYBDINPUT: 24,
         win.HARDWAREINPUT: 8,
         win.INPUT: 40,
+        win.GUITHREADINFO: 72,
+        win.LASTINPUTINFO: 8,
         wt.POINT: 8,
         wt.RECT: 16,
         win.DISPLAYCONFIG_PATH_INFO: 72,
@@ -1400,6 +1566,10 @@ def test_structure_sizes_on_64_bit_windows() -> None:
     }
     assert {t.__name__: ctypes.sizeof(t) for t in sizes} == {t.__name__: n for t, n in sizes.items()}
     assert win.INPUT.u.offset == 8 and win.MOUSEINPUT.dwExtraInfo.offset == 24
+    # The union holds its largest member (the mouse's), so INPUT is the size SendInput's cbSize check wants.
+    assert ctypes.sizeof(win._INPUTUNION) == max(ctypes.sizeof(m) for _n, m in win._INPUTUNION._fields_) == 32
+    assert win.KEYBDINPUT.dwExtraInfo.offset == 16 and win.GUITHREADINFO.rcCaret.offset == 56
+    assert win.LASTINPUTINFO.dwTime.offset == 4
 
 
 @windows_only
@@ -1529,3 +1699,29 @@ def test_real_double_click_and_session_checks(real: WindowsDesktop) -> None:
     assert isinstance(real.input_desktop_ok(), bool)
     assert real.keep_awake(True)
     assert real.keep_awake(False)
+
+
+# --- the keyboard side on the real thing: reads only. Nothing here types, and nothing starts a program.
+
+
+@windows_only
+def test_the_key_probes_answer_on_the_real_desktop(real: WindowsDesktop) -> None:
+    target = real.key_target()  # a CI runner may have no foreground window: any answer, but never an exception
+    assert isinstance(target.hwnd, int) and isinstance(target.pid, int) and isinstance(target.lang_id, int)
+    assert target.hwnd == 0 or target.pid > 0 or target.blocked == "none"
+    assert isinstance(real.foreground_window(), int)
+    assert isinstance(real.modifiers_down(), bool)
+    assert real.foreign_input() is False  # the first call after construction only baselines
+    assert isinstance(real.foreign_input(), bool)
+    real.release_keys()  # nothing to release: no exception, nothing sent
+    assert real.injects_for_real is True
+
+
+@windows_only
+def test_the_real_key_target_of_a_window_of_this_process_is_own(real: WindowsDesktop, own_windows: OwnWindows) -> None:
+    work = _primary_work(real)
+    hwnd = own_windows.create(Rect(work.x + 90, work.y + 90, 360, 240))
+    if not win._win32().SetForegroundWindow(hwnd) or real.foreground_window() != hwnd:
+        pytest.skip("this process could not take the foreground (no interactive desktop?)")
+    target = real.key_target()
+    assert (target.hwnd, target.pid, target.blocked) == (hwnd, os.getpid(), "own")

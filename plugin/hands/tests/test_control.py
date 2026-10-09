@@ -97,11 +97,41 @@ def test_domain_errors_are_http_200(server: tuple[ControlServer, Recorder]) -> N
     assert status == 200 and payload == {"ok": False, "error": {"code": "camera_in_use", "message": "busy"}}
 
 
-@pytest.mark.parametrize("name", sorted(protocol.COMMAND_NAMES - {"calibrate", "status", "pause", "resume"}))
+@pytest.mark.parametrize(
+    "name", sorted(protocol.COMMAND_NAMES - {"calibrate", "keyboard", "status", "pause", "resume"})
+)
 def test_every_command_is_routed(server: tuple[ControlServer, Recorder], name: str) -> None:
     srv, rec = server
     assert post(srv.port, name, {}) == (200, {"ok": True, "echo": name})
     assert rec.calls == [(name, {})]
+
+
+@pytest.mark.parametrize("action", sorted(protocol.KEYBOARD_ACTIONS - {"configure"}))
+def test_the_keyboard_command_is_routed_with_its_action(server: tuple[ControlServer, Recorder], action: str) -> None:
+    """`keyboard` needs an action, so the `{}` loop above leaves it out and it is routed here."""
+    srv, rec = server
+    assert post(srv.port, "keyboard", {"action": action}) == (200, {"ok": True, "echo": "keyboard"})
+    assert rec.calls == [("keyboard", {"action": action})]
+
+
+def test_the_keyboard_command_with_settings_is_routed(server: tuple[ControlServer, Recorder]) -> None:
+    srv, rec = server
+    body = {"action": "configure", "settings": {"enabled": True, "press": "air", "commit": "review", "idleS": 30}}
+    assert post(srv.port, "keyboard", body) == (200, {"ok": True, "echo": "keyboard"})
+    assert rec.calls == [("keyboard", body)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"action": "insert"}, {"action": "send"}, {"action": "type", "text": "x"}, {"action": "stop", "text": "x"}],
+)
+def test_a_keyboard_body_the_schema_refuses_never_reaches_the_handler(
+    server: tuple[ControlServer, Recorder], body: dict[str, Any]
+) -> None:
+    srv, rec = server
+    status, payload = post(srv.port, "keyboard", body)
+    assert status == 400 and payload["error"]["code"] == "bad_request"
+    assert rec.calls == []
 
 
 def test_localhost_host_header_accepted(server: tuple[ControlServer, Recorder]) -> None:
