@@ -47,6 +47,20 @@ Why it is built this way:
   same spot wait half a millisecond instead of four: still long enough to
   read a freed cursor's next move where it went, which skipping the wait
   would not (the executor would take that stale read for the user's mouse).
+- **The air keyboard types through the same pipe.** One ``SendInput`` call per
+  stroke, so a physical key cannot fall between its down and its up (or between
+  our Shift and the letter). Characters go in as Unicode events by default (the
+  layout of the window is then irrelevant); ``inject="vk"`` looks the key up on
+  the foreground thread's layout and falls back to Unicode for anything a plain
+  key cannot type. A key-up Windows refused is never forgotten: it is kept and
+  sent ahead of the next key, by ``release_keys``, ``input_desktop_ok`` and
+  ``close``, because a key left down repeats in whatever has the focus.
+- **Keys are held back unless the target is known to be fine.** ``key_target``
+  fails closed on every probe, and its elevation rule is absolute (an elevated
+  window is refused whatever our own level is, and every window when our own
+  level is unknown), where the mouse path's ``_is_blocked`` is relative to us.
+  ``foreign_input`` compares the last-input tick with the one our own batch
+  left, so a person typing or moving the mouse is told from us.
 
 Every module-level name imports on any OS; the DLLs are loaded on first use,
 on Windows only, with a prototype for every function called (the default
@@ -59,6 +73,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import ntpath
 import os
 import sys
 import threading
@@ -71,11 +86,21 @@ from typing import Any, Literal
 
 from ..clock import now as clock_now
 from ..geometry import Rect
-from .base import Desktop, Display, InputBlocked, UnsupportedPlatform, Window, WindowState
+from .base import Desktop, Display, InputBlocked, KeyTarget, UnsupportedPlatform, Window, WindowState
+from .keys import (
+    INPUT_KEYBOARD,
+    KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE,
+    KeyStroke,
+    VkLookup,
+    events_for,
+)
 
 log = logging.getLogger(__name__)
 
 _Button = Literal["left", "right"]
+_KeyEvent = tuple[int, int, int]  # (wVk, wScan, dwFlags), as desktop/keys.py makes them
+_KeyBlock = Literal["elevated", "shell", "own", "none"]
 
 #: ``dwExtraInfo`` on every event we inject ("JRVS"), so hooks and GetMessageExtraInfo can tell it is ours.
 EXTRA_INFO_TAG = 0x4A525653
@@ -144,6 +169,8 @@ TOKEN_INTEGRITY_LEVEL = 25
 #: Mandatory-label RIDs (the last sub-authority of the S-1-16-x integrity SID).
 INTEGRITY_NAMES = {0x0000: "untrusted", 0x1000: "low", 0x2000: "medium", 0x2100: "medium+", 0x3000: "high"}
 SECURITY_MANDATORY_SYSTEM_RID = 0x4000
+#: The first integrity level the keyboard refuses whatever the helper's own level is (an elevated administrator).
+INTEGRITY_HIGH_RID = 0x3000
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -151,6 +178,23 @@ ES_DISPLAY_REQUIRED = 0x00000002
 
 DESKTOP_SWITCHDESKTOP = 0x0100
 UOI_NAME = 2
+
+# The keyboard side (the air keyboard). INPUT_KEYBOARD and KEYEVENTF_* are the pure layer's (desktop/keys.py).
+ES_PASSWORD = 0x20  # an edit control that shows bullets
+VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL, VK_LWIN, VK_RWIN = 0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C
+#: The keys that turn a typed letter into a shortcut: a physical one of these holds the keyboard back.
+SHORTCUT_MODIFIERS = (VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN)
+KEY_DOWN_BIT = 0x8000  # GetAsyncKeyState: the key is down now
+MAPVK_VK_TO_VSC = 0
+SW_SHOWNORMAL = 1
+#: SHQueryUserNotificationState answers.
+QUNS_NOT_PRESENT, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE = 1, 2, 3, 4
+QUNS_ACCEPTS_NOTIFICATIONS, QUNS_QUIET_TIME, QUNS_APP = 5, 6, 7
+#: Those in which the user is busy with something full screen or presenting: nothing may be typed over it.
+COVERED_STATES = frozenset({QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN, QUNS_PRESENTATION_MODE})
+PROCESS_NAME_WIN32 = 0  # QueryFullProcessImageNameW: the path in Win32 form
+#: Longest path QueryFullProcessImageNameW is asked for (long paths are rare; a longer one just has no name).
+IMAGE_NAME_CHARS = 1024
 
 #: Top-level windows a grab must never pick up: the desktop, taskbars, tray overflow, Start and Search, the
 #: Windows 11 XAML shell surfaces (taskbar thumbnails, Alt+Tab, Snap Layouts), classic thumbnails and the task
@@ -185,6 +229,9 @@ STUCK_SETTLE_S = 0.0005
 RESTORE_WAIT_S = 0.25
 #: Per-window UIPI verdicts kept before the cache starts over.
 BLOCKED_CACHE_SIZE = 512
+
+#: What ``key_target`` answers when it cannot read the foreground window at all: no window anything may be typed into.
+_NO_KEY_TARGET = KeyTarget(0, 0, "", 0, "none", False, False)
 
 # ctypes.wintypes lacks these.
 ULONG_PTR = ctypes.c_size_t
@@ -247,6 +294,24 @@ class _INPUTUNION(ctypes.Union):  # 32
 class INPUT(ctypes.Structure):  # 40: type, 4 bytes of padding, the union
     _anonymous_ = ("u",)
     _fields_ = [("type", wt.DWORD), ("u", _INPUTUNION)]
+
+
+class GUITHREADINFO(ctypes.Structure):  # 72
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("flags", wt.DWORD),
+        ("hwndActive", wt.HWND),
+        ("hwndFocus", wt.HWND),
+        ("hwndCapture", wt.HWND),
+        ("hwndMenuOwner", wt.HWND),
+        ("hwndMoveSize", wt.HWND),
+        ("hwndCaret", wt.HWND),
+        ("rcCaret", wt.RECT),
+    ]
+
+
+class LASTINPUTINFO(ctypes.Structure):  # 8
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
 
 
 class LUID(ctypes.Structure):  # 8
@@ -405,6 +470,35 @@ def is_shell_window(class_name: str) -> bool:
     return class_name in SHELL_WINDOW_CLASSES
 
 
+def is_edit_class(class_name: str) -> bool:
+    """Whether a focused control of this class can hide what is typed with ES_PASSWORD.
+
+    The classic ``Edit``, the RichEdit family and the WinForms TextBox (an Edit under a longer class name). A browser,
+    Electron or a terminal draws its own text box and cannot be told from outside: the docs say so.
+    """
+    lowered = class_name.lower()
+    return lowered == "edit" or lowered.startswith(("richedit", "windowsforms10.edit."))
+
+
+def missing_ups(events: Sequence[_KeyEvent]) -> list[_KeyEvent]:
+    """The key-ups that balance the downs of ``events`` that have no up in it, newest first (as a hand lets go).
+
+    A SendInput call Windows cut short leaves exactly these keys down; the Unicode and the virtual-key form of a key
+    are different keys, as in ``desktop.fake.events_balanced``.
+    """
+    held: list[_KeyEvent] = []
+    for vk, scan, flags in events:
+        if not flags & KEYEVENTF_KEYUP:
+            held.append((vk, scan, flags))
+            continue
+        for index in range(len(held) - 1, -1, -1):
+            same_form = (held[index][2] ^ flags) & KEYEVENTF_UNICODE == 0
+            if held[index][:2] == (vk, scan) and same_form:
+                del held[index]
+                break
+    return [(vk, scan, flags | KEYEVENTF_KEYUP) for vk, scan, flags in reversed(held)]
+
+
 def has_virtual_hint(name: str) -> bool:
     lowered = name.lower()
     return any(hint in lowered for hint in VIRTUAL_NAME_HINTS)
@@ -518,6 +612,7 @@ class _Win32:
         user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)  # type: ignore[attr-defined]
         dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)  # type: ignore[attr-defined]
         c_int, c_uint32, c_void_p, rect_p = ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(wt.RECT)
         u32p = ctypes.POINTER(c_uint32)
@@ -592,6 +687,22 @@ class _Win32:
         self.GetTokenInformation = _fn(
             advapi32, "GetTokenInformation", wt.BOOL, wt.HANDLE, c_int, c_void_p, wt.DWORD, wt.LPDWORD
         )
+        # The keyboard: where keys would land, what is down, what the last input was, and the shell's say.
+        self.GetForegroundWindow = _fn(user32, "GetForegroundWindow", wt.HWND)
+        self.GetGUIThreadInfo = _fn(user32, "GetGUIThreadInfo", wt.BOOL, wt.DWORD, ctypes.POINTER(GUITHREADINFO))
+        self.GetKeyboardLayout = _fn(user32, "GetKeyboardLayout", c_void_p, wt.DWORD)  # an HKL: pointer-sized
+        self.VkKeyScanExW = _fn(user32, "VkKeyScanExW", ctypes.c_short, wt.WCHAR, c_void_p)
+        self.MapVirtualKeyExW = _fn(user32, "MapVirtualKeyExW", wt.UINT, wt.UINT, wt.UINT, c_void_p)
+        self.GetLastInputInfo = _fn(user32, "GetLastInputInfo", wt.BOOL, ctypes.POINTER(LASTINPUTINFO))
+        self.GetAsyncKeyState = _fn(user32, "GetAsyncKeyState", ctypes.c_short, c_int)
+        self.GetKeyState = _fn(user32, "GetKeyState", ctypes.c_short, c_int)
+        self.QueryFullProcessImageNameW = _fn(
+            kernel32, "QueryFullProcessImageNameW", wt.BOOL, wt.HANDLE, wt.DWORD, wt.LPWSTR, wt.LPDWORD
+        )
+        self.ShellExecuteW = _fn(
+            shell32, "ShellExecuteW", c_void_p, wt.HWND, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, wt.LPCWSTR, c_int
+        )
+        self.SHQueryUserNotificationState = _fn(shell32, "SHQueryUserNotificationState", HRESULT, ctypes.POINTER(c_int))
 
 
 _api_lock = threading.Lock()
@@ -774,6 +885,9 @@ def _describe(d: Display) -> str:
 class WindowsDesktop(Desktop):
     """The Desktop protocol on Windows. Safe to call from several threads; construct it before any window."""
 
+    #: The keyboard really types (the KeyDesktop flag a fake leaves False): the sink arms its real-input guards on it.
+    injects_for_real = True
+
     def __init__(self, api: Any = None) -> None:
         """``api`` stands in for the DLLs (tests, on any OS); by default they are loaded, on Windows only."""
         if api is None and sys.platform != "win32":
@@ -799,12 +913,28 @@ class WindowsDesktop(Desktop):
         #: Where the cursor stayed after a move's whole wait ran out, until it is seen anywhere else. A plain
         #: attribute: the executor's thread is the one that moves the cursor, and a lost update costs one wait.
         self._stuck_at: tuple[int, int] | None = None
+        # -- the keyboard. The ledger and the ticks are guarded by _input_lock, like the buttons' state.
+        #: Key-ups Windows refused (the down went in, the up did not), oldest first: sent again ahead of the next key.
+        self._keys_unreleased: list[_KeyEvent] = []
+        #: (hwnd, pid) -> whether keys are refused there (the absolute rule); only answers Windows gave are kept.
+        self._key_blocked: dict[tuple[int, int], bool] = {}
+        #: pid -> executable base name, for the strip on the local screen; a failed read is not kept.
+        self._exe_names: dict[int, str] = {}
+        #: GetLastInputInfo's tick right after our own last batch, and the last tick ``foreign_input`` saw.
+        self._own_tick: int | None = None
+        self._seen_tick: int | None = None
+        #: Said once until a read works again, not once per character.
+        self._target_unreadable = False
+        #: Counts of things that went wrong quietly, so a failing tick read shows without a log line per key.
+        self.key_counts: Counter[str] = Counter()
         log.info(
             "Windows desktop: DPI awareness %s, integrity %s, pid %d",
             self.dpi_awareness,
             integrity_name(self.integrity),
             self._pid,
         )
+        if self.integrity is None:
+            log.warning("our own integrity level is unknown: no key is sent to any window")
 
     # -- displays -----------------------------------------------------------------------
 
@@ -1277,6 +1407,332 @@ class WindowsDesktop(Desktop):
         if pid:
             self._blocked[(hwnd, pid)] = True
 
+    # -- the keyboard (the KeyDesktop protocol of desktop/base.py) -------------------------
+
+    def foreground_window(self) -> int:
+        """The foreground window's handle, 0 when there is none or Windows won't say. Cheap; never raises."""
+        try:
+            return int(self._w.GetForegroundWindow() or 0)
+        except Exception:  # noqa: BLE001 - "no window" is the answer that holds keys back
+            return 0
+
+    def key_target(self) -> KeyTarget:
+        """Where a key typed now would land, read afresh on every call.
+
+        Fails closed: every probe that cannot answer makes the target unusable (``blocked`` "none", or "elevated",
+        or ``covered``) rather than clear, and a probe that raises gives the target of no window at all. Only the
+        name of the program and the layout are cosmetic, and losing them blocks nothing.
+        """
+        try:
+            found = self._read_key_target()
+        except Exception as exc:  # noqa: BLE001 - never raises into the sink; the type only: a text may name a window
+            if not self._target_unreadable:
+                log.warning(
+                    "could not read the foreground window (%s): keys are held back until it can be read",
+                    type(exc).__name__,
+                )
+            self._target_unreadable = True
+            return _NO_KEY_TARGET
+        self._target_unreadable = False
+        return found
+
+    def _read_key_target(self) -> KeyTarget:
+        hwnd = self.foreground_window()
+        if not hwnd:
+            return _NO_KEY_TARGET
+        thread, pid = self._owner_of(hwnd)
+        if not thread or not pid:
+            return KeyTarget(hwnd, 0, "", 0, "none", False, False)  # the owner can't be resolved: not a safe target
+        own = pid == self._pid
+        name = "" if own else self._exe_name(pid)
+        lang_id = self._layout_id(thread)
+        blocked = self._key_block(hwnd, pid)
+        if blocked is not None:
+            return KeyTarget(hwnd, pid, name, lang_id, blocked, False, False)
+        password = self._password_focus()
+        if password is None:
+            return KeyTarget(hwnd, pid, name, lang_id, "none", False, False)
+        return KeyTarget(hwnd, pid, name, lang_id, None, password, self._covered())
+
+    def _owner_of(self, hwnd: int) -> tuple[int, int]:
+        """(thread id, process id) of the window's owner; zeros when Windows won't say."""
+        pid = wt.DWORD(0)
+        thread = self._w.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(thread), pid.value
+
+    def _key_block(self, hwnd: int, pid: int) -> _KeyBlock | None:
+        """Why no key may go to this window, or None. Our own window first, then the shell, then the rights."""
+        if pid == self._pid:
+            return "own"
+        class_name = self._class_name(hwnd)
+        if not class_name:
+            return "none"  # a window whose class can't be read is gone or odd: not a place to type
+        if is_shell_window(class_name):
+            return "shell"
+        return "elevated" if self._key_elevated(hwnd, pid) else None
+
+    def _key_elevated(self, hwnd: int, pid: int) -> bool:
+        """The absolute rule: clear only when our level is known, the target's token was read, it is below High and
+        not above ours. ``_is_blocked`` (the mouse's) is relative to our level and lets everything through when that
+        is unknown, which for a keyboard would type into an administrator's console from an elevated helper.
+
+        Only what Windows told is remembered: a process that could not be opened (it exited) is asked again.
+        """
+        if self.integrity is None:
+            return True
+        key = (hwnd, pid)
+        known = self._key_blocked.get(key)
+        if known is not None:
+            return known
+        told, level = _process_integrity(self._w, pid)
+        if not told:
+            return True
+        # Compared by band (the high byte of the RID): Medium+ (0x2100) is a Medium process for this purpose.
+        elevated = level is None or level >= INTEGRITY_HIGH_RID or level >> 12 > self.integrity >> 12
+        if len(self._key_blocked) >= BLOCKED_CACHE_SIZE:
+            self._key_blocked.clear()
+        self._key_blocked[key] = elevated
+        if elevated:
+            log.info(
+                "window %#x (pid %d) runs at %s integrity (ours: %s): keys are never sent to it",
+                hwnd,
+                pid,
+                integrity_name(level),
+                integrity_name(self.integrity),
+            )
+        return elevated
+
+    def _password_focus(self) -> bool | None:
+        """Whether the control with the keyboard focus is a classic password box; None when that can't be read."""
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(GUITHREADINFO)
+        if not self._w.GetGUIThreadInfo(0, ctypes.byref(info)):  # 0: the foreground thread
+            return None
+        focus = info.hwndFocus
+        if not focus:
+            return False  # nothing has the focus: a key goes nowhere
+        class_name = self._class_name(focus)
+        if not class_name:
+            return None
+        if not is_edit_class(class_name):
+            return False
+        ctypes.set_last_error(0)  # type: ignore[attr-defined]
+        style = self._w.GetWindowLongPtrW(focus, GWL_STYLE)
+        if not style and ctypes.get_last_error():  # type: ignore[attr-defined]
+            return None
+        return bool(style & ES_PASSWORD)
+
+    def _covered(self) -> bool:
+        """The shell says the user is busy (a full-screen game, a presentation); True when it won't say."""
+        state = ctypes.c_int(0)
+        if self._w.SHQueryUserNotificationState(ctypes.byref(state)) != S_OK:
+            return True
+        return state.value in COVERED_STATES
+
+    def _layout_id(self, thread: int) -> int:
+        """The language id of the keyboard layout of the foreground thread (never our own: it is not typed into)."""
+        try:
+            return int(self._w.GetKeyboardLayout(thread) or 0) & 0xFFFF
+        except Exception:  # noqa: BLE001 - the strip loses the language, nothing is blocked
+            return 0
+
+    def _exe_name(self, pid: int) -> str:
+        """The program's base name without ".exe", for the strip on the local screen; "" when it can't be read."""
+        name = self._exe_names.get(pid)
+        if name is None:
+            try:
+                name = self._read_exe_name(pid)
+            except Exception:  # noqa: BLE001 - cosmetic
+                return ""
+            if name is None:
+                return ""  # could not tell (the process exited, say): asked again next time
+            if len(self._exe_names) >= BLOCKED_CACHE_SIZE:
+                self._exe_names.clear()
+            self._exe_names[pid] = name
+        return name
+
+    def _read_exe_name(self, pid: int) -> str | None:
+        """The name, "" for a process that will never say (access denied), None when it could not be read now."""
+        w = self._w
+        process = w.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            # A protected process stays protected: not worth a failed OpenProcess before every character.
+            return "" if ctypes.get_last_error() == ERROR_ACCESS_DENIED else None  # type: ignore[attr-defined]
+        try:
+            buffer = ctypes.create_unicode_buffer(IMAGE_NAME_CHARS)
+            size = wt.DWORD(IMAGE_NAME_CHARS)
+            if not w.QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer, ctypes.byref(size)):
+                return None
+            path = buffer.value
+        finally:
+            w.CloseHandle(process)
+        base = ntpath.basename(path)
+        stem, extension = ntpath.splitext(base)
+        return stem if extension.lower() == ".exe" else base
+
+    def send_keys(self, strokes: Sequence[KeyStroke], *, inject: Literal["unicode", "vk"] = "unicode") -> int:
+        """Types the strokes in order, one SendInput call each. The number sent in full.
+
+        Every stroke is checked and turned into events before the first is sent, so a refused one sends nothing.
+        InputBlocked when Windows took none of the first stroke (UIPI, the secure desktop); OSError when it took
+        part of one (its missing key-ups are sent at once, or kept and retried). A later stroke Windows refuses
+        whole ends the call with the count so far. Nothing in an exception or a log names a typed character.
+        """
+        if inject not in ("unicode", "vk"):
+            raise ValueError("inject must be 'unicode' or 'vk'")
+        batches = self._key_batches(strokes, inject)
+        with self._input_lock:
+            for index, events in enumerate(batches):
+                self._drain_key_ledger()  # a key-up owed from before goes first, in a call of its own
+                taken = self._send_events(events)
+                if taken == len(events):
+                    continue
+                code = ctypes.get_last_error()  # type: ignore[attr-defined]  # before the rescue's calls change it
+                if taken == 0:
+                    if index == 0:
+                        raise InputBlocked(f"Windows took none of the keys (error {code})")
+                    return index
+                self._release_cut_short(events[:taken])
+                raise _win_error(code, f"SendInput ({taken} of {len(events)} events)")
+            return len(batches)
+
+    def _key_batches(self, strokes: Sequence[KeyStroke], inject: Literal["unicode", "vk"]) -> list[list[_KeyEvent]]:
+        lookup, shift_down = None, False
+        if inject == "vk" and any(s.kind == "char" for s in strokes):
+            lookup, shift_down = self._key_lookup()  # asked once per call, not per character
+        return [events_for(s, inject=inject, vk_lookup=lookup, shift_down=shift_down) for s in strokes]
+
+    def _key_lookup(self) -> tuple[VkLookup | None, bool]:
+        """(char -> key on the foreground thread's layout, whether the user holds Shift); no lookup, no foreground."""
+        hwnd = self.foreground_window()
+        thread = self._owner_of(hwnd)[0] if hwnd else 0
+        if not thread:
+            return None, False  # nothing to ask: the characters go in as Unicode
+        w = self._w
+        layout = w.GetKeyboardLayout(thread)
+        if not layout:
+            return None, False  # NULL would mean "our own thread's layout" to VkKeyScanExW: the wrong one
+        shift_down = bool(w.GetAsyncKeyState(VK_SHIFT) & KEY_DOWN_BIT)
+        caps_lock = bool(w.GetKeyState(VK_CAPITAL) & 1)
+
+        def lookup(value: str) -> tuple[int, int, int] | None:
+            answer = w.VkKeyScanExW(value, layout)
+            if answer == -1:
+                return None  # this layout has no key for it
+            vk, state = answer & 0xFF, (answer >> 8) & 0xFF
+            scan = w.MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC, layout)
+            if not scan:
+                return None
+            if caps_lock and value.lower() != value.upper():
+                state ^= 1  # Caps Lock turns the Shift a letter needs around; a mark or a Hebrew letter has no case
+            return vk, state, scan
+
+        return lookup, shift_down
+
+    def _send_events(self, events: list[_KeyEvent]) -> int:
+        """One SendInput call; the number of events Windows took, in order. Notes the tick our own input leaves."""
+        if not events:
+            return 0
+        inputs = (INPUT * len(events))()
+        for item, (vk, scan, flags) in zip(inputs, events, strict=True):
+            item.type = INPUT_KEYBOARD
+            item.ki.wVk, item.ki.wScan, item.ki.dwFlags = vk, scan, flags
+            item.ki.time, item.ki.dwExtraInfo = 0, EXTRA_INFO_TAG  # time 0: the system stamps it
+        ctypes.set_last_error(0)  # type: ignore[attr-defined]
+        taken = max(0, int(self._w.SendInput(len(events), inputs, ctypes.sizeof(INPUT))))
+        if taken:
+            self._note_own_input()
+        return taken
+
+    def _release_cut_short(self, taken: list[_KeyEvent]) -> None:
+        """Let go of the keys a cut-short call left down. What can't be sent now is kept, never raised."""
+        owed = missing_ups(taken)
+        sent = 0
+        try:
+            sent = self._send_events(owed)
+        except Exception as exc:  # noqa: BLE001 - the caller already hears of the cut-short call; this is kept
+            log.debug("could not release the keys of a cut-short batch (%s)", type(exc).__name__)
+        if sent < len(owed):
+            self._keys_unreleased.extend(owed[sent:])
+            log.warning("Windows left %d key-up(s) unsent; they go out ahead of the next key", len(owed) - sent)
+
+    def _drain_key_ledger(self) -> None:
+        """Send the key-ups Windows refused earlier; what is refused again stays. Never raises."""
+        with self._input_lock:
+            if not self._keys_unreleased:
+                return
+            try:
+                sent = self._send_events(list(self._keys_unreleased))
+            except Exception as exc:  # noqa: BLE001 - tried again with the next key or check
+                log.debug("the refused key-ups did not get through yet (%s)", type(exc).__name__)
+                return
+            del self._keys_unreleased[:sent]
+            if sent:
+                log.info("released %d key(s) whose key-up Windows had refused earlier", sent)
+
+    def release_keys(self) -> None:
+        """Send any key-up Windows refused earlier. Never raises."""
+        self._drain_key_ledger()
+
+    def _note_own_input(self) -> None:
+        """Remember the tick our own batch left, so ``foreign_input`` does not take it for the user's.
+
+        Never changes what a stroke returns: the characters are typed already (retyping them would double them),
+        so a failed read only means the next ``foreign_input`` says "foreign" once, which fails safe.
+        """
+        tick = self._last_input_tick()
+        if tick is None:
+            self.key_counts["own_tick_failed"] += 1
+        else:
+            self._own_tick = tick
+
+    def _last_input_tick(self) -> int | None:
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        try:
+            ok = self._w.GetLastInputInfo(ctypes.byref(info))
+        except Exception:  # noqa: BLE001 - "can't tell" is an answer
+            return None
+        return int(info.dwTime) if ok else None
+
+    def foreign_input(self) -> bool:
+        """Whether input other than ours came since the last call (a key or the mouse); True when it can't tell.
+
+        The first call only takes a baseline. The tick is the machine's last input of any kind, so our own batch
+        moves it too: the tick our last batch left is not news.
+        """
+        tick = self._last_input_tick()
+        if tick is None:
+            return True
+        with self._input_lock:
+            seen = self._seen_tick
+            self._seen_tick = tick
+            return seen is not None and tick != seen and tick != self._own_tick
+
+    def modifiers_down(self) -> bool:
+        """A physical Ctrl, Alt or Windows key is down (a typed letter would be a shortcut). True when it can't tell.
+
+        Shift and Caps Lock are no shortcut: a capital letter is fine.
+        """
+        try:
+            return any(self._w.GetAsyncKeyState(vk) & KEY_DOWN_BIT for vk in SHORTCUT_MODIFIERS)
+        except Exception:  # noqa: BLE001 - unknown counts as down
+            return True
+
+    def open_os_keyboard(self) -> bool:
+        """Start the Windows on-screen keyboard by its absolute path (never found through PATH or the cwd)."""
+        root = os.environ.get("SYSTEMROOT") or r"C:\Windows"
+        path = ntpath.join(root, "System32", "osk.exe")
+        try:
+            handle = self._w.ShellExecuteW(None, "open", path, None, None, SW_SHOWNORMAL)
+        except Exception as exc:  # noqa: BLE001 - the caller shows "could not open it"
+            log.warning("could not start the on-screen keyboard (%s)", type(exc).__name__)
+            return False
+        started = int(handle or 0) > 32  # ShellExecute answers a value above 32 on success, an error code below
+        if not started:
+            log.warning("the on-screen keyboard did not start (ShellExecute answered %d)", int(handle or 0))
+        return started
+
     # -- extras (not in the protocol; the runtime looks for them) ------------------------
 
     def input_desktop_ok(self) -> bool:
@@ -1306,6 +1762,7 @@ class WindowsDesktop(Desktop):
 
     def _retry_releases(self) -> None:
         """Send the releases Windows refused while another desktop had the input. Never raises."""
+        self._drain_key_ledger()
         if not self._unreleased:
             return
         try:
@@ -1337,7 +1794,7 @@ class WindowsDesktop(Desktop):
         return True
 
     def close(self) -> None:
-        """Releases any button still held, turns keep_awake off. Idempotent; never raises."""
+        """Releases any button or key still held, turns keep_awake off. Idempotent; never raises."""
         with self._input_lock:
             for button in sorted(self._pressed):
                 if button not in self._pressed:
@@ -1346,10 +1803,13 @@ class WindowsDesktop(Desktop):
                     self.button(button, False)
                 except Exception as exc:  # noqa: BLE001 - closing must not raise
                     log.warning("could not release the %s button: %s", button, exc)
+            self.release_keys()
         try:
             if self._awake_thread is not None:
                 self.keep_awake(False)
         except Exception:
             log.exception("could not turn keep_awake off")
         self._blocked.clear()
+        self._key_blocked.clear()
+        self._exe_names.clear()
         self._display_cache = None

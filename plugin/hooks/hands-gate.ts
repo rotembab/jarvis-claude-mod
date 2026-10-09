@@ -38,6 +38,10 @@ const ACTION_WORDS: Record<HandsToolAction, { what: string; more?: string }> = {
   resume: { what: 'resume hand control', more: ', which turns the camera back on' },
   engage: { what: 'give your hand the cursor', more: ' now, with no open palm needed' },
   disengage: { what: 'take the cursor away from your hand' },
+  // Opening it only puts a keyboard on the screen: what is tapped is the user's own, and the tool has no way to insert or send it.
+  keyboard: { what: 'open the air keyboard', more: ', which you then type on yourself in the air' },
+  keyboard_practice: { what: 'open the air keyboard in practice mode', more: ', where nothing you tap is typed' },
+  keyboard_off: { what: 'close the air keyboard', more: ', which throws away what is in its review box' },
 }
 
 const NOTHING_DONE = 'nothing was done'

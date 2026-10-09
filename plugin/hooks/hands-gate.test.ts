@@ -189,7 +189,9 @@ describe('the hands tool: the user\'s rules', () => {
     await startHelper($, w)
     await promptTurn($)
     w.askAnswer = 'Do it'
-    expect((await hands($, { action: 'explode' })).result).toBe('Unknown action "explode"; use one of on, off, status, calibrate, pause, resume, engage, disengage.')
+    expect((await hands($, { action: 'explode' })).result).toBe(
+      'Unknown action "explode"; use one of on, off, status, calibrate, pause, resume, engage, disengage, keyboard, keyboard_practice, keyboard_off.',
+    )
     expect((await hands($, {})).result).toBe('Give an action, a display, or both.')
     expect((await hands($, { display: 'left' })).result).toBe('"left" is not a display. Use /jarvis hands display all, a display number such as 2, or a list such as 1,2.')
     expect(w.asked).toEqual([])
@@ -633,6 +635,116 @@ describe('the hands tool: sensitivity, a voice turn', () => {
     await say($, w, helper, 'Go ahead.', 't2', { startedAtMs: 40_500, overSpeech: false })
     expect((await hands($, { preset: 'Fast' })).result).toMatch(/^Preset fast: /)
     expect(w.store.get(TUNING_KEY)).toMatchObject({ cursorSpeed: { value: 1.6 } })
+    expect(w.asked).toEqual([])
+  })
+})
+
+describe('the hands tool: the air keyboard actions', () => {
+  const KEYBOARD_CAPS = ['heartbeat', 'status', 'config', 'pause', 'resume', 'engage', 'disengage', 'calibrate', 'shutdown', 'keyboard']
+  const KEYBOARD_ACTIONS = ['keyboard', 'keyboard_practice', 'keyboard_off'] as const
+  /** The plugin option that turns the keyboard on, the only way there is. */
+  const KEYBOARD_ON = { options: { handKeyboard: 'on' } }
+  /** What Jarvis asks about each (the tool's words, not the model's). */
+  const QUESTION = {
+    keyboard: ask('open the air keyboard, which you then type on yourself in the air'),
+    keyboard_practice: ask('open the air keyboard in practice mode, where nothing you tap is typed'),
+    keyboard_off: ask('close the air keyboard, which throws away what is in its review box'),
+  }
+
+  /** Hand control on and up, with a helper that has the keyboard. */
+  async function keyboardUp($: TestEngine, w: World): Promise<void> {
+    await startHelper($, w)
+    const helper = w.lastHands()
+    helper.hello(HANDS_PORT, KEYBOARD_CAPS)
+    helper.event({ type: 'state', state: 'starting' })
+    helper.event({ type: 'ready', camera: 'UGREEN Camera', width: 1280, height: 720, fps: 30, displays: [] })
+    helper.event({ type: 'state', state: 'idle' })
+    await w.settle()
+  }
+
+  /** The keyboard commands the helper has heard so far. */
+  const heard = (w: World): unknown[] => w.handsNamed('keyboard').map(command => command.body)
+
+  test('G1: each asks the user by name before it runs; a no sends nothing, a yes sends the command', KEYBOARD_ON, async ($, on) => {
+    const w = handsWorld(on, true)
+    await keyboardUp($, w)
+    const before = heard(w).length
+    await promptTurn($)
+    w.toolCheck = () => ({ decision: 'ask', reason: 'Permission rule asks', rule: HANDS })
+    w.askAnswer = "Don't do it"
+    for (const action of KEYBOARD_ACTIONS) expect(await hands($, { action }), action).toMatchObject({ result: expect.stringMatching(DONT) })
+    expect(w.asked).toEqual(KEYBOARD_ACTIONS.map(action => QUESTION[action]))
+    expect(heard(w)).toHaveLength(before)
+    w.askAnswer = 'Do it'
+    expect((await hands($, { action: 'keyboard' })).result).toContain("The air keyboard is opening on the user's screen.")
+    expect(heard(w).slice(before).at(-1)).toEqual({ action: 'start' })
+    expect((await hands($, { action: 'keyboard_practice' })).result).toContain('practice is opening')
+    expect(heard(w).at(-1)).toEqual({ action: 'practice' })
+    expect((await hands($, { action: 'keyboard_off' })).result).toContain('closing')
+    expect(heard(w).at(-1)).toEqual({ action: 'stop' })
+    expect(w.asked).toHaveLength(6)
+  })
+
+  test('G2: a deny rule refuses all three before anything is asked or sent', KEYBOARD_ON, async ($, on) => {
+    const w = handsWorld(on, true)
+    await keyboardUp($, w)
+    const before = heard(w).length
+    await promptTurn($)
+    w.toolCheck = () => ({ decision: 'deny', reason: 'Permission rule denies', rule: HANDS })
+    w.askAnswer = 'Do it'
+    for (const action of KEYBOARD_ACTIONS) expect(await hands($, { action }), action).toEqual({ deny: expect.stringMatching(REFUSED) })
+    expect(w.asked).toEqual([])
+    expect(heard(w)).toHaveLength(before)
+  })
+
+  test('G3: plan mode refuses all three, even with the user\'s allow rule', KEYBOARD_ON, async ($, on) => {
+    const w = handsWorld(on, true)
+    await keyboardUp($, w)
+    const before = heard(w).length
+    w.toolCheck = ALLOWED
+    await promptTurn($, 'plan')
+    for (const action of KEYBOARD_ACTIONS) expect(await hands($, { action }), action).toMatchObject({ result: expect.stringMatching(PLAN_MODE) })
+    expect(heard(w)).toHaveLength(before)
+    expect(w.asked).toEqual([])
+  })
+
+  test('G4: dontAsk refuses what no rule allows beforehand; the user\'s own allow rule runs them with no question', KEYBOARD_ON, async ($, on) => {
+    const w = handsWorld(on, true)
+    await keyboardUp($, w)
+    const before = heard(w).length
+    await promptTurn($, 'dontAsk')
+    w.toolCheck = () => ({ decision: 'allow' })
+    w.askAnswer = 'Do it'
+    for (const action of KEYBOARD_ACTIONS) expect(await hands($, { action }), action).toEqual({ deny: expect.stringMatching(REFUSED) })
+    expect(heard(w)).toHaveLength(before)
+    w.toolCheck = ALLOWED
+    expect((await hands($, { action: 'keyboard_practice' })).result).toContain('practice is opening')
+    expect(heard(w).at(-1)).toEqual({ action: 'practice' })
+    expect(w.asked).toEqual([])
+  })
+
+  test('G5: a subagent is asked even with an allow rule', KEYBOARD_ON, async ($, on) => {
+    const w = handsWorld(on, true)
+    await keyboardUp($, w)
+    const before = heard(w).length
+    await promptTurn($)
+    w.toolCheck = ALLOWED
+    w.askAnswer = "Don't do it"
+    expect(await hands($, { action: 'keyboard', agentId: 'agent-1' })).toMatchObject({ result: expect.stringMatching(DONT) })
+    expect(w.asked).toEqual([QUESTION.keyboard])
+    expect(heard(w)).toHaveLength(before)
+  })
+
+  test('G6: with the option off an allowed call is still only the off text; closing still closes', async ($, on) => {
+    const w = handsWorld(on, true)
+    await handsUp($, w)
+    const sent = handsChanges(w, 0).length
+    w.toolCheck = ALLOWED
+    await promptTurn($)
+    const off = 'The air keyboard is off. Turn it on in the Jarvis plugin settings (handKeyboard).'
+    expect((await hands($, { action: 'keyboard' })).result).toBe(off)
+    expect((await hands($, { action: 'keyboard_practice' })).result).toBe(off)
+    expect(handsChanges(w, sent)).toEqual([])
     expect(w.asked).toEqual([])
   })
 })

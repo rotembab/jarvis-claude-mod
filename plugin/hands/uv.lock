@@ -195,6 +195,7 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "opencv-contrib-python" },
+    { name = "pillow" },
 ]
 
 [package.dev-dependencies]
@@ -208,6 +209,7 @@ requires-dist = [
     { name = "mediapipe", specifier = "==0.10.33" },
     { name = "numpy", specifier = ">=2" },
     { name = "opencv-contrib-python", specifier = ">=5.0,<6" },
+    { name = "pillow", specifier = ">=12.3,<13" },
 ]
 
 [package.metadata.requires-dev]
