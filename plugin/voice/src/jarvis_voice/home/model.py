@@ -46,6 +46,7 @@ Value = str | int | float | bool | None
 KINDS = (
     "tv",
     "media_player",
+    "media_server",
     "speaker",
     "light",
     "switch",
@@ -337,6 +338,9 @@ COMMAND_SYNONYMS: dict[str, str] = {
     "open_link": "launch_app",
     "open_url": "launch_app",
     "apps": "list_apps",
+    "search": "find",
+    "lookup": "find",
+    "look_up": "find",
     "input": "set_input",
     "source": "set_input",
     "inputs": "list_inputs",

@@ -25,3 +25,6 @@ Does Rotem run a Plex Media Server, or only use Plex's free catalogue and channe
 
 ## Cheapest next test
 Say to Jarvis: "open https://watch.plex.tv/live-tv on the Apple TV" and note where Plex lands (live TV guide means universal links work; home screen means they do not).
+
+## Update, same day: tried on a real Apple TV
+`plex://preplay/?metadataKey=%2Flibrary%2Fmetadata%2F14779&server=<machineIdentifier>`, sent through the existing `launch_app` of the Apple TV driver (pyatv Companion `_urlS`), opened the show's page in the Plex app. `plex://play/...` has not been tried yet. The Apple TV answers `Open URL failed` for a link no app accepts, and refuses commands while asleep. Kick's `https://kick.com/...` links were refused by tvOS on the same Apple TV, which contradicts the Kick line above. The Plex driver (`plex.py`, `plex_find.py`) builds the preplay link; see the Plex section of `docs/DEVELOPING.md`.

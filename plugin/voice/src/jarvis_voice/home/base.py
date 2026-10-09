@@ -1,6 +1,6 @@
 """The driver interface, the context drivers get, and the registry that loads them lazily.
 
-A driver controls one family of devices (Apple TV, Sony Bravia, Tuya, Home
+A driver controls one family of devices (Apple TV, Sony Bravia, Plex, Tuya, Home
 Assistant). The service calls it from a worker thread with the device's lock
 held, so a driver call may block, but must finish within the time the
 service allows (``DriverContext.call_timeout``); async libraries run on the
@@ -136,6 +136,7 @@ class Prompter(Protocol):
 DRIVERS: dict[str, str] = {
     "appletv": "jarvis_voice.home.appletv:AppleTvDriver",
     "bravia": "jarvis_voice.home.bravia:BraviaDriver",
+    "plex": "jarvis_voice.home.plex:PlexDriver",
     "tuya": "jarvis_voice.home.tuya:TuyaDriver",
     "homeassistant": "jarvis_voice.home.homeassistant:HomeAssistantDriver",
 }
@@ -144,12 +145,19 @@ DRIVERS: dict[str, str] = {
 WIZARD_STEPS: list[tuple[str, str, str]] = [
     ("appletv", "Add an Apple TV", "jarvis_voice.home.appletv:wizard"),
     ("bravia", "Add a Sony Bravia TV", "jarvis_voice.home.bravia:wizard"),
+    ("plex", "Connect Plex", "jarvis_voice.home.plex:wizard"),
     ("tuya", "Link Tuya devices (Tuya Smart or Smart Life)", "jarvis_voice.home.tuya:wizard"),
     ("homeassistant", "Connect Home Assistant", "jarvis_voice.home.homeassistant:wizard"),
 ]
 
 # The driver's display name, for messages when it cannot even be imported.
-LABELS = {"appletv": "Apple TV", "bravia": "Sony Bravia", "tuya": "Tuya", "homeassistant": "Home Assistant"}
+LABELS = {
+    "appletv": "Apple TV",
+    "bravia": "Sony Bravia",
+    "plex": "Plex",
+    "tuya": "Tuya",
+    "homeassistant": "Home Assistant",
+}
 
 
 def load_object(path: str) -> Any:

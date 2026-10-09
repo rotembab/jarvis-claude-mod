@@ -22,12 +22,22 @@ from urllib.parse import urlsplit
 HttpFailure = Literal["unreachable", "timeout", "tls", "bad_url"]
 
 
-class HttpError(Exception):
-    """The request never got an HTTP answer. ``kind`` says why; the message names the host, never a header."""
+# OpenSSL's verify codes for a certificate whose issuer the PC does not know: the server sent a chain that
+# stops short of a root in the PC's store, or one ending at a root that is not in it.
+ISSUER_UNKNOWN = frozenset({2, 19, 20, 21})
 
-    def __init__(self, kind: HttpFailure, message: str) -> None:
+
+class HttpError(Exception):
+    """The request never got an HTTP answer. ``kind`` says why; the message names the host, never a header.
+
+    ``issuer_unknown``: a "tls" failure because the certificate's issuer is not trusted here (a different root
+    in the PC's store might fix it), as opposed to a wrong name, an expired certificate or a broken handshake.
+    """
+
+    def __init__(self, kind: HttpFailure, message: str, *, issuer_unknown: bool = False) -> None:
         super().__init__(message)
         self.kind = kind
+        self.issuer_unknown = issuer_unknown
 
 
 @dataclass(slots=True)
@@ -54,8 +64,13 @@ def request(
     json_body: Any = None,
     timeout: float = 5.0,
     verify_tls: bool = True,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> HttpResponse:
-    """One HTTP request with no proxy, header names sent exactly as given."""
+    """One HTTP request with no proxy, header names sent exactly as given.
+
+    https checks the certificate with the PC's trusted roots, or with ``ssl_context`` when one is given
+    (then ``verify_tls`` is not used: the context decides).
+    """
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise HttpError("bad_url", f"not an http(s) address: {parts.scheme}://{parts.hostname or ''}")
@@ -70,8 +85,8 @@ def request(
         sent.setdefault("Content-Type", "application/json")
     connection: http.client.HTTPConnection
     if parts.scheme == "https":
-        context = ssl.create_default_context()
-        if not verify_tls:
+        context = ssl_context or ssl.create_default_context()
+        if not verify_tls and ssl_context is None:
             # Home hubs and TVs often use self-signed certificates on the LAN.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
@@ -86,6 +101,12 @@ def request(
         return HttpResponse(response.status, data, {k.lower(): v for k, v in response.getheaders()})
     except TimeoutError:
         raise HttpError("timeout", f"{where} did not answer within {timeout:g} s") from None
+    except ssl.SSLCertVerificationError as exc:
+        raise HttpError(
+            "tls",
+            f"{where}: TLS failed ({exc.reason or type(exc).__name__})",
+            issuer_unknown=exc.verify_code in ISSUER_UNKNOWN,
+        ) from None
     except ssl.SSLError as exc:
         raise HttpError("tls", f"{where}: TLS failed ({exc.reason or type(exc).__name__})") from None
     except (OSError, http.client.HTTPException) as exc:
