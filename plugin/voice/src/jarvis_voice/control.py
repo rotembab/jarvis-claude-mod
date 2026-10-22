@@ -73,15 +73,36 @@ class _Handler(BaseHTTPRequestHandler):
     def _fail(self, status: int, code: protocol.ErrorCode, message: str, *, close: bool = False) -> None:
         self._send(status, protocol.error_response(code, message), close=close)
 
+    def _discard_body(self) -> None:
+        """Read a small unread body before a refusal closes the connection.
+
+        Closing a socket with unread bytes makes Windows send a reset, which can
+        reach the client before it reads the refusal (WinError 10053/10054).
+        Bodies that are chunked, malformed or over MAX_BODY_BYTES stay unread.
+        """
+        if self.headers.get("Transfer-Encoding"):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if 0 < length <= MAX_BODY_BYTES:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
     def _guard(self) -> bool:
         """Origin / Host / token checks shared by every method. True = allowed."""
         control = self.server.control
         if self.headers.get("Origin") is not None:
+            self._discard_body()
             self._fail(403, "unauthorized", "requests with an Origin header are not accepted", close=True)
             return False
         host = (self.headers.get("Host") or "").strip().lower()
         port = control.port
         if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            self._discard_body()
             self._fail(403, "unauthorized", "unexpected Host header", close=True)
             return False
         auth = self.headers.get("Authorization") or ""
@@ -89,6 +110,7 @@ class _Handler(BaseHTTPRequestHandler):
         if scheme.lower() != "bearer" or not hmac.compare_digest(
             given.strip().encode("utf-8"), control.token.encode("utf-8")
         ):
+            self._discard_body()
             self._fail(401, "unauthorized", "missing or invalid bearer token", close=True)
             return False
         return True
@@ -142,10 +164,12 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, response)
 
     def _drain_and_fail(self, status: int, message: str) -> None:
+        self._discard_body()
         self._fail(status, "bad_request", message, close=True)
 
     def _method_not_allowed(self) -> None:
         if self._guard():
+            self._discard_body()
             self._fail(405, "bad_request", "use POST", close=True)
 
     do_GET = do_PUT = do_DELETE = do_PATCH = _method_not_allowed  # noqa: N815

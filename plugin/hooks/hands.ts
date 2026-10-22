@@ -12,6 +12,8 @@ import type { HookStream, PluginOptions, ProcessSpawnChunk, ProcessSpawnResult, 
 import type { HandsPhase, JarvisHandsView, JarvisHelperRef } from '../types'
 import type { Engine } from './engine'
 import { delay, describeError, TIMEOUT, withTimeout } from './engine'
+import type { HandsKeyboardEvent, KeyboardCommandBody, KeyboardPress, KeyboardStatus } from './hands-keyboard'
+import { HandsKeyboard, KEYBOARD_PRESS, parseKeyboardEvent } from './hands-keyboard'
 import type { Helper } from './helper'
 import {
   ALREADY_RUNNING_EXIT,
@@ -98,6 +100,7 @@ export type HandsEvent =
   | GestureEvent
   | CalibrationEvent
   | HandsErrorEvent
+  | HandsKeyboardEvent
 
 export type HandsConfigCommand = {
   engage?: EngageMode
@@ -118,6 +121,7 @@ export type HandsCommandBodies = {
   disengage: Empty
   calibrate: { action: 'start' | 'cancel' }
   shutdown: Empty
+  keyboard: KeyboardCommandBody
 }
 export type HandsCommandName = keyof HandsCommandBodies
 
@@ -143,6 +147,8 @@ export type HandsStatusResponse = {
   displays: HandsDisplay[]
   calibrated?: boolean
   settings: { engage: EngageMode; hand: string; anchor: string; overlay: boolean } & Partial<TuningValues>
+  /** Counts and enums only; a helper without the keyboard leaves it out. */
+  keyboard?: KeyboardStatus
 }
 
 const HANDS_STATES: ReadonlySet<string> = new Set<HandsState>(['starting', 'idle', 'active', 'paused', 'calibrating', 'error'])
@@ -228,6 +234,9 @@ export function parseHandsEvent(line: string): HandsEvent | undefined {
       return typeof value.code === 'string' && typeof value.message === 'string'
         ? { ...(value as HandsErrorEvent), fatal: value.fatal === true }
         : undefined
+    case 'keyboard':
+      // Rebuilt from known keys: the other events are cast, this one is never allowed to carry a stray field on.
+      return parseKeyboardEvent(value)
     default:
       return undefined
   }
@@ -383,6 +392,7 @@ const COMMAND_TIMEOUT_MS: Record<HandsCommandName, number> = {
   disengage: 2000,
   calibrate: 3000,
   shutdown: 2000,
+  keyboard: 3000,
 }
 
 /** Fatal errors no restart cures (the platform, a missing model): the supervisor gives up at once. */
@@ -408,6 +418,8 @@ export type HandsHelperOptions = {
    * a setting refuses the whole command, which would cost the rest of it too.
    */
   onConfigRefused?: (config: HandsConfigCommand, message: string) => HandsConfigCommand | undefined
+  /** The `config` went out (or was refused): what must reach the helper after it, such as the air keyboard's settings. */
+  onConfigured?: () => void
   /** Whether the user paused hand control: `pause` then goes out before `config`, before the camera opens. */
   isPaused: () => Promise<boolean>
   onEvent: (event: HandsEvent) => void
@@ -771,6 +783,7 @@ export class HandsHelper {
       if (instead !== undefined) outcome = await this.send('config', instead)
     }
     if (!outcome.ok) this.engine.debug(`jarvis: hands config not applied: ${outcome.message}`)
+    this.options.onConfigured?.()
   }
 
   /**
@@ -953,6 +966,10 @@ export type HandsSettings = {
   tuning: Partial<TuningValues>
   /** What is wrong with the other plugin settings, in words: they use the knob's default instead. */
   badTuning: string[]
+  /** The air keyboard is on (handKeyboard is exactly "on"): the only switch there is for it. */
+  keyboard: boolean
+  /** The press method the keyboard opens with (handKeyboardPress); /jarvis hands keyboard press overrides it. */
+  keyboardPress: KeyboardPress
 }
 
 /** Reads hand control's userConfig values, defaults filled in. */
@@ -981,6 +998,9 @@ export function readHandsSettings(options: PluginOptions): HandsSettings {
     engage: ENGAGE_MODES.find(mode => mode === text('handEngage')) ?? 'palm',
     tuning,
     badTuning,
+    // Only the exact word turns it on, and an unknown press method is the default: a typo can only leave it off or on air.
+    keyboard: text('handKeyboard') === 'on',
+    keyboardPress: KEYBOARD_PRESS.find(press => press === text('handKeyboardPress')) ?? 'air',
   }
 }
 
@@ -1102,19 +1122,34 @@ const HANDS_HELP = [
   '/jarvis hands reset [name]         put every setting (or one) back to its default',
   '/jarvis hands pause|resume         turn the camera off and on without turning hand control off',
   '/jarvis hands restart              restart the hand helper',
+  '/jarvis hands keyboard [off|practice|recenter|private|public|press|help]  type in the air on an on-screen keyboard (tap your fingers over the keys)',
   '/jarvis setup hands                install hand control (about 500 MB)',
 ].join('\n')
 
-const gestures = (holdSeconds: number): string => [
+/** `hasKeyboard`: the air keyboard is on, so its gesture is worth a line; with it off the list is as it was. */
+const gestures = (holdSeconds: number, hasKeyboard = false): string => [
   `Open palm toward the camera, still for ${holdPhrase(holdSeconds)}: start (the cursor follows your hand)`,
   'Pinch thumb and index finger: click; pinch and move: drag; pinch twice: double-click',
   'Pinch thumb and middle finger: right-click',
   'Index and middle finger up, then move: scroll',
   'Fist over a window: grab and move it; a fist with each hand: resize it; fling it sideways: next display, up: maximize, down: minimize',
   'Drop your hand out of view, or touch the mouse: control lets go at once',
+  ...(hasKeyboard ? ['Air keyboard: tap a finger in the air over a key to type it; both fists held for a second close it'] : []),
 ].join('\n')
 
-const TOOL_ACTIONS = ['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage'] as const
+const TOOL_ACTIONS = [
+  'on',
+  'off',
+  'status',
+  'calibrate',
+  'pause',
+  'resume',
+  'engage',
+  'disengage',
+  'keyboard',
+  'keyboard_practice',
+  'keyboard_off',
+] as const
 type ToolAction = (typeof TOOL_ACTIONS)[number]
 
 const TUNING_DESCRIPTION = [
@@ -1126,7 +1161,7 @@ const TUNING_DESCRIPTION = [
 /** The tool the model calls for "Jarvis, turn on hand control" (`mcp__jarvis__hands`). */
 export const HANDS_TOOL = {
   name: 'hands',
-  description: `Jarvis hand control: the user's webcam watches their hands and turns gestures into mouse and window actions on their own computer (an open palm starts it, a pinch clicks, a fist grabs a window). It is separate from Jarvis's voice and off until turned on, since it uses the camera. Use this tool when the user asks to turn hand or gesture control on or off, to calibrate it, to pause or resume it, to choose the displays it reaches (such as a projector), to take or let go of the cursor, to make it more or less sensitive, or to check whether it is working. Actions: on starts the camera and hand tracking; off stops them; calibrate starts the four-corner calibration (the user holds an open palm at each corner of the screen); pause turns the camera off while hand control stays on, and resume turns it back on; engage gives the cursor to the user's hand now, with no open palm needed, and disengage takes it away; status reports the state, the camera and the displays with their numbers and names. display chooses the displays the hand reaches: all, a display number, or a list such as 1,2 (status lists them); it can come alone or with an action, and applies first. ${TUNING_DESCRIPTION} Relay the result to the user in a sentence or two.`,
+  description: `Jarvis hand control: the user's webcam watches their hands and turns gestures into mouse and window actions on their own computer (an open palm starts it, a pinch clicks, a fist grabs a window). It is separate from Jarvis's voice and off until turned on, since it uses the camera. Use this tool when the user asks to turn hand or gesture control on or off, to calibrate it, to pause or resume it, to choose the displays it reaches (such as a projector), to take or let go of the cursor, to make it more or less sensitive, or to check whether it is working. Actions: on starts the camera and hand tracking; off stops them; calibrate starts the four-corner calibration (the user holds an open palm at each corner of the screen); pause turns the camera off while hand control stays on, and resume turns it back on; engage gives the cursor to the user's hand now, with no open palm needed, and disengage takes it away; status reports the state, the camera and the displays with their numbers and names. keyboard opens the on-screen air keyboard the user types on with their own fingers, if they turned it on in the plugin settings (Jarvis types nothing itself, cannot insert or send what was tapped, and cannot turn it on); keyboard_practice opens it in practice mode, where nothing is typed; keyboard_off closes it. display chooses the displays the hand reaches: all, a display number, or a list such as 1,2 (status lists them); it can come alone or with an action, and applies first. ${TUNING_DESCRIPTION} Relay the result to the user in a sentence or two.`,
   inputSchema: {
     type: 'object',
     properties: {
@@ -1189,6 +1224,8 @@ export type HandsOptions = {
  */
 export class Hands {
   readonly helper: HandsHelper
+  /** The air keyboard (hands-keyboard.ts): its commands, tool actions, toasts and status lines. */
+  readonly keyboard: HandsKeyboard
   readonly platform: Platform
   readonly isLocal: boolean
   view: JarvisHandsView = { phase: 'off' }
@@ -1224,16 +1261,38 @@ export class Hands {
       camera: () => this.camera(),
       initialConfig: () => this.initialConfig(),
       onConfigRefused: (config, message) => this.withoutTuning(config, message),
+      // After the helper's own config, as the keyboard's settings are meant to arrive (HandsKeyboard.sync).
+      onConfigured: () => {
+        void this.keyboard.sync().catch((error: unknown) => engine.debug(`jarvis: air keyboard settings not sent: ${describeError(error)}`))
+      },
       isPaused: () => this.isPaused(),
       onEvent: event => this.onEvent(event),
       onPhase: (phase, detail, isFinal) => this.onHelperPhase(phase, detail, isFinal),
       whyHeld: () => options.whyHeld(),
+    })
+    const helper = this.helper
+    this.keyboard = new HandsKeyboard({
+      helper: {
+        get isRunning() {
+          return helper.isRunning
+        },
+        capabilities: () => helper.hello?.capabilities ?? [],
+        send: (name, body) => helper.send(name, body),
+      },
+      engine,
+      userConfig: () => ({ keyboard: options.settings.keyboard, keyboardPress: options.settings.keyboardPress }),
+      notRunning: () => this.notRunning(),
     })
   }
 
   /** Why the hand helper and its setup may not start now (elevated, or the administrator check has not passed); undefined when they may. */
   whyHeld(): string | undefined {
     return this.options.whyHeld()
+  }
+
+  /** Whether the handKeyboard plugin setting is on, which is all that turns the air keyboard on. */
+  hasKeyboard(): boolean {
+    return this.options.settings.keyboard
   }
 
   /**
@@ -1788,7 +1847,8 @@ export class Hands {
     lines.push(`${engageText(engage, hold)} (/jarvis hands engage ${engage === 'palm' ? 'always' : 'palm'} switches).`)
     lines.push(await this.tuningLine())
     if (this.tuningNote !== undefined) lines.push(this.tuningNote)
-    return `${lines.join('\n')}\n\nGestures:\n${gestures(hold)}\n\n${HANDS_HELP}`
+    lines.push(...this.keyboard.statusLines())
+    return `${lines.join('\n')}\n\nGestures:\n${gestures(hold, this.hasKeyboard())}\n\n${HANDS_HELP}`
   }
 
   /**
@@ -1997,6 +2057,9 @@ export class Hands {
       case 'gesture':
         // The on-screen reticle shows gestures; the status line does not chase them.
         return
+      case 'keyboard':
+        this.keyboard.onEvent(event)
+        return
     }
   }
 
@@ -2046,6 +2109,8 @@ export class Hands {
     if (phase !== 'running') {
       this.ready = undefined
       this.isResumePending = false
+      // A helper that is gone takes its open keyboard and the settings it was sent with it.
+      this.keyboard.reset()
     }
     if (phase === 'starting' && !this.hasCheckedInstall) {
       // Before hello: an old helper may not get that far with this mod.
@@ -2195,7 +2260,7 @@ export async function runHandsCommand(hands: Hands | undefined, args: readonly s
     case 'status':
       return await hands.statusText()
     case 'help':
-      return `Gestures:\n${gestures(await hands.holdSeconds())}\n\n${HANDS_HELP}`
+      return `Gestures:\n${gestures(await hands.holdSeconds(), hands.hasKeyboard())}\n\n${HANDS_HELP}`
     case 'on':
       return await hands.turnOn()
     case 'off':
@@ -2225,6 +2290,8 @@ export async function runHandsCommand(hands: Hands | undefined, args: readonly s
       return await hands.resume()
     case 'restart':
       return await hands.restart()
+    case 'keyboard':
+      return await hands.keyboard.run(rest)
     case 'setup':
       return await runHandsSetupCommand(hands, rest)
     default:
@@ -2240,6 +2307,11 @@ function toolDisplay(value: unknown): string {
 
 /** One tool action: the text the matching /jarvis hands command prints. */
 async function runToolAction(hands: Hands | undefined, action: ToolAction): Promise<string> {
+  // The keyboard's three actions are not words of /jarvis hands: they have their own answers, said to the model (hands-keyboard.ts).
+  if (action === 'keyboard' || action === 'keyboard_practice' || action === 'keyboard_off') {
+    if (hands === undefined || !hands.isLocal) return NOT_LOCAL
+    return await hands.keyboard.runTool(action)
+  }
   // /jarvis hands engage chooses the engage mode; the tool's engage takes the cursor now.
   if (action !== 'engage' && action !== 'disengage') return runHandsCommand(hands, [action])
   if (hands === undefined || !hands.isLocal) return NOT_LOCAL

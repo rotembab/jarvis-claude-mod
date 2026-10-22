@@ -8,6 +8,9 @@ path runs), ``DestroyWindow`` sending ``WM_DESTROY``, a DIB section whose
 memory the overlay writes and ``UpdateLayeredWindow`` reads, and
 ``WindowFromPoint`` hit-testing as the layered-window docs describe.
 
+The keyboard layer is tested here as a window (rectangular DIBs, the third layer, health, capture exclusion) with a
+stand-in painter; ``test_kb_render.py`` has the pixels.
+
 Every call the overlay makes goes through the overlay's own ``_Api``
 prototypes first (``Marshalled``): the count and conversion of each argument
 are checked as ctypes would on Windows, and the result comes back as ctypes
@@ -31,23 +34,28 @@ import itertools
 import logging
 import queue
 import re
+import statistics
 import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
 import numpy as np
 import pytest
 
+from jarvis_hands import clock, logs
 from jarvis_hands.geometry import Point
 from jarvis_hands.overlay import NullOverlay, OverlayError, OverlayState, create_overlay
+from jarvis_hands.overlay import keyboard_render as kr
 from jarvis_hands.overlay import windows as win
+from jarvis_hands.overlay.base import ComposeView, KeyboardView, OverlayHealth
 from jarvis_hands.overlay.render import MODES, render, render_helper, reticle_size
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="layered windows exist on Windows only")
+needs_font = pytest.mark.skipif(not kr.font_available(), reason="no font with Latin and Hebrew glyphs on this machine")
 SIXTY_FOUR_BIT = ctypes.sizeof(ctypes.c_void_p) == 8
 
 WM_CREATE = 0x0001
@@ -56,6 +64,8 @@ E_INVALIDARG = -0x7FF8FFA9  # 0x80070057 as an HRESULT
 #: Message parameters that only survive a window procedure declared with pointer-sized WPARAM and LPARAM.
 WIDE_WPARAM = 2**63 + 5 if SIXTY_FOUR_BIT else 2**31 + 5
 WIDE_LPARAM = -(2**62) - 7 if SIXTY_FOUR_BIT else -(2**30) - 7
+#: ``WDA_EXCLUDEFROMCAPTURE``: the window is left out of screenshots and screen sharing (Windows 10 2004 and later).
+WDA_EXCLUDEFROMCAPTURE = 0x11
 _QUIT = object()
 
 _callback_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
@@ -220,6 +230,8 @@ class FakeWindow:
     image: np.ndarray | None = None
     updates: int = 0
     topmost_raises: int = 0
+    #: What ``SetWindowDisplayAffinity`` last set (0 = ``WDA_NONE``).
+    affinity: int = 0
 
 
 @dataclass
@@ -276,7 +288,8 @@ class FakeWin32:
         self.classes: dict[str, Callable[..., int]] = {}
         self.windows: dict[int, FakeWindow] = {}
         self.dcs: dict[int, int] = {}
-        self.bitmaps: dict[int, tuple[Any, int]] = {}
+        #: Per DIB: its memory and its width and height in pixels.
+        self.bitmaps: dict[int, tuple[Any, int, int]] = {}
         self.screen_dcs = 0
         self.ui_thread = -1
         self.thread_awareness: list[int] = []
@@ -456,14 +469,14 @@ class FakeWin32:
             self.problems.append(f"UpdateLayeredWindow flags={flags} src=({p.x},{p.y}) key={key}")
         if (b.BlendOp, b.BlendFlags, b.SourceConstantAlpha, b.AlphaFormat) != (0, 0, 255, 1):
             self.problems.append("UpdateLayeredWindow blend is not AC_SRC_OVER / 255 / AC_SRC_ALPHA")
-        buffer, bitmap_size = self.bitmaps[self.dcs[src_dc]]
-        if (s.cx, s.cy) != (bitmap_size, bitmap_size):
-            self.problems.append(f"UpdateLayeredWindow size {s.cx}x{s.cy} for a {bitmap_size} px DIB")
+        buffer, bitmap_width, bitmap_height = self.bitmaps[self.dcs[src_dc]]
+        if (s.cx, s.cy) != (bitmap_width, bitmap_height):
+            self.problems.append(f"UpdateLayeredWindow size {s.cx}x{s.cy} for a {bitmap_width}x{bitmap_height} DIB")
         window = self.windows[hwnd]
         window.rect = (d.x, d.y, s.cx, s.cy)
-        window.image = np.frombuffer(buffer, np.uint8).reshape(bitmap_size, bitmap_size, 4).copy()
+        window.image = np.frombuffer(buffer, np.uint8).reshape(bitmap_height, bitmap_width, 4).copy()
         window.updates += 1
-        self._record("UpdateLayeredWindow", hwnd, d.x, d.y, s.cx)
+        self._record("UpdateLayeredWindow", hwnd, d.x, d.y, s.cx, s.cy)
         return 1
 
     def SetWindowPos(self, hwnd: int, insert_after: Any, x: int, y: int, cx: int, cy: int, flags: int) -> int:
@@ -478,6 +491,17 @@ class FakeWin32:
             window.visible = False
         if insert_after == win.HWND_TOPMOST:
             window.topmost_raises += 1
+        return 1
+
+    def SetWindowDisplayAffinity(self, hwnd: int, affinity: int) -> int:
+        self._record("SetWindowDisplayAffinity", hwnd, affinity)
+        if "SetWindowDisplayAffinity" in self.fail:
+            return 0
+        if affinity not in (0, WDA_EXCLUDEFROMCAPTURE):
+            self.problems.append(
+                f"SetWindowDisplayAffinity({affinity:#x}): neither WDA_NONE nor WDA_EXCLUDEFROMCAPTURE"
+            )
+        self.windows[hwnd].affinity = affinity
         return 1
 
     def IsWindowVisible(self, hwnd: int) -> int:
@@ -520,15 +544,18 @@ class FakeWin32:
 
     def CreateDIBSection(self, dc: Any, info_ref: Any, usage: int, bits_ref: Any, section: Any, offset: int) -> int:
         self._expect_screen_dc(dc, "CreateDIBSection")
+        if "CreateDIBSection" in self.fail:
+            return 0
         h = info_ref._obj.bmiHeader
         if (h.biSize, h.biPlanes, h.biBitCount, h.biCompression, usage) != (40, 1, 32, win.BI_RGB, 0):
             self.problems.append("CreateDIBSection: not a 32-bit BI_RGB DIB")
-        if h.biHeight != -h.biWidth:
-            self.problems.append("CreateDIBSection: not a square top-down DIB")
-        buffer = (ctypes.c_uint8 * (h.biWidth * h.biWidth * 4))()
+        if h.biHeight >= 0:
+            self.problems.append("CreateDIBSection: not a top-down DIB")
+        width, height = h.biWidth, abs(h.biHeight)
+        buffer = (ctypes.c_uint8 * (width * height * 4))()
         bits_ref._obj.value = ctypes.addressof(buffer)
         bitmap = next(self._handles)
-        self.bitmaps[bitmap] = (buffer, h.biWidth)
+        self.bitmaps[bitmap] = (buffer, width, height)
         return bitmap
 
     def SelectObject(self, dc: int, obj: int) -> int:
@@ -588,6 +615,106 @@ def wait_for(predicate: Callable[[], bool], timeout: float = 2.0) -> bool:
     return predicate()
 
 
+WORK = (0, 0, 1920, 1080)
+
+
+def kb_view(**kw: Any) -> KeyboardView:
+    fields: dict[str, Any] = {
+        "seq": 0,
+        "mode": "live",
+        "phase": "typing",
+        "lang": "en",
+        "shift": False,
+        "private": False,
+        "pulse": False,
+        "hold": None,
+        "armed_enter": False,
+        "drift": False,
+        "tips": (),
+        "homes": (),
+        "lit": (),
+        "strip": "",
+        "echo": "",
+        "prompt": "",
+        "progress": 0.0,
+        "work": WORK,
+    }
+    fields.update(kw)
+    return KeyboardView(**fields)
+
+
+def show_keyboard(overlay: win.WindowsOverlay, **kw: Any) -> OverlayState:
+    state = OverlayState(keyboard=kb_view(**kw))
+    overlay.show(state)
+    assert overlay.wait_drawn(2.0)
+    return state
+
+
+class FakeClock:
+    """The helper's clock, set by the test: ``clock.now`` is replaced by one of these."""
+
+    def __init__(self) -> None:
+        self.t = 5000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+@pytest.fixture
+def ticking(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    stand_in = FakeClock()
+    monkeypatch.setattr(clock, "now", stand_in)
+    return stand_in
+
+
+class StubPainter:
+    """The keyboard painter without pixels or a font: a flat frame of the geometry's size.
+
+    Like the real ``compose`` it hands back the previous array when the view is equal apart from ``seq`` (the layer
+    relies on that to skip a push), and it takes ``cost`` seconds of the injected clock for every new frame.
+    """
+
+    def __init__(self) -> None:
+        self.font = True
+        self.cost = 0.0
+        self.clock: FakeClock | None = None
+        self.composes = 0
+        self.cleared = 0
+        self._last: tuple[Any, np.ndarray] | None = None
+
+    def bake_base(self, lang: str, shift: bool, geometry: kr.KeyboardGeometry, commit: str = "direct") -> np.ndarray:
+        return np.zeros((geometry.height, geometry.width, 4), np.uint8)
+
+    def compose(self, base: np.ndarray, geometry: kr.KeyboardGeometry, view: KeyboardView) -> np.ndarray:
+        self.composes += 1
+        key = (geometry, replace(view, seq=0))
+        if self._last is not None and self._last[0] == key:
+            return self._last[1]
+        if self.clock is not None:
+            self.clock.t += self.cost
+        image = np.full((geometry.height, geometry.width, 4), self.composes % 200 + 1, np.uint8)
+        self._last = (key, image)
+        return image
+
+    def font_available(self) -> bool:
+        return self.font
+
+    def clear_cache(self) -> None:
+        self.cleared += 1
+        self._last = None
+
+
+@pytest.fixture
+def painted(monkeypatch: pytest.MonkeyPatch) -> StubPainter:
+    """The windows are tested here, not the pixels: ``test_kb_render.py`` has those."""
+    painter = StubPainter()
+    monkeypatch.setattr(kr, "bake_base", painter.bake_base)
+    monkeypatch.setattr(kr, "compose", painter.compose)
+    monkeypatch.setattr(kr, "font_available", painter.font_available)
+    monkeypatch.setattr(kr, "clear_cache", painter.clear_cache)
+    return painter
+
+
 def _called_in_source() -> set[str]:
     """The DLL functions ``overlay/windows.py`` calls."""
     source = Path(win.__file__).read_text(encoding="utf-8")
@@ -595,9 +722,9 @@ def _called_in_source() -> set[str]:
 
 
 def run_cycle(fake: FakeWin32) -> str | None:
-    """A whole run on ``fake``: start, every mode on two monitors (and the second hand), the timer, display
-    and DPI changes, then close with the window no longer postable (so through the thread message).
-    Returns the first draw error, if any."""
+    """A whole run on ``fake``: start, every mode on two monitors (and the second hand), the keyboard with capture
+    exclusion turned on and off, the timer, display and DPI changes, then close with the window no longer postable
+    (so through the thread message). Returns the first draw error, if any. Needs the ``painted`` stand-in."""
     overlay = win.WindowsOverlay(api=fake)
     overlay.start()
     try:
@@ -606,6 +733,8 @@ def run_cycle(fake: FakeWin32) -> str | None:
             for mode in MODES:
                 helper = Point(x + 150, y + 80) if mode == "resize" else None
                 show(overlay, mode, x, y, helper=helper, pinch=0.5, progress=0.5)
+        for step, exclude in enumerate((False, True, False)):
+            show_keyboard(overlay, progress=0.1 * (step + 1), exclude_capture=exclude)
         for message, wparam in ((win.WM_TIMER, 1), (win.WM_DISPLAYCHANGE, 32), (win.WM_DPICHANGED, 0)):
             fake.PostMessageW(main, message, wparam, 0)
         show(overlay, "point", 10, 10)
@@ -667,7 +796,7 @@ def test_every_win32_function_the_overlay_calls_has_a_valid_prototype() -> None:
     assert api.gdi32.SelectObject.restype is ctypes.c_void_p
 
 
-def test_every_win32_call_in_a_whole_run_matches_its_declared_prototype() -> None:
+def test_every_win32_call_in_a_whole_run_matches_its_declared_prototype(painted: StubPainter) -> None:
     fake = FakeWin32(monitors=[Monitor(0, 0, 1920, 1080, 96), Monitor(-2560, -200, 0, 1240, 144)])
     assert run_cycle(fake) is None
     assert fake.problems == []
@@ -729,7 +858,7 @@ BROKEN_PROTOTYPES = [
 @pytest.mark.skipif(not SIXTY_FOUR_BIT, reason="several of these only truncate 64-bit values")
 @pytest.mark.parametrize(("breakage", "reported"), BROKEN_PROTOTYPES)
 def test_a_prototype_that_disagrees_with_win32_or_its_call_site_is_caught(
-    breakage: dict[str, Any], reported: str
+    breakage: dict[str, Any], reported: str, painted: StubPainter
 ) -> None:
     fake = FakeWin32(declared=declared_api(**breakage))
     with contextlib.suppress(OverlayError):
@@ -994,6 +1123,647 @@ def test_start_and_close_twice_with_a_new_class_each_time(fake: FakeWin32) -> No
     overlay.show(OverlayState("point", Point(1, 1)))  # after close: ignored, no raise
 
 
+# --------------------------------------------------------------------------- everywhere: rectangular layers (O4)
+
+
+def layer_on(fake: FakeWin32) -> win._Layer:
+    """A layer on a window of the fake that nothing else owns, to drive ``show`` directly."""
+    hwnd = next(fake._handles)
+    fake.windows[hwnd] = FakeWindow("test", win.OVERLAY_EX_STYLE, win.WS_POPUP, thread=FakeWin32._thread())
+    return win._Layer(fake, hwnd)
+
+
+def picture(width: int, height: int, seed: int = 0) -> np.ndarray:
+    return np.random.default_rng(seed).integers(0, 256, (height, width, 4), dtype=np.uint8)
+
+
+def test_o4_a_surface_takes_a_width_and_a_height(fake: FakeWin32) -> None:
+    surface = win._Surface(fake, 8, 5)
+    assert surface.pixels is not None and surface.pixels.shape == (5, 8, 4)
+    assert (surface.width, surface.height) == (8, 5)
+    ((buffer, width, height),) = fake.bitmaps.values()
+    assert (width, height) == (8, 5) and len(buffer) == 8 * 5 * 4
+    surface.pixels[4, 7] = (1, 2, 3, 4)  # the last pixel is the last four bytes: top-down rows of the stated width
+    assert list(buffer[-4:]) == [1, 2, 3, 4]
+    surface.destroy()
+    surface.destroy()  # twice: nothing more to free, nothing raised
+    assert fake.bitmaps == {} and fake.dcs == {} and fake.screen_dcs == 0
+
+
+def test_o4_a_square_surface_is_made_from_one_size_as_before(fake: FakeWin32) -> None:
+    surface = win._Surface(fake, 6)
+    assert surface.pixels is not None and surface.pixels.shape == (6, 6, 4)
+    assert surface.size == 6 and (surface.width, surface.height) == (6, 6)
+    surface.destroy()
+    assert fake.bitmaps == {} and fake.problems == []
+
+
+def test_o4_a_failing_surface_frees_what_it_made(fake: FakeWin32) -> None:
+    fake.fail.add("CreateDIBSection")
+    with pytest.raises(OSError, match="CreateDIBSection"):
+        win._Surface(fake, 8, 5)
+    assert fake.bitmaps == {} and fake.dcs == {} and fake.screen_dcs == 0
+
+
+def test_o4_a_layer_pushes_images_of_any_size_and_rebuilds_its_surface_when_the_size_changes(fake: FakeWin32) -> None:
+    layer = layer_on(fake)
+    window = fake.windows[layer.hwnd]
+    seen = None
+    for width, height in ((8, 5), (5, 8), (8, 6), (7, 7), (7, 7), (96, 96)):
+        image = picture(width, height, seed=width * 100 + height)
+        layer.show(image, (3, 4))
+        assert window.rect == (3, 4, width, height)
+        assert np.array_equal(window.image, image)
+        assert layer.surface is not None and (layer.surface.width, layer.surface.height) == (width, height)
+        assert len(fake.bitmaps) == 1  # the previous DIB went when the size changed
+        if (width, height) == (7, 7):
+            seen = seen or layer.surface  # the same size again: the same surface
+            assert layer.surface is seen
+    assert window.visible
+    layer.release_surface()
+    assert fake.bitmaps == {} and fake.dcs == {} and fake.screen_dcs == 0 and fake.problems == []
+
+
+def test_o4_a_wide_image_and_a_tall_image_of_the_same_area_are_not_confused(fake: FakeWin32) -> None:
+    layer = layer_on(fake)
+    layer.show(picture(12, 3), (0, 0))
+    first = layer.surface
+    layer.show(picture(3, 12), (0, 0))
+    assert layer.surface is not first and fake.windows[layer.hwnd].rect == (0, 0, 3, 12)
+    layer.release_surface()
+
+
+def test_o4_the_fake_notes_a_bottom_up_dib_and_a_wrong_sized_update(fake: FakeWin32) -> None:
+    info = win.BITMAPINFO()
+    header = info.bmiHeader
+    header.biSize, header.biWidth, header.biHeight = ctypes.sizeof(win.BITMAPINFOHEADER), 8, 5  # positive: bottom-up
+    header.biPlanes, header.biBitCount, header.biCompression = 1, 32, win.BI_RGB
+    bits = ctypes.c_void_p()
+    screen = fake.user32.GetDC(None)
+    fake.gdi32.CreateDIBSection(screen, ctypes.byref(info), win.DIB_RGB_COLORS, ctypes.byref(bits), None, 0)
+    fake.user32.ReleaseDC(None, screen)
+    assert any("not a top-down DIB" in p for p in fake.problems)
+    fake.problems.clear()
+    layer = layer_on(fake)
+    layer.show(picture(8, 5), (0, 0))
+    fake.user32.UpdateLayeredWindow(
+        layer.hwnd, fake.screen_dc, ctypes.byref(win.POINT(0, 0)), ctypes.byref(win.SIZE(5, 8)),
+        layer.surface.memdc, ctypes.byref(win.POINT(0, 0)), 0,
+        ctypes.byref(win.BLENDFUNCTION(win.AC_SRC_OVER, 0, 255, win.AC_SRC_ALPHA)), win.ULW_ALPHA,
+    )  # fmt: skip
+    assert any("UpdateLayeredWindow size 5x8 for a 8x5 DIB" in p for p in fake.problems)
+    fake.problems.clear()
+    layer.release_surface()
+
+
+# --------------------------------------------------------------------------- everywhere: the keyboard layer (O5)
+
+
+def test_o5_start_makes_a_third_hidden_window_for_the_keyboard(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    main, helper = started.hwnds  # the reticle's two windows, as before
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None and keyboard not in (main, helper) and len(fake.windows) == 3
+    window = fake.windows[keyboard]
+    assert window.ex_style == win.OVERLAY_EX_STYLE and window.style == win.WS_POPUP and not window.visible
+    # the same window class: a click never activates it either
+    assert fake.classes[window.class_name](keyboard, win.WM_MOUSEACTIVATE, 0, 0) == win.MA_NOACTIVATE
+
+
+def test_o5_a_keyboard_state_shows_the_keyboard_layer_and_hides_the_reticle_layers(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    main, helper = started.hwnds
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None
+    show(started, "resize", 500, 400, helper=Point(900, 600))
+    assert fake.windows[main].visible and fake.windows[helper].visible
+    show_keyboard(started)
+    geometry, origin = kr.keyboard_geometry(WORK, 1.0, 96, "top", "direct")
+    window = fake.windows[keyboard]
+    assert window.visible and window.rect == (*origin, geometry.width, geometry.height)
+    assert window.rect[2] > window.rect[3]  # a wide window: not the reticle's square
+    assert window.image is not None and window.image.shape == (geometry.height, geometry.width, 4)
+    assert not fake.windows[main].visible and not fake.windows[helper].visible
+    # a state that has a keyboard never draws the reticle, whatever else it says
+    started.show(OverlayState("point", Point(500, 400), keyboard=kb_view(seq=1)))
+    assert started.wait_drawn(2.0)
+    assert not fake.windows[main].visible and window.visible
+    assert fake.problems == [] and started.draw_error is None
+
+
+@pytest.mark.parametrize("dock", ["top", "bottom"])
+def test_o5_the_keyboard_window_sits_where_the_geometry_says(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, dock: str
+) -> None:
+    work = (100, 50, 1600, 900)
+    show_keyboard(started, work=work, dock=dock, size=0.6, commit="review")
+    geometry, origin = kr.keyboard_geometry(work, 0.6, 96, dock, "review")  # type: ignore[arg-type]
+    assert started.keyboard_hwnd is not None
+    assert fake.windows[started.keyboard_hwnd].rect == (*origin, geometry.width, geometry.height)
+
+
+def test_o5_the_keyboard_is_sized_for_the_monitor_under_the_middle_of_its_work_area() -> None:
+    fake = FakeWin32(monitors=[Monitor(0, 0, 1920, 1080, 96), Monitor(-2560, -200, 0, 1240, 144)])
+    overlay = win.WindowsOverlay(api=fake)
+    overlay.start()
+    painter = StubPainter()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(kr, "bake_base", painter.bake_base)
+        mp.setattr(kr, "compose", painter.compose)
+        try:
+            work = (-2560, -200, 2560, 1440)  # its middle, (-1280, 520), is on the 144 DPI monitor
+            show_keyboard(overlay, work=work)
+            geometry, origin = kr.keyboard_geometry(work, 1.0, 144, "top", "direct")
+            assert overlay.keyboard_hwnd is not None
+            assert fake.windows[overlay.keyboard_hwnd].rect == (*origin, geometry.width, geometry.height)
+            assert origin[0] < 0  # and at negative coordinates, where the left monitor is
+            show_keyboard(overlay, work=WORK)
+            assert fake.windows[overlay.keyboard_hwnd].rect[2] == kr.keyboard_geometry(WORK, 1.0, 96, "top")[0].width
+            # the middle decides, not the corner: this one starts on the 144 DPI monitor and is centred on the other
+            straddling = (-1000, 0, 3000, 1000)
+            show_keyboard(overlay, work=straddling)
+            expected = kr.keyboard_geometry(straddling, 1.0, 96, "top", "direct")[0]
+            assert fake.windows[overlay.keyboard_hwnd].rect[2:] == (expected.width, expected.height)
+        finally:
+            overlay.close()
+    assert fake.problems == []
+
+
+def test_o5_a_view_equal_apart_from_seq_is_not_pushed_again(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    assert started.keyboard_hwnd is not None
+    window = fake.windows[started.keyboard_hwnd]
+    show_keyboard(started, seq=1)
+    show_keyboard(started, seq=2)
+    show_keyboard(started, seq=3)
+    assert window.updates == 1
+    show_keyboard(started, seq=4, strip="Review")
+    assert window.updates == 2
+
+
+def test_o5_going_back_to_the_reticle_hides_the_keyboard_and_frees_its_surface(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    main, _ = started.hwnds
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None
+    show_keyboard(started)
+    assert fake.windows[keyboard].visible and len(fake.bitmaps) == 1
+    geometry = kr.keyboard_geometry(WORK, 1.0, 96, "top", "direct")[0]
+    show(started, "point", 500, 400)
+    assert not fake.windows[keyboard].visible and fake.windows[main].visible
+    assert [(w, h) for _, w, h in fake.bitmaps.values()] == [(96, 96)]  # only the reticle's own DIB is left
+    show_keyboard(started)
+    show(started, "hidden")  # no hand and no keyboard: nothing at all shows
+    assert not any(w.visible for w in fake.windows.values())
+    assert (geometry.width, geometry.height) not in [(w, h) for _, w, h in fake.bitmaps.values()]
+
+
+def test_o5_the_painters_sprites_are_cleared_when_the_keyboard_layer_hides_and_when_it_closes(
+    fake: FakeWin32, painted: StubPainter
+) -> None:
+    overlay = win.WindowsOverlay(api=fake)
+    overlay.start()
+    show(overlay, "point")
+    assert painted.cleared == 0  # a reticle-only run has nothing to forget
+    show_keyboard(overlay)
+    assert painted.cleared == 0
+    show(overlay, "point")
+    assert painted.cleared == 1
+    show(overlay, "point", 600, 600)
+    assert painted.cleared == 1  # once, not on every reticle frame
+    show_keyboard(overlay, seq=9)
+    overlay.close()
+    assert painted.cleared == 2
+    overlay.close()
+    assert painted.cleared == 2
+
+
+def test_o5_the_one_second_timer_keeps_the_visible_keyboard_on_top(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    main, helper = started.hwnds
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None
+    show(started, "point")
+    show_keyboard(started)
+    before = {h: fake.windows[h].topmost_raises for h in (main, helper, keyboard)}
+    fake.PostMessageW(main, win.WM_TIMER, 1, 0)
+    assert wait_for(lambda: fake.windows[keyboard].topmost_raises == before[keyboard] + 1)
+    assert fake.windows[main].topmost_raises == before[main]  # hidden: left alone
+    assert fake.windows[helper].topmost_raises == before[helper]
+
+
+def test_o5_a_hidden_keyboard_is_not_raised_by_the_timer(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    main, _ = started.hwnds
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None
+    show(started, "point")
+    fake.PostMessageW(main, win.WM_TIMER, 1, 0)
+    fake.PostMessageW(main, win.WM_TIMER, 1, 0)
+    assert wait_for(lambda: fake.windows[main].topmost_raises >= 2)
+    assert fake.windows[keyboard].topmost_raises == 0
+
+
+@pytest.mark.parametrize("message", [win.WM_DISPLAYCHANGE, win.WM_DPICHANGED, win.WM_SETTINGCHANGE])
+def test_o5_a_display_change_pushes_the_keyboard_again(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, message: int
+) -> None:
+    main, _ = started.hwnds
+    assert started.keyboard_hwnd is not None
+    window = fake.windows[started.keyboard_hwnd]
+    show_keyboard(started)
+    assert window.updates == 1
+    fake.PostMessageW(main, message, 32, 0)
+    assert wait_for(lambda: window.updates == 2)  # the same image, shown again: Windows may have dropped it
+
+
+def test_o5_a_dpi_change_redraws_the_keyboard_at_the_new_size(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    main, _ = started.hwnds
+    assert started.keyboard_hwnd is not None
+    window = fake.windows[started.keyboard_hwnd]
+    show_keyboard(started)
+    fake.monitors[0].dpi = 192
+    fake.PostMessageW(main, win.WM_DPICHANGED, 0, 0)
+    geometry, origin = kr.keyboard_geometry(WORK, 1.0, 192, "top", "direct")
+    assert wait_for(lambda: window.rect == (*origin, geometry.width, geometry.height))
+    assert fake.problems == []
+
+
+def test_o5_close_destroys_all_three_windows_and_frees_the_keyboard_surface(
+    fake: FakeWin32, painted: StubPainter
+) -> None:
+    overlay = win.WindowsOverlay(api=fake)
+    overlay.start()
+    show(overlay, "resize", helper=Point(900, 500))
+    show_keyboard(overlay)
+    thread = overlay._ui.thread  # type: ignore[union-attr]
+    overlay.close()
+    assert not thread.is_alive()
+    assert fake.windows == {} and fake.classes == {} and fake.bitmaps == {} and fake.dcs == {}
+    assert fake.screen_dcs == 0 and len(fake.named("DestroyWindow")) == 3
+    assert overlay.hwnds == () and overlay.keyboard_hwnd is None
+    assert fake.problems == []
+
+
+def test_o5_a_failed_keyboard_push_is_retried_and_the_window_shows_after_it(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    assert started.keyboard_hwnd is not None
+    window = fake.windows[started.keyboard_hwnd]
+    fake.fail.add("UpdateLayeredWindow")
+    show_keyboard(started, seq=1)
+    assert not window.visible and started.draw_error is not None and "UpdateLayeredWindow" in started.draw_error
+    fake.fail.clear()
+    show_keyboard(started, seq=2)  # equal apart from seq: the same image, which never reached the screen
+    assert window.visible and window.updates == 1
+
+
+@needs_font
+def test_o5_the_real_painters_frame_reaches_the_window_unchanged(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    assert started.keyboard_hwnd is not None
+    view = kb_view(strip="Typing into Notepad   EN", echo="hello")
+    started.show(OverlayState(keyboard=view))
+    assert started.wait_drawn(2.0) and started.draw_error is None
+    geometry, origin = kr.keyboard_geometry(WORK, 1.0, 96, "top", "direct")
+    expected = kr.compose(kr.bake_base("en", False, geometry, "direct"), geometry, view)
+    window = fake.windows[started.keyboard_hwnd]
+    assert window.rect == (*origin, 660, geometry.height)
+    assert np.array_equal(window.image, expected)  # premultiplied BGRA goes through the DIB as it is
+    assert expected[..., 3].any()
+
+
+@needs_font
+def test_o5_a_real_frame_in_either_layout_fits_its_window(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    assert started.keyboard_hwnd is not None
+    for commit in ("direct", "review"):
+        view = kb_view(commit=commit, strip="Review")
+        if commit == "review":
+            box = ComposeView("abc", 3, "composing", 0, None, 0, 0, 0.0, False, False)
+            view = replace(view, compose=box)
+        started.show(OverlayState(keyboard=view))
+        assert started.wait_drawn(2.0) and started.draw_error is None, commit
+        geometry = kr.keyboard_geometry(WORK, 1.0, 96, "top", commit)[0]  # type: ignore[arg-type]
+        assert fake.windows[started.keyboard_hwnd].rect[2:] == (geometry.width, geometry.height)
+    assert fake.problems == []
+
+
+# --------------------------------------------------------------------------- everywhere: health (O6)
+
+
+def test_o6_an_overlay_that_is_not_started_says_it_is_not_alive() -> None:
+    overlay = win.WindowsOverlay(api=FakeWin32())
+    assert overlay.health() == OverlayHealth(alive=False, failures=0, ok_age_s=None, keyboard_ok=False, draw_ms=None)
+
+
+def test_o6_a_started_overlay_that_has_not_drawn_yet(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    assert started.health() == OverlayHealth(alive=True, failures=0, ok_age_s=None, keyboard_ok=True, draw_ms=None)
+
+
+def test_o6_ok_age_counts_from_the_last_good_draw_on_the_helper_clock(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, ticking: FakeClock
+) -> None:
+    show(started, "point", 500, 400)
+    assert started.health().ok_age_s == 0.0
+    ticking.t += 0.3
+    assert started.health().ok_age_s == pytest.approx(0.3)
+    show(started, "point", 500, 400)  # nothing changed: the early return counts as a good draw
+    assert started.health().ok_age_s == 0.0
+    ticking.t += 2.0
+    show(started, "hidden")  # hiding is a good draw too
+    assert started.health().ok_age_s == 0.0
+    ticking.t -= 10.0  # a clock that stepped back never makes a negative age
+    assert started.health().ok_age_s == 0.0
+
+
+def test_o6_a_swallowed_update_failure_raises_failures_and_a_good_draw_clears_them(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, ticking: FakeClock
+) -> None:
+    show_keyboard(started, progress=0.1)
+    assert started.health().failures == 0
+    ticking.t += 2.0
+    fake.fail.add("UpdateLayeredWindow")
+    show_keyboard(started, progress=0.2)
+    assert started.health().failures == 1
+    show_keyboard(started, progress=0.3)
+    health = started.health()
+    assert health.failures == 2 and health.alive
+    assert health.ok_age_s == pytest.approx(2.0)  # still counted from the last good draw
+    fake.fail.clear()
+    show_keyboard(started, progress=0.4)
+    health = started.health()
+    assert health.failures == 0 and health.ok_age_s == 0.0
+    assert started.draw_error is not None  # the first failure's text stays, as before
+
+
+def test_o6_the_reticles_failures_count_the_same_way(
+    fake: FakeWin32, started: win.WindowsOverlay, ticking: FakeClock
+) -> None:
+    fake.fail.add("UpdateLayeredWindow")
+    show(started, "point", 100, 100)
+    assert started.health().failures == 1 and started.health().ok_age_s is None
+
+
+def test_o6_a_wake_up_that_cannot_be_posted_counts_as_a_failure(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    fake.fail.add("PostMessageW")
+    started.show(OverlayState("point", Point(10, 10)))
+    assert started.health().failures == 1
+    fake.fail.clear()
+    show(started, "point", 600, 600)
+    assert started.health().failures == 0
+
+
+def test_o6_alive_ends_when_the_windows_are_gone_even_before_close(fake: FakeWin32, painted: StubPainter) -> None:
+    overlay = win.WindowsOverlay(api=fake)
+    overlay.start()
+    main, _ = overlay.hwnds
+    assert overlay.health().alive
+    fake.PostMessageW(main, win.WM_CLOSE, 0, 0)  # destroyed behind the overlay's back
+    assert wait_for(lambda: not overlay.health().alive)
+    overlay.close()
+    assert not overlay.health().alive
+
+
+def test_o6_a_live_thread_without_windows_is_not_alive(fake: FakeWin32, started: win.WindowsOverlay) -> None:
+    ui = started._ui
+    assert ui is not None and started.health().alive
+    saved, ui._windows = ui._windows, []  # the thread still runs, but there is nothing to draw on
+    try:
+        assert ui.thread.is_alive() and not started.health().alive
+    finally:
+        ui._windows = saved
+
+
+def test_o6_keyboard_ok_needs_a_font(fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter) -> None:
+    assert started.health().keyboard_ok
+    painted.font = False
+    health = started.health()
+    assert not health.keyboard_ok and health.alive  # the reticle still works; only the keyboard is refused
+    painted.font = True
+    assert started.health().keyboard_ok
+
+
+def test_o6_keyboard_ok_is_false_when_the_painter_cannot_be_imported(
+    fake: FakeWin32, started: win.WindowsOverlay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken() -> bool:
+        raise ImportError("no Pillow")
+
+    monkeypatch.setattr(kr, "font_available", broken)
+    health = started.health()
+    assert health.alive and not health.keyboard_ok  # and the probe itself did not raise
+
+
+def test_o6_draw_ms_is_the_median_of_the_last_hundred_draws_that_pushed_an_image(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, ticking: FakeClock
+) -> None:
+    painted.clock = ticking
+    costs = [0.001 * (i + 1) for i in range(100)]
+    for i, cost in enumerate(costs):
+        assert started.health().draw_ms is None  # until the hundredth
+        painted.cost = cost
+        show_keyboard(started, seq=i, progress=(i + 1) / 1000)
+    assert started.health().draw_ms == pytest.approx(statistics.median(costs) * 1000)
+    painted.cost = 0.2
+    show_keyboard(started, seq=100, progress=0.5)
+    window = [*costs[1:], 0.2]  # the oldest fell out
+    assert started.health().draw_ms == pytest.approx(statistics.median(window) * 1000)
+    median = started.health().draw_ms
+    # draws that push nothing (an unchanged image, a hide) say nothing about the cost of a push: sixty of each would
+    # empty the window of real samples if they were counted
+    for seq in range(101, 161):
+        show_keyboard(started, seq=seq, progress=0.5)
+    assert started.health().draw_ms == median
+    for _ in range(60):
+        show(started, "hidden")
+    assert started.health().draw_ms == median
+    # nor do failed ones
+    fake.fail.add("UpdateLayeredWindow")
+    painted.cost = 5.0
+    show_keyboard(started, seq=102, progress=0.6)
+    assert started.health().draw_ms == median and started.health().failures == 1
+
+
+def test_o6_every_time_the_overlay_compares_comes_from_the_helper_clock() -> None:
+    source = Path(win.__file__).read_text(encoding="utf-8")
+    assert re.search(r"\btime\.(monotonic|perf_counter|time|process_time)\b", source) is None
+    assert "clock.now()" in source
+
+
+# --------------------------------------------------------------------------- everywhere: capture exclusion (O7)
+
+
+def affinity_calls(fake: FakeWin32) -> list[tuple[Any, ...]]:
+    return [c[1:] for c in fake.named("SetWindowDisplayAffinity")]
+
+
+def test_o7_the_keyboard_is_excluded_from_capture_when_asked_and_not_before_it_shows(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, caplog: pytest.LogCaptureFixture
+) -> None:
+    keyboard = started.keyboard_hwnd
+    assert keyboard is not None
+    caplog.set_level(logging.DEBUG, logger="jarvis_hands.overlay.windows")
+    show_keyboard(started)
+    assert affinity_calls(fake) == []  # never asked: never called
+    show_keyboard(started, exclude_capture=True)
+    assert affinity_calls(fake) == [(keyboard, 0x11)]
+    assert fake.windows[keyboard].affinity == 0x11 and started.capture_excluded is True
+    show_keyboard(started, exclude_capture=True, progress=0.5)
+    show_keyboard(started, exclude_capture=True, progress=0.6)
+    assert affinity_calls(fake) == [(keyboard, 0x11)]  # once per change, not once per frame
+    show_keyboard(started, exclude_capture=False, progress=0.7)
+    assert affinity_calls(fake) == [(keyboard, 0x11), (keyboard, 0)]
+    assert fake.windows[keyboard].affinity == 0 and started.capture_excluded is False
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []  # nothing to complain about
+
+
+def test_o7_the_exclusion_is_in_place_before_the_first_frame_is_pushed(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    keyboard = started.keyboard_hwnd
+    show_keyboard(started, exclude_capture=True)
+    names = [(c[0], c[1]) for c in fake.calls if c[1:2] == (keyboard,)]
+    assert names.index(("SetWindowDisplayAffinity", keyboard)) < names.index(("UpdateLayeredWindow", keyboard))
+    shown = next(i for i, c in enumerate(fake.calls) if c[0] == "SetWindowPos" and c[1] == keyboard)
+    asked = next(i for i, c in enumerate(fake.calls) if c[0] == "SetWindowDisplayAffinity")
+    assert asked < shown  # a frame of private text is never visible to a capture
+
+
+def test_o7_only_the_keyboard_window_is_touched(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    show(started, "resize", helper=Point(900, 500))
+    show_keyboard(started, exclude_capture=True)
+    show(started, "point")
+    show_keyboard(started, exclude_capture=False)
+    assert {hwnd for hwnd, _ in affinity_calls(fake)} == {started.keyboard_hwnd}
+
+
+def test_o7_a_refusal_is_logged_once_and_never_stops_the_keyboard(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.fail.add("SetWindowDisplayAffinity")
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.overlay.windows"):
+        show_keyboard(started, exclude_capture=True, progress=0.1)
+        show_keyboard(started, exclude_capture=False, progress=0.2)
+        show_keyboard(started, exclude_capture=True, progress=0.3)
+    assert started.keyboard_hwnd is not None and fake.windows[started.keyboard_hwnd].visible
+    assert started.draw_error is None and started.health().failures == 0  # best effort: not a failed draw
+    assert started.capture_excluded is False  # and it says so
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1 and "capture" in warnings[0].getMessage()
+
+
+def test_o7_the_exclusion_can_succeed_after_a_refusal(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    fake.fail.add("SetWindowDisplayAffinity")
+    show_keyboard(started, exclude_capture=True, progress=0.1)
+    fake.fail.clear()
+    show_keyboard(started, exclude_capture=False, progress=0.2)
+    show_keyboard(started, exclude_capture=True, progress=0.3)
+    assert started.capture_excluded is True
+
+
+# --------------------------------------------------------------------------- everywhere: exception text (F4, S22b)
+
+SENTINEL = "Zq9-sentinel-text-Zq9"
+
+
+def test_the_exception_text_of_a_failed_draw_goes_through_logs_exc_text_when_it_exists(
+    fake: FakeWin32, started: win.WindowsOverlay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+
+    def exc_text(exc: BaseException, *, typed: bool = True) -> str:
+        calls.append(typed)
+        return f"<{type(exc).__name__}>"
+
+    monkeypatch.setattr(logs, "exc_text", exc_text, raising=False)
+    fake.fail.add("UpdateLayeredWindow")
+    show(started, "point", 100, 100)
+    assert started.draw_error == "drawing the reticle failed: <OSError>"
+    assert calls == [False]  # an exception that is never the typed text itself
+
+
+def test_the_exception_text_of_a_failed_message_handler_goes_through_logs_exc_text_too(
+    fake: FakeWin32, started: win.WindowsOverlay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(logs, "exc_text", lambda exc, *, typed=True: f"<{type(exc).__name__}>", raising=False)
+
+    def broken(self: Any) -> None:
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(win._Ui, "_on_wake", broken)
+    started.show(OverlayState("point", Point(5, 5)))
+    assert wait_for(lambda: started.draw_error is not None)
+    assert win.WM_OVERLAY_WAKE == 0x8001
+    assert started.draw_error == "handling message 0x8001 failed: <RuntimeError>"
+    assert SENTINEL not in started.draw_error
+
+
+def test_without_logs_exc_text_the_text_is_what_it_always_was(
+    fake: FakeWin32, started: win.WindowsOverlay, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delattr(logs, "exc_text", raising=False)
+    fake.fail.add("UpdateLayeredWindow")
+    show(started, "point", 100, 100)
+    assert started.draw_error is not None and started.draw_error.startswith("drawing the reticle failed: ")
+    assert "UpdateLayeredWindow failed with Windows error" in started.draw_error
+
+
+def test_s22b_a_draw_hook_that_raises_the_sentinel_never_puts_it_in_a_log_or_an_error(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    def boom(*args: Any) -> Any:
+        try:
+            raise OSError(SENTINEL)
+        except OSError as inner:
+            raise RuntimeError(f"bad stroke {SENTINEL!r}") from inner
+
+    monkeypatch.setattr(kr, "compose", boom)
+    with caplog.at_level(logging.DEBUG, logger="jarvis_hands.overlay.windows"):
+        show_keyboard(started)
+        show_keyboard(started, progress=0.5)
+    assert started.draw_error == "drawing the keyboard failed: internal"  # the fixed code, not what was raised
+    assert started.keyboard_error == "internal"
+    logged = caplog.text + "".join(r.getMessage() + str(r.exc_text) + str(r.args) for r in caplog.records)
+    assert SENTINEL not in logged and SENTINEL not in str(started.draw_error)
+    assert started.health().failures == 2
+
+
+def test_a_keyboard_draw_error_is_recorded_by_its_code(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good = painted.compose
+
+    def refuse(*args: Any) -> Any:
+        raise kr.KeyboardDrawError("font")
+
+    monkeypatch.setattr(kr, "compose", refuse)
+    assert started.keyboard_error is None
+    show_keyboard(started)
+    assert started.keyboard_error == "font" and started.draw_error is not None and "font" in started.draw_error
+    monkeypatch.setattr(kr, "compose", good)
+    show_keyboard(started, progress=0.5)
+    assert started.keyboard_error is None  # the next good frame clears it
+    assert started.health().failures == 0
+
+
+def test_a_keyboard_state_without_a_work_area_is_a_size_error_not_a_crash(
+    fake: FakeWin32, started: win.WindowsOverlay, painted: StubPainter
+) -> None:
+    show_keyboard(started, work=(0, 0, 0, 0))
+    assert started.keyboard_error == "size" and started.health().failures == 1
+    assert started.keyboard_hwnd is not None and not fake.windows[started.keyboard_hwnd].visible
+
+
 # --------------------------------------------------------------------------- Windows: the real windows
 
 
@@ -1096,7 +1866,8 @@ def test_real_overlay_works_at_negative_coordinates(desktop: None, real: win.Win
 def test_real_windows_are_layered_click_through_topmost_tool_windows(desktop: None, real: win.WindowsOverlay) -> None:
     api = win._win32()
     assert api.GetWindowLongPtrW is not None
-    for hwnd in real.hwnds:
+    assert real.keyboard_hwnd is not None
+    for hwnd in (*real.hwnds, real.keyboard_hwnd):  # the keyboard's window is one of them
         ex_style = api.GetWindowLongPtrW(hwnd, win.GWL_EXSTYLE)
         for bit in (
             win.WS_EX_LAYERED,
@@ -1106,6 +1877,32 @@ def test_real_windows_are_layered_click_through_topmost_tool_windows(desktop: No
             win.WS_EX_NOACTIVATE,
         ):
             assert ex_style & bit, f"missing extended style 0x{bit:08X}"
+
+
+@windows_only
+@needs_font
+def test_real_keyboard_layer_shows_at_its_geometry_and_lets_clicks_through(
+    desktop: None, real: win.WindowsOverlay
+) -> None:
+    left, top, right, bottom = _monitor_rects()[0]
+    work = (left, top, right - left, bottom - top)
+    keyboard = real.keyboard_hwnd
+    assert keyboard is not None
+    real.show(OverlayState(keyboard=kb_view(work=work, strip="Typing into Notepad   EN")))
+    assert real.wait_drawn(2.0) and real.draw_error is None and real.keyboard_error is None
+    user32 = win._win32().user32
+    assert user32.IsWindowVisible(keyboard) and not any(user32.IsWindowVisible(h) for h in real.hwnds)
+    rect = win.RECT()
+    assert user32.GetWindowRect(keyboard, ctypes.byref(rect))
+    assert (rect.right - rect.left) > (rect.bottom - rect.top) > 0  # wide, not the reticle's square
+    assert user32.GetForegroundWindow() != keyboard
+    # the middle of the layer is a click-through window: the click reaches what is under the keyboard
+    middle = win.POINT((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+    assert user32.WindowFromPoint(middle) not in (keyboard, *real.hwnds)
+    health = real.health()
+    assert health.alive and health.keyboard_ok and health.failures == 0
+    real.show(OverlayState())
+    assert real.wait_drawn(2.0) and not user32.IsWindowVisible(keyboard)
 
 
 @windows_only

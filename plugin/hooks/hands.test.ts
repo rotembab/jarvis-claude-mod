@@ -1332,7 +1332,7 @@ describe('the hands tool', () => {
 
     const unknown = await $.tool.call({ tool: 'mcp__jarvis__hands', action: 'explode' })
     expect(unknown.result).toBe(
-      'Unknown action "explode"; use one of on, off, status, calibrate, pause, resume, engage, disengage.',
+      'Unknown action "explode"; use one of on, off, status, calibrate, pause, resume, engage, disengage, keyboard, keyboard_practice, keyboard_off.',
     )
   })
 
@@ -1382,7 +1382,7 @@ describe('the hands tool', () => {
 
   test('the schema offers the display, the engage actions and the tuning', () => {
     const { properties } = HANDS_TOOL.inputSchema
-    expect(properties.action.enum).toEqual(['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage'])
+    expect(properties.action.enum).toEqual(['on', 'off', 'status', 'calibrate', 'pause', 'resume', 'engage', 'disengage', 'keyboard', 'keyboard_practice', 'keyboard_off'])
     expect(Object.keys(properties)).toEqual(['action', 'display', 'setting', 'value', 'preset'])
     expect(properties.value.type).toEqual(['number', 'string'])
     expect(properties.preset.enum).toEqual(['precise', 'balanced', 'fast'])

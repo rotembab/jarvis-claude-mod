@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import itertools
 import json
+import math
 import random
 from collections.abc import Callable
 from typing import Any, get_args
@@ -12,6 +14,8 @@ from jarvis_hands import protocol
 from jarvis_hands.desktop.base import Display
 from jarvis_hands.events import encode_line
 from jarvis_hands.geometry import Rect
+from jarvis_hands.keyboard import limits
+from jarvis_hands.settings import HandsSettings
 
 Validate = Callable[[Any, str], None]
 
@@ -194,7 +198,7 @@ def test_an_ok_response_only_carries_pending_when_something_is_pending() -> None
 # --------------------------------------------------------------------------- commands
 
 COMMAND_CASES: list[tuple[str, Any]] = [
-    *((name, {}) for name in sorted(protocol.COMMAND_NAMES - {"calibrate"})),
+    *((name, {}) for name in sorted(protocol.COMMAND_NAMES - {"calibrate", "keyboard"})),
     ("heartbeat", {"x": 1}),
     ("status", {"verbose": True}),
     ("shutdown", []),
@@ -261,6 +265,29 @@ COMMAND_CASES: list[tuple[str, Any]] = [
     ("calibrate", {"action": "start", "display": 1}),
     ("calibrate", {"display": 1}),
     ("calibrate", []),
+    ("keyboard", {}),
+    ("keyboard", {"action": "start"}),
+    ("keyboard", {"action": "practice"}),
+    ("keyboard", {"action": "stop"}),
+    ("keyboard", {"action": "recenter"}),
+    ("keyboard", {"action": "private"}),
+    ("keyboard", {"action": "public"}),
+    ("keyboard", {"action": "configure", "settings": {}}),
+    ("keyboard", {"action": "configure", "settings": {"enabled": True, "commit": "review", "idleS": 30}}),
+    ("keyboard", {"action": "configure"}),
+    ("keyboard", {"action": "configure", "settings": {"commit": "auto"}}),
+    ("keyboard", {"action": "start", "settings": {"enabled": True}}),
+    ("keyboard", {"action": "insert"}),
+    ("keyboard", {"action": "send"}),
+    ("keyboard", {"action": "clear"}),
+    ("keyboard", {"action": "type", "text": "x"}),
+    ("keyboard", {"action": "start", "text": "x"}),
+    ("keyboard", {"action": None}),
+    ("keyboard", {"action": ["start"]}),
+    ("keyboard", {"settings": {"enabled": True}}),
+    ("keyboard", []),
+    ("keyboard", "start"),
+    ("keyboard", None),
 ]
 
 
@@ -421,3 +448,959 @@ def test_a_knob_error_names_the_field_and_the_range() -> None:
 def test_non_finite_knob_values_are_refused(value: float) -> None:
     for knob in protocol.KNOBS:
         assert not command_ok("config", {knob.key: value})
+
+
+# --------------------------------------------------------------------------- the keyboard command, event and status
+
+KEYBOARD_ENUMS = [
+    (protocol.KeyboardState, "KeyboardState"),
+    (protocol.KeyboardPhase, "KeyboardPhase"),
+    (protocol.KeyboardPress, "KeyboardPress"),
+    (protocol.KeyboardLevel, "KeyboardLevel"),
+    (protocol.KeyboardCommit, "KeyboardCommit"),
+    (protocol.KeyboardLang, "KeyboardLang"),
+    (protocol.KeyboardHold, "KeyboardHold"),
+    (protocol.KeyboardCloseReason, "KeyboardCloseReason"),
+    (protocol.ReviewState, "ReviewState"),
+    (protocol.InsertAbort, "InsertAbort"),
+]
+
+
+@pytest.mark.parametrize(("literal", "def_name"), KEYBOARD_ENUMS, ids=[name for _, name in KEYBOARD_ENUMS])
+def test_keyboard_literals_match_schema_enums(literal: Any, def_name: str, schema: dict[str, Any]) -> None:
+    """P1: the Literals the helper uses and the enums the mod reads are one list."""
+    assert list(get_args(literal)) == schema["$defs"][def_name]["enum"]
+
+
+def test_keyboard_actions_match_the_schema(schema: dict[str, Any]) -> None:
+    command = schema["$defs"]["KeyboardCommand"]["oneOf"]
+    plain = next(branch for branch in command if "settings" not in branch["properties"])
+    assert sorted(protocol.KEYBOARD_ACTIONS) == sorted([*plain["properties"]["action"]["enum"], "configure"])
+    assert sorted(protocol.KEYBOARD_ACTIONS) == [
+        "configure",
+        "practice",
+        "private",
+        "public",
+        "recenter",
+        "start",
+        "stop",
+    ]
+
+
+def test_the_keyboard_command_and_event_are_in_the_contract(schema: dict[str, Any]) -> None:
+    assert "keyboard" in protocol.COMMAND_NAMES
+    assert protocol.EVENT_DEFS["keyboard"] == "KeyboardEvent"
+    assert command_def("keyboard", schema) == "KeyboardCommand"
+    assert "keyboard" in get_args(protocol.CommandName)
+
+
+def test_keyboard_settings_in_the_schema_are_the_ten_wire_keys(schema: dict[str, Any]) -> None:
+    settings = schema["$defs"]["KeyboardSettings"]
+    assert settings["additionalProperties"] is False and "required" not in settings
+    assert sorted(settings["properties"]) == sorted(
+        ["enabled", "press", "commit", "layout", "size", "reach", "dock", "idleS", "inject", "enter"]
+    )
+
+
+# ---- P40: the examples and the cases of the review reference model (as parsed objects, never as strings)
+
+EXAMPLE_EVENTS: list[tuple[dict[str, Any], dict[str, Any]]] = [
+    (
+        {
+            "state": "open",
+            "phase": "placing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "placing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {"state": "composing", "chars": 37},
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {"state": "composing", "chars": 37},
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "degraded",
+            "commit": "review",
+            "lang": "he",
+            "private": False,
+            "hold": "yield",
+            "review": {"state": "inserting", "chars": 37},
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "degraded",
+            "commit": "review",
+            "lang": "he",
+            "private": False,
+            "hold": "yield",
+            "review": {"state": "inserting", "chars": 37},
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {
+                "state": "composing",
+                "chars": 0,
+                "insert": {"kind": "text", "outcome": "done", "sent": 37, "of": 37},
+            },
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {
+                "state": "composing",
+                "chars": 0,
+                "insert": {"kind": "text", "outcome": "done", "sent": 37, "of": 37},
+            },
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "he",
+            "private": False,
+            "review": {
+                "state": "aborted",
+                "chars": 25,
+                "insert": {"kind": "text", "outcome": "aborted", "sent": 12, "of": 37, "reason": "focus"},
+            },
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "he",
+            "private": False,
+            "review": {
+                "state": "aborted",
+                "chars": 25,
+                "insert": {"kind": "text", "outcome": "aborted", "sent": 12, "of": 37, "reason": "focus"},
+            },
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {
+                "state": "composing",
+                "chars": 0,
+                "insert": {"kind": "enter", "outcome": "done", "sent": 1, "of": 1},
+            },
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "air",
+            "level": "ok",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {
+                "state": "composing",
+                "chars": 0,
+                "insert": {"kind": "enter", "outcome": "done", "sent": 1, "of": 1},
+            },
+        },
+    ),
+    (
+        {
+            "state": "open",
+            "phase": "warmup",
+            "press": "pinch",
+            "level": "off",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {"state": "composing", "chars": 12},
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "warmup",
+            "press": "pinch",
+            "level": "off",
+            "commit": "review",
+            "lang": "en",
+            "private": False,
+            "review": {"state": "composing", "chars": 12},
+        },
+    ),
+    (
+        {"state": "open", "phase": "typing", "press": "pinch", "commit": "direct", "lang": "en", "private": False},
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "open",
+            "phase": "typing",
+            "press": "pinch",
+            "commit": "direct",
+            "lang": "en",
+            "private": False,
+        },
+    ),
+    (
+        {"state": "practice", "phase": "placing", "press": "air", "level": "ok", "lang": "en", "private": False},
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "practice",
+            "phase": "placing",
+            "press": "air",
+            "level": "ok",
+            "lang": "en",
+            "private": False,
+        },
+    ),
+    (
+        {"state": "closed", "reason": "fists", "discarded": 25},
+        {"v": 1, "type": "keyboard", "state": "closed", "reason": "fists", "discarded": 25},
+    ),
+    (
+        {"state": "closed", "reason": "air_unreliable", "discarded": 0},
+        {"v": 1, "type": "keyboard", "state": "closed", "reason": "air_unreliable", "discarded": 0},
+    ),
+    (
+        {
+            "state": "closed",
+            "reason": "command",
+            "discarded": 0,
+            "practice": {"hitRate": 0.93, "phantomsPerMin": 0.0, "recallIM": 0.92},
+        },
+        {
+            "v": 1,
+            "type": "keyboard",
+            "state": "closed",
+            "reason": "command",
+            "discarded": 0,
+            "practice": {"hitRate": 0.93, "phantomsPerMin": 0.0, "recallIM": 0.92},
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(("args", "wire"), EXAMPLE_EVENTS, ids=[str(i + 1) for i in range(len(EXAMPLE_EVENTS))])
+def test_the_design_examples_validate_and_are_what_the_builder_makes(
+    args: dict[str, Any], wire: dict[str, Any], reference_validator: Validate
+) -> None:
+    reference_validator(wire, "Event")  # exactly one branch of the union
+    reference_validator(wire, "KeyboardEvent")
+    built = protocol.keyboard(**args)
+    assert built == wire  # as parsed objects: key order is the next test's business
+    reference_validator(built, "Event")
+
+
+def test_the_builder_key_order_is_pinned() -> None:
+    """P3 and P41: the order of the keys on the wire, and None fields left out."""
+    full = protocol.keyboard(
+        "closed",
+        phase="typing",
+        reason="fists",
+        hold="yield",
+        lang="en",
+        press="air",
+        level="ok",
+        commit="review",
+        private=False,
+        review={
+            "insert": {"reason": "focus", "of": 3, "sent": 1, "outcome": "aborted", "kind": "text"},
+            "chars": 2,
+            "state": "aborted",
+        },
+        discarded=2,
+        practice={"recallIM": 0.9, "phantomsPerMin": 0.5, "hitRate": 0.8},
+    )
+    assert list(full) == [
+        "v",
+        "type",
+        "state",
+        "phase",
+        "reason",
+        "hold",
+        "lang",
+        "press",
+        "level",
+        "commit",
+        "private",
+        "review",
+        "discarded",
+        "practice",
+    ]
+    assert list(full["review"]) == ["state", "chars", "insert"]
+    assert list(full["review"]["insert"]) == ["kind", "outcome", "sent", "of", "reason"]
+    assert list(full["practice"]) == ["hitRate", "phantomsPerMin", "recallIM"]
+    assert list(protocol.keyboard("closed")) == ["v", "type", "state"]
+    assert protocol.keyboard("closed") == {"v": 1, "type": "keyboard", "state": "closed"}
+
+
+def test_the_builder_takes_only_the_state_positionally() -> None:
+    params = inspect.signature(protocol.keyboard).parameters
+    kinds = [p.kind for p in params.values()]
+    assert next(iter(params)) == "state"
+    assert all(k is inspect.Parameter.KEYWORD_ONLY for k in kinds[1:])
+
+
+def test_the_builder_has_a_parameter_for_every_event_field_and_no_other(schema: dict[str, Any]) -> None:
+    """No parameter can carry text: the builder's names are the schema's (the event is enums and numbers)."""
+    event_fields = set(schema["$defs"]["KeyboardEvent"]["properties"]) - {"v", "type"}
+    assert set(inspect.signature(protocol.keyboard).parameters) - {"state"} == event_fields - {"state"}
+
+
+def test_review_and_practice_are_rebuilt_from_known_fields_only() -> None:
+    event = protocol.keyboard(
+        "open",
+        review={
+            "state": "composing",
+            "chars": 3,
+            "text": "abc",
+            "insert": {"kind": "text", "outcome": "done", "sent": 1, "of": 1, "title": "x"},
+        },
+        practice={"hitRate": 0.5, "phantomsPerMin": 0.1, "keys": "abc"},
+    )
+    assert event["review"] == {
+        "state": "composing",
+        "chars": 3,
+        "insert": {"kind": "text", "outcome": "done", "sent": 1, "of": 1},
+    }
+    assert event["practice"] == {"hitRate": 0.5, "phantomsPerMin": 0.1}
+    assert "abc" not in json.dumps(event)
+
+
+def test_the_builder_clamps_counts_and_keeps_the_event_encodable(reference_validator: Validate) -> None:
+    event = protocol.keyboard(
+        "open",
+        review={
+            "state": "composing",
+            "chars": 999,
+            "insert": {"kind": "text", "outcome": "aborted", "sent": -4, "of": 0, "reason": "failed"},
+        },
+        discarded=10**6,
+    )
+    assert event["review"]["chars"] == 200
+    assert (event["review"]["insert"]["sent"], event["review"]["insert"]["of"]) == (0, 1)
+    assert event["discarded"] == 200
+    reference_validator(event, "KeyboardEvent")
+    hostile = protocol.keyboard(
+        "closed",
+        discarded=-3,
+        practice={"hitRate": float("nan"), "phantomsPerMin": float("inf"), "recallIM": float("-inf")},
+    )
+    assert hostile["discarded"] == 0
+    assert hostile["practice"] == {"hitRate": 0.0, "phantomsPerMin": 0.0, "recallIM": 0.0}
+    reference_validator(hostile, "KeyboardEvent")
+    encode_line(hostile)  # NaN would make the event unencodable and the mod would never hear the session closed
+    over = protocol.keyboard("closed", practice={"hitRate": 7.0, "phantomsPerMin": -2.0})
+    assert over["practice"] == {"hitRate": 1.0, "phantomsPerMin": 0.0}
+
+
+def test_the_builder_does_not_alias_its_arguments() -> None:
+    review = {"state": "composing", "chars": 1}
+    event = protocol.keyboard("open", review=review)
+    review["chars"] = 99
+    assert event["review"]["chars"] == 1
+
+
+def test_private_is_a_real_boolean() -> None:
+    assert protocol.keyboard("open", private=1)["private"] is True
+    assert protocol.keyboard("open", private=0)["private"] is False
+    assert "private" not in protocol.keyboard("open")
+
+
+GOOD_REVIEW_EVENTS = [
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "placing",
+        "press": "air",
+        "commit": "review",
+        "lang": "en",
+        "private": False,
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "commit": "review",
+        "lang": "en",
+        "private": False,
+        "review": {"state": "composing", "chars": 37},
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "commit": "review",
+        "lang": "en",
+        "private": False,
+        "review": {"state": "inserting", "chars": 37},
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "commit": "review",
+        "lang": "en",
+        "private": False,
+        "review": {
+            "state": "composing",
+            "chars": 0,
+            "insert": {"kind": "text", "outcome": "done", "sent": 37, "of": 37},
+        },
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "commit": "review",
+        "lang": "he",
+        "private": False,
+        "review": {
+            "state": "aborted",
+            "chars": 25,
+            "insert": {"kind": "text", "outcome": "aborted", "sent": 12, "of": 37, "reason": "focus"},
+        },
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "commit": "review",
+        "lang": "en",
+        "private": False,
+        "review": {
+            "state": "composing",
+            "chars": 0,
+            "insert": {"kind": "enter", "outcome": "done", "sent": 1, "of": 1},
+        },
+    },
+    {"v": 1, "type": "keyboard", "state": "closed", "reason": "fists", "discarded": 25},
+    {"v": 1, "type": "keyboard", "state": "closed", "reason": "command", "discarded": 0},
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "pinch",
+        "commit": "direct",
+        "lang": "en",
+        "private": False,
+    },
+]
+BAD_REVIEW_EVENTS = [
+    # the three required fields, each missing alone
+    {"v": 1, "type": "keyboard"},
+    {"v": 1, "state": "open"},
+    {"type": "keyboard", "state": "open"},
+    {"v": 1, "type": "keyboard", "state": "ajar"},
+    {"v": 1, "type": "keyboard", "state": "open", "review": {"state": "composing", "chars": 3, "text": "abc"}},
+    {"v": 1, "type": "keyboard", "state": "open", "text": "abc"},
+    {"v": 1, "type": "keyboard", "state": "open", "review": {"state": "typing", "chars": 3}},
+    {"v": 1, "type": "keyboard", "state": "open", "review": {"state": "composing", "chars": 201}},
+    {"v": 1, "type": "keyboard", "state": "open", "review": {"state": "composing", "chars": -1}},
+    {"v": 1, "type": "keyboard", "state": "open", "commit": "auto"},
+    {"v": 1, "type": "keyboard", "state": "closed", "reason": "fists", "discarded": "25"},
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "review": {
+            "state": "aborted",
+            "chars": 1,
+            "insert": {"kind": "text", "outcome": "aborted", "sent": 1, "of": 2, "reason": "window"},
+        },
+    },
+    {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "review": {
+            "state": "aborted",
+            "chars": 1,
+            "insert": {"kind": "text", "outcome": "aborted", "sent": 1, "of": 2, "reason": "focus", "title": "x"},
+        },
+    },
+]
+GOOD_REVIEW_COMMANDS = [
+    {"action": "start"},
+    {"action": "practice"},
+    {"action": "stop"},
+    {"action": "recenter"},
+    {"action": "private"},
+    {"action": "public"},
+    {
+        "action": "configure",
+        "settings": {
+            "enabled": True,
+            "press": "air",
+            "commit": "review",
+            "layout": "auto",
+            "size": 1.0,
+            "reach": 1.0,
+            "dock": "top",
+            "idleS": 30,
+            "inject": "unicode",
+            "enter": "twice",
+        },
+    },
+    {"action": "configure", "settings": {"commit": "direct"}},
+]
+BAD_REVIEW_COMMANDS = [
+    {"action": "insert"},
+    {"action": "send"},
+    {"action": "clear"},
+    {"action": "type", "text": "x"},
+    {"action": "start", "text": "x"},
+    {"action": "configure", "settings": {"commit": "auto"}},
+    {"action": "configure", "settings": {"text": "x"}},
+    {"action": "configure"},
+]
+
+
+@pytest.mark.parametrize("event", GOOD_REVIEW_EVENTS, ids=lambda e: json.dumps(e)[40:90])
+def test_review_reference_events_validate(event: dict[str, Any], reference_validator: Validate) -> None:
+    reference_validator(event, "Event")
+
+
+def bad_event_id(event: dict[str, Any]) -> str:
+    text = json.dumps(event)
+    return text if len(text) < 60 else text[28:100]  # the long ones share their first words
+
+
+@pytest.mark.parametrize("event", BAD_REVIEW_EVENTS, ids=bad_event_id)
+def test_review_reference_bad_events_are_rejected(event: dict[str, Any], reference_validator: Validate) -> None:
+    assert not reference_ok(reference_validator, event, "KeyboardEvent")
+    assert not reference_ok(reference_validator, event, "Event")
+
+
+@pytest.mark.parametrize("body", GOOD_REVIEW_COMMANDS, ids=lambda b: json.dumps(b)[:50])
+def test_review_reference_commands_validate_in_both_validators(
+    body: dict[str, Any], reference_validator: Validate
+) -> None:
+    reference_validator(body, "KeyboardCommand")
+    protocol.validate_command("keyboard", body)
+
+
+@pytest.mark.parametrize("body", BAD_REVIEW_COMMANDS, ids=lambda b: json.dumps(b)[:50])
+def test_review_reference_bad_commands_are_rejected_by_both_validators(
+    body: dict[str, Any], reference_validator: Validate
+) -> None:
+    assert not reference_ok(reference_validator, body, "KeyboardCommand")
+    assert not command_ok("keyboard", body)
+
+
+# ---- S55: no command, field or action can carry text, or insert, send or clear anything
+
+TEXT_CARRIERS = [
+    {"action": "insert"},
+    {"action": "send"},
+    {"action": "clear"},
+    {"action": "type"},
+    {"action": "text"},
+    {"action": "enter"},
+    {"action": "insert", "text": "x"},
+    {"action": "start", "text": "x"},
+    {"action": "start", "insert": True},
+    {"action": "stop", "send": True},
+    {"action": "configure", "settings": {"text": "x"}},
+    {"action": "configure", "settings": {"insert": True}},
+    {"action": "configure", "settings": {"send": True}},
+    {"action": "configure", "settings": {"clear": True}},
+    {"action": "configure", "settings": {"type": "x"}},
+    {"action": "configure", "settings": {"enabled": True}, "text": "x"},
+    {"action": "configure", "settings": {"decoder": "off"}},  # the follow-on's key: not in step 1
+    {"text": "x"},
+    {"insert": 1},
+]
+
+
+@pytest.mark.parametrize("body", TEXT_CARRIERS, ids=lambda b: json.dumps(b)[:60])
+def test_no_keyboard_body_can_insert_send_clear_or_carry_text(
+    body: dict[str, Any], reference_validator: Validate
+) -> None:
+    assert not command_ok("keyboard", body)
+    assert not reference_ok(reference_validator, body, "KeyboardCommand")
+
+
+def test_the_keyboard_defs_hold_enums_and_numbers_only(schema: dict[str, Any]) -> None:
+    """SR15: nothing typed, no key name, window title or executable name has a place in an event or the status."""
+    forbidden = {
+        "text",
+        "typed",
+        "key",
+        "keys",
+        "title",
+        "window",
+        "exe",
+        "name",
+        "word",
+        "buffer",
+        "char",
+        "chars_text",
+    }
+    defs = schema["$defs"]
+
+    def walk(node: Any, where: str) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "string":
+                raise AssertionError(f"free string at {where}")
+            for key, value in node.items():
+                if key == "properties":
+                    assert not forbidden & set(value), where
+                    for prop, sub in value.items():
+                        walk(sub, f"{where}.{prop}")
+                else:
+                    walk(value, f"{where}.{key}")
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{where}[{i}]")
+
+    for name in defs:
+        if name.startswith("Keyboard") or name in ("ReviewState", "InsertAbort"):
+            walk(defs[name], name)
+
+
+def test_compose_max_is_the_schema_maximum(schema: dict[str, Any]) -> None:
+    """P41: the cap of the box and the cap the mod is told about are one number."""
+    defs = schema["$defs"]
+    assert defs["KeyboardReview"]["properties"]["chars"]["maximum"] == limits.COMPOSE_MAX
+    assert defs["KeyboardReviewStatus"]["properties"]["chars"]["maximum"] == limits.COMPOSE_MAX
+    assert defs["KeyboardInsert"]["properties"]["sent"]["maximum"] == limits.COMPOSE_MAX
+    assert defs["KeyboardInsert"]["properties"]["of"]["maximum"] == limits.COMPOSE_MAX
+    assert defs["KeyboardEvent"]["properties"]["discarded"]["maximum"] == limits.COMPOSE_MAX
+
+
+# ---- P2 and P41: the hand-written validator equals jsonschema
+
+
+SETTINGS_POOL: dict[str, list[Any]] = {
+    "enabled": [True, False, 1, "true", None],
+    "press": ["air", "pinch", "windows", "osk", None, 1],
+    "commit": ["review", "direct", "auto", None],
+    "layout": ["auto", "en", "he", "fr", None],
+    "size": [0.6, 1.0, 1.6, 1, 0.59, 1.61, True, "1", None, 1e9, 10**400],
+    "reach": [0.8, 1.0, 1.5, 0.79, 1.51, False, "1", None],
+    "dock": ["top", "bottom", "left", None],
+    "idleS": [5, 30, 300, 4, 301, 30.0, 30.5, True, "30", None, 10**400],
+    "inject": ["unicode", "vk", "both", None],
+    "enter": ["twice", "off", "once", None],
+    "extra": [1],
+    "text": ["x"],
+}
+
+
+def random_keyboard_bodies(count: int, seed: int = 20261008) -> list[Any]:
+    rng = random.Random(seed)
+    actions: list[Any] = [
+        "start",
+        "practice",
+        "stop",
+        "recenter",
+        "private",
+        "public",
+        "configure",
+        "configure",
+        "configure",
+    ]
+    wrong: list[Any] = ["insert", "send", "clear", "type", "Start", "", None, 1, ["start"], True]
+    bodies: list[Any] = []
+    for _ in range(count):
+        body: dict[str, Any] = {}
+        if rng.random() < 0.93:
+            body["action"] = rng.choice(actions) if rng.random() < 0.85 else rng.choice(wrong)
+        if (body.get("action") == "configure" and rng.random() < 0.9) or rng.random() < 0.08:
+            if rng.random() < 0.9:
+                keys = rng.sample(list(SETTINGS_POOL), rng.randint(0, 5))
+                body["settings"] = {key: rng.choice(SETTINGS_POOL[key]) for key in keys}
+            else:
+                body["settings"] = rng.choice([None, [], "x", 5, True])
+        if rng.random() < 0.05:
+            body["text"] = "x"
+        bodies.append(body)
+    return bodies
+
+
+def test_random_keyboard_bodies_agree_with_jsonschema(schema: dict[str, Any], reference_validator: Validate) -> None:
+    bodies = random_keyboard_bodies(500)
+    outcomes = [reference_ok(reference_validator, body, "KeyboardCommand") for body in bodies]
+    assert sum(outcomes) > 50 and not all(outcomes)  # both kinds are well represented
+    for body, expected in zip(bodies, outcomes, strict=True):
+        assert command_ok("keyboard", body) is expected, body
+
+
+def test_more_random_keyboard_bodies_with_other_seeds(schema: dict[str, Any], reference_validator: Validate) -> None:
+    for seed in (1, 2, 3):
+        for body in random_keyboard_bodies(300, seed):
+            assert command_ok("keyboard", body) is reference_ok(reference_validator, body, "KeyboardCommand"), body
+
+
+@pytest.mark.parametrize("key", [k for k in SETTINGS_POOL if k not in ("extra", "text")])
+def test_every_setting_value_agrees_with_jsonschema(
+    key: str, schema: dict[str, Any], reference_validator: Validate
+) -> None:
+    edges: list[Any] = [*SETTINGS_POOL[key], [], {}, 0, -1, 2**63, float("nan"), float("inf")]
+    for value in edges:
+        body = {"action": "configure", "settings": {key: value}}
+        if isinstance(value, float) and not math.isfinite(value):
+            # Deliberately stricter than the reference: NaN and infinity are not JSON.
+            assert not command_ok("keyboard", body)
+            continue
+        assert command_ok("keyboard", body) is reference_ok(reference_validator, body, "KeyboardCommand"), body
+
+
+def test_keyboard_validation_errors_name_the_field_and_never_echo_the_value() -> None:
+    sentinel = "zzqxjv"
+    with pytest.raises(protocol.ValidationError, match=r"settings\.size"):
+        protocol.validate_command("keyboard", {"action": "configure", "settings": {"size": 5}})
+    with pytest.raises(protocol.ValidationError, match=r"settings\.idleS"):
+        protocol.validate_command("keyboard", {"action": "configure", "settings": {"idleS": 3}})
+    with pytest.raises(protocol.ValidationError, match="'action'"):
+        protocol.validate_command("keyboard", {})
+    with pytest.raises(protocol.ValidationError, match="settings"):
+        protocol.validate_command("keyboard", {"action": "configure"})
+    for body in (
+        {"action": sentinel},
+        {"action": "configure", "settings": {"press": sentinel}},
+        {"action": "configure", "settings": {"size": sentinel}},
+        {"action": "configure", "settings": {"enabled": sentinel}},
+        {"action": "configure", "settings": sentinel},
+        {"action": "configure", "settings": {sentinel: 1}},
+        {sentinel: 1},
+    ):
+        with pytest.raises(protocol.ValidationError) as caught:
+            protocol.validate_command("keyboard", body)
+        assert sentinel not in str(caught.value)
+
+
+def test_a_keyboard_refusal_does_not_repeat_the_name_of_an_unexpected_property() -> None:
+    """The control server returns the text as it is; a body may hold anything, so the text names no key of it."""
+    sentinel = "zzqxjv"
+    for body in (
+        {"action": "start", sentinel: 1},
+        {"action": "stop", sentinel: {sentinel: sentinel}},
+        {"action": "configure", "settings": {"commit": "review"}, sentinel: 1},
+    ):
+        with pytest.raises(protocol.ValidationError) as caught:
+            protocol.validate_command("keyboard", body)
+        assert str(caught.value) == "$: unexpected property"
+    # the other commands keep the text they have on main, which the mod's older-helper check reads
+    with pytest.raises(protocol.ValidationError, match="unexpected property 'nope'"):
+        protocol.validate_command("pause", {"nope": 1})
+
+
+def test_bools_and_fractions_are_not_integers_for_idle_seconds() -> None:
+    ok = {"action": "configure", "settings": {"idleS": 30}}
+    assert command_ok("keyboard", ok)
+    assert command_ok("keyboard", {"action": "configure", "settings": {"idleS": 30.0}})
+    for bad in (True, 30.5, "30", None):
+        assert not command_ok("keyboard", {"action": "configure", "settings": {"idleS": bad}})
+
+
+# ---- P4, X34a: the status and the old and new events
+
+
+def test_status_keyboard_is_optional_and_settings_are_unchanged(schema: dict[str, Any]) -> None:
+    status = schema["$defs"]["StatusResponse"]
+    assert "keyboard" in status["properties"] and "keyboard" not in status["required"]
+    assert status["properties"]["keyboard"] == {"$ref": "#/$defs/KeyboardStatus"}
+    # the pointer settings of the status are exactly the thirteen they are on main (C8)
+    assert status["properties"]["settings"]["required"] == [
+        "engage",
+        "hand",
+        "anchor",
+        "overlay",
+        "cursorSpeed",
+        "smoothing",
+        "pinch",
+        "fist",
+        "engageSeconds",
+        "dragDistance",
+        "flingSensitivity",
+        "scrollSpeed",
+        "deadZone",
+    ]
+    assert sorted(HandsSettings().status()) == sorted(status["properties"]["settings"]["properties"])
+
+
+def a_status(**keyboard: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "ok": True,
+        "state": "active",
+        "version": "0.1.0",
+        "platform": "windows",
+        "engaged": False,
+        "fps": 30.0,
+        "inferMs": 8.0,
+        "displays": [],
+        "settings": HandsSettings().status(),
+    }
+    if keyboard:
+        body["keyboard"] = keyboard
+    return body
+
+
+STATUS_KEYBOARD = [
+    {"enabled": False, "state": "closed", "practiced": False},
+    {"enabled": True, "state": "closed", "practiced": True, "press": "air", "commit": "review"},
+    {
+        "enabled": True,
+        "state": "open",
+        "phase": "typing",
+        "press": "air",
+        "level": "ok",
+        "airFps": 29.8,
+        "airNoise": 0.017,
+        "commit": "review",
+        "lang": "en",
+        "hold": "yield",
+        "private": False,
+        "practiced": True,
+        "phantomsPerMin": 0.0,
+        "review": {"state": "composing", "chars": 12},
+    },
+]
+
+
+@pytest.mark.parametrize("keyboard", STATUS_KEYBOARD, ids=["minimal", "closed", "full"])
+def test_status_with_a_keyboard_object_validates(keyboard: dict[str, Any], reference_validator: Validate) -> None:
+    reference_validator(a_status(**keyboard), "StatusResponse")
+    reference_validator(a_status(**keyboard), "CommandResponse")
+    reference_validator(keyboard, "KeyboardStatus")
+
+
+def test_status_without_a_keyboard_object_still_validates(reference_validator: Validate) -> None:
+    reference_validator(a_status(), "StatusResponse")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"enabled": True, "state": "open"},  # practiced is required
+        {"state": "open", "practiced": True},
+        {"enabled": True, "state": "open", "practiced": True, "text": "x"},
+        {"enabled": True, "state": "idle", "practiced": True},
+        {"enabled": True, "state": "open", "practiced": True, "airFps": -1},
+        {"enabled": True, "state": "open", "practiced": True, "airNoise": -0.1},
+        {
+            "enabled": True,
+            "state": "open",
+            "practiced": True,
+            "review": {"state": "composing", "chars": 3, "insert": {}},
+        },
+        {"enabled": True, "state": "open", "practiced": True, "review": {"state": "composing", "chars": 201}},
+        {"enabled": 1, "state": "open", "practiced": True},
+    ],
+    ids=lambda b: json.dumps(b)[:60],
+)
+def test_bad_keyboard_status_is_rejected(bad: dict[str, Any], reference_validator: Validate) -> None:
+    assert not reference_ok(reference_validator, bad, "KeyboardStatus")
+
+
+def test_status_review_carries_no_insert(schema: dict[str, Any]) -> None:
+    review = schema["$defs"]["KeyboardReviewStatus"]
+    assert sorted(review["properties"]) == ["chars", "state"]
+
+
+def test_air_unreliable_and_the_air_fields_are_optional_for_an_older_reader(reference_validator: Validate) -> None:
+    """X34a: the schema accepts the old events and the new ones; an extra text field is not part of either."""
+    new = {"v": 1, "type": "keyboard", "state": "closed", "reason": "air_unreliable", "discarded": 0}
+    old_open = {
+        "v": 1,
+        "type": "keyboard",
+        "state": "open",
+        "phase": "typing",
+        "press": "pinch",
+        "lang": "en",
+        "private": False,
+    }
+    with_level = {**old_open, "press": "air", "level": "degraded"}
+    old_close = {"v": 1, "type": "keyboard", "state": "closed", "reason": "fists"}
+    for event in (new, old_open, with_level, old_close):
+        reference_validator(event, "Event")
+    assert protocol.keyboard("closed", reason="air_unreliable", discarded=0) == new
+    assert protocol.keyboard("open", phase="typing", press="air", level="degraded", lang="en", private=False) == {
+        **with_level
+    }
+    assert not reference_ok(reference_validator, {**new, "text": "abc"}, "KeyboardEvent")
+    assert not reference_ok(reference_validator, {**old_open, "keys": "abc"}, "KeyboardEvent")

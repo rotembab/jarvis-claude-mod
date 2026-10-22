@@ -94,7 +94,8 @@
     "Event": {
       "oneOf": [
         { "$ref": "#/$defs/HelloEvent" }, { "$ref": "#/$defs/StateEvent" }, { "$ref": "#/$defs/ReadyEvent" },
-        { "$ref": "#/$defs/GestureEvent" }, { "$ref": "#/$defs/CalibrationEvent" }, { "$ref": "#/$defs/ErrorEvent" }
+        { "$ref": "#/$defs/GestureEvent" }, { "$ref": "#/$defs/CalibrationEvent" }, { "$ref": "#/$defs/ErrorEvent" },
+        { "$ref": "#/$defs/KeyboardEvent" }
       ]
     },
 
@@ -128,6 +129,127 @@
       "required": ["action"],
       "properties": { "action": { "enum": ["start", "cancel"] } }
     },
+
+    "KeyboardState": { "enum": ["open", "practice", "closed"] },
+    "KeyboardPhase": { "enum": ["placing", "warmup", "typing"] },
+    "KeyboardPress": { "enum": ["pinch", "air", "windows"] },
+    "KeyboardLevel": { "enum": ["ok", "degraded", "off"] },
+    "KeyboardCommit": { "enum": ["review", "direct"] },
+    "KeyboardLang": { "enum": ["en", "he"] },
+    "KeyboardHold": { "enum": ["blocked", "password", "covered", "overlay", "focus", "yield", "slow"] },
+    "KeyboardCloseReason": {
+      "enum": [
+        "command", "close_key", "fists", "idle", "paused", "desktop_locked", "runaway", "no_overlay", "camera",
+        "disabled", "error", "input_blocked", "air_unreliable"
+      ]
+    },
+    "ReviewState": { "enum": ["composing", "inserting", "aborted"] },
+    "InsertAbort": { "enum": ["blocked", "password", "covered", "overlay", "focus", "yield", "stopped", "timeout", "failed"] },
+    "KeyboardInsert": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "outcome", "sent", "of"],
+      "properties": {
+        "kind": { "enum": ["text", "enter"] },
+        "outcome": { "enum": ["done", "aborted"] },
+        "sent": { "type": "integer", "minimum": 0, "maximum": 200 },
+        "of": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "reason": { "$ref": "#/$defs/InsertAbort" }
+      }
+    },
+    "KeyboardReview": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "chars"],
+      "properties": {
+        "state": { "$ref": "#/$defs/ReviewState" },
+        "chars": { "type": "integer", "minimum": 0, "maximum": 200, "description": "How many characters the review box holds, never which." },
+        "insert": { "$ref": "#/$defs/KeyboardInsert" }
+      }
+    },
+    "KeyboardReviewStatus": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "chars"],
+      "properties": {
+        "state": { "$ref": "#/$defs/ReviewState" },
+        "chars": { "type": "integer", "minimum": 0, "maximum": 200 }
+      }
+    },
+    "KeyboardPractice": {
+      "type": "object", "additionalProperties": false,
+      "required": ["hitRate", "phantomsPerMin"],
+      "properties": {
+        "hitRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "phantomsPerMin": { "type": "number", "minimum": 0 },
+        "recallIM": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "KeyboardSettings": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "press": { "$ref": "#/$defs/KeyboardPress" },
+        "commit": { "$ref": "#/$defs/KeyboardCommit" },
+        "layout": { "enum": ["auto", "en", "he"] },
+        "size": { "type": "number", "minimum": 0.6, "maximum": 1.6 },
+        "reach": { "type": "number", "minimum": 0.8, "maximum": 1.5 },
+        "dock": { "enum": ["top", "bottom"] },
+        "idleS": { "type": "integer", "minimum": 5, "maximum": 300 },
+        "inject": { "enum": ["unicode", "vk"] },
+        "enter": { "enum": ["twice", "off"] }
+      }
+    },
+    "KeyboardStatus": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "state", "practiced"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "state": { "$ref": "#/$defs/KeyboardState" },
+        "phase": { "$ref": "#/$defs/KeyboardPhase" },
+        "press": { "$ref": "#/$defs/KeyboardPress" },
+        "level": { "$ref": "#/$defs/KeyboardLevel" },
+        "airFps": { "type": "number", "minimum": 0 },
+        "airNoise": { "type": "number", "minimum": 0 },
+        "commit": { "$ref": "#/$defs/KeyboardCommit" },
+        "lang": { "$ref": "#/$defs/KeyboardLang" },
+        "hold": { "$ref": "#/$defs/KeyboardHold" },
+        "private": { "type": "boolean" },
+        "practiced": { "type": "boolean" },
+        "phantomsPerMin": { "type": "number", "minimum": 0 },
+        "review": { "$ref": "#/$defs/KeyboardReviewStatus" }
+      }
+    },
+    "KeyboardEvent": {
+      "type": "object", "additionalProperties": false,
+      "required": ["v", "type", "state"],
+      "properties": {
+        "v": { "$ref": "#/$defs/v" }, "type": { "const": "keyboard" },
+        "state": { "$ref": "#/$defs/KeyboardState" },
+        "phase": { "$ref": "#/$defs/KeyboardPhase" },
+        "reason": { "$ref": "#/$defs/KeyboardCloseReason" },
+        "hold": { "$ref": "#/$defs/KeyboardHold" },
+        "lang": { "$ref": "#/$defs/KeyboardLang" },
+        "press": { "$ref": "#/$defs/KeyboardPress" },
+        "level": { "$ref": "#/$defs/KeyboardLevel" },
+        "commit": { "$ref": "#/$defs/KeyboardCommit" },
+        "private": { "type": "boolean" },
+        "review": { "$ref": "#/$defs/KeyboardReview" },
+        "discarded": { "type": "integer", "minimum": 0, "maximum": 200 },
+        "practice": { "$ref": "#/$defs/KeyboardPractice" }
+      }
+    },
+    "KeyboardCommand": {
+      "description": "Open, close and set the air keyboard. There is no action that inserts, sends or clears text, and no field that carries any.",
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["action"],
+          "properties": { "action": { "enum": ["start", "practice", "stop", "recenter", "private", "public"] } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["action", "settings"],
+          "properties": { "action": { "const": "configure" }, "settings": { "$ref": "#/$defs/KeyboardSettings" } }
+        }
+      ]
+    },
+
     "Commands": {
       "description": "Command name -> body schema.",
       "type": "object",
@@ -140,7 +262,8 @@
         "engage": { "$ref": "#/$defs/EmptyCommand" },
         "disengage": { "$ref": "#/$defs/EmptyCommand" },
         "calibrate": { "$ref": "#/$defs/CalibrateCommand" },
-        "shutdown": { "$ref": "#/$defs/EmptyCommand" }
+        "shutdown": { "$ref": "#/$defs/EmptyCommand" },
+        "keyboard": { "$ref": "#/$defs/KeyboardCommand" }
       }
     },
 
@@ -179,7 +302,8 @@
             "scrollSpeed": { "type": "number" },
             "deadZone": { "type": "number" }
           }
-        }
+        },
+        "keyboard": { "$ref": "#/$defs/KeyboardStatus" }
       }
     },
     "OkResponse": {

@@ -7,10 +7,12 @@ implements it with ctypes; ``fake.py`` is the test double; other platforms get
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 from ..geometry import Rect
+from .keys import KeyStroke
 
 WindowState = Literal["normal", "maximized", "minimized"]
 
@@ -89,3 +91,89 @@ class Desktop(Protocol):
     def close(self) -> None:
         """Releases anything the backend holds (never raises)."""
         ...
+
+
+# --------------------------------------------------------------------------- the keyboard side (air keyboard)
+
+
+@dataclass(frozen=True)
+class KeyTarget:
+    """The window a typed key would land in, as far as the desktop can tell without looking inside it."""
+
+    #: Foreground window; 0 = none.
+    hwnd: int
+    pid: int
+    #: Executable base name without ".exe"; "" unknown. Local screen only: never in an event or a log.
+    name: str = field(repr=False)
+    #: Keyboard layout language id of the foreground thread (0x040D Hebrew); 0 unknown.
+    lang_id: int
+    #: Why keys must not be sent there: an elevated window, the shell (Start, Alt+Tab, the taskbar), our own window,
+    #: or none.
+    blocked: Literal["elevated", "shell", "own", "none"] | None
+    #: A classic password edit control (ES_PASSWORD) has the focus.
+    password: bool
+    #: The shell says the user is busy: D3D full screen or a presentation.
+    covered: bool
+
+
+class KeyDesktop(Protocol):
+    """What the keyboard needs of a desktop.
+
+    ``WindowsDesktop`` and ``FakeDesktop`` offer it; ``Desktop`` itself is not extended.
+    """
+
+    injects_for_real: bool
+
+    def key_target(self) -> KeyTarget: ...
+
+    def foreground_window(self) -> int:
+        """Cheap; 0 when none."""
+        ...
+
+    def send_keys(self, strokes: Sequence[KeyStroke], *, inject: Literal["unicode", "vk"] = "unicode") -> int:
+        """Types the strokes in order, each as ONE atomic input batch (all its downs and ups together).
+
+        Returns the number of strokes sent in full. Raises InputBlocked when Windows took none of the first,
+        OSError when it took some, KeyRefused for a stroke the allow-list refuses.
+        """
+        ...
+
+    def foreign_input(self) -> bool:
+        """Input other than ours since the previous call; True when it cannot tell."""
+        ...
+
+    def modifiers_down(self) -> bool:
+        """A physical Ctrl, Alt or Win key is down."""
+        ...
+
+    def release_keys(self) -> None:
+        """Sends any key-up Windows refused earlier; never raises."""
+        ...
+
+    def open_os_keyboard(self) -> bool:
+        """Launches osk.exe by absolute path; False if it did not start."""
+        ...
+
+
+#: The names a desktop must have to be a KeyDesktop (the Protocol's own attributes, in its order).
+KEY_DESKTOP_NAMES = (
+    "injects_for_real",
+    "key_target",
+    "foreground_window",
+    "send_keys",
+    "foreign_input",
+    "modifiers_down",
+    "release_keys",
+    "open_os_keyboard",
+)
+
+
+def as_key_desktop(desktop: object) -> KeyDesktop | None:
+    """The desktop if it has every name of ``KeyDesktop``, else None.
+
+    The ``Desktop`` protocol itself is not extended: ``WindowsDesktop`` and ``FakeDesktop`` subclass it explicitly,
+    so a method added to it would be inherited with an empty body and a desktop without keys would look like one with.
+    """
+    if desktop is not None and all(hasattr(desktop, name) for name in KEY_DESKTOP_NAMES):
+        return desktop  # type: ignore[return-value]
+    return None

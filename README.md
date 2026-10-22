@@ -251,6 +251,27 @@ Some things to try:
 - **Windows fly off when you let go of a fist, or do not fly when you flick.** Lower fling (`0.7`) or raise it (`1.5`).
 - **Scrolling is too slow or too fast.** Raise scroll-speed (`2`) or lower it (`0.5`).
 
+### The air keyboard
+
+For a short message when voice does not fit and the real keyboard is out of reach, hand control can draw a keyboard on your screen and let you type on it in the air: hold your hands over the keys as if they rested on a real keyboard, and tap a finger down over a key. The webcam sees the tap. It is off until you turn it on, and it has only ever run against test fakes, not on a real PC with a real webcam.
+
+1. Update and restart: `claude plugin update jarvis@jarvis-claude-mod`, then restart Claude Code and run `/jarvis setup hands`.
+2. In `/plugin configure jarvis@jarvis-claude-mod` set **Air keyboard** (`handKeyboard`) to `on`. Nothing else can turn it on, not a command and not Claude.
+3. Practise once: `/jarvis hands keyboard practice`. Nothing you tap goes into any window.
+4. Click into the window you want to type into, then `/jarvis hands keyboard`. Rest both hands over the home row, tap each finger the strip names (the warm-up), and type.
+
+What you tap goes into a box on the keyboard. Nothing reaches another window until you tap **Insert** three times, firmly, with your hand still; **Send** presses Enter, also after three taps, for ten seconds after an Insert. `Bksp` and `Clear` fix mistakes, and closing the keyboard throws the box away. It types English and Hebrew letters, a few marks and space, no digits and no shortcuts, and it refuses administrator windows and the password boxes Windows lets it recognise. Hold both fists up for a second, or run `/jarvis hands keyboard off`, to close it.
+
+The honest limits:
+
+- **It is slow and it makes mistakes.** Plan for a short sentence to take about a minute. A fast roll of two neighbouring fingers loses a letter, and ring and little fingers are the least reliable. A hand talking in view can type letters you did not mean into the box.
+- **No figure is measured on a real hand.** The accuracy numbers in the guide come from a model with clean landmarks, and a real webcam will do worse. `/jarvis hands keyboard practice` and the `keytrace` and `keyreplay` tools measure your camera.
+- **It needs light and frames.** Under about 26 frames a second the keyboard shows a banner and asks for firmer taps; under 13 it switches the air tap off and moves to pinch.
+- **Jarvis cannot see Claude Code's prompts.** A box holding only `y` can answer a permission question. Look at the window before the third Insert tap.
+- **Passwords are not for it.** Only classic Windows password boxes are recognised, not those in browsers or terminals.
+
+[docs/HANDS-KEYBOARD.md](docs/HANDS-KEYBOARD.md) has the walk-through, every key, the commands and settings, the tests to run on your PC, troubleshooting and, for developers, the safety rules and their tests.
+
 ## Home devices
 
 Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Tuya devices from the Tuya Smart or Smart Life app (Fingerbots too, through a Tuya gateway), and anything Home Assistant controls, and talks to them directly on your home network. It can also look up a title on your own Plex Media Server and have the Apple TV open it. It can't reach Apple Home from Windows; see [Siri and Apple Home](docs/HOME.md#siri-and-apple-home).
@@ -306,6 +327,7 @@ Jarvis can work your Windows PC from a spoken request: "open Spotify and play my
 | `/jarvis hands preset [precise\|balanced\|fast]` | Set several at once; the settings a preset does not name go back to their defaults. With no name, lists the presets. |
 | `/jarvis hands reset [name]` | Put every setting (or one) back to its default. |
 | `/jarvis hands pause\|resume\|restart` | Turn the camera off and on, or restart the hand helper. |
+| `/jarvis hands keyboard [on\|practice\|off\|recenter\|private\|public\|status\|help]` | The air keyboard: open it (after a practice), open the practice, close it, place it under your hands again, hide or show the box, or show its state. A setting by name (`press`, `commit`, `layout`, `size`, `reach`, `dock`, `enter`) shows or sets it. See [The air keyboard](#the-air-keyboard). |
 
 ## Settings
 
@@ -333,6 +355,8 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `handSmoothing` | `1` | How much the cursor is smoothed, from 0.2 to 3. Higher is steadier at rest but lags more when you move; lower is snappier but jitters more. `/jarvis hands set smoothing` overrides it until this setting is changed. |
 | `handPinch` | `1` | How close thumb and finger must be for a pinch click, from 0.85 to 1.15. Higher counts a lighter, looser pinch (and may click by accident); lower needs a firmer pinch. `/jarvis hands set pinch` overrides it until this setting is changed. |
 | `handScrollSpeed` | `1` | How far a scroll gesture scrolls, from 0.1 to 10. Higher scrolls faster. `/jarvis hands set scroll-speed` overrides it until this setting is changed. |
+| `handKeyboard` | `off` | `on` lets hand control show the air keyboard (type in the air; what you tap goes into a review box, and nothing reaches another window until three taps on Insert). This is the only switch: no command and no tool call turns it on. See [The air keyboard](#the-air-keyboard). |
+| `handKeyboardPress` | `air` | How a key is pressed: `air` (tap a finger in the air), `pinch` (pinch the finger to your thumb) or `windows` (Windows' own on-screen keyboard, **without** Jarvis' safeguards). `/jarvis hands keyboard press` overrides it until you run `/jarvis hands keyboard press default`. |
 
 ## How it works
 
@@ -374,6 +398,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
 - **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Tuya scenes, the one-time Tuya account link and, only if you turn it on, Tuya's cloud fallback for devices that don't answer at home. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
 - **Hand control uses the camera only while it is on.** The hand helper reads each frame, finds your hands on your own computer (MediaPipe, on the CPU) and drops the frame; no picture is stored or sent anywhere. Jarvis pins MediaPipe 0.10.33, the newest version that sends Google no usage statistics. The camera light is on while hand control watches, and off after `/jarvis hands pause` or `off`.
+- **The air keyboard never logs what you type.** The characters you tap and the text in its box are not written to a log, an event or a file, and the keyboard does not pass them to the mod or to Claude; once you Insert them they are in the window you typed into, like any typing. The box is on screen in clear text unless you turn on private mode, and in the hand helper's memory while the keyboard is open. A practice records numbers about your hands and the taps it prompted, and the `keytrace` tool records landmarks only, never a picture. Closing the keyboard throws the box away.
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log` (hand control: `hands.log`). API keys and tokens are masked in it.
 - Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word models from GitHub: openWakeWord's releases, and the plain "Jarvis" model from a community collection, and `/jarvis setup hands` downloads the hand model from Google's MediaPipe models) and the helper fetching a wake word model that is missing (the "Hey Jarvis" model when it starts, the plain "Jarvis" model when you switch it on), Jarvis talks to nothing else.
 
@@ -394,6 +419,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | Hand control: "camera blocked" | Settings > Privacy & security > Camera: turn on **Camera access** and **Let desktop apps access your camera**, then `/jarvis hands restart`. |
 | Hand control: "camera in use" | Another app (Teams, Zoom, the Camera app, OBS) has the webcam. Close it, then `/jarvis hands restart`. |
 | Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. Then tune it: raise `pinch` for missed pinches, raise `smoothing` and then `dead-zone` for a jittery cursor ([Tuning the feel](#tuning-the-feel)). |
+| The air keyboard misses taps, types letters you did not mean, or will not open | Light your hands from the front, raise and curve your fingers, tap a little firmer. If it will not open, the strip or the answer says why (the option is off, a practice is needed, the helper is too old). [docs/HANDS-KEYBOARD.md](docs/HANDS-KEYBOARD.md#troubleshooting) has the list. |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
 
 More detail, including logs and running the helper by hand, is in [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -414,7 +440,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 (now) | Hands | Now: a guard on Claude's commands and edits, with spoken and on-screen confirmations, and the desktop tool ([docs/PC-CONTROL.md](docs/PC-CONTROL.md)). Next: checking it on real PCs. |
-| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview), with settings for how it feels. Next: tuning on a real desk, then a projector wall mode. |
+| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview), with settings for how it feels, and an air keyboard for short messages (preview, not yet tried on a real PC). Next: tuning on a real desk, then a projector wall mode. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).
 

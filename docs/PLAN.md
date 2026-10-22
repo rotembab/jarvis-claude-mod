@@ -253,6 +253,7 @@ Added Oct 7, 2026, from Rotem's ask: control the screen with your hands through 
 - **Fit to your reach.** By default the middle of the camera's view maps to your screens, so your hand moves in a small box in front of you, elbow down. `/jarvis hands calibrate` fits it to where you actually reach.
 - **Displays.** Every display Windows reports, except virtual ones (your Virtual Display Driver), is in reach as Windows arranges them, so a projector set up to the right of the monitor is reached by moving your hand right, and a window flung right lands on it. `/jarvis hands display` picks which.
 - **By voice or command.** `/jarvis hands on|off|calibrate|pause|resume`, and "Jarvis, turn on hand control" through the mod's `hands` tool.
+- **An air keyboard (Oct 8, 2026, built, not yet tried on a real PC).** For a short message when voice does not fit and the real keyboard is out of reach: `/jarvis hands keyboard` draws a keyboard on screen and you tap a finger down in the air over a key. Taps fill a box on the keyboard, and nothing reaches the window in front until you tap Insert three times, so a wrong tap costs a Backspace. It is off until the `handKeyboard` option is on, and it is slow and error-prone on a webcam; the honest numbers are in the guide. Guide: [HANDS-KEYBOARD.md](HANDS-KEYBOARD.md).
 
 Stages:
 

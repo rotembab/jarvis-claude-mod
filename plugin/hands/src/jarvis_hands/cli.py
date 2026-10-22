@@ -1,4 +1,5 @@
-"""Command line: ``run`` (the helper the mod starts), ``setup`` (model download), ``doctor`` and ``preview``.
+"""Command line: ``run`` (the helper the mod starts), ``setup`` (model download), ``doctor`` and ``preview``,
+and the air keyboard's console tools ``keytest``, ``keytrace`` and ``keyreplay``.
 
 ``run`` is wired like the voice helper's: stdout is claimed for protocol lines
 before anything else can write to it, the single-instance lock and the token
@@ -87,7 +88,28 @@ def build_parser() -> argparse.ArgumentParser:
     preview.add_argument("--height", type=int, default=720)
     preview.add_argument("--fps", type=int, default=30)
     preview.set_defaults(func=cmd_preview)
+
+    _add_keyboard_tools(sub)
     return parser
+
+
+def _add_keyboard_tools(sub: Any) -> None:
+    """``keytest``, ``keytrace`` and ``keyreplay``: console tools for the air keyboard (DESIGN-KEYBOARD.md 3.13).
+
+    Each module declares its own arguments and runs itself, so this stays a list. They are imported here, inside the
+    function, because argparse needs the arguments to parse a command line; the keyboard's controller and the rest
+    stay unloaded until the runtime opens a session.
+    """
+    from .keyboard import keyreplay, keytest, keytrace
+
+    for module, help_text in (
+        (keytest, "type a fixed line into the window in front, to see how it takes the air keyboard's keys"),
+        (keytrace, "record hand landmarks (never pixels) for tuning the air keyboard; asks for --yes-record"),
+        (keyreplay, "replay a landmark recording offline and print the air keyboard's report"),
+    ):
+        tool = sub.add_parser(module.__name__.rsplit(".", 1)[-1], help=help_text, description=help_text)
+        module.add_arguments(tool)
+        tool.set_defaults(func=module.run)
 
 
 def _claim_stdout() -> BinaryIO:
@@ -132,7 +154,18 @@ class _NoLock:
 
 
 def capabilities(fake: bool) -> list[str]:
-    caps = ["heartbeat", "status", "config", "pause", "resume", "engage", "disengage", "calibrate", "shutdown"]
+    caps = [
+        "heartbeat",
+        "status",
+        "config",
+        "pause",
+        "resume",
+        "engage",
+        "disengage",
+        "calibrate",
+        "shutdown",
+        "keyboard",
+    ]
     return [*caps, "fake"] if fake else caps
 
 

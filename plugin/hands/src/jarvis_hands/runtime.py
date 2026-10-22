@@ -72,6 +72,7 @@ from .events import EventSink
 from .executor import Executor
 from .gestures import EngineView, GestureEngine
 from .landmarks import Frame
+from .logs import exc_text
 from .mapping import ScreenMapper
 from .overlay.base import NullOverlay, Overlay, OverlayMode, OverlayState
 from .settings import HandsSettings, load_calibration, save_calibration
@@ -324,6 +325,30 @@ class HandsRuntime:
         self._next_desktop_check = 0.0
         self._display_error_logged = False
 
+        from .keyboard.controller import KeyboardController, KeyboardDeps  # lazy: with the keyboard off nobody loads it
+
+        # The air keyboard (DESIGN-KEYBOARD.md 3.8). It is only ever called with ``self._lock`` held and reaches back
+        # through these, so it holds no reference to the runtime and a test can run it with none.
+        self._kb = KeyboardController(
+            KeyboardDeps(
+                data_dir=options.data_dir,
+                desktop=lambda: self._desktop,
+                overlay=lambda: self._overlay,
+                displays=lambda: self._mapper.displays if self._mapper is not None else [],
+                ready=self._kb_ready,
+                paused=lambda: self._paused,
+                desktop_blocked=lambda: self._desktop_blocked,
+                overlay_enabled=lambda: self.options.overlay and self._settings.overlay,
+                fps=lambda: self._tracked_fps(self._clock()),
+                emit=self._emit,
+                show=self._show,
+                pointer_off=self._kb_pointer_off,
+                pointer_reset=self._kb_pointer_reset,
+                report=self._report,
+                clock=lambda: self._clock(),
+            )
+        )
+
     # -- default factories ----------------------------------------------------------------
 
     def _default_desktop(self) -> Desktop:
@@ -388,7 +413,7 @@ class HandsRuntime:
         except Exception as exc:
             log.exception("hand control failed to start")
             self._release_everything()
-            self._fatal("internal", f"Hand control failed to start: {type(exc).__name__}: {exc}")
+            self._fatal("internal", f"Hand control failed to start: {exc_text(exc)}")
         finally:
             self._start_done.set()
             if self._stopped:  # stop() ran while we were starting: let go of what was made since
@@ -414,6 +439,8 @@ class HandsRuntime:
             self._stopped = True
             started = self._started
         self.request_stop()
+        with self._lock:
+            self._kb.close("command")  # no key goes out while the loop winds down
         try:
             if started and not self._start_done.wait(START_WAIT_S):
                 log.warning("start() is still busy; stopping anyway")
@@ -484,7 +511,7 @@ class HandsRuntime:
             return
         except Exception as exc:  # e.g. the tracker's module or MediaPipe failed to import
             log.exception("the hand tracker could not be created")
-            self._fatal("tracker_failed", f"The hand tracker could not start: {type(exc).__name__}: {exc}")
+            self._fatal("tracker_failed", f"The hand tracker could not start: {exc_text(exc)}")
             return
         with self._lock:
             self._tracker = tracker
@@ -534,6 +561,7 @@ class HandsRuntime:
     def _release_resources(self) -> None:
         """Close whatever exists, each exactly once. Buttons first."""
         with self._lock:
+            self._kb.close("command")  # while the desktop and the overlay still exist to be released and blanked
             executor, self._executor = self._executor, None
             camera, self._camera = self._camera, None
             tracker, self._tracker = self._tracker, None
@@ -590,7 +618,7 @@ class HandsRuntime:
                 log.debug("the hand loop ended while stopping: %r", exc)
             else:
                 log.exception("the hand loop failed")
-                self._fatal("internal", f"Hand tracking failed: {type(exc).__name__}: {exc}")
+                self._fatal("internal", f"Hand tracking failed: {exc_text(exc)}")
         finally:
             self._release_everything()
             self._keep_awake(False)
@@ -619,19 +647,24 @@ class HandsRuntime:
             if self._wish_calibrate and arrived is not None:
                 self._wish_calibrate = False
                 engine.start_calibration(frame.t)
-            actions = engine.update(frame)
-            executor.submit(actions)
-            self._drain(engine)
-            view = engine.view()
-            result = engine.take_calibration_result()
-            if not view.pressed:
-                self._dragging = False
-            # Under the lock, so a pause or a config that hides the reticle can never be overdrawn by this frame.
-            self._show(self._overlay_for(view, engine.engaged, now))
+            kb = self._kb
+            if kb.active:
+                kb.frame(frame, now)  # the pointer is off: the engine is not called
+                view = result = None
+            else:
+                actions = engine.update(kb.pointer_frame(frame))  # an empty frame while the pointer is quarantined
+                executor.submit(actions)
+                self._drain(engine)
+                view = engine.view()
+                result = engine.take_calibration_result()
+                if not view.pressed:
+                    self._dragging = False
+                # Under the lock, so a pause or a config that hides the reticle can never be overdrawn by this frame.
+                self._show(self._overlay_for(view, engine.engaged, now))
         if result is not None:
             self._calibrated(result)
-        self._set_num_hands(2 if view.grabbing else 1)
-        self._keep_awake(engine.engaged or view.state == "calibrating")
+        self._set_num_hands(2 if (kb.wants_two_hands or (view is not None and view.grabbing)) else 1)
+        self._keep_awake(kb.active or (view is not None and (engine.engaged or view.state == "calibrating")))
 
     def _no_frame(self, now: float) -> None:
         """A read timed out: past ``hold_s`` without a frame, the engine sees an empty one (see the module docstring).
@@ -693,7 +726,7 @@ class HandsRuntime:
                 error, failed = (exc.code, exc.message), True
             except Exception as exc:
                 log.exception("could not reopen the camera")
-                error = ("internal", f"Could not reopen the camera: {type(exc).__name__}: {exc}")
+                error = ("internal", f"Could not reopen the camera: {exc_text(exc)}")
                 failed = True
             if failed and error is not None:
                 with self._lock:
@@ -868,6 +901,7 @@ class HandsRuntime:
         log.info("the input desktop is not ours (lock screen or a UAC prompt); hand control waits")
         with self._lock:
             self._desktop_blocked = True
+            self._kb.close("desktop_locked")
             self._disengage_all("desktop_locked")
             self._last_visible = None
             self._show(OverlayState())
@@ -959,15 +993,17 @@ class HandsRuntime:
             self._overlay_broke(exc)
 
     def _overlay_broke(self, exc: Exception) -> None:
-        log.warning("the overlay failed (%s: %s); hand control carries on without it", type(exc).__name__, exc)
+        log.warning("the overlay failed (%s); hand control carries on without it", exc_text(exc))
+        detail = exc_text(exc, typed=False)  # before the close below ends the scrub: an open session never reports text
         with self._lock:
             first = not self._overlay_failed
             self._overlay_failed = True
             self._overlay = NullOverlay()
+            self._kb.close("no_overlay")  # after the swap, so that its blanking draw goes to the null overlay
             if first:
                 self._report(
                     "overlay_failed",
-                    f"The on-screen reticle could not be shown ({exc}); hand control works without it.",
+                    f"The on-screen reticle could not be shown ({detail}); hand control works without it.",
                     always=True,
                 )
 
@@ -1040,6 +1076,7 @@ class HandsRuntime:
             if self._failed:
                 return
             self._failed = True
+            self._kb.close("camera")
             self.exit_code = EXIT_FATAL
             log.error("fatal: %s: %s", code, message)
             self._emit(protocol.error(code, message, hint, fatal=True))
@@ -1102,6 +1139,7 @@ class HandsRuntime:
                 "engage": self._cmd_engage,
                 "disengage": self._cmd_disengage,
                 "calibrate": self._cmd_calibrate,
+                "keyboard": self._cmd_keyboard,
             }.get(name)
             if handler is None:
                 return protocol.error_response("bad_request", f"unknown command {name!r}")
@@ -1111,7 +1149,7 @@ class HandsRuntime:
             return response
         except Exception as exc:
             log.exception("command %s failed", name)
-            return protocol.error_response("internal", f"{type(exc).__name__}: {exc}")
+            return protocol.error_response("internal", exc_text(exc))
 
     def _status(self) -> dict[str, Any]:
         now = self._clock()
@@ -1128,6 +1166,9 @@ class HandsRuntime:
                 "displays": self._display_dicts(),
                 "settings": self._settings.status(),
             }
+            keyboard = self._kb.status()
+            if keyboard is not None:
+                response["keyboard"] = keyboard
             if info is not None:
                 response["camera"] = info.name
         if tracker is not None:
@@ -1151,6 +1192,7 @@ class HandsRuntime:
             if self._mapper is not None and self._settings.displays != displays:
                 self._mapper.set_selection(self._settings.displays)
             if overlay and not self._settings.overlay:
+                self._kb.close("no_overlay")
                 self._last_visible = None
                 self._show(OverlayState())
             log.info("settings: %s", self._settings.status() | {"displays": self._settings.displays})
@@ -1161,6 +1203,7 @@ class HandsRuntime:
             again = self._paused
             if not again:
                 self._paused = True
+                self._kb.close("paused")
                 self._disengage_all("command")
                 self._sync_state()
                 self._last_visible = None
@@ -1224,6 +1267,7 @@ class HandsRuntime:
 
     def _cmd_engage(self, body: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            self._kb.close("command", quarantine=False)  # an explicit request wins over the quarantine (2.9)
             engine = self._engine
             if engine is None:
                 self._wish_engage = True
@@ -1254,6 +1298,7 @@ class HandsRuntime:
                     return protocol.error_response(
                         "bad_request", "The camera is still turning back on; calibrate once it is on."
                     )
+                self._kb.close("command", quarantine=False)
                 if engine is None or self._last_frame is None:  # starts with the first frame, on its clock
                     self._wish_calibrate = True
                 else:
@@ -1267,6 +1312,29 @@ class HandsRuntime:
             else:
                 return protocol.error_response("bad_request", f"unknown calibrate action {action!r}")
         return protocol.ok_response()
+
+    def _cmd_keyboard(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            response = self._kb.command(body)
+        if self._kb.take_release():  # an open lifted every button; the executor's own lock is taken outside ours
+            self._release_everything()
+        return response
+
+    # -- the air keyboard's view of the runtime (runtime lock held) -------------------------------
+
+    def _kb_ready(self) -> bool:
+        """The engine exists and the camera has been on; a pause counts, so that it is refused as "paused"."""
+        return self._engine is not None and self._ready and (self._camera is not None or self._paused)
+
+    def _kb_pointer_off(self) -> None:
+        """A session opens: the pointer lets go of everything and forgets its tracks (the caller then releases)."""
+        self._disengage_all("keyboard")
+        if self._engine is not None:
+            self._engine.reset_tracks()
+
+    def _kb_pointer_reset(self) -> None:
+        if self._engine is not None:
+            self._engine.reset_tracks()
 
 
 def _double_click(desktop: Desktop) -> tuple[float, int, int]:

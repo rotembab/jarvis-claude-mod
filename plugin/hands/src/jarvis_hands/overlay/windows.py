@@ -1,4 +1,4 @@
-"""The reticle on Windows: two click-through layered windows, drawn from ``render.py`` on their own thread.
+"""The reticle and the air keyboard on Windows: click-through layered windows, drawn on their own thread.
 
 Layered windows (``UpdateLayeredWindow`` with per-pixel alpha) show the soft,
 anti-aliased reticle over whatever is under it. The extended styles do the
@@ -21,6 +21,11 @@ pixels, like the rest of the helper's, and the reticle is sized for the DPI of
 the monitor under it (96 px at 100 %, 144 px at 150 %). The second window is
 the helper hand's marker during a two-hand resize.
 
+A third window of the same kind carries the air keyboard (``keyboard_render.py``): a wide layer, not a square one, so
+surfaces and layers take a width and a height. While a state has a keyboard the reticle windows are hidden; when it
+goes, the keyboard window is hidden, its surface freed and the painter's sprites (made of typed text) forgotten.
+``health()`` says whether the thread draws and how recently; the keyboard stops when it does not.
+
 ctypes: private ``WinDLL`` handles with ``use_last_error``, a prototype on
 every function (handles, WPARAM and LPARAM are 64-bit; the default ``int``
 would truncate them), structures from fixed-width fields that match the Win64
@@ -31,6 +36,9 @@ process).
 ``start()`` raises ``OverlayError`` when the windows cannot be made. After
 that nothing here raises into the caller: a failing draw is logged once and
 the next state tries again, and ``close()`` never raises.
+
+Typed characters never reach a log from here: the keyboard's drawing lets only a ``KeyboardDrawError`` (a fixed code)
+out, and every exception text goes through ``exc_text``.
 """
 
 from __future__ import annotations
@@ -40,14 +48,17 @@ import itertools
 import logging
 import math
 import os
+import statistics
 import sys
 import threading
+from collections import deque
 from typing import Any
 
 import numpy as np
 
+from .. import clock
 from ..geometry import Point
-from .base import OverlayError, OverlayState
+from .base import KeyboardView, OverlayError, OverlayHealth, OverlayState
 from .render import helper_size, render, render_helper, reticle_size, top_left
 
 log = logging.getLogger(__name__)
@@ -58,6 +69,8 @@ START_TIMEOUT_S = 3.0
 STOP_TIMEOUT_S = 2.0
 #: How often topmost is re-asserted (and the per-monitor DPI re-read) while the reticle shows.
 TOPMOST_INTERVAL_MS = 1000
+#: How many draws that pushed an image ``health().draw_ms`` takes the median of.
+HEALTH_SAMPLES = 100
 
 # --------------------------------------------------------------------------- Win32 types and constants
 
@@ -108,6 +121,10 @@ SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
 HWND_TOPMOST = -1
+
+#: ``SetWindowDisplayAffinity``: no exclusion; and left out of screenshots and screen sharing (Windows 10 2004 on).
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
 ULW_ALPHA = 0x00000002
 AC_SRC_OVER = 0x00
@@ -255,6 +272,7 @@ class _Api:
         _proto(user32.ReleaseDC, _INT, _HANDLE, _HANDLE)
         _proto(user32.MonitorFromPoint, _HANDLE, POINT, _DWORD)
         _proto(user32.SetTimer, _UINT_PTR, _HANDLE, _UINT_PTR, _UINT, ctypes.c_void_p)
+        _proto(user32.SetWindowDisplayAffinity, _BOOL, _HANDLE, _DWORD)
         # Not called here: for tests and diagnostics (is it shown, where, is it foreground, what a click hits).
         _proto(user32.IsWindowVisible, _BOOL, _HANDLE)
         _proto(user32.GetWindowRect, _BOOL, _HANDLE, ctypes.POINTER(RECT))
@@ -394,11 +412,18 @@ class Mailbox:
 
 
 class _Surface:
-    """A top-down 32-bit DIB section selected into a memory DC; ``pixels`` is its memory as (size, size, 4)."""
+    """A top-down 32-bit DIB section selected into a memory DC; ``pixels`` is its memory as (height, width, 4).
 
-    def __init__(self, api: _Api, size: int) -> None:
+    ``height`` defaults to ``width`` (the reticle's square layers); the keyboard's layer is wider than it is tall.
+    """
+
+    def __init__(self, api: _Api, width: int, height: int | None = None) -> None:
         self.api = api
-        self.size = size
+        height = width if height is None else height
+        self.width = width
+        self.height = height
+        #: The width, which is the side of a square surface.
+        self.size = width
         self.memdc: int | None = None
         self.bitmap: int | None = None
         self.previous: int | None = None
@@ -414,8 +439,8 @@ class _Surface:
             info = BITMAPINFO()
             header = info.bmiHeader
             header.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            header.biWidth = size
-            header.biHeight = -size  # negative: rows run top-down, like the numpy image
+            header.biWidth = width
+            header.biHeight = -height  # negative: rows run top-down, like the numpy image
             header.biPlanes = 1
             header.biBitCount = 32
             header.biCompression = BI_RGB
@@ -428,8 +453,8 @@ class _Surface:
             self.previous = gdi32.SelectObject(self.memdc, self.bitmap)
             if not self.previous:
                 raise _fail("SelectObject")
-            buffer = (ctypes.c_uint8 * (size * size * 4)).from_address(bits.value)
-            self.pixels = np.ctypeslib.as_array(buffer).reshape(size, size, 4)
+            buffer = (ctypes.c_uint8 * (width * height * 4)).from_address(bits.value)
+            self.pixels = np.ctypeslib.as_array(buffer).reshape(height, width, 4)
         except BaseException:
             self.destroy()
             raise
@@ -461,14 +486,20 @@ class _Layer:
         self.image: np.ndarray | None = None
         self.origin: tuple[int, int] | None = None
         self.visible = False
+        #: Whether Windows is known to leave this window out of captures (``set_capture_excluded`` took).
+        self.excluded = False
 
-    def show(self, image: np.ndarray, origin: tuple[int, int]) -> None:
-        size = image.shape[0]
-        if self.surface is None or self.surface.size != size:
+    def show(self, image: np.ndarray, origin: tuple[int, int]) -> bool:
+        """Shows ``image`` (any height and width) with its top-left at ``origin``; True when it went to the screen.
+
+        False is the early return for an image and a place that are already shown.
+        """
+        height, width = image.shape[:2]
+        if self.surface is None or (self.surface.width, self.surface.height) != (width, height):
             self.release_surface()
-            self.surface = _Surface(self.api, size)
+            self.surface = _Surface(self.api, width, height)
         if image is self.image and origin == self.origin and self.visible:
-            return
+            return False
         if image is not self.image:
             assert self.surface.pixels is not None
             self.api.gdi32.GdiFlush()  # no GDI drawing may be pending on the DIB while we write it
@@ -476,7 +507,7 @@ class _Layer:
             self.image = image
         self.origin = None  # until the update below succeeds
         dst, src = POINT(*origin), POINT(0, 0)
-        extent = SIZE(size, size)
+        extent = SIZE(width, height)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
         user32 = self.api.user32
         screen = user32.GetDC(None)
@@ -504,6 +535,16 @@ class _Layer:
             if not user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags):
                 raise _fail("SetWindowPos(show)")
             self.visible = True
+        return True
+
+    def set_capture_excluded(self, excluded: bool) -> bool:
+        """Asks Windows to keep this window out of screenshots and screen sharing (or to stop); True when it took."""
+        affinity = WDA_EXCLUDEFROMCAPTURE if excluded else WDA_NONE
+        if not self.api.user32.SetWindowDisplayAffinity(self.hwnd, affinity):
+            log.debug("SetWindowDisplayAffinity(%#x) failed with Windows error %d", affinity, _last_error())
+            return False
+        self.excluded = excluded
+        return True
 
     def hide(self) -> None:
         if not self.visible:
@@ -554,6 +595,30 @@ def _make_thread_dpi_aware(api: _Api) -> None:
         log.warning("could not make the overlay thread per-monitor DPI aware (v2)")
 
 
+def _exc_text(exc: BaseException) -> str:
+    """What to say of ``exc`` in a log line: ``logs.exc_text``, which keeps typed text out while a keyboard session
+    is open (the type name only), or plain ``str(exc)`` where that does not exist yet (and so nothing is scrubbed)."""
+    try:
+        from .. import logs
+
+        exc_text = getattr(logs, "exc_text", None)
+        if exc_text is not None:
+            return str(exc_text(exc, typed=False))
+    except Exception:  # noqa: BLE001 - describing a failure must not become another one
+        return type(exc).__name__
+    return str(exc)
+
+
+def _forget_keyboard_pixels() -> None:
+    """The keyboard painter keeps its last frame and its sprites, which are made of typed text: drop them.
+
+    Looked up in ``sys.modules`` so that a run which never drew a keyboard does not import Pillow to clear nothing.
+    """
+    module = sys.modules.get(f"{__package__}.keyboard_render")
+    if module is not None:
+        module.clear_cache()
+
+
 # --------------------------------------------------------------------------- the UI thread
 
 _class_ids = itertools.count(1)
@@ -582,13 +647,66 @@ class _Ui:
         self._proc: Any = None
         self._main: _Layer | None = None
         self._helper: _Layer | None = None
+        self._keyboard: _Layer | None = None
         #: Windows not yet destroyed (UI thread only).
         self._windows: list[int] = []
         self._dpi: dict[int, int] = {}
+        #: The keyboard layer has drawn since it was last hidden, so it has pixels and sprites to let go of.
+        self._keyboard_drawn = False
+        #: What the last keyboard state asked of capture exclusion, and whether a refusal was logged yet.
+        self._capture_wanted = False
+        self._capture_refused = False
+        #: The code of the keyboard's last draw error, None after a good frame.
+        self.keyboard_error: str | None = None
+        #: Liveness, for ``health()``: written on the UI thread (and by ``submit``), read from any.
+        self._health_lock = threading.Lock()
+        self._failures = 0
+        self._last_ok: float | None = None
+        self._draw_s: deque[float] = deque(maxlen=HEALTH_SAMPLES)
 
     @property
     def hwnds(self) -> tuple[int, ...]:
+        """The reticle's two windows (the keyboard's is ``keyboard_hwnd``)."""
         return tuple(layer.hwnd for layer in (self._main, self._helper) if layer is not None)
+
+    @property
+    def keyboard_hwnd(self) -> int | None:
+        return self._keyboard.hwnd if self._keyboard is not None else None
+
+    def _layers(self) -> tuple[_Layer, ...]:
+        return tuple(layer for layer in (self._main, self._helper, self._keyboard) if layer is not None)
+
+    @property
+    def capture_excluded(self) -> bool:
+        return self._keyboard is not None and self._keyboard.excluded
+
+    # ----- liveness (any thread)
+
+    def _note_failure(self) -> None:
+        with self._health_lock:
+            self._failures += 1
+
+    def _note_ok(self, finished: float, began: float | None) -> None:
+        """A draw returned without raising at ``finished``; ``began`` is set when it pushed an image."""
+        with self._health_lock:
+            self._failures = 0
+            self._last_ok = finished
+            if began is not None:
+                self._draw_s.append(finished - began)
+
+    def health(self) -> OverlayHealth:
+        alive = self.thread.is_alive() and bool(self._windows) and not self._abandoned
+        try:
+            from . import keyboard_render
+
+            keyboard_ok = bool(keyboard_render.font_available()) and self._keyboard is not None
+        except Exception:  # noqa: BLE001 - Pillow missing or broken: no keyboard, but the reticle may still work
+            keyboard_ok = False
+        with self._health_lock:
+            failures, last_ok, samples = self._failures, self._last_ok, list(self._draw_s)
+        age = None if last_ok is None else max(0.0, clock.now() - last_ok)
+        draw_ms = statistics.median(samples) * 1000.0 if len(samples) >= HEALTH_SAMPLES else None
+        return OverlayHealth(alive, failures, age, keyboard_ok, draw_ms)
 
     # ----- any thread
 
@@ -602,6 +720,7 @@ class _Ui:
             return
         if not self.api.user32.PostMessageW(hwnd, WM_OVERLAY_WAKE, 0, 0):
             self.mailbox.wake_failed()
+            self._note_failure()  # the state cannot be drawn: that is a failed draw
             self._failed(f"PostMessageW failed with Windows error {_last_error()}")
 
     def stop(self, timeout: float) -> None:
@@ -668,6 +787,7 @@ class _Ui:
         self._class_registered = True
         self._main = _Layer(api, self._create_window("Jarvis hands reticle"))
         self._helper = _Layer(api, self._create_window("Jarvis hands reticle (second hand)"))
+        self._keyboard = _Layer(api, self._create_window("Jarvis hands keyboard"))
         if not api.user32.SetTimer(self._main.hwnd, _TIMER_ID, TOPMOST_INTERVAL_MS, None):
             raise _fail("SetTimer")
 
@@ -702,16 +822,14 @@ class _Ui:
                 return 0
             if msg == WM_TIMER and wparam == _TIMER_ID:
                 self._dpi.clear()
-                for layer in (self._main, self._helper):
-                    if layer is not None:
-                        layer.keep_on_top()
+                for layer in self._layers():
+                    layer.keep_on_top()
                 return 0
             if msg in (WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE):
                 # Only note it and redraw from the queue: WM_DPICHANGED can arrive inside our own update.
                 self._dpi.clear()
-                for layer in (self._main, self._helper):
-                    if layer is not None:
-                        layer.invalidate()
+                for layer in self._layers():
+                    layer.invalidate()
                 self.submit(self.mailbox.state)
                 if msg == WM_DPICHANGED:
                     return 0  # we size ourselves; do not take the suggested rect
@@ -724,34 +842,86 @@ class _Ui:
                 self.api.user32.PostQuitMessage(0)
                 return 0
         except Exception as exc:  # noqa: BLE001 - _failed logs it; the windows must keep working
-            self._failed(f"handling message 0x{msg:04X} failed: {exc}", exc_info=True)
+            self._failed(f"handling message 0x{msg:04X} failed: {_exc_text(exc)}", exc_info=True)
         return int(self.api.user32.DefWindowProcW(hwnd, msg, wparam, lparam))
 
     def _on_wake(self) -> None:
         state, seq = self.mailbox.take()
+        began = clock.now()
         try:
-            self._draw(state)
+            pushed = self._draw(state)
         except Exception as exc:  # noqa: BLE001 - _failed logs it; the next state tries again
-            self._failed(f"drawing the reticle failed: {exc}", exc_info=True)
+            self._note_failure()
+            what = "keyboard" if state.keyboard is not None else "reticle"
+            self._failed(f"drawing the {what} failed: {_exc_text(exc)}", exc_info=True)
+        else:
+            finished = clock.now()
+            # Only a draw that pushed an image says what a push costs; the early return for an unchanged image
+            # and a hide take no time at all, and counting them would hide the cost the median is there to show.
+            self._note_ok(finished, began if pushed else None)
         finally:
             self.mailbox.drawn(seq)
 
-    def _draw(self, state: OverlayState) -> None:
-        main, helper = self._main, self._helper
-        if main is None or helper is None:
-            return
+    def _draw(self, state: OverlayState) -> bool:
+        """Draws ``state``; True when an image was pushed to a window (False: nothing changed, or it only hid)."""
+        main, helper, keyboard = self._main, self._helper, self._keyboard
+        if main is None or helper is None or keyboard is None:
+            return False
+        if state.keyboard is not None:
+            main.hide()
+            helper.hide()
+            return self._draw_keyboard(keyboard, state.keyboard)
+        if keyboard.visible or self._keyboard_drawn:
+            self._leave_keyboard(keyboard)
         cursor = state.cursor
         if state.mode == "hidden" or cursor is None or not _finite(cursor):
             main.hide()
             helper.hide()
-            return
+            return False
         size = reticle_size(state.mode, self._dpi_at(cursor))
-        main.show(render(state, size), top_left(cursor, size))
+        pushed = main.show(render(state, size), top_left(cursor, size))
         if state.helper is not None and _finite(state.helper):
             marker = helper_size(self._dpi_at(state.helper))
-            helper.show(render_helper(marker), top_left(state.helper, marker))
+            pushed = helper.show(render_helper(marker), top_left(state.helper, marker)) or pushed
         else:
             helper.hide()
+        return pushed
+
+    def _draw_keyboard(self, layer: _Layer, view: KeyboardView) -> bool:
+        from . import keyboard_render as kr
+
+        self._keyboard_drawn = True
+        # Before the first frame is pushed, so that not one frame of a private keyboard is ever capturable.
+        if view.exclude_capture != self._capture_wanted:
+            self._capture_wanted = view.exclude_capture
+            if not layer.set_capture_excluded(view.exclude_capture) and not self._capture_refused:
+                self._capture_refused = True
+                log.warning("overlay: could not change the keyboard's capture exclusion (logged once)")
+        work = view.work
+        try:
+            dpi = self._dpi_at(Point(work[0] + work[2] / 2, work[1] + work[3] / 2))
+            geometry, origin = kr.keyboard_geometry(work, view.size, dpi, view.dock, view.commit)
+            image = kr.compose(kr.bake_base(view.lang, view.shift, geometry, view.commit), geometry, view)
+        except kr.KeyboardDrawError as exc:
+            self.keyboard_error = exc.code
+            raise
+        except Exception:  # noqa: BLE001 - the painter's own text may be typed text: only the code leaves
+            # Whatever else came out of the painter may carry what was being drawn: say only that it failed.
+            self.keyboard_error = "internal"
+            raise kr.KeyboardDrawError("internal") from None
+        pushed = layer.show(image, origin)
+        self.keyboard_error = None
+        return pushed
+
+    def _leave_keyboard(self, layer: _Layer) -> None:
+        """No keyboard any more: hide it, free its surface, forget the painter's frame and sprites (typed text)."""
+        try:
+            layer.hide()
+        finally:
+            layer.release_surface()
+            _forget_keyboard_pixels()
+            if not layer.visible:
+                self._keyboard_drawn = False
 
     def _dpi_at(self, p: Point) -> int:
         """The effective DPI of the monitor nearest ``p`` (cached per monitor; cleared every second)."""
@@ -795,9 +965,11 @@ class _Ui:
             self.mailbox.close()
             if self._windows:
                 self._destroy_windows()
-            for layer in (self._main, self._helper):
-                if layer is not None:
-                    layer.release_surface()
+            for layer in self._layers():
+                layer.release_surface()
+            if self._keyboard_drawn:
+                _forget_keyboard_pixels()
+                self._keyboard_drawn = False
             if self._class_registered:
                 if not self.api.user32.UnregisterClassW(self.class_name, self._hinstance):
                     log.debug("UnregisterClassW failed with Windows error %d", _last_error())
@@ -868,13 +1040,44 @@ class WindowsOverlay:
         except Exception:
             log.debug("overlay close failed", exc_info=True)
 
+    def health(self) -> OverlayHealth:
+        """Whether the overlay draws and how recently (the keyboard controller reads this with ``overlay_health``).
+
+        Not part of the ``Overlay`` protocol. Never raises: an overlay that cannot say is reported as not alive.
+        """
+        ui = self._ui
+        if ui is not None:
+            try:
+                return ui.health()
+            except Exception:
+                log.debug("overlay health failed", exc_info=True)
+        return OverlayHealth(alive=False, failures=0, ok_age_s=None, keyboard_ok=False)
+
     # ----- for tests and diagnostics
 
     @property
     def hwnds(self) -> tuple[int, ...]:
-        """The main and helper windows' handles while started, else ()."""
+        """The reticle's two windows' handles (main and helper) while started, else ()."""
         ui = self._ui
         return ui.hwnds if ui is not None else ()
+
+    @property
+    def keyboard_hwnd(self) -> int | None:
+        """The keyboard window's handle while started, else None."""
+        ui = self._ui
+        return ui.keyboard_hwnd if ui is not None else None
+
+    @property
+    def keyboard_error(self) -> str | None:
+        """The code of the keyboard's last draw error (``font``, ``surface``, ``size``, ``internal``), or None."""
+        ui = self._ui
+        return ui.keyboard_error if ui is not None else None
+
+    @property
+    def capture_excluded(self) -> bool:
+        """Windows has agreed to keep the keyboard window out of captures."""
+        ui = self._ui
+        return ui.capture_excluded if ui is not None else False
 
     @property
     def draw_error(self) -> str | None:
