@@ -6,9 +6,10 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - **Fish Audio voice.** Replies are spoken sentence by sentence as Claude writes them, through Fish Audio's streaming text-to-speech, in the voice you pick.
 - **Hands-free.** Say "Hey Jarvis" (or just "Jarvis", once you switch it on) and talk; talk over him to interrupt.
 - **HUD.** An arc reactor ring in a pane beside the conversation shows Jarvis standing by, listening, thinking and speaking, with what you said and what Claude is running.
-- **Later:** control of your PC with permission tiers.
+- **Home devices.** Ask Jarvis to control your Apple TV, Sony Bravia TV, Tuya devices (Tuya Smart or Smart Life app) and Home Assistant, over your home network, or to find a movie or the next episode on your Plex server and open it on the Apple TV. See [docs/HOME.md](docs/HOME.md).
+- **PC control.** Ask Jarvis to open an app, a folder or a link, press the media keys, set the volume or a timer. A guard reads every command Claude runs: it asks you before risky ones and blocks the worst. See [docs/PC-CONTROL.md](docs/PC-CONTROL.md).
 
-> **Status: phase 3 of 4 ("HUD").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. Expect rough edges; see the [roadmap](#roadmap).
+> **Status: phase 4 of 4 ("Hands").** Hands-free voice (with an optional plain "Jarvis" wake word), barge-in, echo cancelling for speakers and the HUD work on Windows. PC control is new and still being checked on real PCs. Expect rough edges; see the [roadmap](#roadmap).
 
 ## Contents
 
@@ -18,6 +19,8 @@ A JARVIS-style voice assistant mod for [Claude Code](https://code.claude.com). H
 - [Local voice (optional)](#local-voice-optional)
 - [Using Jarvis](#using-jarvis)
 - [Hand control (preview)](#hand-control-preview)
+- [Home devices](#home-devices)
+- [PC control](#pc-control)
 - [Commands](#commands)
 - [Settings](#settings)
 - [How it works](#how-it-works)
@@ -195,7 +198,7 @@ npm start
 Your webcam can drive the mouse and windows: point with your hand, pinch to click and drag files, make a fist to grab a window and fling it to another screen. It runs on Windows, needs a webcam, and is off until you turn it on.
 
 1. Install it once: `/jarvis setup hands` (about 500 MB: MediaPipe and OpenCV in `%USERPROFILE%\.jarvis\hands`, and an 8 MB hand model in `%USERPROFILE%\.jarvis\models\hands`).
-2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control". The camera light comes on.
+2. Turn it on: `/jarvis hands on`, or say "Jarvis, turn on hand control" and answer yes when Jarvis asks. The camera light comes on.
 3. Hold an open palm toward the camera, still, for half a second. A cyan ring appears at the cursor, which now follows your hand.
 
 | Gesture | What it does |
@@ -212,13 +215,82 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 
 - Sit so the camera sees your hand at chest height with your elbow down; small movements cover the whole screen.
 - `/jarvis hands calibrate` fits the mapping to your reach: hold an open palm still on each corner target as it appears.
+- Cursor too fast, too jumpy, or pinches missed? `/jarvis hands tune` and the presets change how it feels ([Tuning the feel](#tuning-the-feel)).
 - `/jarvis hands pause` turns the camera off without turning hand control off. It stays paused when the helper restarts and in new sessions, until `/jarvis hands resume`, `on` or `off`.
 - Some webcams take up to about 20 seconds to open. If the camera is still opening when `/jarvis hands resume` answers, it says so, and a message follows when the camera is on or why it could not open.
-- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed) or "take the cursor away from my hand".
+- You can ask Claude too: "turn on hand control", "pause hand control", "calibrate my hands", "put hand control on display 2", "let my hand take the cursor" (no open palm needed), "take the cursor away from my hand", "make the cursor faster" or "use the precise preset". Jarvis asks you first (a spoken yes when you talk, else a click) unless your own permission rules allow `mcp__jarvis__hands`, and a deny rule refuses it. That includes a change to how it feels, which names the setting and its new value. In plan mode Claude can only check its status or read a setting. [docs/PC-CONTROL.md](docs/PC-CONTROL.md#hand-controls-tool) has the details.
 - Hand control runs in one Claude Code window at a time, since one camera can serve only one. In another window `/jarvis hands` says where it runs; turning it off there and running `/jarvis hands restart` brings it to this window.
 - Displays are reached the way Windows arranges them, so a projector set to the right of your monitor is reached by moving your hand right. Virtual displays (virtual display drivers and streaming dummies) are left out; USB display adapters count as real displays. `/jarvis hands display 1` keeps your hand on one display, and a display you leave out takes none of your reach.
 - Windows run as administrator can't be clicked, moved or resized by hand control (Windows blocks it). Jarvis says so once when you grab one; a pinch on one does nothing.
-- `/jarvis hands` shows the camera, the displays and the gestures. The camera picture never leaves your computer.
+- `/jarvis hands` shows the camera, the displays, how the feel is tuned and the gestures. The camera picture never leaves your computer.
+
+### Tuning the feel
+
+The defaults suit most hands and rooms. Nine settings change how hand control feels:
+
+- `/jarvis hands tune` lists them with their value, default and range.
+- `/jarvis hands set <name> <number>` changes one, for example `/jarvis hands set speed 1.4`. A name alone (`/jarvis hands set speed`) shows it.
+- `/jarvis hands set <name> default` puts one back, and `/jarvis hands reset` puts them all back.
+- A change applies at once, but never moves what you are holding: a click, a drag or a grab goes on as it was, and the new value takes over when you let go. A change is remembered for new sessions.
+- A number outside the range is refused, not trimmed, and nothing changes.
+
+You can ask Claude instead: "make the cursor faster", "my clicks turn into drags". It reads the setting, changes it by a small step and tells you the new value; Jarvis asks you first, as for anything else Claude does with hand control. Four settings are also plugin settings (`handCursorSpeed`, `handSmoothing`, `handPinch`, `handScrollSpeed`; see [Settings](#settings)). They give the default, and `/jarvis hands set` overrides one until that plugin setting is changed.
+
+| Setting | What it changes | Range | Default |
+| --- | --- | --- | --- |
+| `speed` | How far the cursor goes for a hand movement. Higher: less hand travel crosses the screen. | 0.7 to 3 | 1 |
+| `smoothing` | Steadiness against lag. Higher: steadier at rest, more lag when you move. | 0.2 to 3 | 1 |
+| `dead-zone` | Pixels the cursor must move before it follows. Higher: steadier at rest, coarser small moves. | 0 to 8 px | 1 px |
+| `pinch` | How close thumb and finger must be to click. Higher: a lighter, looser pinch counts, and may click by accident. | 0.85 to 1.15 | 1 |
+| `drag-distance` | How far your hand may drift during a pinch before it becomes a drag. Higher: steadier clicks, and a drag starts later. | 0.7 to 4 | 1 |
+| `fist` | How tightly your fingers must curl to grab a window. Higher: a looser fist counts. | 0.9 to 1.1 | 1 |
+| `fling` | How light a flick throws a grabbed window. Higher: a lighter flick throws it. | 0.5 to 2.5 | 1 |
+| `scroll-speed` | How far a scroll gesture scrolls. Higher: faster. | 0.1 to 10 | 1 |
+| `engage-time` | Seconds an open palm is held still to take the cursor. Higher: slower to start. | 0.1 to 2 s | 0.5 s |
+
+The ranges end where hand control stops working well. A pinch looser than 1.15, for example, starts to read a relaxed open palm as a pinch. Change one setting at a time, in small steps, and try it before you change the next.
+
+**Presets.** `/jarvis hands preset <name>` sets several at once; with no name it lists them. A preset is a whole profile: a setting it does not name goes back to its default. `/jarvis hands` shows which preset is in force, or "custom" when you changed settings one by one.
+
+| Preset | Sets | Feels like |
+| --- | --- | --- |
+| `precise` | speed 0.8, smoothing 1.8, dead-zone 2, drag-distance 1.5, pinch 0.9 | Slower and steadier, for small targets. It needs a firmer pinch and a drag starts later. |
+| `balanced` | Every setting at its default | The behaviour you start with. |
+| `fast` | speed 1.6, smoothing 0.5, dead-zone 0, pinch 1.1 | Less hand travel and little lag. The cursor is jumpier at rest, so raise smoothing or dead-zone if it twitches. |
+
+Some things to try:
+
+- **The cursor is jumpy when your hand rests.** Raise smoothing a step (`/jarvis hands set smoothing 1.5`). If it still twitches, raise the dead zone (`/jarvis hands set dead-zone 3`).
+- **The cursor lags behind your hand.** Lower smoothing (`0.6`), and the dead zone if you raised it.
+- **Your hand has to travel too far, or the cursor is too touchy for small targets.** Raise speed (`1.4`) for less travel; lower it (`0.8`) for finer control.
+- **Pinches are missed.** Raise pinch (`1.1`). Clicks that happen by accident: lower it (`0.9`).
+- **Clicks turn into small drags.** Raise drag-distance (`1.5`).
+- **A palm takes the cursor too slowly or too easily.** Lower engage-time (`0.3`) or raise it (`1`).
+- **Windows fly off when you let go of a fist, or do not fly when you flick.** Lower fling (`0.7`) or raise it (`1.5`).
+- **Scrolling is too slow or too fast.** Raise scroll-speed (`2`) or lower it (`0.5`).
+
+## Home devices
+
+Jarvis can control your TVs and smart home: "turn on the TV and open Netflix on the Apple TV", "dim the bedroom lights to 30 percent", "run movie night". It supports Apple TV, Sony Bravia TVs, Tuya devices from the Tuya Smart or Smart Life app (Fingerbots too, through a Tuya gateway), and anything Home Assistant controls, and talks to them directly on your home network. It can also look up a title on your own Plex Media Server and have the Apple TV open it. It can't reach Apple Home from Windows; see [Siri and Apple Home](docs/HOME.md#siri-and-apple-home).
+
+Run `/jarvis home setup`, or say "open home setup". A setup window opens where you add each device. PINs, keys and tokens are typed there, never into the chat, and are kept encrypted for your Windows account. Unlocking a lock, disarming an alarm and opening a garage door need your OK on screen first.
+
+Jarvis runs device commands without a question, like a remote control's button. To have it ask on screen first, add `mcp__jarvis__home_control` to `ask` in your Claude Code settings; a lock, an alarm or a garage door always asks. See [What Jarvis asks you first](docs/HOME.md#what-jarvis-asks-you-first).
+
+To see which smart devices are on your network and which ones Jarvis can control, run `/jarvis home scan` or ask "what smart devices are on my network?"
+
+[docs/HOME.md](docs/HOME.md) has the one-time steps for each kind of device, where everything is stored, and troubleshooting.
+
+## PC control
+
+Jarvis can work your Windows PC from a spoken request: "open Spotify and play my focus playlist", "turn the volume down", "set a tea timer for 4 minutes". Claude gets a desktop tool with a few narrow actions (open an app, a folder or a link, bring a window to the front, the media and volume keys, a screenshot, locking the PC, the clipboard, timers); for anything else it uses PowerShell.
+
+- **The guard.** Every PowerShell, Bash and Monitor command Claude runs, and every edit to Claude Code's own settings, passes Jarvis's guard first. Risky commands wait for your OK: a click on screen or, for some, a spoken yes in a voice conversation. A short list is blocked outright, such as turning off Windows Defender or formatting a disk. The guard only ever makes Claude Code stricter: Claude Code's own rules and prompts still apply after it.
+- **The desktop tool** asks you on screen before each action unless your own rules allow `mcp__jarvis__desktop`, and always asks before reading the clipboard or taking a screenshot.
+- **Never as administrator.** Jarvis stays off while Claude Code runs as administrator.
+- `/jarvis pc stop`, or saying "Jarvis, stand down", stops speech, the running turn and the background commands Jarvis saw start.
+
+[docs/PC-CONTROL.md](docs/PC-CONTROL.md) has the tiers, what the guard is and isn't, the rules to paste into your settings, and what to check on your PC.
 
 ## Commands
 
@@ -239,6 +311,8 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 | `/jarvis focus [on\|off]` | Focus mode: while Jarvis runs, only the HUD and the prompt show. |
 | `/jarvis app [on\|off]` | Whether the Jarvis app is connected. `off` stops sending it the HUD, in new sessions too; `on` sends it again. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
+| `/jarvis home [setup\|list\|status\|do\|scan]` | Home devices: what is set up, open the setup window, list devices, show one device's state, run one command, or search your network for smart devices. See [docs/HOME.md](docs/HOME.md#commands). |
+| `/jarvis pc [check <command>\|rules\|stop]` | PC control: the guard's state, which tier a command falls in, permission rules to paste into your settings, or stand down. See [docs/PC-CONTROL.md](docs/PC-CONTROL.md#commands). |
 | `/jarvis restart` | Restart the voice helper. |
 | `/jarvis setup hands` | Install hand control (MediaPipe, OpenCV and the hand model). |
 | `/jarvis hands [on\|off]` | Hand control status, or turn it (and the camera) on or off. |
@@ -246,6 +320,10 @@ Your webcam can drive the mouse and windows: point with your hand, pinch to clic
 | `/jarvis hands display <n\|all>` | The displays your hand reaches (a list such as `1,2` works). |
 | `/jarvis hands engage <palm\|always>` | Start with an open palm (default), or let any hand take the cursor at once. |
 | `/jarvis hands camera <n\|name>` | The camera to use: its number or part of its name. |
+| `/jarvis hands tune` | Every hand control setting with its value, default and range, and what a higher value does ([Tuning the feel](#tuning-the-feel)). |
+| `/jarvis hands set <name> <number\|default>` | Change one setting: `speed`, `smoothing`, `dead-zone`, `pinch`, `drag-distance`, `fist`, `fling`, `scroll-speed` or `engage-time`. A name alone shows it. |
+| `/jarvis hands preset [precise\|balanced\|fast]` | Set several at once; the settings a preset does not name go back to their defaults. With no name, lists the presets. |
+| `/jarvis hands reset [name]` | Put every setting (or one) back to its default. |
 | `/jarvis hands pause\|resume\|restart` | Turn the camera off and on, or restart the hand helper. |
 
 ## Settings
@@ -269,7 +347,11 @@ Change these with `/plugin configure jarvis@jarvis-claude-mod`, from the `/plugi
 | `language` | `en` | Language code for speech-to-text, such as `en`, `de` or `he`. English-only models (`.en`) ignore it. |
 | `handControl` | `off` | `on` watches your hands through the webcam (after `/jarvis setup hands`). `/jarvis hands on\|off` changes it too. |
 | `handCamera` | empty | The webcam for hand control: its number or part of its name, such as `UGREEN`. Empty means the first camera. |
-| `handEngage` | `palm` | `palm`: hold an open palm still to take the cursor. `always`: any hand in view takes it at once. |
+| `handEngage` | `palm` | `palm`: hold an open palm still to take the cursor (half a second by default; `/jarvis hands set engage-time` changes it). `always`: any hand in view takes it at once. |
+| `handCursorSpeed` | `1` | How fast the cursor follows your hand, from 0.7 to 3. Higher is faster, with less hand travel to cross the screen. `/jarvis hands set speed` overrides it until this setting is changed. |
+| `handSmoothing` | `1` | How much the cursor is smoothed, from 0.2 to 3. Higher is steadier at rest but lags more when you move; lower is snappier but jitters more. `/jarvis hands set smoothing` overrides it until this setting is changed. |
+| `handPinch` | `1` | How close thumb and finger must be for a pinch click, from 0.85 to 1.15. Higher counts a lighter, looser pinch (and may click by accident); lower needs a firmer pinch. `/jarvis hands set pinch` overrides it until this setting is changed. |
+| `handScrollSpeed` | `1` | How far a scroll gesture scrolls, from 0.1 to 10. Higher scrolls faster. `/jarvis hands set scroll-speed` overrides it until this setting is changed. |
 
 ## How it works
 
@@ -309,6 +391,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 - **Your audio stays on your computer.** The wake word, speech detection and transcription all run locally. While Jarvis runs, the helper keeps the microphone open (Windows shows Python using the microphone) and listens for the wake word ("Hey Jarvis", and plain "Jarvis" too once you switch it on), holding only the last 2 seconds in memory. Nothing is recorded, transcribed or kept until it hears the wake word, you hold push-to-talk, you speak in the few seconds after a reply, or you talk over Jarvis while he speaks. With plain "Jarvis" on, a clip that woke it is transcribed on your computer and dropped unless it starts with "Jarvis", so a sound-alike such as "Travis" goes nowhere. Audio is never written to disk. `/jarvis wake off` turns the wake word off.
 - **Transcripts go to Claude as your prompt**, the same way typed messages do, and are handled like any other Claude Code message. With model routing on, each one also goes to Haiku, through the same Claude Code connection, to choose the model.
 - **Only text goes to Fish Audio**: the sentences Jarvis speaks, sent with your API key to produce the audio. Fish Audio's own terms and privacy policy apply to that text.
+- **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Tuya scenes, the one-time Tuya account link and, only if you turn it on, Tuya's cloud fallback for devices that don't answer at home. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
 - **Hand control uses the camera only while it is on.** The hand helper reads each frame, finds your hands on your own computer (MediaPipe, on the CPU) and drops the frame; no picture is stored or sent anywhere. Jarvis pins MediaPipe 0.10.33, the newest version that sends Google no usage statistics. The camera light is on while hand control watches, and off after `/jarvis hands pause` or `off`.
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log` (hand control: `hands.log`). API keys and tokens are masked in it.
 - **The Jarvis app**, if you run it, receives the HUD from the plugin over `127.0.0.1` with a token only the two of them know, and makes no network requests of its own.
@@ -330,7 +413,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 | `JARVIS · active in another window` | Another Claude Code window has the helper. Close that window, then run `/jarvis` here. |
 | Hand control: "camera blocked" | Settings > Privacy & security > Camera: turn on **Camera access** and **Let desktop apps access your camera**, then `/jarvis hands restart`. |
 | Hand control: "camera in use" | Another app (Teams, Zoom, the Camera app, OBS) has the webcam. Close it, then `/jarvis hands restart`. |
-| Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. |
+| Hand control misses pinches or the cursor jitters | Light your hand from the front, keep it 40 to 80 cm from the camera, and run `/jarvis hands calibrate`. Then tune it: raise `pinch` for missed pinches, raise `smoothing` and then `dead-zone` for a jittery cursor ([Tuning the feel](#tuning-the-feel)). |
 | Slow transcription | Without an NVIDIA GPU, use `small.en` or `base.en`. With one, run `/jarvis setup` again so it installs the CUDA libraries. |
 
 More detail, including logs and running the helper by hand, is in [docs/DEVELOPING.md](docs/DEVELOPING.md).
@@ -352,9 +435,11 @@ If you ran the Jarvis app, untick **Start with Windows** in its tray menu first,
 | 1 (done) | Talking Jarvis | Push-to-talk, local speech-to-text, Fish Audio speech, the JARVIS persona for voice turns, `/jarvis` commands, an optional local voice. |
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
-| 4 | Hands | Control of your PC (apps, windows, files) behind permission tiers, with a guard on risky tool calls. |
+| 4 (now) | Hands | Now: a guard on Claude's commands and edits, with spoken and on-screen confirmations, and the desktop tool ([docs/PC-CONTROL.md](docs/PC-CONTROL.md)). Next: checking it on real PCs. |
 | App | Jarvis app | Step A1 (now): a desktop app that shows the HUD over your screen while Claude Code runs, with an orb, a tray icon and Ctrl+Alt+J ([docs/APP.md](docs/APP.md)). Next: the app runs the voice helper itself, so Jarvis listens from the moment Windows starts. |
-| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview). Next: tuning on a real desk, then a projector wall mode. |
+| Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview), with settings for how it feels. Next: tuning on a real desk, then a projector wall mode. |
+
+Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).
 
 Not scheduled yet: macOS support, a hardened mode, and signed releases.
 

@@ -2,7 +2,10 @@
 // python, where uv is, how to install it, and the persona's OS paragraph.
 // Windows is the phase 1 target; macOS and Linux get working defaults.
 
+import type { ProcessRunResult } from 'claude-code'
+
 import type { Engine, EnvSnapshot } from './engine'
+import { describeError } from './engine'
 
 export type OsKind = 'windows' | 'macos' | 'linux'
 
@@ -184,4 +187,114 @@ export function withLoopbackNoProxy(current: string | undefined): string {
     if (!entries.includes(host)) entries.push(host)
   }
   return entries.join(',')
+}
+
+/** True on Windows: `OS=Windows_NT` is set on every Windows process. */
+export function isWindowsEnv(env: EnvSnapshot): boolean {
+  return env.OS === 'Windows_NT'
+}
+
+// ---- Administrator rights and UAC (docs/PC-CONTROL.md) ----
+
+/** Windows' UAC level, as its policy values set it; `standard-account` when the user is no administrator. */
+export type UacLevel = 'off' | 'never-notify' | 'default' | 'default-no-dim' | 'always-notify' | 'admin-protection' | 'standard-account'
+
+/** What the administrator check found. */
+export type AdminFacts = {
+  /** Claude Code runs with an administrator's (or root's) full rights, and so does every command it starts. */
+  isElevated: boolean
+  /** Windows: the user is in the Administrators group, so an admin step needs only a click on the UAC prompt. */
+  isAdminAccount?: boolean
+  /** Windows: the UAC level; undefined when the policy could not be read. */
+  uacLevel?: UacLevel
+}
+
+/** The mandatory labels of an elevated (High) and a SYSTEM token. */
+const ELEVATED_SIDS = ['S-1-16-12288', 'S-1-16-16384']
+/** BUILTIN\Administrators: in an administrator's token whether elevated or not (then "for deny only"). */
+const ADMINISTRATORS_SID = 'S-1-5-32-544'
+const UAC_POLICY_KEY = 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'
+const ADMIN_PROBE_TIMEOUT_MS = 5000
+
+/** The SIDs `whoami /groups /fo csv /nh` lists. Group names are translated; SIDs are not. */
+export function parseWhoamiGroups(csv: string): Set<string> {
+  return new Set(csv.match(/S-1-[0-9-]*[0-9]/g) ?? [])
+}
+
+/**
+ * The UAC level from `reg query` of the UAC policy key, read from its
+ * REG_DWORD values (never translated); undefined when they are not there.
+ */
+export function parseUacPolicy(text: string): Exclude<UacLevel, 'standard-account'> | undefined {
+  const values = new Map<string, number>()
+  for (const match of text.matchAll(/^\s*(\w+)\s+REG_DWORD\s+0x([0-9a-f]+)\s*$/gim)) {
+    values.set((match[1] ?? '').toLowerCase(), Number.parseInt(match[2] ?? '', 16))
+  }
+  if (values.get('enablelua') === 0) return 'off'
+  if (values.get('typeofadminapprovalmode') === 2) return 'admin-protection'
+  const consent = values.get('consentpromptbehavioradmin')
+  if (consent === undefined) return undefined
+  if (consent === 0) return 'never-notify'
+  if (consent === 5) return values.get('promptonsecuredesktop') === 0 ? 'default-no-dim' : 'default'
+  return 'always-notify' // 1 to 4: every elevation asks
+}
+
+/**
+ * Windows's own System32 folder: the programs there are run by full path, so
+ * another `whoami` earlier on PATH (Git's, from Git Bash) cannot answer.
+ */
+export function system32(systemRoot: string | undefined): string {
+  const root = systemRoot !== undefined && /^[A-Za-z]:\\[^"<>|?*]*$/.test(systemRoot) ? systemRoot.replace(/\\+$/, '') : 'C:\\Windows'
+  return `${root}\\System32`
+}
+
+/**
+ * The system's own `id`, by full path (a program of that name earlier on PATH
+ * cannot answer): /usr/bin/id, else /bin/id on a system without it.
+ */
+const ID_PROGRAMS = ['/usr/bin/id', '/bin/id']
+
+/**
+ * `id -u` by the first of ID_PROGRAMS that runs, all of them within the one
+ * time limit; throws when none does in time.
+ */
+async function runId(engine: Engine): Promise<ProcessRunResult> {
+  const deadline = (await engine.now()) + ADMIN_PROBE_TIMEOUT_MS
+  const failures: string[] = []
+  for (const program of ID_PROGRAMS) {
+    const timeoutMs = Math.floor(deadline - (await engine.now()))
+    if (timeoutMs <= 0) break
+    try {
+      return await engine.run([program, '-u'], { timeoutMs })
+    } catch (error) {
+      failures.push(`${program}: ${describeError(error)}`)
+    }
+  }
+  throw new Error(`id -u could not run (${failures.join('; ')})`)
+}
+
+/**
+ * Whether Claude Code runs elevated and, on Windows, the UAC level: the
+ * token's groups from `whoami`, the policy from `reg query`. macOS and
+ * Linux check for root. Throws when it cannot tell, or when either Windows
+ * command fails or times out: the check fails closed.
+ */
+export async function probeAdmin(engine: Engine, platform: Platform): Promise<AdminFacts> {
+  if (platform.os !== 'windows') {
+    const { exitCode, stdout } = await runId(engine)
+    if (exitCode !== 0 || !/^\d+$/.test(stdout.trim())) throw new Error(`id -u exited with ${exitCode}`)
+    return { isElevated: stdout.trim() === '0' }
+  }
+  const init = { timeoutMs: ADMIN_PROBE_TIMEOUT_MS }
+  const folder = system32((await engine.env()).SystemRoot)
+  const [groups, policy] = await Promise.all([
+    engine.run([`${folder}\\whoami.exe`, '/groups', '/fo', 'csv', '/nh'], init),
+    engine.run([`${folder}\\reg.exe`, 'query', UAC_POLICY_KEY], init),
+  ])
+  const sids = parseWhoamiGroups(groups.stdout)
+  if (groups.exitCode !== 0 || sids.size === 0) throw new Error(`whoami /groups exited with ${groups.exitCode}`)
+  if (policy.exitCode !== 0) throw new Error(`reg query of the UAC policy exited with ${policy.exitCode}`)
+  const isAdminAccount = sids.has(ADMINISTRATORS_SID)
+  const uacLevel = !isAdminAccount ? 'standard-account' : parseUacPolicy(policy.stdout)
+  return { isElevated: ELEVATED_SIDS.some(sid => sids.has(sid)), isAdminAccount, ...(uacLevel === undefined ? {} : { uacLevel }) }
 }

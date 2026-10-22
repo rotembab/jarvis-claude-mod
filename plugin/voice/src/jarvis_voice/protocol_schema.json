@@ -52,7 +52,9 @@
         "id": { "type": "string" }, "text": { "type": "string", "minLength": 1 },
         "source": { "$ref": "#/$defs/UtteranceSource" },
         "durationMs": { "type": "integer", "minimum": 0 },
-        "language": { "type": "string" }
+        "language": { "type": "string" },
+        "startedAtMs": { "type": "integer", "minimum": 0, "description": "when the user began speaking (the push-to-talk press, or where the listener heard the voice begin), on the helper's own millisecond clock" },
+        "overSpeech": { "type": "boolean", "description": "the clip began while Jarvis was audible: it cut him off" }
       }
     },
     "SpeechStartedEvent": {
@@ -65,7 +67,8 @@
       "required": ["v", "type", "replyId", "interrupted", "spokenText"],
       "properties": {
         "v": { "$ref": "#/$defs/v" }, "type": { "const": "speech_done" },
-        "replyId": { "type": "string" }, "interrupted": { "type": "boolean" }, "spokenText": { "type": "string" }
+        "replyId": { "type": "string" }, "interrupted": { "type": "boolean" }, "spokenText": { "type": "string" },
+        "endedAtMs": { "type": "integer", "minimum": 0, "description": "when the reply's speech ended (played out or stopped), on the helper's own millisecond clock" }
       }
     },
     "BargeInEvent": {
@@ -120,6 +123,17 @@
       "type": "object", "additionalProperties": false, "required": ["action"],
       "properties": { "action": { "enum": ["start", "stop"] } }
     },
+    "DesktopCommand": {
+      "type": "object", "additionalProperties": false, "required": ["action"],
+      "properties": {
+        "action": { "enum": ["open", "focus", "media", "volume", "screenshot", "lock", "clipboard_read", "clipboard_write"] },
+        "target": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "key": { "enum": ["play_pause", "next", "previous", "stop"] },
+        "level": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "change": { "enum": ["up", "down", "mute", "unmute"] },
+        "text": { "type": "string", "maxLength": 20000 }
+      }
+    },
     "ConfigCommand": {
       "type": "object", "additionalProperties": false,
       "properties": {
@@ -134,6 +148,18 @@
     "StatusCommand": { "type": "object", "additionalProperties": false, "properties": {} },
     "TestVoiceCommand": { "type": "object", "additionalProperties": false, "properties": { "text": { "type": "string", "maxLength": 1000 } } },
     "ShutdownCommand": { "type": "object", "additionalProperties": false, "properties": {} },
+    "HomeCommand": {
+      "type": "object", "additionalProperties": false, "required": ["action"],
+      "description": "Home control (the mod's home_control tool). list: the devices and their commands; status: one device's state; do: run a command; info: what is set up and where it is saved; scan: look for smart devices on the home network (read-only, about 10 s); reload: drop cached connections and re-read devices.json. Answered with the home fields of CommandResponse.",
+      "properties": {
+        "action": { "enum": ["list", "status", "do", "info", "scan", "reload"] },
+        "device": { "type": "string", "minLength": 1, "maxLength": 200, "description": "status, do: a device id, name, alias or room and name" },
+        "command": { "type": "string", "minLength": 1, "maxLength": 64, "description": "do: e.g. turn_on, set_volume, launch_app" },
+        "value": { "type": ["string", "number", "boolean"], "maxLength": 500, "description": "do: the command's value (a level, an app name, a colour)" },
+        "query": { "type": "string", "maxLength": 200, "description": "list: only devices whose name, room or kind match" },
+        "confirmed": { "type": "boolean", "description": "do: the user confirmed it on screen; the mod sets it after a 'confirm' answer" }
+      }
+    },
 
     "CommandResponse": {
       "type": "object",
@@ -145,10 +171,20 @@
           "properties": { "code": { "$ref": "#/$defs/ErrorCode" }, "message": { "type": "string" } }
         },
         "stopped": { "type": "boolean", "description": "stop: true when a reply was playing or queued" },
+        "desktop": { "type": "object", "description": "desktop: { result: done|failed|refused|unsupported, text, path?, clipboard? }" },
         "dropped": { "type": "boolean", "description": "speak: the sentence was ignored (stopped or finished reply, duplicate seq)" },
         "replyId": { "type": "string", "description": "test_voice: the reply id its speech events carry" },
         "applied": { "type": "array", "items": { "type": "string" }, "description": "config: the fields that took effect" },
-        "already": { "type": "boolean", "description": "listen: already in the requested state" }
+        "already": { "type": "boolean", "description": "listen: already in the requested state" },
+        "result": { "enum": ["done", "failed", "confirm"], "description": "home: how it went; confirm: ask the user on screen, then send it again with confirmed" },
+        "code": { "type": "string", "description": "home: ok, confirm, not_found, ambiguous, unsupported, bad_value, unreachable, auth, needs_setup, timeout, busy, refused or failed" },
+        "text": { "type": "string", "description": "home: plain words for Claude (and the user); never a secret" },
+        "prompt": { "type": "string", "description": "home confirm: the question to ask" },
+        "tier": { "enum": ["screen"], "description": "home confirm: how the user must confirm" },
+        "device": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } }, "description": "home: the device the request named" },
+        "count": { "type": "integer", "minimum": 0, "description": "home list, info: how many devices; scan: how many smart devices answered" },
+        "devicesFile": { "type": "string", "description": "home info: where the devices are saved" },
+        "credentialsFile": { "type": "string", "description": "home info: where the credentials are saved" }
       }
     },
     "StatusResponse": {
@@ -175,7 +211,9 @@
     "listen": "#/$defs/ListenCommand",
     "config": "#/$defs/ConfigCommand",
     "status": "#/$defs/StatusCommand",
+    "desktop": "#/$defs/DesktopCommand",
     "test_voice": "#/$defs/TestVoiceCommand",
-    "shutdown": "#/$defs/ShutdownCommand"
+    "shutdown": "#/$defs/ShutdownCommand",
+    "home": "#/$defs/HomeCommand"
   }
 }

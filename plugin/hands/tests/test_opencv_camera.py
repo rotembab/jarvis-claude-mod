@@ -8,14 +8,16 @@ DirectShow, the error classification, the ctypes enumeration) run on any OS.
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import sys
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from itertools import pairwise
+from itertools import islice, pairwise
 from typing import Any
 
 import cv2
@@ -39,6 +41,12 @@ MSMF_PARAMS = [
     cv2.VIDEO_ACCELERATION_NONE,
 ]
 
+
+#: How long a test polls for what the camera's reader thread does before it fails. A hang guard, not a claim about
+#: speed: it costs nothing while the thread is quick, and a runner that oversleeps by hundreds of ms must not fail it.
+PATIENCE = 30.0
+#: How long a test sleeps between two polls of a camera.
+POLL_S = 0.005
 
 #: The device interface classes one camera appears under: KSCATEGORY_VIDEO_CAMERA for Media Foundation's
 #: symbolic link, KSCATEGORY_CAPTURE for DirectShow's DevicePath.
@@ -90,6 +98,8 @@ class FakeCapture:
             time.sleep(self.delay)
         n, self.reads = self.reads, self.reads + 1
         image = self.frames(n)
+        if image is None and isinstance(oc.time, ReadClock):  # nothing to return: the read waited, on that clock
+            oc.time.advance(oc.time.step)
         return image is not None, image
 
     def set(self, prop: int, value: float) -> bool:
@@ -114,14 +124,124 @@ class FakeFactory:
     calls: list[tuple[int, int, list[int]]] = field(default_factory=list)
     made: list[FakeCapture] = field(default_factory=list)
     events: list[str] = field(default_factory=list)
+    #: ``ReadClock.now`` at each call, when the camera runs on one: when, in simulated seconds, each open was asked for.
+    at: list[float] = field(default_factory=list)
 
     def __call__(self, index: int, api: int, params: Any) -> FakeCapture:
         self.calls.append((index, api, list(params)))
         self.events.append(f"open {index} {api}")
+        if isinstance(oc.time, ReadClock):
+            self.at.append(oc.time.now)
         capture = self.captures.pop(0) if self.captures else FakeCapture(opened=False)
         capture.events = self.events
         self.made.append(capture)
         return capture
+
+
+def silent_capture() -> FakeCapture:
+    """A camera that opens and then sends nothing: what MSMF does on the webcams the DirectShow fallback is for."""
+    return FakeCapture(frames=lambda n: None, delay=0)
+
+
+class ReadClock:
+    """The camera module's ``time``, on simulated seconds that pass only while a fake read blocks.
+
+    The camera counts its waits on ``time.monotonic``: the reader gives up on
+    a backend ``first_frame_timeout`` after it began waiting, and the caller of
+    ``open()`` has a safety net at twice that, for a read begun just before
+    the reader's deadline that blocks about as long again. On the wall clock
+    the two race: a runner that wakes the reader tens of ms late on every
+    read, as GitHub's macOS runners do, has the net fire while the reader is
+    still on the first backend. Here a wait is a number of reads instead, so
+    nothing a slow machine does moves either deadline.
+
+    A read with nothing to return takes ``step`` seconds (``FakeCapture``
+    does that); ``advance`` is for a read that blocks longer, and
+    ``watching`` makes the thread that waits on the camera look at every
+    moment a read ends at. The clock
+    starts up to a second ahead of the real ``monotonic``, which
+    ``_Session.phase_started`` still defaults to (bound at import), so an
+    opening deadline counted from that default is still ahead of it.
+
+    A test that waits for frames on it polls with ``new_frames``: a
+    ``read(timeout)`` is counted on this clock, which stands still while the
+    fake streams.
+    """
+
+    def __init__(self, step: float = 1 / 16) -> None:  # exact in binary: sums of steps are exact
+        self.step = step
+        self.now = float(int(time.monotonic()) + 1)
+        self._lock = threading.Lock()
+        self._caller = threading.get_ident()  # the thread that opens the camera
+        self._looked = threading.Event()
+        self._camera: OpenCVCamera | None = None
+
+    def monotonic(self) -> float:
+        with self._lock:
+            if threading.get_ident() == self._caller:
+                self._looked.set()
+            return self.now
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self.now += seconds
+            self._looked.clear()
+            camera = self._camera
+        session = camera._session if camera is not None else None
+        if session is not None:
+            with session.cond:
+                session.cond.notify_all()
+            self._looked.wait(10.0)
+
+    @contextmanager
+    def watching(self, camera: OpenCVCamera) -> Iterator[None]:
+        """After every advance, wake whoever waits on ``camera`` (``open()`` or ``read()``) and hold the reader until
+        the calling thread has looked at the new time. What it decides from that time, such as the safety net of
+        ``open()``, is then judged against every moment a read ends at, not whichever one it happens to catch."""
+        self._camera = camera
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._camera = None
+            self._looked.set()  # a reader still held goes on
+
+
+@pytest.fixture
+def read_clock(monkeypatch: pytest.MonkeyPatch) -> ReadClock:
+    """The camera module on a ReadClock, for a test that waits on a silent camera: see ``ReadClock``."""
+    clock = ReadClock()
+    monkeypatch.setattr(oc, "time", clock)
+    return clock
+
+
+def new_frames(camera: OpenCVCamera, seconds: float = PATIENCE) -> Iterator[CameraFrame]:
+    """Each new frame the camera has, polled, until ``seconds`` of real time have passed.
+
+    For a test on a ReadClock, where ``read(timeout)`` must not be used to wait: its timeout is counted on the
+    camera module's ``time``, which moves only while a fake read fails. Once the fake streams, that clock stands
+    still, the read waits on the camera's condition with the same time left for ever, and a reader that has
+    stalled hangs the test (and the CI job) where it should fail it. So this asks with ``read(0.0)`` and sleeps
+    between the asks, and counts ``seconds`` on the real clock: this module's ``time`` is the real one, only
+    ``oc.time`` is replaced.
+    """
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        frame = camera.read(0.0)
+        if frame is not None:
+            yield frame
+        time.sleep(POLL_S)
+
+
+def assert_streaming(camera: OpenCVCamera) -> None:
+    """The camera delivers new frames: two, so the one picture a stream that stopped left unread does not count."""
+    assert len(list(islice(new_frames(camera), 2))) == 2, "the camera is not delivering frames"
+
+
+def assert_took(read_clock: ReadClock, seconds: float, took: float, what: str) -> None:
+    """``what`` took ``seconds`` of simulated time, as the camera counts it: it acts on the first read that ends at or
+    after ``seconds``, so never sooner and never more than one read of the clock (a step) later."""
+    assert seconds <= took <= seconds + read_clock.step, f"{what} took {took} simulated seconds, not {seconds}"
 
 
 @pytest.fixture(autouse=True)
@@ -272,9 +392,10 @@ def test_directshow_is_the_fallback_and_gets_mjpg_last(cameras: list[OpenCVCamer
     assert info is not None and info.backend == "dshow"
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_directshow_is_tried_when_msmf_opens_but_sends_nothing(cameras: list[OpenCVCamera]) -> None:
     # Some UVC webcams open on MSMF and then fail every grab, yet stream on DirectShow.
-    msmf, dshow = FakeCapture(frames=lambda n: None, delay=0.01), FakeCapture()
+    msmf, dshow = silent_capture(), FakeCapture()
     factory = FakeFactory([msmf, dshow])
     info = opened(cameras, factory, first_frame_timeout=0.2).info
     assert info is not None and info.backend == "dshow"
@@ -282,28 +403,31 @@ def test_directshow_is_tried_when_msmf_opens_but_sends_nothing(cameras: list[Ope
     # The silent MSMF capture is let go before DirectShow asks for the device.
     assert factory.events[:3] == [f"open 0 {cv2.CAP_MSMF}", "release", f"open 0 {cv2.CAP_DSHOW}"]
     assert msmf.released == 1 and dshow.released == 0
-    assert cameras[0].read(1.0) is not None
+    assert next(new_frames(cameras[0]), None) is not None
 
 
-def test_a_reopen_tries_the_backend_that_streamed_first(cameras: list[OpenCVCamera]) -> None:
+def test_a_reopen_tries_the_backend_that_streamed_first(read_clock: ReadClock, cameras: list[OpenCVCamera]) -> None:
     factory = FakeFactory(
         [
-            FakeCapture(frames=lambda n: None, delay=0.01),  # MSMF: open but silent
+            silent_capture(),  # MSMF: open but silent
             FakeCapture(frames=fails_after(3)),  # DirectShow streams, then the camera goes away
             FakeCapture(frames=lambda n: picture(100 + n)),  # DirectShow again after the reopen
         ]
     )
     camera = opened(cameras, factory, first_frame_timeout=0.2, lost_after=0.1, reopen_delays=(0.01,))
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        frame = camera.read(0.2)
-        if frame is not None and frame.image[0, 0, 0] >= 100:
+    for frame in new_frames(camera):
+        if frame.image[0, 0, 0] >= 100:
             break
     else:
         pytest.fail("no frame from the reopened camera")
     assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF, cv2.CAP_DSHOW, cv2.CAP_DSHOW]
     info = camera.info
     assert info is not None and info.backend == "dshow"
+    # Counted in failed reads: MSMF had its whole first_frame_timeout, and DirectShow, once its stream stopped, its
+    # lost_after of silence before the reopen: not a read sooner and not a read later.
+    msmf_opened, dshow_opened, reopened = factory.at
+    assert_took(read_clock, camera.first_frame_timeout, dshow_opened - msmf_opened, "the wait on MSMF's silence")
+    assert_took(read_clock, camera.lost_after, reopened - dshow_opened, "the reopen after the stream stopped")
 
 
 # -- DirectShow counts devices in its own list ---------------------------------------------
@@ -364,9 +488,10 @@ def test_one_device_behind_two_monikers_is_not_chosen_between() -> None:
 
 def silent_then_streaming() -> FakeFactory:
     """MSMF opens the camera and sends nothing (the webcams this fallback exists for); DirectShow streams."""
-    return FakeFactory([FakeCapture(frames=lambda n: None, delay=0.01), FakeCapture()])
+    return FakeFactory([silent_capture(), FakeCapture()])
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_directshow_opens_the_device_where_directshow_counts_it(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
 ) -> None:
@@ -381,6 +506,7 @@ def test_directshow_opens_the_device_where_directshow_counts_it(
     assert info is not None and (info.name, info.index, info.backend) == ("UGREEN Camera", 1, "dshow")
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_the_device_path_matches_the_camera_even_when_directshow_calls_it_something_else(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
 ) -> None:
@@ -396,6 +522,7 @@ def test_the_device_path_matches_the_camera_even_when_directshow_calls_it_someth
     assert info is not None and info.backend == "dshow"
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_a_unique_friendly_name_is_enough_when_there_is_no_device_path(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
 ) -> None:
@@ -407,6 +534,7 @@ def test_a_unique_friendly_name_is_enough_when_there_is_no_device_path(
     assert info is not None and info.backend == "dshow"
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_directshow_is_skipped_when_nothing_tells_the_device_apart(monkeypatch: pytest.MonkeyPatch) -> None:
     # Two DirectShow devices of that name and no paths to tell them apart: opening one of them would be a guess.
     listed(monkeypatch, "USB Camera")
@@ -420,6 +548,7 @@ def test_directshow_is_skipped_when_nothing_tells_the_device_apart(monkeypatch: 
     camera.close()
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_directshow_is_skipped_when_it_does_not_list_the_camera_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     listed(monkeypatch, "UGREEN Camera", links=True)
     dshow_listed(monkeypatch, "OBS Virtual Camera")
@@ -431,6 +560,7 @@ def test_directshow_is_skipped_when_it_does_not_list_the_camera_at_all(monkeypat
     camera.close()
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_a_directshow_listing_that_fails_skips_directshow_instead_of_crashing(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -449,6 +579,7 @@ def test_a_directshow_listing_that_fails_skips_directshow_instead_of_crashing(
     camera.close()
 
 
+@pytest.mark.usefixtures("read_clock")
 def test_when_media_foundation_cannot_be_asked_directshow_keeps_the_number_it_was_given(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
 ) -> None:
@@ -523,7 +654,7 @@ class Machine:
         name = names[index]
         self.opened.append((name, backend))
         if backend == "msmf" and name == UGREEN:
-            return FakeCapture(frames=lambda n: None, delay=0.01)
+            return silent_capture()
         return FakeCapture(frames=lambda n: None if name in self.unplugged else picture(n))
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -543,20 +674,25 @@ def machine_camera(machine: Machine, spec: str | None, **overrides: Any) -> Open
     return OpenCVCamera(spec, capture_factory=machine.factory, **options)
 
 
-def read_until(camera: OpenCVCamera, done: Callable[[], bool], seconds: float = 5.0) -> CameraError | None:
-    """Read frames until ``done()`` or the camera raises (returned); fails the test after ``seconds``."""
+def read_until(camera: OpenCVCamera, done: Callable[[], bool], seconds: float = PATIENCE) -> CameraError | None:
+    """Read frames until ``done()`` or the camera raises (returned); fails the test after ``seconds`` of real time.
+
+    Polls with ``read(0.0)`` for the reason given at ``new_frames``: these tests run on a ReadClock.
+    """
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         try:
-            camera.read(0.05)
+            camera.read(0.0)
         except CameraError as exc:
             return exc
         if done():
             return None
+        time.sleep(POLL_S)
     pytest.fail("the camera neither got there nor gave up")
 
 
 @pytest.mark.parametrize("spec", [None, "0", "ugreen"])
+@pytest.mark.usefixtures("read_clock")
 def test_a_reopen_after_the_webcam_is_unplugged_never_opens_another_device_on_directshow(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str | None
 ) -> None:
@@ -577,6 +713,7 @@ def test_a_reopen_after_the_webcam_is_unplugged_never_opens_another_device_on_di
 
 
 @pytest.mark.parametrize("spec", [None, "0"])
+@pytest.mark.usefixtures("read_clock")
 def test_a_webcam_plugged_back_in_is_found_where_directshow_now_counts_it(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str | None
 ) -> None:
@@ -590,6 +727,7 @@ def test_a_webcam_plugged_back_in_is_found_where_directshow_now_counts_it(
     error = read_until(camera, lambda: (OBS, "dshow") in machine.opened or machine.opened[2:] == [(UGREEN, "dshow")])
     assert (OBS, "dshow") not in machine.opened, "a reopen streamed OBS's placeholder as the user's camera"
     assert error is None and machine.opened == [(UGREEN, "msmf"), (UGREEN, "dshow"), (UGREEN, "dshow")]
+    assert_streaming(camera)  # the camera it found streams
     info = camera.info
     assert info is not None and (info.name, info.index, info.backend) == (UGREEN, 0, "dshow")
 
@@ -621,6 +759,7 @@ def test_a_number_media_foundation_does_not_list_is_not_opened_on_directshow(mon
 
 
 @pytest.mark.parametrize("spec", ["ugreen", "1"])
+@pytest.mark.usefixtures("read_clock")
 def test_a_reopen_while_media_foundation_will_not_answer_maps_the_camera_it_had(
     monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera], spec: str
 ) -> None:
@@ -655,10 +794,11 @@ def test_a_reopen_while_media_foundation_will_not_answer_maps_the_camera_it_had(
     assert error is None
     assert opens == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW), (2, cv2.CAP_DSHOW)]
     assert (OBS, "dshow") not in machine.opened
+    assert_streaming(camera)  # the device it reopened streams
 
 
 def test_a_reopen_maps_the_directshow_index_against_the_current_listing(
-    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+    monkeypatch: pytest.MonkeyPatch, read_clock: ReadClock, cameras: list[OpenCVCamera]
 ) -> None:
     mf = [
         [
@@ -684,16 +824,14 @@ def test_a_reopen_maps_the_directshow_index_against_the_current_listing(
     monkeypatch.setattr(oc, "list_dshow_devices", lambda: next(dshow_listings, later_dshow))
     factory = FakeFactory(
         [
-            FakeCapture(frames=lambda n: None, delay=0.01),  # MSMF: open but silent
+            silent_capture(),  # MSMF: open but silent
             FakeCapture(frames=fails_after(3)),  # DirectShow streams, then the webcam is unplugged
             FakeCapture(frames=lambda n: picture(100 + n)),  # the reopen, DirectShow first: its new position
         ]
     )
     camera = opened(cameras, factory, "ugreen", first_frame_timeout=0.2, lost_after=0.1, reopen_delays=(0.01,))
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        frame = camera.read(0.2)
-        if frame is not None and frame.image[0, 0, 0] >= 100:
+    for frame in new_frames(camera):
+        if frame.image[0, 0, 0] >= 100:
             break
     else:
         pytest.fail("no frame from the reopened camera")
@@ -701,6 +839,8 @@ def test_a_reopen_maps_the_directshow_index_against_the_current_listing(
     assert [c[:2] for c in factory.calls] == [(1, cv2.CAP_MSMF), (2, cv2.CAP_DSHOW), (1, cv2.CAP_DSHOW)]
     info = camera.info
     assert info is not None and (info.index, info.backend) == (0, "dshow")
+    _, dshow_opened, reopened = factory.at  # the reopen came lost_after of failed reads after DirectShow's stream began
+    assert_took(read_clock, camera.lost_after, reopened - dshow_opened, "the reopen after the stream stopped")
 
 
 def test_a_backend_that_raises_counts_as_not_opening(cameras: list[OpenCVCamera]) -> None:
@@ -751,28 +891,70 @@ def test_create_camera_builds_a_closed_opencv_camera() -> None:
 
 
 def test_reads_skip_to_the_newest_frame(cameras: list[OpenCVCamera]) -> None:
-    camera = opened(cameras, FakeFactory([FakeCapture(delay=0.002)]))
-    frames = []
-    for _ in range(5):
-        frame = camera.read(1.0)
-        assert frame is not None
-        frames.append(frame)
-        time.sleep(0.03)  # a slow tracker
-    seqs = [f.seq for f in frames]
-    assert seqs == sorted(set(seqs)), seqs
-    assert any(b - a > 1 for a, b in pairwise(seqs)), seqs
+    # The reader is let through a few pictures at a time while the consumer is away, so how many pass between two
+    # reads is decided here and not by how fast the runner sleeps: a macOS runner wakes a 2 ms sleep 25 ms late,
+    # and a reader paced by sleeps then no longer gets two pictures ahead of a consumer that sleeps 30 ms.
+    permits = threading.Semaphore(1)  # the first picture, which open() waits for
+    closing = threading.Event()
+
+    def gated(n: int) -> np.ndarray | None:
+        while not permits.acquire(timeout=0.05):
+            if closing.is_set():
+                return None
+        return picture(n)
+
+    capture = FakeCapture(frames=gated, delay=0)
+    camera = opened(cameras, FakeFactory([capture]))
+    frames = [camera.read(1.0)]
+    made = 1  # pictures the reader has been let through
+    try:
+        for let_through in (3, 1, 4):
+            for _ in range(let_through):
+                permits.release()
+            made += let_through
+            deadline = time.monotonic() + PATIENCE
+            while capture.reads <= made and time.monotonic() < deadline:  # until it waits on the next picture
+                time.sleep(0.001)
+            frames.append(camera.read(1.0))
+    finally:
+        closing.set()
+    assert all(f is not None for f in frames)
+    # Three pictures went by unread, then one, then four: a read returns the newest, and no picture twice.
+    assert [f.seq for f in frames if f is not None] == [1, 4, 5, 9]
     for f in frames:
-        assert int(f.image[0, 0, 0]) == (f.seq - 1) % 256  # the frame that seq names, not an older one
-    assert all(a.t < b.t for a, b in pairwise(frames))
+        assert f is not None and int(f.image[0, 0, 0]) == (f.seq - 1) % 256  # the frame that seq names
+    assert all(a is not None and b is not None and a.t < b.t for a, b in pairwise(frames))
 
 
-def test_each_frame_is_returned_once_and_a_read_times_out(cameras: list[OpenCVCamera]) -> None:
-    camera = opened(cameras, FakeFactory([FakeCapture(frames=fails_after(1), delay=0.01)]), lost_after=10.0)
-    first = camera.read(1.0)
+def test_each_frame_is_returned_once_and_a_read_times_out(
+    monkeypatch: pytest.MonkeyPatch, read_clock: ReadClock, cameras: list[OpenCVCamera]
+) -> None:
+    # On simulated time, which moves as the reader's failed reads do, so "times out" is counted in reads: on a wall
+    # clock a runner that oversleeps the wait by hundreds of ms made a read of 0.05 s take half a second.
+    camera = opened(cameras, FakeFactory([FakeCapture(frames=fails_after(1), delay=0)]), lost_after=10.0)
+    first = camera.read(0.0)  # open() has returned, so its first frame is there: no waiting for it
     assert first is not None and first.seq == 1
-    started = time.monotonic()
-    assert camera.read(0.05) is None
-    assert time.monotonic() - started < 0.5
+    session = camera._session
+    assert session is not None
+    waits: list[float | None] = []
+    wait = session.cond.wait
+
+    def recording_wait(timeout: float | None = None) -> bool:
+        waits.append(timeout)
+        return wait(timeout)
+
+    monkeypatch.setattr(session.cond, "wait", recording_wait)
+    with read_clock.watching(camera):
+        started = read_clock.monotonic()
+        assert camera.read(0.05) is None
+        passed = read_clock.monotonic() - started
+    # It answered once its 0.05 s had passed, a few failed reads later, not when the reader gave up (10 s).
+    assert 0.05 <= passed <= 5 * read_clock.step
+    # watching() wakes the read at every moment a read ends at, so the simulated deadline alone ends it whatever the
+    # read waits for. What it waits for must itself be the time it has left: a wait with no timeout, or a hundred
+    # times too long, would keep a read waiting on a reader that has gone quiet instead of ending it on its timeout.
+    # Never above the time left (0.05 s): a read that waits 1.5 or twice that long is as wrong as one with no timeout.
+    assert waits and all(t is not None and math.isfinite(t) and t <= 0.05 + 1e-6 for t in waits), waits
 
 
 def test_frames_are_contiguous_bgr_uint8(cameras: list[OpenCVCamera]) -> None:
@@ -829,15 +1011,16 @@ def test_the_frame_rate_is_measured_over_its_window() -> None:
 
 
 class FakeClock:
-    """``clock.now`` for the camera module: each call is one 30 fps frame interval later, from 5000 s."""
+    """``clock.now`` for the camera module: each call is one frame interval at ``fps`` later, from 5000 s."""
 
-    def __init__(self) -> None:
+    def __init__(self, fps: float = 30) -> None:
+        self.fps = fps
         self._lock = threading.Lock()
         self.given: list[float] = []
 
     def __call__(self) -> float:
         with self._lock:
-            self.given.append(5000.0 + len(self.given) / 30)
+            self.given.append(5000.0 + len(self.given) / self.fps)
             return self.given[-1]
 
 
@@ -856,39 +1039,81 @@ def test_frames_are_stamped_with_the_helpers_clock(
     assert info is not None and info.fps == pytest.approx(30.0)
 
 
-def test_info_reports_the_requested_rate_until_it_is_measured(cameras: list[OpenCVCamera]) -> None:
-    camera = make_camera(FakeFactory([FakeCapture(delay=0.004)]), fps_window=0.3)
+def test_info_reports_the_requested_rate_until_it_is_measured(
+    monkeypatch: pytest.MonkeyPatch, cameras: list[OpenCVCamera]
+) -> None:
+    # Frames are stamped by a simulated 120 fps clock, and the fake reads without sleeping, so the measured rate
+    # is exact however slowly the runner runs: a macOS runner oversleeps a 4 ms read by 20-30 ms, which a wall
+    # clock measures as ~36 fps, and the ~20 reads it takes to measure a rate then take as long as the runner
+    # makes them.
+    monkeypatch.setattr(oc, "clock_now", FakeClock(fps=120))
+    more = threading.Event()  # only the first picture until open() has answered: nothing measured yet
+    capture = FakeCapture(frames=lambda n: picture(n) if n == 0 or more.wait(10.0) else None, delay=0)
+    camera = make_camera(FakeFactory([capture]), fps_window=0.3)
     cameras.append(camera)
     assert camera.open().fps == 30.0
-    time.sleep(0.5)
-    info = camera.info
-    assert info is not None and info.fps != 30.0 and 40.0 < info.fps < 1000.0
+    more.set()
+    deadline = time.monotonic() + PATIENCE  # measured once about 20 frames span half the window: a few ms of reads
+    while (info := camera.info) is not None and info.fps == 30.0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert info is not None and info.fps == 120.0
 
 
 # --------------------------------------------------------------------------- failures
 
 
-def test_no_picture_in_time_means_the_camera_is_in_use() -> None:
-    capture = FakeCapture(frames=lambda n: None, delay=0.01)
+def test_no_picture_in_time_means_the_camera_is_in_use(read_clock: ReadClock) -> None:
+    capture = silent_capture()
     camera = make_camera(FakeFactory([capture]), first_frame_timeout=0.2)
-    started = time.monotonic()
+    started = read_clock.now
     with pytest.raises(CameraError) as error:
         camera.open()
-    assert time.monotonic() - started < 1.5
+    assert read_clock.now - started < camera.open_timeout  # the first_frame_timeout ended it, not the open timeout
     assert error.value.code == "camera_in_use" and error.value.hint == plat.camera_in_use_hint()
+    assert error.value.message.endswith("within 0.2 s on msmf.")  # the reader's own verdict, not the caller's net
     assert capture.released == 1 and camera.info is None
     camera.close()
 
 
-def test_two_silent_backends_mean_the_camera_is_in_use() -> None:
-    msmf, dshow = FakeCapture(frames=lambda n: None, delay=0.01), FakeCapture(frames=lambda n: None, delay=0.01)
+def test_two_silent_backends_mean_the_camera_is_in_use(read_clock: ReadClock) -> None:
+    # On simulated time: a macOS runner can wake the reader hundreds of ms late, and on a wall clock that left it
+    # still waiting on MSMF when the caller's safety net (twice the wait) gave up, before DirectShow was tried.
+    wait = 0.25  # exactly four reads of the clock's 1/16 s
+    msmf, dshow = silent_capture(), silent_capture()
     factory = FakeFactory([msmf, dshow])
-    camera = make_camera(factory, first_frame_timeout=0.2)
+    camera = make_camera(factory, first_frame_timeout=wait)
     with pytest.raises(CameraError) as error:
         camera.open()
     assert error.value.code == "camera_in_use" and "msmf" in error.value.message and "dshow" in error.value.message
     assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF, cv2.CAP_DSHOW]
+    for capture in (msmf, dshow):
+        # Each backend had its whole first_frame_timeout, and the reader moved on within one read of it.
+        assert wait <= capture.reads * read_clock.step <= wait + read_clock.step
     assert msmf.released == 1 and dshow.released == 1
+    camera.close()
+
+
+def test_a_read_that_blocks_as_long_again_does_not_trip_the_callers_safety_net(read_clock: ReadClock) -> None:
+    # The reader gives up on a backend once first_frame_timeout has passed, but a read begun just before that can
+    # block about as long again (an MSMF grab waits up to 10 s), so open() allows twice the wait before it decides
+    # the reader is stuck. Here MSMF's last read begins one read before the reader's deadline and blocks 0.9 waits
+    # more, and open() looks at the clock after every read: a net shorter than that ends open() on MSMF's silence
+    # alone, before DirectShow is tried.
+    wait = 1.0
+    last = int(wait / read_clock.step) - 1  # the read that begins a hair before the reader's deadline
+
+    def msmf_read(n: int) -> None:
+        if n == last:
+            read_clock.advance(0.9 * wait)
+
+    msmf, dshow = FakeCapture(frames=msmf_read, delay=0), silent_capture()
+    factory = FakeFactory([msmf, dshow])
+    camera = make_camera(factory, first_frame_timeout=wait)
+    with read_clock.watching(camera), pytest.raises(CameraError) as error:
+        camera.open()
+    assert msmf.reads == last + 1, "MSMF's long read never happened: this test proves nothing"
+    assert [c[1] for c in factory.calls] == [cv2.CAP_MSMF, cv2.CAP_DSHOW], "DirectShow was never tried"
+    assert error.value.code == "camera_in_use" and "msmf" in error.value.message and "dshow" in error.value.message
     camera.close()
 
 
@@ -931,17 +1156,13 @@ def test_a_failing_privacy_check_does_not_hide_the_real_error(monkeypatch: pytes
     assert error.value.code == "no_camera"
 
 
-def test_a_run_of_failed_reads_reopens_the_camera(cameras: list[OpenCVCamera]) -> None:
+def test_a_run_of_failed_reads_reopens_the_camera(read_clock: ReadClock, cameras: list[OpenCVCamera]) -> None:
     first = FakeCapture(frames=fails_after(3))
     second = FakeCapture(frames=lambda n: picture(100 + n))
     factory = FakeFactory([first, second])
     camera = opened(cameras, factory, lost_after=0.1, reopen_delays=(0.01,))
-    deadline = time.monotonic() + 3.0
     seqs = []
-    while time.monotonic() < deadline:
-        frame = camera.read(0.2)
-        if frame is None:
-            continue
+    for frame in new_frames(camera):
         seqs.append(frame.seq)
         if frame.image[0, 0, 0] >= 100:
             break
@@ -952,27 +1173,32 @@ def test_a_run_of_failed_reads_reopens_the_camera(cameras: list[OpenCVCamera]) -
     # Released before it was opened again (one device, one owner).
     assert factory.events[:3] == [f"open 0 {cv2.CAP_MSMF}", "release", f"open 0 {cv2.CAP_MSMF}"]
     assert first.released == 1 and camera.info is not None
+    # The simulated clock moves only on failed reads: the camera was reopened once those had added up to lost_after.
+    opened_first, reopened = factory.at
+    assert_took(read_clock, camera.lost_after, reopened - opened_first, "reopening a camera that stopped sending")
 
 
-def test_repeated_reopen_failures_lose_the_camera(cameras: list[OpenCVCamera]) -> None:
+def test_repeated_reopen_failures_lose_the_camera(read_clock: ReadClock, cameras: list[OpenCVCamera]) -> None:
     factory = FakeFactory([FakeCapture(frames=fails_after(2))])
     camera = opened(cameras, factory, lost_after=0.1)
-    deadline = time.monotonic() + 3.0
     with pytest.raises(CameraError) as error:
-        while time.monotonic() < deadline:
-            camera.read(0.2)
+        for _ in new_frames(camera):
+            pass
     assert error.value.code == "camera_lost" and error.value.hint
     assert len(factory.calls) == 1 + 3 * 2  # three reopens, each trying MSMF then DirectShow
+    # The reopens read nothing, so the clock stopped at the failed read that made the camera give up on the stream:
+    # it did so once those had added up to lost_after, not sooner and not later.
+    assert_took(read_clock, camera.lost_after, read_clock.now - factory.at[0], "losing a camera that stopped sending")
     assert all(c.released == 1 for c in factory.made)
     assert camera.info is None
     with pytest.raises(CameraError):
         camera.read(0.0)
 
 
-def test_a_read_waiting_while_the_reader_gives_up_raises_instead_of_going_quiet() -> None:
+def test_a_read_waiting_while_the_reader_gives_up_raises_instead_of_going_quiet(read_clock: ReadClock) -> None:
     # A read that started before the reader gave up must learn why: otherwise it returns None for ever, the
     # runtime keeps asking for frames that never come and nothing tells the user why the camera stopped.
-    capture = FakeCapture(frames=lambda n: None, delay=0.01)
+    capture = silent_capture()
     camera = make_camera(FakeFactory([capture]), backends=("msmf",), first_frame_timeout=0.3)
     errors: list[CameraError] = []
     reads: list[CameraFrame | None] = []
@@ -983,21 +1209,18 @@ def test_a_read_waiting_while_the_reader_gives_up_raises_instead_of_going_quiet(
         except CameraError as exc:
             errors.append(exc)
 
-    def read_it() -> None:
-        deadline = time.monotonic() + 2.0
+    opener = threading.Thread(target=open_it)
+    with read_clock.watching(camera):  # the reader goes on only as this thread looks: it is in read() all the while
+        opener.start()
+        deadline = time.monotonic() + PATIENCE
         while camera._session is None and time.monotonic() < deadline:  # until open() has started the reader
             time.sleep(0.001)
         try:
             reads.append(camera.read(3.0))
         except CameraError as exc:
             errors.append(exc)
-
-    threads = [threading.Thread(target=open_it), threading.Thread(target=read_it)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(5.0)
-        assert not thread.is_alive()
+    opener.join(PATIENCE)
+    assert not opener.is_alive()
     assert reads == [], "the read must not report 'no frame yet' when the camera is not coming back"
     assert len(errors) == 2 and {e.code for e in errors} == {"camera_in_use"}
     assert all(e.hint == plat.camera_in_use_hint() for e in errors)
@@ -1006,7 +1229,7 @@ def test_a_read_waiting_while_the_reader_gives_up_raises_instead_of_going_quiet(
 
 def test_a_reader_that_gave_up_without_saying_why_is_still_camera_lost(cameras: list[OpenCVCamera]) -> None:
     camera = opened(cameras, FakeFactory([FakeCapture(frames=fails_after(2))]), lost_after=0.1)
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + PATIENCE
     with pytest.raises(CameraError):
         while time.monotonic() < deadline:
             camera.read(0.2)
@@ -1028,7 +1251,7 @@ def test_a_camera_chosen_by_name_is_looked_up_again_on_reopen(
     monkeypatch.setattr(oc, "list_mf_devices", lambda: next(listings, later))
     factory = FakeFactory([FakeCapture(frames=fails_after(2)), FakeCapture(frames=lambda n: picture(100 + n))])
     camera = opened(cameras, factory, "ugreen", lost_after=0.1, reopen_delays=(0.01,))
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + PATIENCE
     while time.monotonic() < deadline:
         frame = camera.read(0.2)
         if frame is not None and frame.image[0, 0, 0] >= 100:
@@ -1073,7 +1296,7 @@ def test_open_after_close_starts_numbering_again(cameras: list[OpenCVCamera]) ->
 
 
 def test_close_while_opening_returns_promptly() -> None:
-    capture = FakeCapture(frames=lambda n: None, delay=0.01)
+    capture = silent_capture()
     camera = make_camera(FakeFactory([capture]), first_frame_timeout=5.0)
     errors: list[BaseException] = []
 
@@ -1084,12 +1307,14 @@ def test_close_while_opening_returns_promptly() -> None:
             errors.append(exc)
 
     opener = threading.Thread(target=open_it)
-    started = time.monotonic()
     opener.start()
-    time.sleep(0.1)
+    deadline = time.monotonic() + PATIENCE
+    while capture.reads == 0 and time.monotonic() < deadline:  # until the reader is waiting for a first picture
+        time.sleep(0.001)
+    started = time.monotonic()
     camera.close()
-    opener.join(3.0)
-    assert not opener.is_alive() and time.monotonic() - started < 2.0
+    opener.join(PATIENCE)
+    assert not opener.is_alive() and time.monotonic() - started < 2.0  # not the 5 s first_frame_timeout
     assert len(errors) == 1 and capture.released == 1
 
 

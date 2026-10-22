@@ -120,6 +120,39 @@ def test_follow_up_window_takes_speech_without_the_wake_word() -> None:
     assert kind == "follow" and seconds >= 0.5 + 1.0 + 0.7
 
 
+def play_stamped(rig: Rig, audio: np.ndarray, clock: list[float]) -> None:
+    """10 ms blocks, each stamped when it would arrive in real time (``clock[0]``, advanced per block)."""
+    for i in range(0, audio.size, 160):
+        block = audio[i : i + 160]
+        clock[0] += block.size / RATE
+        rig.listener.process(block, stamp=clock[0])
+
+
+def test_onset_is_where_the_follow_up_voice_began_on_the_blocks_clock() -> None:
+    # Not where the pre-roll begins (half a second earlier), nor when the follow-up fired (a quarter second later).
+    rig = Rig()
+    clock = [100.0]
+    play_stamped(rig, hush(0.5), clock)
+    rig.listener.open_follow_up()
+    play_stamped(rig, hush(2.0), clock)  # the voice begins at 102.5
+    play_stamped(rig, tone(1.0), clock)
+    assert rig.kinds("start") == ["follow"]
+    onset = rig.listener.onset_at
+    assert onset is not None and 102.49 <= onset <= 102.53
+
+
+def test_onset_after_the_wake_word_reaches_back_to_where_the_phrase_began() -> None:
+    rig = Rig()
+    clock = [100.0]
+    play_stamped(rig, hush(1.0), clock)
+    play_stamped(rig, tone(0.6), clock)  # "Hey Jarvis", from 101.0
+    rig.wake.say()
+    play_stamped(rig, tone(0.08), clock)
+    assert rig.kinds("start") == ["wake"]
+    onset = rig.listener.onset_at
+    assert onset is not None and 100.99 <= onset <= 101.03
+
+
 def test_follow_up_window_closes_after_eight_seconds() -> None:
     rig = Rig()
     rig.listener.open_follow_up()

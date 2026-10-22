@@ -23,9 +23,9 @@ import queue
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import numpy as np
 
@@ -119,6 +119,14 @@ def strip_plain_wake(text: str) -> str | None:
     return text[match.end() :].strip()
 
 
+class HomeHandler(Protocol):
+    """What the daemon needs of home control (``jarvis_voice.home.HomeService``)."""
+
+    def handle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass
 class DaemonConfig:
     stt_model: str = "auto"
@@ -149,6 +157,9 @@ class _Clip:
     kind: Kind | None = None
     # Its pre-roll reaches back to where the speech began (Listener.long_preroll).
     long_preroll: bool = False
+    # When the user began speaking (protocol.clock_ms), and whether the clip cut Jarvis off.
+    started_at_ms: int | None = None
+    over_speech: bool = False
 
 
 class Daemon:
@@ -166,6 +177,7 @@ class Daemon:
         rescan_audio: Callable[[], None] | None = None,
         vad: VoiceDetector | None = None,
         wake_loader: Callable[[], WakeScorer] | None = None,
+        home_factory: Callable[[], HomeHandler] | None = None,
         plain_loader: Callable[[WakeScorer], None] | None = None,
         echo_loader: Callable[[], EchoCanceller] | None = None,
     ) -> None:
@@ -186,6 +198,9 @@ class Daemon:
         self._lock = threading.RLock()
         self._base: protocol.HelperState = "starting"
         self._listen_source: protocol.UtteranceSource | None = None
+        # The clip being recorded: when the user began speaking (clock_ms), and whether it cut Jarvis off.
+        self._clip_started_at_ms: int | None = None
+        self._clip_over_speech = False
         self._transcribing = 0
         self._speaking = False
         self._last_state: str | None = None
@@ -193,6 +208,11 @@ class Daemon:
         self._ready_sent = False
         self._awake = False  # the follow-up window is open
         self._wake_loader = wake_loader
+        # Home control is built on its first command, so a helper that never
+        # controls a device never loads its libraries.
+        self._home_factory = home_factory
+        self._home: HomeHandler | None = None
+        self._home_lock = threading.Lock()
         # Attaches plain "Jarvis" to a loaded scorer that lacks it (fetching the
         # model first); raises when it cannot.
         self._plain_loader = plain_loader
@@ -337,6 +357,10 @@ class Daemon:
         if callable(close_synth):
             steps.append(close_synth)
         steps += [self.pipeline.close, self._capture.close, self._playback.close]
+        with self._home_lock:
+            home, self._home, self._home_factory = self._home, None, None
+        if home is not None:
+            steps.append(home.close)
         for step in steps:
             try:
                 step()
@@ -416,12 +440,13 @@ class Daemon:
     # ------------------------------------------------------------------ push-to-talk
 
     def _on_ptt_down(self) -> None:  # keyboard-hook thread: enqueue only
-        self._actions.put(lambda: self._begin_listening("ptt"))
+        pressed_at_ms = protocol.clock_ms()  # the key went down now; the action runs a moment later
+        self._actions.put(lambda: self._begin_listening("ptt", pressed_at_ms))
 
     def _on_ptt_up(self) -> None:
         self._actions.put(lambda: self._end_listening(only_source="ptt"))
 
-    def _begin_listening(self, source: protocol.UtteranceSource) -> dict[str, Any]:
+    def _begin_listening(self, source: protocol.UtteranceSource, pressed_at_ms: int | None = None) -> dict[str, Any]:
         with self._lock:
             if self._listen_source is not None:
                 return {"ok": True, "already": True}
@@ -431,6 +456,8 @@ class Daemon:
             self._chime("error")
             return protocol.error_response(stt_error.code, stt_error.message)
 
+        started_at_ms = protocol.clock_ms() if pressed_at_ms is None else pressed_at_ms
+        over_speech = not self._playback.speech_idle()
         # Barge-in: talking over Jarvis stops him (outside our lock: see speech.py).
         self.pipeline.stop("push-to-talk", barge_in=True)
 
@@ -448,6 +475,7 @@ class Daemon:
         self._chime("start")
         with self._lock:
             self._listen_source = source
+            self._clip_started_at_ms, self._clip_over_speech = started_at_ms, over_speech
             self._awake = False
         self._refresh_state()
         return {"ok": True}
@@ -471,6 +499,7 @@ class Daemon:
             if source is None or source == "wake" or (only_source is not None and source != only_source):
                 return {"ok": True, "already": True}
             self._listen_source = None
+            started_at_ms, over_speech = self._clip_started_at_ms, self._clip_over_speech
         if self.listener is not None:
             self.listener.resume()
         self._playback.set_paused(False)
@@ -482,7 +511,7 @@ class Daemon:
             self._refresh_state()
             return protocol.error_response(exc.code, exc.message)
         self._chime("stop")
-        return self._queue_clip(pcm, source)
+        return self._queue_clip(pcm, source, started_at_ms=started_at_ms, over_speech=over_speech)
 
     def _queue_clip(
         self,
@@ -491,6 +520,8 @@ class Daemon:
         *,
         kind: Kind | None = None,
         long_preroll: bool = False,
+        started_at_ms: int | None = None,
+        over_speech: bool = False,
     ) -> dict[str, Any]:
         queued = False
         duration_s = pcm.size / STT_SAMPLERATE
@@ -504,7 +535,9 @@ class Daemon:
         else:
             with self._lock:
                 self._transcribing += 1
-            self._clips.put(_Clip(pcm, source, round(duration_s * 1000), kind, long_preroll))
+            self._clips.put(
+                _Clip(pcm, source, round(duration_s * 1000), kind, long_preroll, started_at_ms, over_speech)
+            )
             queued = True
         self._refresh_state()
         if queued:
@@ -618,14 +651,17 @@ class Daemon:
         self._emit_error("aec_unavailable", message, ECHO_STOPPED_HINT)
 
     def _on_listener_start(self, kind: Kind) -> None:  # listener thread: enqueue only
-        self._actions.put(lambda: self._begin_hands_free(kind))
+        # Read here, on the listener's thread: its next utterance sets it afresh.
+        onset = self.listener.onset_at if self.listener is not None else None
+        started_at_ms = protocol.clock_ms(onset) if onset is not None else protocol.clock_ms()
+        self._actions.put(lambda: self._begin_hands_free(kind, started_at_ms))
 
     def _on_listener_end(self, pcm: np.ndarray | None, kind: Kind) -> None:  # listener thread
         # Read here, on the listener's thread: its next utterance sets it afresh.
         long_preroll = self.listener is not None and self.listener.long_preroll
         self._actions.put(lambda: self._end_hands_free(pcm, kind, long_preroll))
 
-    def _begin_hands_free(self, kind: Kind) -> None:
+    def _begin_hands_free(self, kind: Kind, started_at_ms: int | None = None) -> None:
         assert self.listener is not None
         with self._lock:
             busy = self._listen_source is not None
@@ -646,13 +682,16 @@ class Daemon:
         # Only cut Jarvis off when he is audible: a reply that is open but quiet
         # (Claude is running a tool) keeps going, and the mod queues the new words.
         woken = kind in ("wake", "jarvis")
-        if kind == "barge" or not self._playback.speech_idle():
+        over_speech = kind == "barge" or not self._playback.speech_idle()
+        if over_speech:
             self.pipeline.stop("wake word" if woken else "voice", barge_in=True)
         self._playback.set_paused(True)
         if woken:
             self._chime("start")
         with self._lock:
             self._listen_source = "wake"
+            self._clip_started_at_ms = protocol.clock_ms() if started_at_ms is None else started_at_ms
+            self._clip_over_speech = over_speech
             self._awake = False
         self._refresh_state()
 
@@ -661,12 +700,15 @@ class Daemon:
             if self._listen_source != "wake":
                 return
             self._listen_source = None
+            started_at_ms, over_speech = self._clip_started_at_ms, self._clip_over_speech
         self._playback.set_paused(False)
         self._chime("stop")
         if pcm is None:
             self._refresh_state()
             return
-        self._queue_clip(pcm, "wake", kind=kind, long_preroll=long_preroll)
+        self._queue_clip(
+            pcm, "wake", kind=kind, long_preroll=long_preroll, started_at_ms=started_at_ms, over_speech=over_speech
+        )
 
     def _on_follow_up(self, opened: bool) -> None:
         with self._lock:
@@ -777,6 +819,8 @@ class Daemon:
                             source=clip.source,
                             duration_ms=clip.duration_ms,
                             language=result.language,
+                            started_at_ms=clip.started_at_ms,
+                            over_speech=clip.over_speech,
                         )
                     )
                 else:
@@ -838,11 +882,22 @@ class Daemon:
                 return protocol.error_response("fish_key_missing", message)
             reply_id = self.pipeline.speak_now((body.get("text") or "").strip() or DEFAULT_TEST_LINE)
             return {"ok": True, "replyId": reply_id}
+        if name == "home":
+            return self._home_command(body)
         if name == "shutdown":
             # Answer first, then exit.
             threading.Timer(0.1, self.request_exit, args=(0,)).start()
             return {"ok": True}
         return protocol.error_response("bad_request", f"unknown command {name!r}")
+
+    def _home_command(self, body: dict[str, Any]) -> dict[str, Any]:
+        with self._home_lock:
+            if self._home is None and self._home_factory is not None:
+                self._home = self._home_factory()
+            home = self._home
+        if home is None:
+            return protocol.error_response("bad_request", "home control is not available in this helper")
+        return home.handle(body)
 
     def _apply_config(self, body: dict[str, Any]) -> dict[str, Any]:
         """Apply every valid field; a bad pttKey is reported but does not void the rest."""

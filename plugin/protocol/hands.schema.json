@@ -112,7 +112,15 @@
         "hand": { "$ref": "#/$defs/HandChoice" },
         "anchor": { "$ref": "#/$defs/AnchorChoice" },
         "overlay": { "type": "boolean" },
-        "scrollSpeed": { "type": "number", "minimum": 0.1, "maximum": 10 }
+        "cursorSpeed": { "type": "number", "minimum": 0.7, "maximum": 3, "description": "Gain on the cursor around the centre of the target region; the hand travel that crosses the screen is divided by it. Default 1." },
+        "smoothing": { "type": "number", "minimum": 0.2, "maximum": 3, "description": "Steadiness against lag: higher is steadier at rest and lags more. Default 1." },
+        "pinch": { "type": "number", "minimum": 0.85, "maximum": 1.15, "description": "How close thumb and finger must be for a pinch click; higher counts a looser pinch. Default 1." },
+        "fist": { "type": "number", "minimum": 0.9, "maximum": 1.1, "description": "How tightly the fingers must curl for a fist (a grab); higher counts a looser fist. Default 1." },
+        "engageSeconds": { "type": "number", "minimum": 0.1, "maximum": 2, "description": "Seconds an open palm is held still to take the cursor. Default 0.5." },
+        "dragDistance": { "type": "number", "minimum": 0.7, "maximum": 4, "description": "How far the hand may drift during a pinch before it becomes a drag; higher is steadier clicks and a later drag. Default 1." },
+        "flingSensitivity": { "type": "number", "minimum": 0.5, "maximum": 2.5, "description": "How light a flick throws a grabbed window; higher is a lighter flick. Default 1." },
+        "scrollSpeed": { "type": "number", "minimum": 0.1, "maximum": 10, "description": "Multiplier on the scroll distance per pixel of hand motion (2.4 wheel units per pixel at 1). Default 1." },
+        "deadZone": { "type": "number", "minimum": 0, "maximum": 8, "description": "Pixels the filtered cursor must move before it follows; higher is steadier at rest and coarser. Default 1." }
       }
     },
     "CalibrateCommand": {
@@ -152,13 +160,24 @@
         "calibrated": { "type": "boolean" },
         "settings": {
           "type": "object", "additionalProperties": false,
-          "required": ["engage", "hand", "anchor", "overlay", "scrollSpeed"],
+          "required": [
+            "engage", "hand", "anchor", "overlay", "cursorSpeed", "smoothing", "pinch", "fist", "engageSeconds",
+            "dragDistance", "flingSensitivity", "scrollSpeed", "deadZone"
+          ],
           "properties": {
             "engage": { "$ref": "#/$defs/EngageMode" },
             "hand": { "$ref": "#/$defs/HandChoice" },
             "anchor": { "$ref": "#/$defs/AnchorChoice" },
             "overlay": { "type": "boolean" },
-            "scrollSpeed": { "type": "number" }
+            "cursorSpeed": { "type": "number" },
+            "smoothing": { "type": "number" },
+            "pinch": { "type": "number" },
+            "fist": { "type": "number" },
+            "engageSeconds": { "type": "number" },
+            "dragDistance": { "type": "number" },
+            "flingSensitivity": { "type": "number" },
+            "scrollSpeed": { "type": "number" },
+            "deadZone": { "type": "number" }
           }
         }
       }

@@ -345,3 +345,79 @@ def test_non_finite_numbers_are_refused(value: float) -> None:
     # Deliberately stricter than the schema validator: NaN and infinity are not JSON.
     assert not command_ok("config", {"scrollSpeed": value})
     assert not command_ok("config", {"displays": [value]})
+
+
+# --------------------------------------------------------------------------- the sensitivity knobs
+
+
+def knob_values(low: float, high: float) -> list[Any]:
+    """The edges, just inside and just outside them, the middle, and what is no number."""
+    return [
+        low,
+        high,
+        (low + high) / 2,
+        low + (high - low) * 0.001,
+        high - (high - low) * 0.001,
+        low - 1e-9,
+        high + 1e-9,
+        low - 1,
+        high + 1,
+        int(high) if high == int(high) else high,
+        10**400,
+        -(10**400),
+        True,
+        False,
+        "1",
+        None,
+        [low],
+        {"v": low},
+    ]
+
+
+KNOB_CASES = [(knob.key, value) for knob in protocol.KNOBS for value in knob_values(knob.low, knob.high)]
+
+
+@pytest.mark.parametrize(("key", "value"), KNOB_CASES, ids=[f"{k}={v!r:.20}" for k, v in KNOB_CASES])
+def test_knob_validation_agrees_with_jsonschema(
+    key: str, value: Any, schema: dict[str, Any], reference_validator: Validate
+) -> None:
+    body = {key: value}
+    assert command_ok("config", body) is reference_ok(reference_validator, body, "ConfigCommand")
+
+
+def test_every_knob_in_one_body_and_unknown_keys(schema: dict[str, Any], reference_validator: Validate) -> None:
+    everything = {knob.key: knob.default for knob in protocol.KNOBS}
+    for body in (everything, {**everything, "extra": 1}, {**everything, "pinch": 99}, {**everything, "fist": None}):
+        assert command_ok("config", body) is reference_ok(reference_validator, body, "ConfigCommand")
+    assert command_ok("config", everything) and not command_ok("config", {**everything, "extra": 1})
+
+
+def test_random_bodies_over_every_knob_agree_with_jsonschema(
+    schema: dict[str, Any], reference_validator: Validate
+) -> None:
+    rng = random.Random(20261008)
+    pool = {knob.key: knob_values(knob.low, knob.high) for knob in protocol.KNOBS}
+    pool["engage"] = ["palm", "always", "PALM"]
+    pool["overlay"] = [True, False, 1]
+    outcomes = []
+    for _ in range(800):
+        body = {key: rng.choice(pool[key]) for key in rng.sample(list(pool), rng.randint(0, 5))}
+        expected = reference_ok(reference_validator, body, "ConfigCommand")
+        outcomes.append(expected)
+        assert command_ok("config", body) is expected, body
+    assert any(outcomes) and not all(outcomes)
+
+
+def test_a_knob_error_names_the_field_and_the_range() -> None:
+    for knob in protocol.KNOBS:
+        with pytest.raises(protocol.ValidationError, match=knob.key) as caught:
+            protocol.validate_command("config", {knob.key: knob.high + 1})
+        assert f"{knob.low:g}" in str(caught.value) and f"{knob.high:g}" in str(caught.value)
+        with pytest.raises(protocol.ValidationError, match=f"{knob.key}: expected number"):
+            protocol.validate_command("config", {knob.key: "fast"})
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_knob_values_are_refused(value: float) -> None:
+    for knob in protocol.KNOBS:
+        assert not command_ok("config", {knob.key: value})

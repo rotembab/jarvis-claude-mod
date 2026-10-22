@@ -6,6 +6,7 @@ import pytest
 from jarvis_hands.geometry import Point
 from jarvis_hands.landmarks import FINGERS, INDEX_TIP, MIDDLE_TIP, THUMB_TIP, WRIST, HandObservation
 from jarvis_hands.poses import (
+    BAND,
     HandPose,
     PoseThresholds,
     PoseTracker,
@@ -13,7 +14,9 @@ from jarvis_hands.poses import (
     finger_reach,
     palm_size,
     pinch_ratio,
+    thresholds_for,
 )
+from jarvis_hands.settings import KNOB_BY_KEY
 
 from scripted import HEIGHT, POSES, SCALE, WIDTH, hand
 
@@ -301,3 +304,230 @@ def test_hand_pose_is_frozen() -> None:
     assert isinstance(pose, HandPose)
     with pytest.raises(AttributeError):
         pose.pose = "fist"  # type: ignore[misc]
+
+
+# -- the pinch and fist sensitivity knobs (thresholds_for) -----------------------------------------------------
+
+#: The pinned contract's ranges; the helper's own (settings.KNOBS) are narrower where the measurements said so.
+CONTRACT_PINCH, CONTRACT_FIST = (0.6, 1.6), (0.8, 1.2)
+PINCH_RANGE = (KNOB_BY_KEY["pinch"].low, KNOB_BY_KEY["pinch"].high)
+FIST_RANGE = (KNOB_BY_KEY["fist"].low, KNOB_BY_KEY["fist"].high)
+
+
+def grid(low: float, high: float, n: int = 17) -> list[float]:
+    return [float(v) for v in np.linspace(low, high, n)]
+
+
+def test_the_knob_ranges_sit_inside_the_contract_and_around_the_default() -> None:
+    for (low, high), (c_low, c_high) in ((PINCH_RANGE, CONTRACT_PINCH), (FIST_RANGE, CONTRACT_FIST)):
+        assert c_low <= low < 1.0 < high <= c_high
+
+
+def test_the_default_sensitivities_are_exactly_the_default_thresholds() -> None:
+    assert thresholds_for() == PoseThresholds()
+    assert thresholds_for(1.0, 1.0) == PoseThresholds()
+    assert thresholds_for(1, 1) == PoseThresholds()
+
+
+@pytest.mark.parametrize("pinch", grid(0.5, 2.0, 7))
+@pytest.mark.parametrize("fist", grid(0.5, 1.6, 12))
+def test_the_threshold_order_holds_everywhere(pinch: float, fist: float) -> None:
+    """Far beyond the ranges too: a finger is never curled and extended at once, a pinch closes before it opens."""
+    th = thresholds_for(pinch, fist)
+    assert th.curled_enter < th.curled_leave < th.extended_leave < th.extended_enter
+    fist_enter, fist_leave = fist_thresholds(th)
+    assert 0 < fist_enter < fist_leave < th.extended_leave  # a fist is never an extended finger either
+    assert fist_enter <= th.curled_enter and fist_leave <= th.curled_leave  # and it implies curled fingers
+    assert 0 < th.pinch_close < th.pinch_open
+    assert th.pinch_close < th.pinch_display_open
+
+
+def test_pinch_sensitivity_scales_the_close_threshold_and_never_raises_the_open_one() -> None:
+    """A looser pinch closes at a larger ratio, but a hand lets go where it always did.
+
+    The hand that rests its thumb against the index (woman_hands' relaxed palms: 0.39 to 0.47) must not hold a
+    pinch, so the open threshold stays at the default 0.40 above a pinch sensitivity of 1.0 (and a strict pinch
+    lowers both, in proportion), with the noise-proof gap above the close threshold in any case.
+    """
+    base = PoseThresholds()
+    for s in grid(*PINCH_RANGE):
+        th = thresholds_for(s, 1.0)
+        assert th.pinch_close == pytest.approx(base.pinch_close * s)
+        assert th.pinch_open == pytest.approx(max(base.pinch_open * min(s, 1.0), th.pinch_close + BAND))
+        assert th.pinch_open >= th.pinch_close + BAND - 1e-12  # the hysteresis, about six times the ratio noise
+        if s >= 1.0:
+            assert th.pinch_open == pytest.approx(base.pinch_open)  # nothing in the knob's range raises it
+        assert (th.curled_enter, th.curled_leave, th.extended_leave, th.extended_enter) == (
+            base.curled_enter,
+            base.curled_leave,
+            base.extended_leave,
+            base.extended_enter,
+        )
+
+
+def fist_thresholds(th: PoseThresholds) -> tuple[float, float]:
+    """What a finger must reach to count toward a fist (enter, leave): the curled thresholds unless a tighter fist."""
+    return (
+        th.curled_enter if th.fist_enter is None else th.fist_enter,
+        th.curled_leave if th.fist_leave is None else th.fist_leave,
+    )
+
+
+def test_a_looser_fist_scales_the_curled_thresholds_and_not_the_pinch() -> None:
+    base = PoseThresholds()
+    previous = thresholds_for(1.0, 1.0)
+    for s in grid(1.0, FIST_RANGE[1], 9)[1:]:
+        th = thresholds_for(1.0, s)
+        assert th.curled_enter == pytest.approx(base.curled_enter * s)
+        assert th.curled_leave == pytest.approx(base.curled_leave * s)
+        assert fist_thresholds(th) == (th.curled_enter, th.curled_leave)  # the fist and the pinch gate go together
+        assert (th.pinch_close, th.pinch_open) == (base.pinch_close, base.pinch_open)
+        assert th.curled_enter > previous.curled_enter and th.curled_leave > previous.curled_leave
+        assert th.extended_leave >= previous.extended_leave and th.extended_enter >= previous.extended_enter
+        previous = th
+
+
+def test_a_stricter_fist_leaves_the_curled_flags_that_gate_the_pinch_alone() -> None:
+    """A stricter fist asks more of the fist and nothing else: the curled flags (which gate the pinch and tell the
+    engine how settled a pinch is) stay at the default, or a slow closing into a fist stops being judged as before."""
+    base = PoseThresholds()
+    for s in grid(FIST_RANGE[0], 1.0, 6)[:-1]:
+        th = thresholds_for(1.0, s)
+        assert (th.curled_enter, th.curled_leave) == (base.curled_enter, base.curled_leave)
+        assert th.fist_enter == pytest.approx(base.curled_enter * s)
+        assert th.fist_leave == pytest.approx(base.curled_leave * s)
+        assert th.fist_enter < th.fist_leave <= th.curled_leave
+        assert th.fist_enter < th.curled_enter  # a fist implies curled fingers, never the other way round
+        assert (th.pinch_close, th.pinch_open) == (base.pinch_close, base.pinch_open)
+    assert thresholds_for(1.0, 1.0).fist_enter is None and thresholds_for(1.0, 1.0).fist_leave is None
+
+
+@pytest.mark.parametrize("reach", [1.0, 1.04, 1.07])
+def test_fingers_curled_short_of_a_stricter_fist_make_no_fist_but_stay_curled(reach: float) -> None:
+    world = hand("fist").world
+    for finger in FINGERS:
+        world = with_reach(world, finger, reach)
+    default = PoseTracker().classify(observation(world))
+    strict = PoseTracker(thresholds_for(1.0, FIST_RANGE[0])).classify(observation(world))
+    assert default.pose == "fist" and strict.pose != "fist"
+    assert strict.curled == default.curled == (True, True, True, True)  # the same curled flags
+
+
+def test_a_tighter_fist_leaves_the_extended_thresholds_alone() -> None:
+    base = PoseThresholds()
+    for s in grid(FIST_RANGE[0], 1.0, 6):
+        th = thresholds_for(1.0, s)
+        assert (th.extended_leave, th.extended_enter) == (base.extended_leave, base.extended_enter)
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, float("nan"), float("inf")])
+def test_a_sensitivity_that_is_not_a_positive_number_is_refused(bad: float) -> None:
+    with pytest.raises(ValueError):
+        thresholds_for(bad, 1.0)
+    with pytest.raises(ValueError):
+        thresholds_for(1.0, bad)
+
+
+@pytest.mark.parametrize("ratio", [0.14, 0.2, 0.26, 0.3, 0.34, 0.38, 0.45, 0.52])
+def test_a_pinch_fires_below_the_scaled_close_threshold(ratio: float) -> None:
+    base = hand("palm").world
+    fired = [
+        s
+        for s in grid(*PINCH_RANGE, 29)
+        if PoseTracker(thresholds_for(s)).classify(observation(with_pinch(base, ratio))).pose == "pinch"
+    ]
+    assert fired == [
+        s for s in grid(*PINCH_RANGE, 29) if ratio < 0.28 * s
+    ]  # every setting above ratio / 0.28, none below
+    assert fired == sorted(fired)
+
+
+def test_a_closed_pinch_lets_go_above_the_open_threshold() -> None:
+    base = hand("palm").world
+    for s in grid(*PINCH_RANGE, 9):
+        th = thresholds_for(s)
+        tracker = PoseTracker(th)
+        assert tracker.classify(observation(with_pinch(base, 0.05))).pose == "pinch"
+        assert tracker.classify(observation(with_pinch(base, th.pinch_open - 0.01))).pose == "pinch"
+        assert tracker.classify(observation(with_pinch(base, th.pinch_open + 0.01))).pose == "palm"
+
+
+@pytest.mark.parametrize("rest", [0.42, 0.45, 0.5, 0.6])
+def test_a_closed_pinch_lets_go_into_a_hand_that_rests_its_thumb_near_the_index(rest: float) -> None:
+    """At every setting, as at the default: a looser pinch must not hold a click until the thumb opens wide."""
+    base = hand("palm").world
+    for s in grid(*PINCH_RANGE, 9):
+        tracker = PoseTracker(thresholds_for(s))
+        assert tracker.classify(observation(with_pinch(base, 0.05))).pose == "pinch"
+        assert tracker.classify(observation(with_pinch(base, rest))).pose == "palm", s
+
+
+@pytest.mark.parametrize("reach", [0.9, 1.0, 1.05, 1.12, 1.17, 1.22, 1.28])
+def test_a_fist_forms_below_the_scaled_curled_threshold(reach: float) -> None:
+    fist = hand("fist").world
+    world = fist
+    for finger in FINGERS:
+        world = with_reach(world, finger, reach)
+    found = [
+        s
+        for s in grid(*FIST_RANGE, 21)
+        if PoseTracker(thresholds_for(1.0, s)).classify(observation(world)).pose == "fist"
+    ]
+    assert found == [s for s in grid(*FIST_RANGE, 21) if reach < 1.10 * s]
+    assert found == sorted(found)
+
+
+def test_a_fist_lets_go_above_the_scaled_leave_threshold() -> None:
+    fist = hand("fist").world
+
+    def loosened(reach: float) -> np.ndarray:
+        world = fist
+        for finger in FINGERS:
+            world = with_reach(world, finger, reach)
+        return world
+
+    for s in grid(*FIST_RANGE, 9):
+        th = thresholds_for(1.0, s)
+        leave = fist_thresholds(th)[1]
+        tracker = PoseTracker(th)
+        assert tracker.classify(observation(loosened(0.9))).pose == "fist"
+        assert tracker.classify(observation(loosened(leave - 0.02))).pose == "fist"
+        assert tracker.classify(observation(loosened(leave + 0.02))).pose != "fist"
+
+
+#: The thumbs-up is left out of the tightest fist setting. These landmarks come from MediaPipe's WORLD output, whose
+#: depth is poor: its pinky reaches 1.05 here, against 0.88 at most in the image landmarks the helper really
+#: classifies (160 variants of the photo in test_poses_real), so a fist this loose needs a sensitivity of 0.96 or more.
+RANGE_ENDS = [
+    (name, pinch, fist)
+    for name in REAL_EXPECTED
+    for pinch in PINCH_RANGE
+    for fist in FIST_RANGE
+    if not (name == "thumb_up" and fist < 0.96)
+]
+
+
+@pytest.mark.parametrize(("name", "pinch", "fist"), RANGE_ENDS)
+def test_mediapipes_hands_classify_the_same_at_the_ends_of_both_ranges(name: str, pinch: float, fist: float) -> None:
+    pose = PoseTracker(thresholds_for(pinch, fist)).classify(observation(real_world(name))).pose
+    assert pose == REAL_EXPECTED[name]
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_a_relaxed_synthetic_hand_never_pinches_or_grabs_at_the_loosest_settings(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    tracker = PoseTracker(thresholds_for(PINCH_RANGE[1], FIST_RANGE[1]))
+    poses = {tracker.classify(hand("hover", (0.5, 0.45), jitter=0.002, rng=rng)).pose for _ in range(300)}
+    assert poses == {"hover"}
+
+
+@pytest.mark.parametrize("name", ["palm", "two", "point", "thumb_up"])
+def test_the_other_synthetic_poses_keep_their_name_at_the_loosest_settings(name: str) -> None:
+    tracker = PoseTracker(thresholds_for(PINCH_RANGE[1], FIST_RANGE[1]))
+    assert tracker.classify(hand(name)).pose == EXPECTED[name]
+
+
+@pytest.mark.parametrize("name", ["pinch", "pinch_middle", "fist"])
+def test_the_synthetic_pinches_and_fist_hold_at_the_strictest_settings(name: str) -> None:
+    tracker = PoseTracker(thresholds_for(PINCH_RANGE[0], FIST_RANGE[0]))
+    assert tracker.classify(hand(name)).pose == EXPECTED[name]

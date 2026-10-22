@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--fake-audio", action="store_true", help="no audio hardware or keyboard hook (tests)")
     run.add_argument("--fake-stt", action="store_true", help="fixed transcription instead of faster-whisper (tests)")
     run.add_argument("--fake-fish", metavar="URL", default=None, help="Fish Audio base URL of a fake server (tests)")
+    run.add_argument("--fake-desktop", action="store_true", help="desktop actions are recorded, not performed (tests)")
     run.add_argument("--stt-model", default=_env("JARVIS_STT_MODEL") or "auto")
     run.add_argument("--ptt-key", default=_env("JARVIS_PTT_KEY") or "right ctrl")
     run.add_argument("--voice-id", default=_env("JARVIS_VOICE_ID"))
@@ -81,6 +82,28 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--no-network", action="store_true", help="skip the Fish Audio reachability check")
     doctor.add_argument("--no-mic", action="store_true", help="skip the one-second microphone test")
     doctor.set_defaults(func=cmd_doctor)
+
+    home = sub.add_parser("home", help="home devices: setup wizard, list, status, do, scan")
+    home.add_argument("--data-dir", type=Path, default=None)
+    home_sub = home.add_subparsers(dest="home_command", required=True)
+    home_sub.add_parser("setup", help="the interactive setup wizard (add, name and try devices)")
+    home_sub.add_parser("open-setup", help="open the setup wizard in a new console window (prints JSON)")
+    home_sub.add_parser("info", help="what is set up and where it is saved")
+    home_list = home_sub.add_parser("list", help="the devices and their commands")
+    home_list.add_argument("query", nargs="?", default=None)
+    home_status = home_sub.add_parser("status", help="a device's state")
+    home_status.add_argument("device")
+    home_do = home_sub.add_parser("do", help="run a command on a device (asks no confirmation)")
+    home_do.add_argument("device")
+    home_do.add_argument("command")
+    home_do.add_argument("value", nargs="?", default=None)
+    home_sub.add_parser("scan", help="look for smart devices on the home network (about ten seconds)")
+    home_call = home_sub.add_parser("call", help="(internal) answer one home command body, given as JSON; prints JSON")
+    home_call.add_argument("body")
+    for parser_ in (home, *home_sub.choices.values()):
+        parser_.set_defaults(func=cmd_home)
+        if parser_ is not home:
+            parser_.add_argument("--data-dir", type=Path, default=argparse.SUPPRESS)
 
     # Internal: run/setup test the GPU in this child because a broken CUDA install can abort the process.
     probe = sub.add_parser("probe-cuda", help="(internal) load a model on the GPU once and report")
@@ -146,12 +169,16 @@ def _capabilities(args: argparse.Namespace) -> list[str]:
         "wake",
         "wake.plain",  # config takes plainWake
         "follow_up",
+        "home",
         *(["aec"] if args.aec != "off" and not args.fake_audio else []),  # fake audio has nothing to cancel
         "stt.faster-whisper",
         "tts.local" if args.tts_engine == "local" else "tts.fish-live",
     ]
     fakes = (("audio", args.fake_audio), ("stt", args.fake_stt), ("fish", args.fake_fish), ("local", args.fake_local))
     caps += [f"fake.{n}" for n, on in fakes if on]
+    from .desktop import desktop_capabilities  # lazy
+
+    caps += desktop_capabilities(fake=getattr(args, "fake_desktop", False) or args.fake_audio)
     return caps
 
 
@@ -234,6 +261,11 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
 
         echo_loader = loader(playback, capture)
 
+    def home_factory() -> Any:
+        from .home import HomeService
+
+        return HomeService(data_dir)
+
     config = DaemonConfig(
         stt_model=args.stt_model,
         language=args.language,
@@ -254,6 +286,7 @@ def _build_daemon(args: argparse.Namespace, data_dir: Path, writer: EventWriter)
         rescan_audio=rescan,
         vad=vad,
         wake_loader=wake_loader,
+        home_factory=home_factory,
         plain_loader=plain_loader,
         echo_loader=echo_loader,
     )
@@ -359,7 +392,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     try:
         daemon = _build_daemon(args, data_dir, writer)
         daemon_ref.append(daemon)
-        server = ControlServer(token, daemon.handle_command).start()
+        from .desktop import create_service, route_desktop  # lazy: nothing Windows-only at import
+
+        desktop = create_service(fake=args.fake_desktop or args.fake_audio)
+        server = ControlServer(token, route_desktop(daemon.handle_command, desktop)).start()
         writer.emit(
             protocol.Hello(
                 port=server.port,
@@ -416,6 +452,62 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     out.write((json.dumps(report, indent=2, ensure_ascii=True) + "\n").encode("ascii"))
     out.flush()
     return EXIT_OK
+
+
+def cmd_home(args: argparse.Namespace) -> int:
+    data_dir: Path = (args.data_dir or default_data_dir()).expanduser()
+    what = args.home_command
+    if what == "setup":
+        from .home.wizard import run_wizard
+
+        setup_logging(data_dir, "WARNING")
+        _quiet_stderr_logging()
+        return run_wizard(data_dir)
+    if what == "open-setup":
+        from .home.wizard import launch_in_new_console
+
+        out = _claim_stdout()
+        setup_logging(None, "WARNING")
+        opened, text = launch_in_new_console(data_dir)
+        out.write(encode_line({"ok": True, "opened": opened, "text": text}))
+        out.flush()
+        return EXIT_OK
+    from .home.commandline import call_once, run_console
+
+    if what == "call":
+        out = _claim_stdout()
+        setup_logging(data_dir, "WARNING")
+        out.write(encode_line(call_once(data_dir, args.body)))
+        out.flush()
+        # A device call past its time limit still runs on a pool thread, which
+        # Python would wait for at exit (the mod would then time out and lose
+        # this answer). The answer is out: leave now.
+        logging.shutdown()
+        os._exit(EXIT_OK)
+    setup_logging(data_dir, "WARNING")
+    _quiet_stderr_logging()
+    bodies: dict[str, dict[str, Any]] = {
+        "info": {"action": "info"},
+        "list": {"action": "list", **({"query": args.query} if getattr(args, "query", None) else {})},
+        "status": {"action": "status", "device": getattr(args, "device", "")},
+        "do": {
+            "action": "do",
+            "device": getattr(args, "device", ""),
+            "command": getattr(args, "command", ""),
+            **({"value": args.value} if getattr(args, "value", None) is not None else {}),
+        },
+        "scan": {"action": "scan"},
+    }
+    response = run_console(data_dir, bodies[what], stdin=sys.stdin)
+    print(response.get("text", ""))
+    return EXIT_OK if response.get("result") != "failed" else EXIT_ERROR
+
+
+def _quiet_stderr_logging() -> None:
+    """Keeps an interactive console free of log lines (they still go to voice.log)."""
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            handler.setLevel(logging.CRITICAL)
 
 
 def cmd_probe_cuda(args: argparse.Namespace) -> int:

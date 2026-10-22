@@ -1,0 +1,363 @@
+# Home control
+
+Jarvis can control the devices in your home over your home network: an Apple TV, a Sony Bravia TV, your own Plex Media Server (to find a movie or the next episode and open it on the Apple TV), Tuya devices from the Tuya Smart or Smart Life app (lights, plugs, switches, curtains, fans, heaters, Fingerbots), and anything Home Assistant controls. Ask in your own words, by voice or typed:
+
+- "Jarvis, turn on the TV and open Netflix on the Apple TV."
+- "Dim the bedroom lights to 30 percent."
+- "Pause the Apple TV." "Switch the TV to HDMI 2." "What's the TV on?"
+- "Close the living room curtains." "Run movie night."
+- "Put on the next episode of How I Met Your Mother." "Play Inception on the Apple TV."
+
+Claude sees your devices through a tool called `home_control`, finds the one you mean ("the TV", "bedroom light"), and runs the command. Jarvis talks to most devices directly on your network, so they answer quickly and keep working when the internet is down. The exceptions are Plex when your server is away from home, Tuya scenes, which run in Tuya's cloud, the one-time Tuya account link that fetches your Tuya devices' keys, and [Tuya's cloud fallback](#tuyas-cloud-fallback), only if you turn it on.
+
+## Contents
+
+- [Set up your devices](#set-up-your-devices)
+  - [Apple TV](#apple-tv)
+  - [Sony Bravia TV](#sony-bravia-tv)
+  - [Plex](#plex)
+  - [Tuya Smart and Smart Life](#tuya-smart-and-smart-life)
+    - [Devices in a brand app (MOES and others)](#devices-in-a-brand-app-moes-and-others)
+    - [Fingerbots and other button pushers](#fingerbots-and-other-button-pushers)
+    - [Tuya's cloud fallback](#tuyas-cloud-fallback)
+  - [Home Assistant](#home-assistant)
+- [Find what's on your network](#find-whats-on-your-network)
+- [Siri and Apple Home](#siri-and-apple-home)
+- [Using it](#using-it)
+- [Open a channel or a video](#open-a-channel-or-a-video)
+- [Play something from Plex](#play-something-from-plex)
+- [What Jarvis asks you first](#what-jarvis-asks-you-first)
+- [Commands](#commands)
+- [Where your devices and keys are kept](#where-your-devices-and-keys-are-kept)
+- [Privacy](#privacy)
+- [Troubleshooting](#troubleshooting)
+- [How it works](#how-it-works)
+
+## Set up your devices
+
+Run this in Claude Code, or just say "Jarvis, open home setup":
+
+```text
+/jarvis home setup
+```
+
+A **Jarvis home setup** window opens on your desktop. It has a menu to add each kind of device, find smart devices on your network, rename them, set their rooms, choose which ones Jarvis must ask about first, and try them out. Everything you type there, such as PINs, keys and tokens, goes straight into Jarvis's encrypted store on your PC. None of it passes through Claude Code, your chat or the model. **Never paste a PIN, key or token into the chat.**
+
+The PC and your devices must be on the same home network. Give each TV a fixed address: in your router's settings, reserve its current IP (often called a "DHCP reservation"). Jarvis can find a TV again if its address changes, but that is slower.
+
+**Windows Firewall.** The first time Jarvis searches your network, Windows may ask whether to let Python communicate on networks. Tick **Private networks** only and click **Allow**. If you click Cancel, finding devices automatically stops working. Controlling a device whose address you type in still works.
+
+### Apple TV
+
+1. On the Apple TV, open **Settings > AirPlay and HomeKit > Allow Access** and choose **Anyone on the Same Network** (or **Same Network**).
+2. In the setup window, choose **Add an Apple TV**. Pick it from the list, or type its IP address (on the Apple TV: **Settings > Network**).
+3. Name it (for example "Apple TV") and give it a room.
+4. The TV shows a 4-digit code. Type it into the setup window. After three wrong codes, setup stops; start it again for a new code.
+
+Jarvis can turn the Apple TV on and off, play and pause, skip, navigate, type into a search field, list and open apps, open a link in its app (such as a Kick channel), and change the volume. Volume works only if the Apple TV controls your TV's volume over HDMI-CEC; otherwise ask Jarvis to change the TV's volume instead. The Apple TV doesn't tell Jarvis which app is open, so "what's on?" only says whether it is on or asleep. To remove Jarvis later, use **Settings > Remotes and Devices > Remote App and Devices** on the Apple TV.
+
+If no code appears, or the right code is refused, restart the Apple TV (**Settings > System > Restart**) and try again. Some Apple TV 4K units on tvOS 26 have a known pairing bug.
+
+### Sony Bravia TV
+
+1. On the TV, open **Settings > Network & Internet > IP control** (on some models it is inside **Local network setup** or **Home network setup**; on older Android TVs, **Settings > Network > Home network setup > IP control**):
+   - **Authentication**: **Pre-Shared Key** (or **Normal and Pre-Shared Key**). Never choose **None**: it lets any device on your network control the TV. TVs made since August 2025 have no Authentication item; just set the key.
+   - **Pre-Shared Key**: make up a key of 16 to 20 random letters and numbers (TVs made since August 2025 need at least 16). Don't use a password you use elsewhere: on older TVs the key travels unencrypted on your home network.
+2. On Google TV models, set **Settings > Network & Internet > Remote device settings > Control remotely** to **On**. On some older Google TVs, **Control remotely** is inside IP control instead.
+3. Still under **Settings > Network & Internet**, turn **Remote start** on (some models say **On (Powered on by apps)** or **On (Networked standby)**). Then Jarvis can turn the TV on from standby; it uses a little more power in standby. With it off, the TV disappears from the network when it is off.
+4. If the TV has had the Android 14 update, also set **Settings > System > Power and Energy > Energy Mode** to **Increased**. **Low** turns the network off in standby, so Jarvis can't turn the TV on, and the update sets Low if Remote start was off before.
+5. With the TV on, choose **Add a Sony Bravia TV** in the setup window. Pick it from the search, or type its IP address (on the TV: **Settings > Network & Internet**, then your network); newer TVs may not answer the search. Then type the pre-shared key. Jarvis checks the key at once and says if it is wrong or IP control is off.
+6. Name it (for example "TV") and give it a room. Jarvis offers a test: it reads the TV's state and presses Home.
+
+TVs made since August 2025 accept only a secure (HTTPS) connection. Setup tries both kinds and keeps the one that works. If a TV Jarvis already knows starts to need a secure connection, Jarvis switches to it by itself when it can; otherwise it asks you to add the TV again.
+
+Jarvis can turn the TV on and off, set the volume and mute, switch inputs by their names ("Apple TV", "HDMI 2"), open apps, type into the TV's on-screen keyboard, press remote buttons (play, pause, back, home, arrows) and say what is on. With a soundbar or receiver on HDMI (eARC), Jarvis always uses the remote's volume and mute buttons, because the TV's own volume setting can silently do nothing then. So "volume 20" works only if the TV reports the soundbar's level, and the TV's status leaves the volume out. The TV can't tell Jarvis whether something is playing, so "play/pause" pauses; say "play" to carry on.
+
+Some budget models (BRAVIA 2 II and some BRAVIA 3) list only **Simple IP control** and **Control4** under IP control. Jarvis can't control those.
+
+### Plex
+
+Jarvis can look up a movie, a show or a particular episode on your own Plex Media Server and ask the Apple TV to open it in the Plex app. You need:
+
+- the Apple TV set up in Jarvis ([above](#apple-tv)), with the Plex app installed on it and signed in to the Plex account you watch with;
+- a Plex Media Server that this PC can reach. It can be on your home network, or away from home with remote access turned on (Plex's own **Settings > Remote Access**).
+
+Then:
+
+1. In the setup window, choose **Connect Plex**.
+2. A page from plex.tv opens in your browser. Sign in to Plex there if it asks, and approve Jarvis, the way you would approve a TV app. Jarvis never sees your Plex password. If no browser opens, Jarvis shows the sign-in link instead, to open on any device (only then, because the link holds the sign-in code).
+3. If your account has more than one server, pick yours. Jarvis looks for it, the home network first, then the internet, and tells you how it got there. If it can't reach the server from this PC, it asks whether to keep the sign-in anyway.
+4. Name it (the default is "Plex"). Jarvis offers a test that reads the names of your libraries.
+
+What it can do: `find` a title on the server. Say "the next episode of Severance", "season 3 episode 5 of How I Met Your Mother", "the latest episode of Fauda", "continue watching Chernobyl", "Inception" or "Dune 1984". Titles can be in any language. For a show, "next" means the episode Plex would continue with (one you stopped halfway, or the one after the last you watched); Specials are skipped unless you ask for season 0. When two titles fit, such as two films called Dune, Jarvis tells you which and asks. You can try it from Claude Code: `/jarvis home do Plex -- find inception`.
+
+The answer says what Jarvis found and where you stopped, and ends with a link. Claude gives that link to the Apple TV, which opens it in the Plex app. The link opens the title's page in Plex, so **press play on the remote**. The Apple TV doesn't say whether it worked, so Jarvis says it only *asked*. The Apple TV must be awake: say "turn on the Apple TV" first, or press a button on its remote.
+
+Which episode is next follows the Plex account Jarvis signed in with. If different people use different Plex users on the Apple TV, connect Plex with the account that does the watching. Jarvis only looks things up and sends a link; it doesn't play anything itself, and it doesn't change what Plex counts as watched. In plan mode Jarvis runs no device commands, so it won't look up a title then.
+
+Advanced: the link kind is the `link` setting of the Plex entry in `%USERPROFILE%\.jarvis\home\devices.json`. Add `"link": "play"` to that entry's `settings` (next to `"server_id"`), save the file and ask again; Jarvis reads the file on every request, so there is nothing to restart. `preplay` (the default) opens the title's page. `play` is meant to start it but hasn't been tried on a real Apple TV yet, so use it only to experiment, and set it back to `preplay` if the Apple TV answers `Open URL failed`. Any value other than `play` or `preplay` means `preplay`.
+
+### Tuya Smart and Smart Life
+
+Jarvis controls Tuya devices directly on your network with each device's *local key*. A short, one-time link with your Tuya account fetches those keys. It works with the Smart Life app and with the Tuya Smart app, and only with those two. If your devices are in a brand's own app, such as MOES, Lidl Home or Gosund, [move them to Smart Life first](#devices-in-a-brand-app-moes-and-others). You don't need a Tuya developer account.
+
+Use the same app, the one your devices are in, for every step. Tuya Smart and Smart Life have separate accounts, so a User Code from one app doesn't work with a scan from the other.
+
+1. Check that your devices are added and working in the app.
+2. In the app, open **Me**, tap the gear (top right), then **Account and Security**. Your **User Code** is at the bottom. Note it exactly: it is case-sensitive.
+3. In the setup window, choose **Link Tuya devices (Tuya Smart or Smart Life)**, then **Link your Tuya account** if it asks, and type the User Code.
+4. A QR code appears in the window and as an image. In the same app, go to the **Home** tab and tap **+** (top right), then **Scan**. Scan the code, then tap **Confirm login** on the phone. Use the app's scanner, not the phone's camera, and do it straight away: the code is valid only briefly. **The phone may say the login is for Home Assistant.** That is expected: Jarvis signs in the same way Home Assistant's Tuya integration does. Then come back to the setup window (on Windows the QR image may cover it). Jarvis notices the login by itself within a few seconds, and says every 30 seconds that it is still waiting. If the code expires, or 3 minutes pass without a login, Jarvis says what usually causes that and offers a new code.
+5. Jarvis asks whether to also use Tuya's cloud when a device doesn't answer on your home network. Pressing Enter means no; see [Tuya's cloud fallback](#tuyas-cloud-fallback).
+6. Jarvis lists your devices and finds each one on your network. For a switch or plug with several buttons ("gangs"), each becomes its own device; name them when asked. For a Fingerbot, it asks what the Fingerbot presses, and in switch mode which way round it is ([below](#fingerbots-and-other-button-pushers)). Devices that are off, or run on batteries, may not be found. Jarvis keeps them anyway and looks again when you use them.
+
+Your rooms and names carry over from the app. **Tap-to-Run scenes** also show up, and Jarvis can run them ("run movie night"), including the ones you added to Siri. Scenes are also how Jarvis controls an air conditioner or TV through a Tuya IR blaster: create scenes such as "AC cool 24" and "AC off" in the app, then refresh (below).
+
+Keep the PC and your Tuya devices on the same network, not a guest network or one with Wi-Fi client isolation. The PC can be wired. Jarvis listens for the devices on UDP ports 6666, 6667 and 7000 and reaches them on TCP port 6668, which is why Windows Firewall asks about Python.
+
+The **Link Tuya devices** step also has:
+
+- **Refresh devices and scenes from your Tuya account (no QR code)**: after you add a device, re-pair one (its key changes), or add a scene. If Jarvis says the link has expired, choose **Link your Tuya account** again.
+- **Use Tuya's cloud when a device does not answer on the network**: turns the [cloud fallback](#tuyas-cloud-fallback) on or off. The item says whether it is on now.
+- **Find my Tuya devices on the network again**: after a device moved or was off during setup.
+- **Reverse a curtain's position**: if a curtain moves the wrong way when Jarvis sets its position.
+
+The link uses Home Assistant's Tuya sign-in. Tuya has not published it for other apps, so it could stop working one day. Your devices keep working locally even then, because Jarvis already has their keys; only scenes, refreshing and the cloud fallback need the link.
+
+#### Devices in a brand app (MOES and others)
+
+Many brands sell Tuya devices with an app of their own: MOES, Lidl Home, LSC Smart Connect, Gosund, Nedis, Konyks and more. The link works only with Smart Life and Tuya Smart. Tuya keeps each brand app's accounts separate, so a code scanned with a brand app never signs in (the phone often says "Please use the designated APP to scan the code to log in", sometimes only after you tap **Confirm login**). A device belongs to one account at a time, so move your devices to Smart Life:
+
+1. In the brand app, remove each device. For a Fingerbot behind a hub, remove the Fingerbot first, then the hub. If the app offers **Disconnect and wipe data**, pick it.
+2. Install Smart Life and sign up, choosing the same country or region as in the brand app.
+3. Add the hub first, then the Fingerbot through the hub, then your other devices.
+4. Set each Fingerbot's mode again (switch mode, for example): a reset can clear it.
+5. In the setup window, link your Tuya account with the User Code from Smart Life.
+
+Scenes and automations from the brand app don't move: make them again in Smart Life. Fingerbots from MOES officially work with Smart Life and Tuya Smart.
+
+#### Fingerbots and other button pushers
+
+A Fingerbot, or another Tuya button pusher, sits on a wall switch and moves it for you. Jarvis drives it the way the mode you chose in the Tuya Smart or Smart Life app says:
+
+- **Switch mode.** The arm moves to one position for on and stays there, and to the other for off. Jarvis turns it on and off ("turn on the bedroom light", "switch off the Fingerbot"), toggles it, and tells you whether the light is on or off. If the light is already on, "turn on" leaves the Fingerbot alone and says so.
+- **Click mode.** Each press is one push on the switch. Say "press the Fingerbot" or "press the bedroom light". Jarvis can't see the light, so it never says whether the light is on or off, and it doesn't turn a click-mode Fingerbot "on" or "off", because a press only flips the switch. If Jarvis couldn't read the Fingerbot before pressing, it says the arm may not have moved.
+- **Program mode.** Jarvis can say its state and battery, but doesn't drive it. Put it in click or switch mode to use it with Jarvis.
+
+- **Setup learns the mode.** Setup reads each Fingerbot's mode from Tuya and lists it. When the hub reports the Fingerbot's state, Jarvis checks its mode again before each command: if you changed it in the app since, Jarvis leaves the Fingerbot alone and says so. When the hub doesn't report it (some hubs never do), Jarvis follows the mode setup saved. So after you change the mode in the app, choose **Refresh devices and scenes** in the setup window, and Jarvis follows the new mode.
+- **Which way round.** Which arm position the app calls On is up to you (the app can reverse it), so for each Fingerbot in switch mode, setup asks: "In the Tuya app, when the Bedroom Fingerbot shows On, is the bedroom light on or off?" Answer **on** or **off**. Jarvis then turns the light on when you ask for it on, whichever way round the arm is set, and says whether the light is on. A refresh in switch mode asks again, with your last answer as the default: press Enter to keep it. Jarvis keeps your answer while the Fingerbot is in another mode.
+- **It needs a Tuya gateway.** A Fingerbot talks Bluetooth, to your phone. Jarvis can reach it only through a Tuya Bluetooth or multi-mode gateway on your network. Until there is one, setup leaves the Fingerbot out and says why. Add a gateway in the Tuya Smart or Smart Life app, pair the Fingerbot to it, then choose **Refresh devices and scenes** in the setup window. Setup lists the Fingerbot "through" its hub. If Tuya gives the Fingerbot a key of its own, Jarvis pairs it to your hub when you have only one, and says so; with more than one hub, it can't tell which, so it leaves a new Fingerbot out and keeps one it saved before as it was (or, with the [cloud fallback](#tuyas-cloud-fallback) on, reaches it through Tuya's cloud).
+- **Name what it presses.** When setup first adds a Fingerbot, it asks what it switches on and off, for example "bedroom light". Jarvis keeps that as another name for it, so "turn on the bedroom light" finds the Fingerbot. If the name ends in "light", "lamp", "bulb" or "fan", Jarvis also knows it by those words, so "the bedroom lamp" finds it too. A refresh keeps the name and doesn't ask again. To change it, use **Rename a device, set its room, or remove it > Set other names (aliases)**.
+- **Hubs.** A Tuya hub takes only a few connections at a time, and the Tuya app open on a phone can hold one. If Jarvis says the hub turned it away, close the app and try again. Some hubs don't pass commands on over the home network at all. For a Fingerbot in switch mode, turn on [Tuya's cloud fallback](#tuyas-cloud-fallback), and Jarvis sends the command through Tuya's cloud instead. A press in click mode that the hub took is never sent again through the cloud, because a second press would undo the first, so the fallback can't help a hub that doesn't pass presses on.
+- **Sent once.** Jarvis sends each command once and waits for the hub to confirm it. If a press in click mode isn't confirmed, Jarvis says so and doesn't press again, because a second press would undo the first. A switch-mode on or off that isn't confirmed is safe to send again, so with the cloud fallback on, Jarvis sends it through Tuya's cloud.
+
+Ask Jarvis about it and it says its mode, whether the light is on or off in switch mode, and its battery. If you put it in switch mode in the app after setup, Jarvis says so, but not whether the light is on until you refresh, because setup hasn't asked which way round it is. Jarvis also knows it as "the button", "the clicker" or "the button pusher".
+
+#### Tuya's cloud fallback
+
+Jarvis controls your Tuya devices over your home network. With the cloud fallback on, it can also send a command through Tuya's cloud, over the internet, when a device doesn't answer at home. It is off unless you turn it on.
+
+- **Turning it on or off.** Jarvis asks right after you link your Tuya account. To change your answer, choose **Link Tuya devices (Tuya Smart or Smart Life)** in the setup window, then **Use Tuya's cloud when a device does not answer on the network**. After turning it on, choose **Refresh devices and scenes** to add devices only the cloud can reach.
+- **What it does.** Jarvis always tries your home network first. Only if the device doesn't answer, takes too long or turns Jarvis away does the same command go through Tuya's cloud, and Jarvis's answer then says it went "through Tuya's cloud" (unless nothing needed sending, such as a Fingerbot already where you asked). A device Jarvis hasn't found on the network goes to the cloud at once, while Jarvis looks for it in the background so the next command can stay at home. A value the device refused, or a command it doesn't have, never goes to the cloud. A toggle is never flipped twice, and a Fingerbot press in click mode is sent once: if its hub doesn't confirm it, Jarvis says so instead of sending it again.
+- **Devices only the cloud reaches.** With the fallback on, a refresh also adds devices Tuya gives no local key for and devices behind a hub Jarvis couldn't match. Setup lists them as "through Tuya's cloud only". If you turn the fallback off, Jarvis can't control them until you turn it on again.
+- **What it can't do.** A Bluetooth device with no Tuya gateway, such as a Fingerbot paired only to your phone, can't be reached either way. If Tuya's cloud says a device is offline, Jarvis says so. If Tuya limits requests, Jarvis sends no commands or scenes through the cloud for a minute.
+- **Devices saved earlier.** Colours and some brightness ranges on devices Jarvis saved before the fallback existed need **Refresh devices and scenes** before the cloud can set them. On and off work right away.
+
+The fallback uses the same unofficial sign-in as the link. If Tuya blocks it, the fallback and scenes stop working, and control over your home network carries on.
+
+### Home Assistant
+
+If you run Home Assistant, Jarvis can control everything it does, including Hue, Sonos, Shelly, vacuums and Matter devices.
+
+1. In Home Assistant, open your profile (your name, bottom left) > **Security** > **Long-lived access tokens** > **Create token**. Name it "Jarvis" and copy it; Home Assistant shows it only once.
+2. In the setup window, choose **Connect Home Assistant**. Type its address (`homeassistant.local` or its IP address is enough), then paste the token. It isn't shown as you paste.
+3. If your Home Assistant user is an administrator, Jarvis offers to see only the devices you've exposed to Assist. That is the recommended choice: you pick them in Home Assistant under **Settings > Voice assistants > Expose**.
+
+Names and rooms come from Home Assistant, so change them there. Unlocking, disarming and opening a garage door need your OK on screen; see [What Jarvis asks you first](#what-jarvis-asks-you-first). Jarvis never sends a lock or alarm code: if one needs a code, set a default code for it in Home Assistant, or use the Home Assistant app.
+
+If Home Assistant uses https with a self-signed certificate, setup offers to skip the certificate check. Accept only on your home network.
+
+## Find what's on your network
+
+Jarvis can search your home network and tell you which smart devices are there and which of them it can control. Use any of these:
+
+- In the setup window, choose **Find smart devices on my network**. Do your first search here: if Windows Firewall asks about Python, the question comes up where you can answer it.
+- Type `/jarvis home scan` in Claude Code.
+- Ask Jarvis, for example "what smart devices are on my network?"
+
+A search takes about ten seconds. It only asks the network who is there, and reads the description a device offers about itself. If you connected Home Assistant by its name, such as `homeassistant.local`, it also looks that name up. It doesn't pair with anything, sign in or change anything, and it saves nothing. While Jarvis is running, it searches at most once a minute; ask again sooner and you get what that search found, checked against your setup as it is now. The setup window keeps its own minute, so its first search always starts afresh, and so does any search while Jarvis isn't running.
+
+The answer puts what it found in groups:
+
+| Group | What it means |
+| --- | --- |
+| Jarvis controls these | Apple TVs, Sony Bravia TVs, Tuya devices and Home Assistant. Each says the name Jarvis knows it by, or that it isn't set up yet and how to add it in home setup. If Jarvis couldn't look up the name you connected Home Assistant by, it says it couldn't check. If it finds a Home Assistant at another address than the one you connected, it says so rather than offer to connect it, since Jarvis connects to only one. |
+| Jarvis could control these with a new driver | Brands Jarvis has no driver of its own for, such as Philips Hue or Sonos, and what adding one would take. If they are in your Home Assistant, Jarvis already controls them through it. |
+| Already in a HomeKit home | HomeKit devices something has already paired with, usually Apple's Home app, where Siri controls them. Jarvis can't pair with them too; if Home Assistant paired them, Jarvis controls them through it. See [Siri and Apple Home](#siri-and-apple-home). |
+| HomeKit devices not in any home yet | HomeKit devices nothing has paired with yet. Jarvis can't pair with HomeKit devices itself. |
+| Matter devices | Jarvis has no Matter driver of its own: the app that set them up can control them, and Matter devices in your Home Assistant work through it. Ones already set up can only be counted, per Matter home; a device shared between two homes counts once. |
+
+Printers, computers, phones and routers are only counted. Bluetooth and Zigbee devices never show up in a network search, only their hub or gateway does, so a Fingerbot paired only to your phone won't appear.
+
+Claude sees the devices' names and kinds, never their network addresses. A name is shown as the device announces it, minus the MACs, ids and serial numbers Jarvis recognizes in it.
+
+If nothing answers, Windows Firewall may be blocking Python, or your network may be set to Public. In **Windows Security > Firewall & network protection > Allow an app through firewall**, allow Python on Private networks, and check that your network is set to Private. Govee and Yeelight lights answer only when **LAN Control** is on in their own app.
+
+## Siri and Apple Home
+
+Jarvis runs on Windows, and Apple gives Windows programs no way into Apple Home. So Jarvis can't run your Apple Home scenes or control accessories that live only in Apple's Home app. An accessory already in Apple Home also won't accept a second controller unless you remove it there, which would take it away from Siri.
+
+- **The Apple TV.** Pairing it in Jarvis makes Jarvis a remote for the Apple TV, not a HomeKit controller. It doesn't give Jarvis your Home accessories.
+- **Tuya scenes in Siri.** A Tap-to-Run scene you added to Siri from the Tuya Smart or Smart Life app is the same scene Jarvis runs once your Tuya account is linked.
+- **Devices Jarvis reaches itself.** A Sony TV or Tuya devices work with Jarvis whether or not they are also in Apple Home.
+
+A network search shows which devices are already in a HomeKit home, usually Apple Home. A Mac version of Jarvis could one day run your Shortcuts, and Apple Home through them; there is none yet.
+
+## Using it
+
+Talk to Jarvis as usual. To see what Jarvis knows, ask "what devices do you have?" or run `/jarvis home list`.
+
+- **Names.** Jarvis understands a device's name, its room ("the bedroom light"), its kind ("the TV", if you have only one), the other names you give it in the setup window, and near misses ("Sonny TV").
+- **Two of a kind.** "Turn off the light" with two lights makes Jarvis ask which one.
+- **Values.** Volume, brightness and positions go from 0 to 100: "volume 20", "brightness half". Colours are names or hex codes: "warm white", "blue", "#ff8800".
+- **Apps and inputs.** "Open YouTube on the TV" matches the app list loosely. So does "switch to the Apple TV" for a TV input you have named "Apple TV".
+
+## Open a channel or a video
+
+Ask for a streamer or a link, for example "open xQc on Kick on the Apple TV". Claude gives Jarvis the channel's link (`https://kick.com/xqc`), and Jarvis opens it in the app.
+
+- **Apple TV.** Jarvis checks that Kick is installed, then hands the Apple TV the link. Kick needs tvOS 26 or later; get it from the App Store on the Apple TV. Links to other apps that claim their web links, such as Netflix or Disney+, work the same way. The Apple TV doesn't say whether a link opened, so Jarvis says it *asked*. If Kick opens on its home screen instead of the channel, select Kick's search box with the remote and say the name: Jarvis types it.
+- **Sony TV.** Sony's control API only starts apps; it can't open a link inside one. So Jarvis opens Kick and asks you to select Kick's search box; say the name and Jarvis types it. Get Kick from the Google Play Store on the TV. It needs Android 8 or later: see **Settings > Device Preferences > About**. Typing works only where the TV's own on-screen keyboard comes up. If an app has a keyboard of its own, type with the remote.
+- **Channel names.** A channel's link uses its Kick name, which can differ from how people know the streamer. If Kick shows "Channel Not Found", check the name on kick.com.
+- **Don't have Jarvis type a password.** What Jarvis types passes through the chat.
+- **On this PC**, Claude can open the channel in your browser instead, with Jarvis's desktop tool (Windows). It asks you on screen first unless your rules allow `mcp__jarvis__desktop`; see [the desktop tool](PC-CONTROL.md#the-desktop-tool).
+
+## Play something from Plex
+
+Ask for a title and the device to show it on, for example "put on the next episode of Severance on the Apple TV". Claude does two steps. It asks the Plex server (`find`), which answers with the episode and a link. Then it gives that link to the Apple TV's `launch_app`, exactly as it came. The link looks like `plex://preplay/?metadataKey=%2Flibrary%2Fmetadata%2F14779&server=...`: the number is the title's id on your server, and the server is named by its machine identifier. It holds no token.
+
+- **Apple TV only.** Opening a link in an app is what the Apple TV's remote connection does. The Sony TV can't open a link inside an app, so use the Plex app on the Apple TV, or open Plex on the Sony TV by name and use the remote.
+- **Pressing play.** The link opens the title's page. Press play, and Plex continues from where you stopped.
+- **Wrong title or episode.** Say more: the year ("Dune 1984"), or the season and episode ("season 2 episode 4"). Ask Claude what Jarvis found; the answer names the title and the episode.
+
+## What Jarvis asks you first
+
+Jarvis applies your Claude Code permission rules to the device tool, and asks once more for a device that needs your OK.
+
+**Your Claude Code rules.** Jarvis's device tool is `mcp__jarvis__home_control`. Jarvis answers it itself, so Claude Code's own permission prompt never sees its calls. Jarvis applies your rules for it instead, as it does for the [desktop tool](PC-CONTROL.md#the-desktop-tool), except that it runs on Claude Code's default (you chose this, so that commands work like a remote control):
+
+- **Commands run.** With no rule for the tool, Claude Code's own default is to ask, but Jarvis runs a device command, a read or the setup window without a question, the way a remote control's button does. That also holds when the permission mode alone allows it (bypassPermissions), and with your own allow rule.
+- **An ask rule brings the question back.** To have Jarvis ask before every call, add `"mcp__jarvis__home_control"` to `ask` in your settings yourself, or with `/permissions`: Jarvis asks on screen ("No" / "Yes, do it"). It also asks when a PreToolUse or PermissionRequest hook in your settings could match the tool (Claude Code runs none of your settings hooks for it), and before a change when the permission mode isn't known for the turn: a subagent's call, or a turn that didn't start from a prompt Jarvis saw just before it.
+- **Deny rule**: Jarvis can't use the tool at all, not even to list devices. `/jarvis home` still works when you type it.
+- **dontAsk mode**: only your allow rule lets a call run, reading included. Anything that would ask is refused.
+- If your rules or your settings can't be read, nothing is done.
+
+**Devices that need your OK.** A few commands need your OK on screen even though the tool otherwise runs without a question: unlocking a lock, disarming an alarm, and opening a garage door or gate. If Jarvis already asked because of an ask rule, it asks again for these, naming the device it found. Jarvis never accepts a spoken "yes" for either question, because a TV or a video could say it too. A question that closes by itself while you are away, or when you ask to talk it over first, counts as a no, whichever option was picked.
+
+In the setup window, **Ask before Jarvis uses a device** sets any device you added there (not Home Assistant's) to:
+
+- **Just do it**: the default.
+- **Ask me on screen first**: for example, a plug that powers a heater.
+- **Never**: Jarvis may only read its state.
+
+In plan mode, Jarvis only looks at devices and doesn't change them. If Jarvis doesn't know the mode at all (right after the plugin reloads, before your next prompt), it changes nothing; in a turn that didn't start from a prompt Jarvis saw, a change asks you first.
+
+While Claude Code runs as administrator, or before Jarvis's check for that has passed, home control does nothing, from Claude or from `/jarvis home`. See [Never as administrator](PC-CONTROL.md#never-as-administrator).
+
+These checks cover Jarvis's own device tool. Programs that run under your Windows account can still use the helper, and that includes shell commands Claude runs: DPAPI keeps your keys from other accounts, not from your own programs. Jarvis's guard asks on screen before Claude runs Jarvis's own Python (`-m jarvis_voice`), even when your rules allow the command, and blocks Claude's requests to the helper's port. The guard only reads command text and can miss a spelling it doesn't know, so Claude Code's own prompt for a shell command you haven't allowed is what really stops Claude going around the tool. So don't allow commands that run Jarvis's Python (`.jarvis\venv`) without asking.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/jarvis home` | What is set up, and where it is saved |
+| `/jarvis home setup` | Opens the setup window |
+| `/jarvis home list [words]` | Your devices and what each one can do; words filter by name, room or kind |
+| `/jarvis home status <device>` | A device's state ("The Sony TV is on, showing Apple TV (HDMI 2), volume 20%.") |
+| `/jarvis home do <device> -- <command> [value]` | Runs one command, for example `/jarvis home do Sony TV -- set_volume 20`. Asks on screen first where the device needs it. |
+| `/jarvis home scan` | Searches your home network for smart devices, about ten seconds; see [Find what's on your network](#find-whats-on-your-network) |
+
+From a terminal on the PC, the same commands work without Claude Code, for example to try a device. There, a command that needs confirming asks you to type yes. These are for a terminal of your own: if Claude runs them, Jarvis's guard asks you on screen first.
+
+```powershell
+& "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice home list
+& "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice home do "Sony TV" set_volume 20
+& "$env:USERPROFILE\.jarvis\venv\Scripts\python.exe" -m jarvis_voice home scan
+```
+
+## Where your devices and keys are kept
+
+| File | Holds |
+| --- | --- |
+| `%USERPROFILE%\.jarvis\home\devices.json` | Your devices: names, rooms, network addresses, what they can do. For Plex, the server's name, its machine identifier, the addresses plex.tv lists for it and an id for this PC's Plex sign-in. No secrets. |
+| `%USERPROFILE%\.jarvis\home\credentials.dat` | The Apple TV pairing, the Sony pre-shared key, the Plex sign-in token (and the token plex.tv gives for your server), the Tuya local keys and your Tuya account link (with your cloud fallback choice), and the Home Assistant token. They are encrypted with Windows DPAPI, so only your Windows account on this PC can read them. |
+
+To remove a device, use **Rename a device, set its room, or remove it** in the setup window. That also deletes its credentials. To remove everything, delete the `home` folder. Then also remove Jarvis on the devices themselves: unpair it on the Apple TV, change the TV's pre-shared key, remove Jarvis from your Plex account (**Account settings > Authorized Devices** on plex.tv; it is listed as Jarvis), and delete the Home Assistant token.
+
+## Privacy
+
+- Jarvis sends device commands from your PC straight to your devices on your network. They don't go through Anthropic, Fish Audio or any cloud, with one exception that you choose: with [Tuya's cloud fallback](#tuyas-cloud-fallback) on, a Tuya command goes through Tuya's cloud when the device doesn't answer at home, or when only the cloud can reach it.
+- Claude sees your device names, rooms, states and commands, and the names and kinds of devices a network search finds. It never sees an address, a PIN, a key or a token. For Plex it sees the titles your server finds, the episode and the link described [above](#play-something-from-plex); the link holds the title's id and the server's machine identifier, not a token.
+- Plex: plex.tv sees the sign-in and the list of your servers and their addresses. The titles you ask for go only to your own server, on your home network when the PC can reach it there; away from home they cross the internet (encrypted), or Plex's relay. The Plex token is sent only in a header, and only to an address that has first said it is your server (asked without the token, and without this PC's name). That check is a name, not a password: it keeps the token from another machine that inherited an address, not from someone on your own network. Jarvis tries the encrypted address first. When it can't be used and the server's **Secure connections** setting is **Preferred** (Plex's default), Jarvis uses the server's plain home-network address, and then the token crosses your home network unencrypted, as it does for Plex's own apps. Set **Secure connections** to **Required** in the server's Network settings to rule that out, if the encrypted address works for this PC. The token of your account is sent only to a server your account owns; a server shared with you is reached with the token plex.tv gives for it.
+- The Tuya link signs in to Tuya's cloud once, to fetch your devices and their keys, and again when you refresh. Running a Tuya scene asks Tuya's cloud to run it, and so does a command that falls back to the cloud.
+- The helper's log never holds a Tuya key, token or reply from Tuya's cloud. For a Tuya command it records the device's Tuya id, whether it went over your network or the cloud, and error codes.
+- Nothing polls your devices in the background. Jarvis talks to a device, or searches the network, only when you ask it to.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| "No home devices are set up yet" | Run `/jarvis home setup`. |
+| A device is "off or unreachable" | Check that it is on and connected to the same network as the PC. For a Sony TV, turn on **Remote start**, and after the Android 14 update set **Energy Mode** to **Increased**. Tuya devices must be powered; battery sensors sleep. |
+| The Sony TV "refused the pre-shared key", or "now needs a secure connection" | Re-enter the key: in the setup window, add the TV again with the same address. Setup finds by itself whether the TV needs a secure connection. |
+| Sony setup says the TV "refused the connection" | Check that IP control and **Control remotely** are on (see the [Sony Bravia TV](#sony-bravia-tv) steps). If IP control lists only **Simple IP control** and **Control4**, Jarvis can't control this model. |
+| The Sony TV "has no on-screen keyboard open" | Select the app's search box with the remote first. If it is selected, the app uses a keyboard of its own, which Jarvis can't type into: type with the remote. |
+| The Apple TV says pairing failed | See the [Apple TV](#apple-tv) steps: allow access, restart it, and pair again. |
+| Plex says it "no longer accepts Jarvis's sign-in" | The sign-in was revoked (for example under **Authorized Devices** on plex.tv) or its account was changed. Choose **Connect Plex** in the setup window again. |
+| "The Plex server doesn't accept the account Jarvis is signed in with" | Plex knows the sign-in but the server turns the account away, for example because the server's owner stopped sharing it. Check that the account can open the server in the Plex app, or connect Plex with another account. |
+| "The Plex server isn't answering" | Check that the server is on, and that this PC can reach it: on the same network, or with **Remote Access** on in the server's settings. Jarvis tries the home network, then the internet, then Plex's relay, which is slow and may be limited. Connect Plex again if the server's address changed. |
+| Plex says this PC "doesn't trust its secure certificate" | Jarvis couldn't complete the check of the server's secure certificate, and it never turns checking off. At home, set **Secure connections** to **Preferred** in the server's **Settings > Network**, and Jarvis uses the server's plain home-network address instead. Away from home that doesn't help yet: try again from home. |
+| Plex says the server "refused Jarvis's sign-in, and plex.tv could not be reached to check it" | Jarvis couldn't tell whether the sign-in is still good, so it kept it. Check the internet connection and ask again in a minute. |
+| Plex setup says plex.tv gave Jarvis no access to a server shared with you | plex.tv sent no key for that server, and Jarvis never uses your account's own key on someone else's server. Ask the owner to share it with you again, or connect Plex with the owner's account. |
+| Plex says it has nothing matching a title | The server's search found nothing, and neither did a look through each library. Check the spelling, say the title as your library spells it (original titles work too), or add the year ("Dune 1984"). It can also be that the title isn't on the server. |
+| The Apple TV says `Open URL failed` for a Plex link | Try these in order: wake the Apple TV ("turn on the Apple TV", or press a button on its remote); make sure the Plex app is installed on it and that you have opened it once and signed in; if you changed the `link` setting to `play` ([Plex](#plex)), set it back to `preplay`. |
+| The Apple TV "isn't answering. It may be asleep or off the network" when opening a Plex title | Wake the Apple TV ("turn on the Apple TV", or press a button on its remote), then ask again. |
+| The Plex app opens but doesn't play | The link opens the title's page: press play. See [Play something from Plex](#play-something-from-plex). |
+| Plex offers the wrong episode as the next one | "Next" follows the Plex account Jarvis signed in with. Connect Plex with the account that watches, or name the season and episode. |
+| Plex setup says the sign-in link expired | Say yes when Jarvis offers a new link, and approve it in the browser straight away. |
+| The Apple TV "didn't accept that command" | The Apple TV answered and turned the command down. When it gives a reason, Jarvis adds it (`It said: "..."`) and `%USERPROFILE%\.jarvis\logs\voice.log` keeps it: include it if you report the problem. The text comes only from the Apple TV and never holds a key. Make sure the Apple TV is awake and the TV is on, then try again. Opening an app by name ("open Kick") and opening a link are separate requests, and a link can be turned down while the app opens fine. |
+| The phone says "Please use the designated APP to scan the code to log in" | Only Smart Life and Tuya Smart work. If your devices are in a brand's app such as MOES, [move them to Smart Life](#devices-in-a-brand-app-moes-and-others) first. Otherwise, scan with the same app you took the User Code from: Tuya Smart and Smart Life have separate accounts. If you did, try the other of the two apps: since 2026 Tuya has sometimes accepted only one of them. Tuya doesn't tell Jarvis the phone refused, so Jarvis keeps waiting until the code expires or the wait ends, then offers a new code. |
+| Setup keeps waiting after you confirmed on the phone | Jarvis notices a confirmed login within a few seconds, so if it still waits, Tuya didn't accept the login. The causes are the same as for "designated APP" above: a brand app such as MOES, a User Code from the other app, or Tuya accepting only one of the two apps for now. When the wait ends, Jarvis shows Tuya's last answer (such as `E0020003`), and `%USERPROFILE%\.jarvis\logs\voice.log` keeps it: include it if you report the problem. |
+| The QR code expired | Say yes when Jarvis offers a new code, and scan it straight away: a code is valid only briefly. |
+| "The Tuya link has expired", or Tuya's cloud keeps turning Jarvis's sign-in away | In the setup window, choose **Link Tuya devices (Tuya Smart or Smart Life)**, then **Link your Tuya account**, and scan a new code. |
+| A Tuya device stopped answering after you re-paired it in the app | Its key changed. Use **Refresh devices and scenes from your Tuya account** in the setup window. |
+| A Fingerbot is "Not added" because it is a Bluetooth device | It needs a Tuya Bluetooth or multi-mode gateway. Add one in the Tuya Smart or Smart Life app, pair the Fingerbot to it, then choose **Refresh devices and scenes**. See [Fingerbots](#fingerbots-and-other-button-pushers). |
+| A Fingerbot "is in click mode now" (or switch mode), and Jarvis left it alone | Its mode was changed in the Tuya app after setup. Choose **Refresh devices and scenes** in the setup window. |
+| A Fingerbot turns the light off when you ask for on | Setup has it the wrong way round. Choose **Refresh devices and scenes** and answer the question about what the app's On does the other way. |
+| "The Fingerbot's hub turned Jarvis away" | The hub has no free connection. Close the Tuya app on phones nearby and try again. If it keeps happening, open the Fingerbot once in the app, or refresh your Tuya devices. |
+| "The hub took the command but did not confirm it" | The hub passed it on but didn't report back in time. Check the light. If your hub never confirms a Fingerbot in switch mode, turn on [Tuya's cloud fallback](#tuyas-cloud-fallback). In click mode, check before asking again: a second press undoes the first, and the cloud fallback never sends a press again. |
+| "Its hub ... was not found on the network" | Check that the hub is powered and on the same network as the PC, then choose **Find my Tuya devices on the network again**. |
+| Setup says a Fingerbot was "saved before, but Jarvis cannot use it now" | An earlier Jarvis saved it in a way that can't work now: as a plain switch, before Jarvis knew Fingerbots, or behind a hub it is no longer paired to. The reason says why. Say yes to remove it, or keep it until you have fixed what the reason says. |
+| Setup says a Fingerbot was "kept as saved before" | Setup couldn't read all it needs from Tuya this time; the reason says what. The Fingerbot it saved before still works, so setup kept it as it was. Refresh again later, or fix what the reason says. |
+| Tuya setup or the network search says it could not listen for Tuya devices | Another program has the ports. Close other programs that scan for Tuya devices (another tinytuya tool, for example), wait a few seconds for any Tuya search Jarvis is running to finish, then try again (in setup, **Find my Tuya devices on the network again**). |
+| Devices are never found automatically, or a network search finds nothing | Windows Firewall may be blocking Python. In **Windows Security > Firewall & network protection > Allow an app through firewall**, allow Python on Private networks, and check that your network is set to Private. You can always type a TV's address instead. |
+| Home Assistant "rejected Jarvis's token" | Create a new long-lived token and connect Home Assistant again in the setup window. |
+| Home Assistant says the PC is banned | Too many failed logins. Remove the PC's address from `ip_bans.yaml` in Home Assistant's config folder and restart Home Assistant. |
+| Claude says home control isn't available | Home control runs on your own PC, so it isn't available in cloud sessions. Run `/jarvis setup` to repair the helper if it isn't installed. |
+| Home control says "Jarvis stays off" or "Jarvis is still checking whether Claude Code runs as administrator" | Home control does nothing while Claude Code runs as administrator, or before Jarvis's check for that has passed. Start Claude Code from a normal window, not with "Run as administrator". If the check is still running, try again in a few seconds; if it failed, `/jarvis restart` checks again. See [Never as administrator](PC-CONTROL.md#never-as-administrator). |
+| Jarvis asks on screen before a device command | Your Claude Code rules have an `ask` rule for `mcp__jarvis__home_control`, or a PreToolUse or PermissionRequest hook in your settings could match it, or this is a subagent's call. Remove the `ask` rule (or add the tool to `allow`) to skip the question; see [What Jarvis asks you first](#what-jarvis-asks-you-first). |
+
+## How it works
+
+The `home_control` tool belongs to the Jarvis mod. The mod checks each call (its arguments, plan mode and your permission rules) and sends it to the voice helper on your PC (`jarvis_voice.home`). The helper finds the device, checks the command against the device's tier, and runs it with that device's driver:
+
+- **Apple TV**: [pyatv](https://pyatv.dev), over Apple's Companion protocol.
+- **Sony**: the Bravia REST API and IRCC remote codes, over HTTP or HTTPS, with the pre-shared key.
+- **Plex**: your Plex Media Server's own web API (search and library details), found through plex.tv. Setup signs in with plex.tv's PIN flow, the way a TV app does. Jarvis only searches; the Apple TV's Plex app plays what the link names.
+- **Tuya**: [tinytuya](https://github.com/jasonacox/tinytuya) with local keys, fetched once by the Tuya account link ([tuya-device-sharing-sdk](https://github.com/tuya/tuya-device-sharing-sdk)). The cloud fallback sends commands through the same SDK.
+- **Home Assistant**: its REST and WebSocket APIs.
+
+A network search (`scan`) needs no driver: it uses [python-zeroconf](https://github.com/python-zeroconf/python-zeroconf) for mDNS, an SSDP search, tinytuya's scanner without connecting to anything, and the discovery messages of Kasa, LIFX, WiZ, Yeelight and Govee.
+
+If the helper isn't running, the mod runs a one-off `jarvis_voice home call` instead. That path never accepts an on-screen confirmation. Neither path, nor the setup window, runs while Claude Code runs as administrator or before Jarvis's check for that has passed.
+
+Developer notes are in [DEVELOPING.md](DEVELOPING.md#home-control), and the message format is the `home` command in [plugin/protocol/schema.json](../plugin/protocol/schema.json).

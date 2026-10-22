@@ -151,6 +151,9 @@ class Listener:
         self._ring_max_s = 2.0
         self._kind: Kind = "wake"
         self._long_preroll = False
+        # When the block being processed arrived (perf_counter): the wall time of audio time self._t.
+        self._stamp: float | None = None
+        self._onset_at: float | None = None
         self._clip: list[np.ndarray] = []
         self._rec_s = 0.0
         self._rec_voiced = 0.0
@@ -191,6 +194,16 @@ class Listener:
         Read it in ``on_end``: the next utterance sets it afresh.
         """
         return self._long_preroll
+
+    @property
+    def onset_at(self) -> float | None:
+        """When the voice of the utterance just started began (perf_counter seconds), from the audio's own stamps.
+
+        The voiced run that set it off, or the utterance it belongs to; after the
+        wake word, at least as far back as its pre-roll. Read it in ``on_start``:
+        the next utterance sets it afresh.
+        """
+        return self._onset_at
 
     @property
     def wake_name(self) -> str | None:
@@ -329,12 +342,16 @@ class Listener:
         self._watch_digital_silence(raw, raw.size / RATE)
         echo = self._echo
         # The canceller runs while paused too, so it stays converged and in step with the speaker.
-        self.process(echo.near(raw, stamp) if echo is not None else raw, watch_silence=False)
+        self.process(echo.near(raw, stamp) if echo is not None else raw, watch_silence=False, stamp=stamp)
 
-    def process(self, audio: np.ndarray, *, watch_silence: bool = True) -> None:
-        """Handle 16 kHz mono float audio (called on the listener thread, or directly by tests)."""
+    def process(self, audio: np.ndarray, *, watch_silence: bool = True, stamp: float | None = None) -> None:
+        """Handle 16 kHz mono float audio (called on the listener thread, or directly by tests).
+
+        ``stamp`` is when the block arrived (perf_counter); without one, now.
+        """
         if audio.size == 0:
             return
+        self._stamp = time.perf_counter() if stamp is None else stamp
         seconds = audio.size / RATE
         if watch_silence:
             self._watch_digital_silence(audio, seconds)
@@ -477,6 +494,14 @@ class Listener:
             # The speech that triggered this is part of the utterance, plus a little before it.
             preroll = self._voiced_run + cfg.onset_preroll_s
             self._min_speech, self._rec_voiced = 0.0, self._voiced_run
+        # Where the voice began (onset_at): never later than the voiced run that set this off, the
+        # utterance it belongs to or, after the wake word, its pre-roll. Audio time self._t is now.
+        began = self._t - self._voiced_run
+        if self._utt_onset is not None:
+            began = min(began, self._utt_onset)
+        if kind in ("wake", "jarvis"):
+            began = min(began, self._t - preroll)
+        self._onset_at = (time.perf_counter() if self._stamp is None else self._stamp) - (self._t - began)
         ring = np.concatenate(list(self._ring)) if self._ring else np.zeros(0, np.float32)
         keep = min(ring.size, int(preroll * RATE))
         self._clip = [ring[ring.size - keep :]]

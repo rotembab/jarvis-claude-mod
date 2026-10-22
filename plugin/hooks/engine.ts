@@ -4,6 +4,7 @@
 // closures, and every other module depends on the port instead of on `$`.
 
 import type {
+  AskOptions,
   HookStream,
   HttpInit,
   HttpResponse,
@@ -26,6 +27,17 @@ import type {
 import type { JarvisHelperRef, JarvisHud, JarvisView } from '../types'
 import type { PaneSize } from './hud'
 
+/** The engine's permission decision for a tool call (`$.tool.check`'s answer, the fields the mod reads). */
+export type ToolVerdict = {
+  decision: 'allow' | 'ask' | 'deny'
+  /** Why, in a sentence. */
+  reason?: string
+  /** The settings rule that decided, as written; absent for a mode's own decision. */
+  rule?: string
+  /** The most permissive verdict the organization lets a call of the tool reach. */
+  ceiling?: 'allow' | 'ask' | 'deny'
+}
+
 /** The environment variables the mod reads (each read by its literal name). */
 export type EnvSnapshot = {
   OS?: string
@@ -36,6 +48,8 @@ export type EnvSnapshot = {
   CLAUDE_CODE_REMOTE?: string
   /** Where the Jarvis app writes its address (docs/APP.md); unset, the data folder. */
   JARVIS_HOME?: string
+  /** Windows only: its own folder, for running System32 programs by full path. */
+  SystemRoot?: string
 }
 
 export type Engine = {
@@ -52,6 +66,10 @@ export type Engine = {
   run: (argv: readonly string[], init?: ProcessRunInit) => Promise<ProcessRunResult>
   exists: (path: string) => Promise<boolean>
   writeFile: (path: string, text: string) => Promise<void>
+  /** A file's text, or null when it cannot be read (missing, too big, or refused): the guard reads a script it is about to run. */
+  readFileText: (path: string) => Promise<string | null>
+  /** Where a path lands, every link and `..` folded, or null when it cannot be placed: the guard resolves an 8.3 short name before judging a Write. */
+  realPath: (path: string) => Promise<string | null>
 
   storeGet: (key: string) => Promise<unknown>
   storeSet: (key: string, value: unknown) => Promise<void>
@@ -78,10 +96,18 @@ export type Engine = {
   blit: (args: UiBlitArgs) => Promise<UiBlitResult>
   /** Redraws this plugin's drawings (the desktop ring follows the levels this way). */
   invalidate: () => void
+  /**
+   * Asks the user in the engine's on-screen question dialog; resolves to the
+   * label chosen or the text typed under "Other". Rejects when the dialog is
+   * dismissed, and in a `-p` run (nobody to ask).
+   */
+  ask: (question: string, options: readonly string[] | AskOptions) => Promise<string>
 
   /** Submits text as the user's own words; resolves once its turn started or it was queued, or with `drop`. */
   submitPrompt: (text: string) => Promise<PromptSubmitResult>
   abortTurn: (turnId: string) => Promise<void>
+  /** Stops a background task (a backgrounded command or a monitor) through the TaskStop tool. */
+  stopTask: (taskId: string) => Promise<unknown>
   /** One completion through the session's own client and credentials. */
   complete: (request: ModelCompleteRequest) => Promise<ModelCompleteResult>
   /** The main conversation's messages (the newest 4096). */

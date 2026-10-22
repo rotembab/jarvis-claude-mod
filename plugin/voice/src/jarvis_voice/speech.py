@@ -528,7 +528,11 @@ class SpeechPipeline:
         self._closed_ids[reply.id] = None
         while len(self._closed_ids) > 256:
             self._closed_ids.popitem(last=False)
-        self._events.emit(protocol.SpeechDone(reply_id=reply.id, interrupted=interrupted, spoken_text=spoken))
+        self._events.emit(
+            protocol.SpeechDone(
+                reply_id=reply.id, interrupted=interrupted, spoken_text=spoken, ended_at_ms=protocol.clock_ms()
+            )
+        )
         if reply.started:
             self._on_speaking(False)
             self._on_reply_done(reply.id, interrupted, bool(self._order))

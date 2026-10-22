@@ -27,7 +27,8 @@ spread, which is what keeps a click from dragging the cursor along.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import numpy as np
@@ -51,6 +52,62 @@ class PoseThresholds:
     pinch_open: float = 0.40
     #: Pinch ratio shown as fully open (0) by the overlay's closing arc; ``pinch_close`` shows as 1.
     pinch_display_open: float = 0.80
+    #: What a finger must reach to count toward a fist (and the ring and pinky of the two-finger pose): ``None`` is the
+    #: curled thresholds. Tighter than them for a fist sensitivity below 1.0, which asks more of the fist and nothing
+    #: else: the curled flags also gate the pinch and tell the engine how settled one is (see ``thresholds_for``).
+    fist_enter: float | None = None
+    fist_leave: float | None = None
+
+
+#: Between a curled threshold and the extended one above it, and between the two extended ones: the band a
+#: half-bent finger sits in, which belongs to neither state (see ``thresholds_for``).
+BAND = 0.04
+
+
+def thresholds_for(pinch: float = 1.0, fist: float = 1.0) -> PoseThresholds:
+    """The pose thresholds for the pinch and fist sensitivities (1.0 each is ``PoseThresholds()`` exactly).
+
+    ``pinch`` scales ``pinch_close``: higher counts a looser pinch. The
+    ``pinch_open`` threshold scales down with a stricter pinch but never up
+    with a looser one: a pinch lets go where it always did, so a hand that
+    rests its thumb near the index (0.39 to 0.47 palm sizes on a relaxed open
+    palm) cannot hold the button down after a click. Where the close threshold
+    climbs to within ``BAND`` of the open one (a pinch above 1.29), the open
+    one is pushed up to keep that gap, which is about six times the ratio's
+    noise. ``fist`` scales what counts as a fist: higher counts a fist whose
+    fingers are less tightly curled. Above 1.0 it scales the curled
+    thresholds, which then also gate the pinch (the thumb rests on a loose
+    fist's index). Below 1.0 the curled thresholds stay where they are and
+    only ``fist_enter`` and ``fist_leave`` tighten: the curled flags keep a
+    pinch from starting on a curled finger and tell the engine how settled a
+    pinch is, so scaling them would change when a hand that closes slowly
+    into a fist presses the button. A finger must never be curled and
+    extended at once, so where the curled thresholds climb into the extended
+    ones those are pushed up, ``BAND`` clear of them, and the order
+    ``curled_enter < curled_leave < extended_leave < extended_enter`` holds
+    for every value. The extended thresholds only move for a fist
+    sensitivity above the default's headroom (about 1.01), and then by little.
+    """
+    if not (math.isfinite(pinch) and math.isfinite(fist) and pinch > 0 and fist > 0):
+        raise ValueError("sensitivities must be positive, finite numbers")
+    base = PoseThresholds()
+    curled_enter = base.curled_enter * max(fist, 1.0)
+    curled_leave = base.curled_leave * max(fist, 1.0)
+    extended_leave = max(base.extended_leave, curled_leave + BAND)
+    extended_enter = max(base.extended_enter, extended_leave + BAND)
+    pinch_close = base.pinch_close * pinch
+    return replace(
+        base,
+        extended_enter=extended_enter,
+        extended_leave=extended_leave,
+        curled_enter=curled_enter,
+        curled_leave=curled_leave,
+        pinch_close=pinch_close,
+        pinch_open=max(base.pinch_open * min(pinch, 1.0), pinch_close + BAND),
+        pinch_display_open=max(base.pinch_display_open, pinch_close + BAND),
+        fist_enter=base.curled_enter * fist if fist < 1.0 else None,
+        fist_leave=base.curled_leave * fist if fist < 1.0 else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -119,6 +176,7 @@ class PoseTracker:
     def reset(self) -> None:
         self._extended = [False] * 4
         self._curled = [False] * 4
+        self._fisted = [False] * 4
         self._pinch_index = False
         self._pinch_middle = False
 
@@ -129,9 +187,12 @@ class PoseTracker:
         th = self.thresholds
         points = pose_points(hand.image, aspect)
         reach = finger_reach(points)
+        fist_enter = th.curled_enter if th.fist_enter is None else th.fist_enter
+        fist_leave = th.curled_leave if th.fist_leave is None else th.fist_leave
         for i, r in enumerate(reach):
             self._extended[i] = r > th.extended_leave if self._extended[i] else r > th.extended_enter
             self._curled[i] = r < th.curled_leave if self._curled[i] else r < th.curled_enter
+            self._fisted[i] = r < fist_leave if self._fisted[i] else r < fist_enter
 
         index_ratio = pinch_ratio(points, INDEX_TIP)
         if self._curled[0]:
@@ -151,9 +212,9 @@ class PoseTracker:
             pose = "pinch"
         elif self._pinch_middle:
             pose = "pinch_middle"
-        elif all(curled):
+        elif all(self._fisted):
             pose = "fist"
-        elif extended[0] and extended[1] and curled[2] and curled[3]:
+        elif extended[0] and extended[1] and self._fisted[2] and self._fisted[3]:
             pose = "two"
         elif all(extended):
             pose = "palm"

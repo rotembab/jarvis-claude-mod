@@ -123,6 +123,7 @@ def test_startup_reaches_sleeping_and_ready(rig: Rig) -> None:
 def test_ptt_press_release_produces_utterance(rig: Rig) -> None:
     wait_ready(rig)
     mark = rig.sink.mark()
+    pressed_ms = protocol.clock_ms()
     rig.ptt.press()
     rig.sink.wait_type("state", after=mark, state="listening")
     assert rig.playback.effects_played == 1  # start chime
@@ -131,6 +132,8 @@ def test_ptt_press_release_produces_utterance(rig: Rig) -> None:
     utt = rig.sink.wait_type("utterance", after=mark)
     assert utt["text"] == "turn on the lights" and utt["source"] == "ptt" and utt["language"] == "en"
     assert utt["durationMs"] >= 600  # 300 ms pre-roll + ~400 ms held
+    # The user began speaking when the key went down, and Jarvis was quiet.
+    assert pressed_ms <= utt["startedAtMs"] <= pressed_ms + 300 and utt["overSpeech"] is False
     rig.sink.wait_type("state", after=mark, state="sleeping")
     assert [e["state"] for e in rig.sink.of_type("state")][-3:] == ["listening", "transcribing", "sleeping"]
     assert rig.playback.effects_played == 2  # stop chime
@@ -206,7 +209,9 @@ def test_ptt_during_speech_barges_in_and_listens(sink: RecordingSink) -> None:
         # Late sentences of the interrupted reply are dropped.
         assert rig.command("speak", {"replyId": "r9", "seq": 1, "text": "More.", "final": True})["dropped"] is True
         rig.ptt.release()
-        sink.wait_type("utterance", after=mark)
+        utt = sink.wait_type("utterance", after=mark)
+        # It cut Jarvis off: the words began before his reply ended.
+        assert utt["overSpeech"] is True and utt["startedAtMs"] <= done["endedAtMs"]
     finally:
         rig.daemon.request_exit(0)
         assert rig.thread is not None
@@ -406,6 +411,7 @@ def test_end_to_end_with_fish_websocket(sink: RecordingSink) -> None:
             rig.command("speak", {"replyId": "r1", "seq": 0, "text": "The build is green.", "final": False})
             rig.command("speak", {"replyId": "r1", "seq": 2, "text": "", "final": True})
             done = sink.wait_type("speech_done", timeout=10)
+            assert isinstance(done.pop("endedAtMs"), int)
             assert done == {
                 "v": 1,
                 "type": "speech_done",

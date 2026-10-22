@@ -13,6 +13,14 @@ different sizes still leave gaps, so the point is clamped into the nearest
 chosen display; overshooting the box therefore pins the cursor to screen
 edges and corners, which is how the taskbar and the corners are reached.
 
+The cursor's speed is a gain on the unit square around its centre, after the
+homography: ``(uv - 0.5) * gain + 0.5``, so a gain of 2 crosses the screen with
+half the hand travel and the centre stays put. It belongs to the cursor
+(``to_target``, ``to_desktop``), not to the relative motion that scrolls and
+throws (``to_region``) and not to the calibration's targets (``target_point``),
+and the calibration itself fits the homography alone. The engine sets it
+(``set_cursor_gain``) when nothing that is held would jump.
+
 The runtime changes displays, selection and calibration from the control
 server's thread while the engine thread maps, so one lock guards the state
 and every method works on a consistent snapshot.
@@ -20,6 +28,7 @@ and every method works on a consistent snapshot.
 
 from __future__ import annotations
 
+import math
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -154,6 +163,7 @@ class ScreenMapper:
         self._selection: DisplaySelection = settings.displays
         self._homography: np.ndarray | None = None
         self._h = box_homography(*settings.box)
+        self._gain = float(settings.cursor_speed)
         self._layout = _Layout.of([])
         self._set_homography(homography)
         self._recompute()
@@ -174,6 +184,13 @@ class ScreenMapper:
         """A calibrated camera -> unit square homography, or None for the settings' default box."""
         with self._lock:
             self._set_homography(h)
+
+    def set_cursor_gain(self, gain: float) -> None:
+        """Gain on the cursor around the centre of the unit square (1.0 maps the homography's square as it is)."""
+        if not math.isfinite(gain) or gain <= 0:
+            raise ValueError("the cursor gain must be a positive finite number")
+        with self._lock:
+            self._gain = float(gain)
 
     def _set_homography(self, h: np.ndarray | None) -> None:
         if h is None:
@@ -213,6 +230,11 @@ class ScreenMapper:
             return self._homography is not None
 
     @property
+    def cursor_gain(self) -> float:
+        with self._lock:
+            return self._gain
+
+    @property
     def homography(self) -> np.ndarray:
         """The homography in use (the calibrated one or the default box's)."""
         with self._lock:
@@ -221,10 +243,10 @@ class ScreenMapper:
     # -- mapping ----------------------------------------------------------------------
 
     def to_target(self, anchor: Point) -> Point:
-        """Unit-square coordinates of a camera point (not clamped)."""
+        """Unit-square coordinates of a camera point, with the cursor gain (not clamped)."""
         with self._lock:
-            h = self._h
-        return apply_homography(h, anchor)
+            h, gain = self._h, self._gain
+        return _gained(apply_homography(h, anchor), gain)
 
     def to_region(self, anchor: Point) -> Point:
         """Pixels of a camera point in the region, NOT clamped to the displays.
@@ -232,17 +254,19 @@ class ScreenMapper:
         For relative motion (scrolling, throw speed), which must keep counting
         when the hand overshoots an edge. In the region's compact layout, so it
         moves as many pixels as the cursor does on a display and never jumps
-        where a left-out display was.
+        where a left-out display was. Without the cursor gain: how fast the
+        cursor travels does not change how far a scroll goes or how hard a
+        flick must be.
         """
         with self._lock:
             h, layout = self._h, self._layout
         return layout.region_point(apply_homography(h, anchor))
 
     def to_desktop(self, anchor: Point) -> Point:
-        """Desktop pixels of a camera point, clamped into the nearest used display."""
+        """Desktop pixels of a camera point, with the cursor gain, clamped into the nearest used display."""
         with self._lock:
-            h, layout = self._h, self._layout
-        return layout.desktop_point(apply_homography(h, anchor))
+            h, layout, gain = self._h, self._layout, self._gain
+        return layout.desktop_point(_gained(apply_homography(h, anchor), gain))
 
     def target_point(self, u: float, v: float) -> Point:
         """Desktop pixels of unit-square coordinates, clamped like ``to_desktop``."""
@@ -257,6 +281,13 @@ class ScreenMapper:
         if not used:
             raise LookupError("no displays")
         return _nearest(p, used)
+
+
+def _gained(uv: Point, gain: float) -> Point:
+    """``uv`` scaled by ``gain`` around the centre of the unit square (exactly ``uv`` for a gain of 1)."""
+    if gain == 1.0:
+        return uv
+    return Point(0.5 + (uv.x - 0.5) * gain, 0.5 + (uv.y - 0.5) * gain)
 
 
 def _nearest(p: Point, displays: list[Display]) -> Display:

@@ -94,7 +94,8 @@ log = logging.getLogger(__name__)
 
 #: A restored window's top edge sits at most this far above the cursor (the title bar's height).
 TITLE_GRAB_PX = 40
-#: A maximized window is restored once the drag has moved this far (Windows' drag threshold is 4 px).
+#: A maximized window is restored once the drag has moved this far (Windows' drag threshold is 4 px), at a cursor
+#: gain of 1; a faster cursor moves that many times as far for the same hand jitter, so it is wider by the gain.
 RESTORE_DRAG_PX = 8.0
 #: Seconds after a real-mouse override during which queued actions are dropped.
 SUSPEND_S = 0.25
@@ -119,6 +120,8 @@ class _Grab:
     was_maximized: bool = False
     #: Still maximized (not yet restored by a drag).
     maximized: bool = False
+    #: The drag (px) that restores it, as it was when the window was grabbed.
+    restore_px: float = RESTORE_DRAG_PX
     #: a0, b0 and the rect when the two-hand resize began.
     resize: tuple[Point, Point, Rect] | None = None
     last_rect: Rect | None = None
@@ -130,6 +133,7 @@ class Executor:
         desktop: Desktop,
         *,
         displays: Callable[[], list[Display]],
+        cursor_gain: Callable[[], float] = lambda: 1.0,
         on_user_input: Callable[[], None] | None = None,
         on_error: Callable[[str, str], None] | None = None,
         frame_interval: float = 1 / 30,
@@ -143,6 +147,9 @@ class Executor:
         self._desktop = desktop
         #: The displays hand control uses (resize bounds, throw targets).
         self._displays = displays
+        #: The cursor's gain over the hand's travel (the mapper's): the same hand jitter moves the cursor that many
+        #: times as far, so the drag that restores a maximized window is that much wider.
+        self._cursor_gain = cursor_gain
         self._on_user_input = on_user_input
         self._on_error = on_error
         self.frame_interval = frame_interval
@@ -490,7 +497,7 @@ class Executor:
         if window is None:
             self._grab = _Grab(window=None)
             return
-        grab = _Grab(window=window, grab_point=p, ref=p)
+        grab = _Grab(window=window, grab_point=p, ref=p, restore_px=RESTORE_DRAG_PX * max(1.0, self._cursor_gain()))
         self._grab = grab
         try:
             self._desktop.raise_window(window)
@@ -529,7 +536,7 @@ class Executor:
     def _drag(self, grab: _Grab, p: Point) -> None:
         assert grab.window is not None
         if grab.maximized:
-            if p.distance(grab.grab_point) >= RESTORE_DRAG_PX:
+            if p.distance(grab.grab_point) >= grab.restore_px:
                 self._restore_at(grab, p)
             return
         # The size is read back, not carried from the grab: dragged onto a monitor with another DPI, the app
