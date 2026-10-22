@@ -23,7 +23,7 @@ import jsonschema
 import numpy as np
 import pytest
 
-from jarvis_hands import clock, logs, protocol
+from jarvis_hands import clock, executor, logs, protocol
 from jarvis_hands.camera.base import CameraError, CameraFrame, CameraInfo
 from jarvis_hands.desktop.fake import FakeDesktop
 from jarvis_hands.keyboard import synth
@@ -631,7 +631,10 @@ class Lockstep:
 
 
 @pytest.fixture
-def lockstep(tmp_path: Path) -> Iterator[Callable[..., Lockstep]]:
+def lockstep(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Lockstep]]:
+    # The executor ticks on the real clock and drops a press or a move older than two frames (67 ms). A slow CI
+    # runner can schedule its thread later than that, and a press or move a test waits for never happens.
+    monkeypatch.setattr(executor, "SHELF_FRAMES", 0.0)
     made: list[Lockstep] = []
 
     def make(**kwargs: Any) -> Lockstep:
