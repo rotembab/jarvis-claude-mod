@@ -158,3 +158,54 @@ jobs:
       # No `tsc -p plugin` step: Claude Code writes the API declarations into
       # plugin/.claude-plugin/types/ only when a session loads the mod, and no
       # command lays them without one. docs/DEVELOPING.md has the local check.
+
+  app:
+    name: app (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # Electron 44 fetches its binary on first launch, not at install, so the
+      # unit tests (plain Node) never download it.
+      - name: Install the app's dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Run unit tests
+        run: npm test
+
+      # The end-to-end tests launch Electron under a virtual screen. Fetch the
+      # binary first so the first launch does not time out downloading it.
+      - name: Install Xvfb and Electron
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb
+          npx install-electron
+
+      # The tests pass --no-sandbox on Linux only (runners cannot use Chromium's
+      # sandbox); the app itself never does.
+      - name: Run end-to-end tests
+        if: runner.os == 'Linux'
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" npm run e2e

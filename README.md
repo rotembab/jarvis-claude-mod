@@ -175,6 +175,24 @@ Under the ring are the last thing you said and the last six things Claude ran (`
 - In the desktop app focus mode does nothing yet.
 - `/jarvis focus off` turns it off. The choice is kept for new sessions.
 
+### The Jarvis app (optional)
+
+The Jarvis app shows the HUD on your desktop as well: a ring over your screen while you talk to Jarvis, a small orb you can put anywhere, and a tray icon. Claude Code and the plugin still do all the work; the app only shows what the plugin sends it, over `127.0.0.1` on your own computer.
+
+It needs the plugin 0.8.0 or later, so [update Jarvis](#update) first (`claude plugin update jarvis@jarvis-claude-mod`, restart Claude Code, `/jarvis setup`). There is no installer yet, so the app runs from a clone of this repository:
+
+```text
+git clone https://github.com/rotembab/jarvis-claude-mod
+cd jarvis-claude-mod/app
+npm ci
+npm start
+```
+
+- It needs [Node.js](https://nodejs.org) 22 or later (`winget install OpenJS.NodeJS.LTS`). The first start downloads Electron, about 100 MB. If PowerShell refuses to run `npm`, type `npm.cmd` instead.
+- Claude Code finds the app within a few seconds of it starting. `/jarvis app` says whether it is connected (if it says `Unknown subcommand "app"`, the plugin is not updated yet); `/jarvis app off` stops sending it the HUD.
+- To update the app, quit it from its tray menu first, then `git pull`, `npm ci` and `npm start`.
+- [docs/APP.md](docs/APP.md) covers the overlay, the orb, the tray menu, Ctrl+Alt+J and starting with Windows.
+
 ## Hand control (preview)
 
 Your webcam can drive the mouse and windows: point with your hand, pinch to click and drag files, make a fist to grab a window and fling it to another screen. It runs on Windows, needs a webcam, and is off until you turn it on.
@@ -291,6 +309,7 @@ Jarvis can work your Windows PC from a spoken request: "open Spotify and play my
 | `/jarvis voice <id\|default>` | Use a Fish Audio voice by its model id, or go back to the default voice. |
 | `/jarvis hud [on\|off]` | Open the HUD pane. `off` closes it and keeps it closed in new sessions; `on` opens it with each session again. |
 | `/jarvis focus [on\|off]` | Focus mode: while Jarvis runs, only the HUD and the prompt show. |
+| `/jarvis app [on\|off]` | Whether the Jarvis app is connected. `off` stops sending it the HUD, in new sessions too; `on` sends it again. |
 | `/jarvis devices` | Show the microphone, speakers and models in use. |
 | `/jarvis home [setup\|list\|status\|do\|scan]` | Home devices: what is set up, open the setup window, list devices, show one device's state, run one command, or search your network for smart devices. See [docs/HOME.md](docs/HOME.md#commands). |
 | `/jarvis pc [check <command>\|rules\|stop]` | PC control: the guard's state, which tier a command falls in, permission rules to paste into your settings, or stand down. See [docs/PC-CONTROL.md](docs/PC-CONTROL.md#commands). |
@@ -375,6 +394,7 @@ Jarvis has two halves: a **mod** inside Claude Code (TypeScript hooks) and a **v
 - **Home devices** are controlled from your PC over your home network; commands don't go through any cloud, except Tuya scenes, the one-time Tuya account link and, only if you turn it on, Tuya's cloud fallback for devices that don't answer at home. Claude sees device names and states, never their addresses or keys. See [docs/HOME.md](docs/HOME.md#privacy).
 - **Hand control uses the camera only while it is on.** The hand helper reads each frame, finds your hands on your own computer (MediaPipe, on the CPU) and drops the frame; no picture is stored or sent anywhere. Jarvis pins MediaPipe 0.10.33, the newest version that sends Google no usage statistics. The camera light is on while hand control watches, and off after `/jarvis hands pause` or `off`.
 - The helper keeps a log in `%USERPROFILE%\.jarvis\logs\voice.log` (hand control: `hands.log`). API keys and tokens are masked in it.
+- **The Jarvis app**, if you run it, receives the HUD from the plugin over `127.0.0.1` with a token only the two of them know, and makes no network requests of its own.
 - Apart from installing (uv downloads Python packages, `/jarvis setup` downloads the speech model from Hugging Face and the wake word models from GitHub: openWakeWord's releases, and the plain "Jarvis" model from a community collection, and `/jarvis setup hands` downloads the hand model from Google's MediaPipe models) and the helper fetching a wake word model that is missing (the "Hey Jarvis" model when it starts, the plain "Jarvis" model when you switch it on), Jarvis talks to nothing else.
 
 ## Troubleshooting
@@ -406,6 +426,8 @@ More detail, including logs and running the helper by hand, is in [docs/DEVELOPI
 
 Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech models and logs). To remove the marketplace too: `/plugin marketplace remove jarvis-claude-mod`.
 
+If you ran the Jarvis app, untick **Start with Windows** in its tray menu first, then delete its folder and `%APPDATA%\Jarvis`.
+
 ## Roadmap
 
 | Phase | Name | What it adds |
@@ -414,6 +436,7 @@ Then delete `%USERPROFILE%\.jarvis` (the helper's Python environment, speech mod
 | 2 (now) | Always listening | Done: "Hey Jarvis", plain "Jarvis" (optional), end-of-speech detection, the follow-up window, barge-in, echo cancelling for speakers, spoken "stop", Sonnet by default with Opus and Fable for hard requests. Next: a plain "Jarvis" model trained for Jarvis. |
 | 3 (now) | HUD | Done: an arc reactor ring pane in Windows Terminal and the desktop app that shows Jarvis standing by, listening, thinking and speaking, with your last words and Claude's last actions. Next: tuning it on your screen. |
 | 4 (now) | Hands | Now: a guard on Claude's commands and edits, with spoken and on-screen confirmations, and the desktop tool ([docs/PC-CONTROL.md](docs/PC-CONTROL.md)). Next: checking it on real PCs. |
+| App | Jarvis app | Step A1 (now): a desktop app that shows the HUD over your screen while Claude Code runs, with an orb, a tray icon and Ctrl+Alt+J ([docs/APP.md](docs/APP.md)). Next: the app runs the voice helper itself, so Jarvis listens from the moment Windows starts. |
 | Alongside | Hand control | Now: webcam gestures for the mouse and windows (preview), with settings for how it feels. Next: tuning on a real desk, then a projector wall mode. |
 
 Alongside the phases: control of home devices ([docs/HOME.md](docs/HOME.md)).

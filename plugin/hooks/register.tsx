@@ -66,6 +66,7 @@ export const register: Register = (on, options) => {
         HOME: await $.env.get('HOME'),
         NO_PROXY: await $.env.get('NO_PROXY'),
         CLAUDE_CODE_REMOTE: await $.env.get('CLAUDE_CODE_REMOTE'),
+        JARVIS_HOME: await $.env.get('JARVIS_HOME'),
         SystemRoot: await $.env.get('SystemRoot'),
       }),
       now: () => $.clock.now(),
@@ -227,6 +228,7 @@ export const register: Register = (on, options) => {
     app.pc.onTurnStart(e)
     app.voice?.onTurnStart(e)
     app.hud?.onTurnStart()
+    app.companion?.onTurnStart()
     return next(e)
   })
 

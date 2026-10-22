@@ -182,6 +182,11 @@ export class Hud {
     return { mic: this.mic, out: this.out, t: performance.now() / 1000 }
   }
 
+  /** The action log, newest first. */
+  get actionLog(): readonly HudAction[] {
+    return this.actions
+  }
+
   // -- inputs
 
   setPhase(phase: JarvisPhase): void {
@@ -342,6 +347,9 @@ export class Hud {
   /** Called when the terminal pane starts or stops being drawn, or moves between dock and inline (focus mode follows both). */
   onShownChange: ((isShown: boolean) => void) | undefined
 
+  /** Called when what the HUD shows may have changed (its mode, actions or reply): the Jarvis app follows it. */
+  onChange: (() => void) | undefined
+
   dispose(): void {
     this.onClosed()
   }
@@ -367,6 +375,7 @@ export class Hud {
   /** The mode may have changed: the desktop redraws (the terminal ring repaints on its own). */
   private changed(): void {
     if (this.isDesktopShown) this.redrawDesktop(performance.now())
+    this.onChange?.()
   }
 
   /** Writes what the pane shows to the session state (a new module's HUD starts from its own). */
@@ -378,6 +387,7 @@ export class Hud {
       ...(this.isFocus ? { isFocus: true } : {}),
     }
     void this.engine.writeHud(hud).catch(() => undefined)
+    this.onChange?.()
   }
 
   /** Asks for the size the screen and focus mode call for, once it differs from the last ask. */

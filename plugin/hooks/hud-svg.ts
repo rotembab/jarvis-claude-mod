@@ -57,8 +57,8 @@ const DEFS = `<defs>
 <mask id="depth" maskUnits="userSpaceOnUse" x="-90" y="-90" width="180" height="180"><rect x="-80" y="-80" width="160" height="160" fill="url(#depthFade)"/></mask>
 </defs>`
 
-/** The monitor photo: grid, ruler, the blue ring and its marks. */
-function blueRing(mode: HudMode, mic: number, t: number): string {
+/** The monitor photo: grid, ruler, the blue ring and its marks (without the square backdrop when `frame` is false). */
+function blueRing(mode: HudMode, mic: number, t: number, frame: boolean): string {
   const isOffline = mode === 'offline'
   const level = mode === 'listening' ? Math.min(1, mic) : 0
   const blue = isOffline ? '#5d666e' : mode === 'interrupted' ? '#9fdcff' : '#2f9bff'
@@ -114,7 +114,7 @@ function blueRing(mode: HudMode, mic: number, t: number): string {
     `<g fill="${white}" fill-opacity="${dotOpacity}" stroke-opacity="${dotOpacity}" stroke-width="1">${dots.join('')}${isOffline ? '' : spin(90 - level * 60, t)}</g>`,
     `<g stroke="${white}" stroke-opacity="0.75" stroke-width="1.4"><path d="M${C} 18V30"/><path d="M${C} 210V222"/></g>`,
   )
-  return backdrop.join('') + zoomed(parts.join(''), mode, mic, 0, t)
+  return (frame ? backdrop.join('') : '') + zoomed(parts.join(''), mode, mic, 0, t)
 }
 
 /** The sphere's radius, and how far the camera looks down on it (radians). */
@@ -172,13 +172,13 @@ function meridians(seconds: number, t: number): string {
     .join('')
 }
 
-/** The orange sphere: frame, the turning 3D shell, debris, orbits and the core. */
-function amberSphere(mode: HudMode, out: number, t: number): string {
+/** The orange sphere: frame (unless `frame` is false), the turning 3D shell, debris, orbits and the core. */
+function amberSphere(mode: HudMode, out: number, t: number, frame: boolean): string {
   const isSpeaking = mode === 'speaking'
   const level = isSpeaking ? Math.min(1, out) : 0.35
   const turn = isSpeaking ? 20 : 13
   // The frame stays put: bars top and bottom, lines down the right, a dial in the corner.
-  const frame = [
+  const box = [
     `<rect width="${SIZE}" height="${SIZE}" rx="10" fill="#0a0705"/>`,
     `<g fill="#3a2410"><rect x="14" y="12" width="150" height="5"/><rect x="40" y="226" width="160" height="3"/></g>`,
     `<g fill="#c8792a"><rect x="14" y="17" width="58" height="2"/><rect x="132" y="12" width="20" height="5" fill-opacity="0.7"/></g>`,
@@ -245,7 +245,7 @@ function amberSphere(mode: HudMode, out: number, t: number): string {
       isSpeaking ? '' : `<animate attributeName="r" values="${core};${round(core * 1.18)};${core}" dur="1.6s" repeatCount="indefinite"/>`
     }</circle>`,
   ].join('')
-  return frame + zoomed(ball, mode, 0, out, t)
+  return (frame ? box : '') + zoomed(ball, mode, 0, out, t)
 }
 
 /**
@@ -282,8 +282,13 @@ function zoomed(content: string, mode: HudMode, mic: number, out: number, t: num
   return `<g transform="translate(${C} ${C})"><g transform="scale(${s(scale)})">${animation}<g transform="translate(${-C} ${-C})">${content}</g></g></g>`
 }
 
-/** The ring as an SVG document for `mode`, with the levels (0..1) it shows, `t` seconds into its motion. */
-export function ringSvg(mode: HudMode, mic: number, out: number, t = 0): string {
-  const body = mode === 'thinking' || mode === 'speaking' ? amberSphere(mode, out, t) : blueRing(mode, mic, t)
+/**
+ * The ring as an SVG document for `mode`, with the levels (0..1) it shows, `t`
+ * seconds into its motion. `frame: false` leaves out the square tile behind it
+ * (backdrop, grid, ruler, the sphere's bars and dial), for a page that draws it
+ * round over other windows (the desktop app).
+ */
+export function ringSvg(mode: HudMode, mic: number, out: number, t = 0, { frame = true }: { frame?: boolean } = {}): string {
+  const body = mode === 'thinking' || mode === 'speaking' ? amberSphere(mode, out, t, frame) : blueRing(mode, mic, t, frame)
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${SIZE} ${SIZE}" width="${SIZE}" height="${SIZE}">${DEFS}${body}</svg>`
 }

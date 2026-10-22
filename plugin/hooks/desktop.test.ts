@@ -2,6 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Engine as TestEngine } from 'claude-code/testing'
 
 import type { JarvisHud } from '../types'
+import { APP_LINK_KEY } from './companion'
 import type { DesktopAnswer } from './desktop'
 import { DESKTOP_TOOL, DESKTOP_TOOL_SPEC, duration, parseDesktopInput, settingsHooksMatch } from './desktop'
 import type { RuleVerdict } from './pc'
@@ -428,6 +429,8 @@ describe('desktop tool: timers', () => {
 
   test('timer_cancel stops it', async ($, on) => {
     const w = world(on)
+    // Ten minutes of app-link heartbeats outrun the test's time limit; the link is not under test here.
+    w.store.set(APP_LINK_KEY, false)
     await startDesktop($, w)
     await desktop($, { action: 'timer', seconds: 300, label: 'Pasta' })
     await desktop($, { action: 'timer', seconds: 600, label: 'tea' })

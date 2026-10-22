@@ -166,6 +166,16 @@ describe('HUD ring', () => {
     }
   })
 
+  test('the desktop app can have the ring without its square tile', () => {
+    const tile = `<rect width="240" height="240"`
+    for (const mode of MODES) {
+      expect(ringSvg(mode, 0.5, 0.5, 1)).toContain(tile)
+      const round = ringSvg(mode, 0.5, 0.5, 1, { frame: false })
+      expect(round).not.toContain(tile)
+      expect(round).not.toContain('url(#grid)')
+    }
+  })
+
   test('a tool call becomes one line of the log', () => {
     expect(actionLabel({ tool: 'Bash', command: 'npm test', description: 'Run the tests' })).toBe('Bash Run the tests')
     expect(actionLabel({ tool: 'Read', file_path: 'C:\\work\\src\\app.ts' })).toBe('Read app.ts')
